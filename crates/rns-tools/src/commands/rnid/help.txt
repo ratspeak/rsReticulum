@@ -1,0 +1,57 @@
+usage: rnid-rs [-h] [--config path] [-i rid] [-g path] [-m rid] [-M rid] [-x]
+               [-X] [-v] [-q] [-a [aspects]] [-H aspects] [-d [file ...]]
+               [-e [file ...]] [-V [path ...]] [-s [path ...]] [-S [text]]
+               [-E [path]] [--meta-spec [path]] [--raw] [-w path] [-r path]
+               [-f] [-R] [-N] [-t seconds] [-p] [-P] [-B] [-b] [-U] [-F]
+               [--meta] [--version]
+
+Reticulum Identity & Encryption Utility
+
+options:
+  -h, --help            show this help message and exit
+  --config path         path to alternative Reticulum config directory
+  -i, --identity rid    hexadecimal Reticulum identity or destination hash, or
+                        path to Identity file
+  -g, --generate path   generate a new Identity and save to path
+  -m, --import-pub rid  import public Reticulum identity in hex, base32 or
+                        base64 format, or from file
+  -M, --import-prv rid  import Reticulum identity in hex, base32 or base64
+                        format, or from file
+  -x, --export-pub      export public identity to hex, base32 or base64 format
+  -X, --export-prv      export private identity to hex, base32 or base64
+                        format, or to file
+  -v, --verbose         increase verbosity
+  -q, --quiet           decrease verbosity
+  -a, --announce [aspects]
+                        announce a destination based on this Identity
+  -H, --hash aspects    show destination hashes for other aspects for this
+                        Identity
+  -d, --decrypt [file ...]
+                        decrypt file
+  -e, --encrypt [file ...]
+                        encrypt file
+  -V, --validate [path ...]
+                        validate signature
+  -s, --sign [path ...]
+                        sign file
+  -S, --sign-message [text]
+                        create embedded signed message
+  -E, --embed-meta [path]
+                        embed metadata structure from file
+  --meta-spec [path]    validate metadata for embedding with spec from file
+  --raw                 sign raw input data instead of hashing first
+  -w, --write path      output file path
+  -r, --read path       input file path for operations with optional file
+                        input
+  -f, --force           write output even if it overwrites existing files
+  -R, --request         request unknown Identities from the network
+  -N, --no-cache        never used cached or network-sourced information
+  -t seconds            identity request timeout before giving up
+  -p, --print-identity  print identity info and exit
+  -P, --print-private   allow displaying private keys
+  -B, --base32          Use base32-encoded input and output
+  -b, --base64          Use base64-encoded input and output
+  -U, --base256         Use base256-encoded input and output
+  -F, --hex             Use hex-encoded input and output
+  --meta                Display RSM metadata if available
+  --version             show program's version number and exit

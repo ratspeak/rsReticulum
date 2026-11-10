@@ -1,26 +1,30 @@
 //! rnid-rs - identity create/inspect/sign/verify/encrypt/decrypt.
 //!
-//! Python reference: `RNS/Utilities/rnid.py` from Reticulum 1.3.8.
+//! Port of `RNS/Utilities/rnid.py` from Reticulum 1.6.0: operation order,
+//! exit codes and the text printed on stdout follow the Python tool.
 
 mod b256;
 mod meta;
+mod pyfmt;
+mod pyre;
 mod rsg;
 
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE;
+use clap::Parser;
 #[cfg(feature = "hardware")]
 use clap::Subcommand;
-use clap::{CommandFactory, Parser};
+use rmpv::Value;
 use rns_identity::destination::{DestType, Destination, Direction};
 use rns_identity::identity::Identity;
-use rns_identity::known_destinations::KnownDestinations;
+use rns_runtime::reticulum::ReticulumHandle;
 use rns_transport::messages::{
     OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
 };
@@ -29,177 +33,183 @@ use rns_transport::messages::{
 mod hw_commands;
 
 use rns_tools::RS_RETICULUM_VERSION;
+use rns_tools::format::pretty_size;
+
 const DEFAULT_ASPECTS: &str = "rns.id";
-const PUB_EXT: &str = "pub";
-const SIG_EXT: &str = "rsg";
-const MSG_EXT: &str = "rsm";
-const ENCRYPT_EXT: &str = "rfe";
+const NO_MESSAGE: &str = "\u{1}";
+const NO_META: &str = "\u{2}";
 const ENC_CHUNK: usize = 16 * 1024 * 1024;
+/// A known destination: `(destination hash, public key)`.
+type Known = ([u8; 16], [u8; 64]);
+
 const DEC_CHUNK: usize = ENC_CHUNK + rns_crypto::TOKEN_OVERHEAD * 2;
-const BLOCK_SIZE: usize = 16;
-const FULL_CHUNK_TOKEN_SIZE: usize =
-    ENC_CHUNK + rns_identity::identity::IDENTITY_OVERHEAD + BLOCK_SIZE;
+
+const R_NO_IDENTITY: u8 = 2;
+const R_NO_PRVKEY: u8 = 4;
+const R_NO_KEYS: u8 = 5;
+const R_NO_FILE: u8 = 6;
+const R_INVALID_FILE: u8 = 7;
+const R_INVALID_IDENTITY: u8 = 8;
+const R_INVALID_ASPECTS: u8 = 9;
+const R_INVALID_SIGNATURE: u8 = 10;
+const R_FILE_EXISTS: u8 = 11;
+const R_DECRYPT_FAILED: u8 = 12;
+const R_INVALID_ARGS: u8 = 250;
+const R_READ_ERROR: u8 = 252;
+const R_WRITE_ERROR: u8 = 253;
+const R_UNKNOWN_ERROR: u8 = 254;
+const R_INTERRUPTED: u8 = 255;
 
 #[derive(Parser)]
 #[command(
     name = "rnid-rs",
     about = "Reticulum Identity & Encryption Utility",
-    disable_version_flag = true
+    disable_version_flag = true,
+    disable_help_flag = true,
+    infer_long_args = true
 )]
 struct Args {
-    /// Path to alternative Reticulum config directory.
-    #[arg(long)]
+    /// show this help message and exit
+    #[arg(short = 'h', long)]
+    help: bool,
+
+    /// path to alternative Reticulum config directory
+    #[arg(long, value_name = "path")]
     config: Option<String>,
 
-    /// Hexadecimal identity/destination hash, or path to an Identity file.
-    #[arg(short = 'i', long)]
+    /// hexadecimal Reticulum identity or destination hash, or path to Identity file
+    #[arg(short = 'i', long, value_name = "rid")]
     identity: Option<String>,
 
-    /// Generate a new Identity and write it to this file.
-    #[arg(short = 'g', long)]
-    generate: Option<PathBuf>,
+    /// generate a new Identity and save to path
+    #[arg(short = 'g', long, value_name = "path")]
+    generate: Option<String>,
 
-    /// Import 64 public-key bytes from a raw file, hex, base32 or URL-safe base64.
-    #[arg(short = 'm', long = "import-pub", value_name = "identity_data")]
+    /// import public Reticulum identity in hex, base32 or base64 format, or from file
+    #[arg(short = 'm', long = "import-pub", value_name = "rid")]
     import_pub: Option<String>,
 
-    /// Import 64 private-key bytes from a raw file, hex, base32 or URL-safe base64.
-    #[arg(
-        short = 'M',
-        long = "import-prv",
-        alias = "import",
-        visible_alias = "import-private",
-        value_name = "identity_data"
-    )]
+    /// import Reticulum identity in hex, base32 or base64 format, or from file
+    #[arg(short = 'M', long = "import-prv", value_name = "rid")]
     import_prv: Option<String>,
 
-    /// Export public Identity data in hex, base32 or base64 format.
+    /// export public identity to hex, base32 or base64 format
     #[arg(short = 'x', long = "export-pub")]
     export_pub: bool,
 
-    /// Export private Identity data in hex, base32 or base64 format, or to file.
-    #[arg(
-        short = 'X',
-        long = "export-prv",
-        alias = "export",
-        visible_alias = "export-private"
-    )]
+    /// export private identity to hex, base32 or base64 format, or to file
+    #[arg(short = 'X', long = "export-prv")]
     export_prv: bool,
 
-    /// Increase verbosity.
+    /// increase verbosity
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Decrease verbosity.
+    /// decrease verbosity
     #[arg(short = 'q', long, action = clap::ArgAction::Count)]
     quiet: u8,
 
-    /// Queue a destination announce for this private Identity (default aspects: rns.id).
-    #[arg(short = 'a', long, num_args = 0..=1, default_missing_value = DEFAULT_ASPECTS)]
+    /// announce a destination based on this Identity
+    #[arg(short = 'a', long, value_name = "aspects", num_args = 0..=1, default_missing_value = DEFAULT_ASPECTS)]
     announce: Option<String>,
 
-    /// Show destination hash for aspects based on this Identity.
-    #[arg(short = 'H', long = "hash")]
+    /// show destination hashes for other aspects for this Identity
+    #[arg(short = 'H', long = "hash", value_name = "aspects")]
     hash: Option<String>,
 
-    /// Encrypt file.
-    #[arg(short = 'e', long, num_args = 0.., value_name = "file")]
-    encrypt: Option<Vec<PathBuf>>,
-
-    /// Decrypt file.
+    /// decrypt file
     #[arg(short = 'd', long, num_args = 0.., value_name = "file")]
-    decrypt: Option<Vec<PathBuf>>,
+    decrypt: Option<Vec<String>>,
 
-    /// Sign file.
-    #[arg(short = 's', long, num_args = 0.., value_name = "path")]
-    sign: Option<Vec<PathBuf>>,
+    /// encrypt file
+    #[arg(short = 'e', long, num_args = 0.., value_name = "file")]
+    encrypt: Option<Vec<String>>,
 
-    /// Validate an RSG signature or RSM signed message. Use --identity to require a particular signer.
+    /// validate signature
     #[arg(short = 'V', long = "validate", num_args = 0.., value_name = "path")]
-    validate: Option<Vec<PathBuf>>,
+    validate: Option<Vec<String>>,
 
-    /// Sign embedded message text, a --read file, or editor input if neither is supplied.
-    /// Binary output requires --write; an encoding option prints an armored message.
-    #[arg(short = 'S', long = "sign-message", num_args = 0..=1, value_name = "text")]
-    sign_message: Option<Option<String>>,
+    /// sign file
+    #[arg(short = 's', long, num_args = 0.., value_name = "path")]
+    sign: Option<Vec<String>>,
 
-    /// Embed metadata from a file with --sign-message.
-    #[arg(short = 'E', long = "embed-meta", value_name = "path")]
-    embed_meta: Option<PathBuf>,
+    /// create embedded signed message
+    #[arg(short = 'S', long = "sign-message", value_name = "text", num_args = 0..=1, default_missing_value = NO_MESSAGE)]
+    sign_message: Option<String>,
 
-    /// Metadata specification for --sign-message/--embed-meta; defaults to `<metadata-file>.spec`.
-    /// A missing specification file skips validation, including when an explicit path is supplied.
-    #[arg(long = "meta-spec", num_args = 0..=1, value_name = "path")]
-    meta_spec: Option<Option<PathBuf>>,
+    /// embed metadata structure from file
+    #[arg(short = 'E', long = "embed-meta", value_name = "path", num_args = 0..=1, default_missing_value = NO_META)]
+    embed_meta: Option<String>,
 
-    /// With --sign, sign file bytes directly instead of an RSG envelope containing the file hash.
+    /// validate metadata for embedding with spec from file
+    #[arg(long = "meta-spec", value_name = "path", num_args = 0..=1)]
+    meta_spec: Option<Option<String>>,
+
+    /// sign raw input data instead of hashing first
     #[arg(long)]
     raw: bool,
 
-    /// UTF-8 input file for --sign-message; cannot be combined with inline message text.
+    /// output file path
+    #[arg(short = 'w', long, value_name = "path")]
+    write: Option<String>,
+
+    /// input file path for operations with optional file input
     #[arg(short = 'r', long, value_name = "path")]
-    read: Option<PathBuf>,
+    read: Option<String>,
 
-    /// Output file path.
-    #[arg(short = 'w', long)]
-    write: Option<PathBuf>,
-
-    /// Write output even if it overwrites existing files.
+    /// write output even if it overwrites existing files
     #[arg(short = 'f', long)]
     force: bool,
 
-    /// Request an unknown --identity hash from the network (unless --no-cache is set).
-    #[arg(short = 'R', long = "request")]
-    request: bool,
-
-    /// Skip cached/network resolution of --identity; explicit identity files and imports still work.
-    #[arg(short = 'N', long = "no-cache")]
-    no_cache: bool,
-
-    /// Identity-request polling budget in seconds after requests are submitted.
-    /// Runtime startup and awaited transport queries can add time.
-    #[arg(short = 't', value_name = "seconds", default_value_t = rns_transport::constants::PATH_REQUEST_TIMEOUT)]
-    timeout: f64,
-
-    /// Print identity information; other selected operations may still run.
-    #[arg(short = 'p', long = "print-identity")]
-    print_identity: bool,
-
-    /// Include private keys in --print-identity output; --export-prv has its own output.
-    #[arg(short = 'P', long = "print-private")]
-    print_private: bool,
-
-    /// Use URL-safe base64 for key display/export and armored signature/message output.
-    #[arg(short = 'b', long)]
-    base64: bool,
-
-    /// Use base32 for key display/export and armored signature/message output.
-    #[arg(short = 'B', long)]
-    base32: bool,
-
-    /// Use base256 for armored signature/message output; key display/export stays hexadecimal.
-    #[arg(short = 'U', long)]
-    base256: bool,
-
-    /// Use hexadecimal key display/export and armored signature/message output.
-    #[arg(short = 'F', long)]
-    hex: bool,
-
-    /// Display RSM metadata if available.
-    #[arg(long)]
-    meta: bool,
-
-    /// Print version and exit.
-    #[arg(long)]
-    version: bool,
-
-    /// Compatibility flag; file operations still read their named paths.
     #[arg(short = 'I', long = "stdin", hide = true)]
     stdin: bool,
 
-    /// Compatibility flag; file operations still write their named paths.
     #[arg(short = 'O', long = "stdout", hide = true)]
     stdout: bool,
+
+    /// request unknown Identities from the network
+    #[arg(short = 'R', long = "request")]
+    request: bool,
+
+    /// never used cached or network-sourced information
+    #[arg(short = 'N', long = "no-cache")]
+    no_cache: bool,
+
+    /// identity request timeout before giving up
+    #[arg(short = 't', value_name = "seconds", default_value_t = rns_transport::constants::PATH_REQUEST_TIMEOUT)]
+    timeout: f64,
+
+    /// print identity info and exit
+    #[arg(short = 'p', long = "print-identity")]
+    print_identity: bool,
+
+    /// allow displaying private keys
+    #[arg(short = 'P', long = "print-private")]
+    print_private: bool,
+
+    /// Use base32-encoded input and output
+    #[arg(short = 'B', long)]
+    base32: bool,
+
+    /// Use base64-encoded input and output
+    #[arg(short = 'b', long)]
+    base64: bool,
+
+    /// Use base256-encoded input and output
+    #[arg(short = 'U', long)]
+    base256: bool,
+
+    /// Use hex-encoded input and output
+    #[arg(short = 'F', long)]
+    hex: bool,
+
+    /// Display RSM metadata if available
+    #[arg(long)]
+    meta: bool,
+
+    /// show program's version number and exit
+    #[arg(long)]
+    version: bool,
 }
 
 #[cfg(feature = "hardware")]
@@ -219,7 +229,7 @@ enum HwCommands {
         nickname: Option<String>,
         /// Output directory; writes <identity-hash>/identity.hwid. Omit to save no file.
         #[arg(short, long)]
-        output: Option<PathBuf>,
+        output: Option<std::path::PathBuf>,
         /// PIV management key (hex). Defaults to the factory key.
         #[arg(long)]
         mgmt_key: Option<String>,
@@ -228,22 +238,22 @@ enum HwCommands {
     List {
         /// Parent directory of identity folders; required by the command.
         #[arg(short, long)]
-        dir: Option<PathBuf>,
+        dir: Option<std::path::PathBuf>,
     },
     /// Show saved .hwid metadata without contacting a token or verifying attestation.
     Info {
         /// Path to a saved public .hwid metadata file.
-        hwid: PathBuf,
+        hwid: std::path::PathBuf,
     },
     /// Compare the token's 9A/9D public keys with a .hwid file; no signing or attestation test.
     Verify {
         /// Path to a saved public .hwid metadata file.
-        hwid: PathBuf,
+        hwid: std::path::PathBuf,
     },
     /// Test signing, X25519 agreement and decryption against a .hwid identity; requires --pin.
     Test {
         /// Path to a saved public .hwid metadata file.
-        hwid: PathBuf,
+        hwid: std::path::PathBuf,
         /// Current token PIN, required by this command; no interactive PIN prompt.
         #[arg(long)]
         pin: Option<String>,
@@ -262,6 +272,23 @@ struct HwArgs {
     command: HwCommands,
 }
 
+/// Result of one operation: keep going, or `exit(code)` like the Python tool.
+type Step = Result<(), u8>;
+
+/// Identity argument after resolution: Python passes `identity or args.identity`.
+enum Target<'a> {
+    Identity(&'a Identity),
+    Text(&'a str),
+    None,
+}
+
+/// Lazily started runtime (`ensure_reticulum`).
+struct Ctx {
+    handle: Option<ReticulumHandle>,
+    shutdown: rns_runtime::lifecycle::ShutdownSignal,
+    started: Arc<AtomicBool>,
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 pub(crate) async fn main() -> ExitCode {
     #[cfg(feature = "hardware")]
@@ -276,13 +303,50 @@ pub(crate) async fn main() -> ExitCode {
     }
 
     let args = Args::parse();
-    run(args).await
+    let mut ctx = Ctx {
+        handle: None,
+        shutdown: rns_runtime::lifecycle::ShutdownSignal::new(),
+        started: Arc::new(AtomicBool::new(false)),
+    };
+    let started = ctx.started.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            // Before Reticulum starts Python exits R_INTERRUPTED; after, its
+            // SIGINT handler exits 0.
+            if started.load(Ordering::SeqCst) {
+                std::process::exit(0);
+            }
+            println!();
+            std::process::exit(i32::from(R_INTERRUPTED));
+        }
+    });
+    let code = run(&args, &mut ctx).await;
+    let _ = std::io::stdout().flush();
+    if let Some(handle) = ctx.handle.take() {
+        handle.shutdown_and_wait().await;
+    }
+    ExitCode::from(code)
 }
 
-async fn run(args: Args) -> ExitCode {
+fn nonempty(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|v| !v.is_empty())
+}
+
+fn paths_active(paths: &Option<Vec<String>>) -> bool {
+    paths.as_ref().is_some_and(|p| !p.is_empty())
+}
+
+/// argparse help of upstream rnid at its default 80-column width.
+const HELP: &str = include_str!("help.txt");
+
+async fn run(args: &Args, ctx: &mut Ctx) -> u8 {
+    if args.help {
+        print!("{HELP}");
+        return 0;
+    }
     if args.version {
         println!("rnid-rs {RS_RETICULUM_VERSION}");
-        return ExitCode::SUCCESS;
+        return 0;
     }
 
     let level = rns_tools::Utility::Rnid.loglevel(None, args.verbose, args.quiet, false);
@@ -294,644 +358,750 @@ async fn run(args: Args) -> ExitCode {
         std::io::stderr,
     );
 
-    // Python truthiness: empty path lists (`-s` with no values) and an empty
-    // `-S ""` message do not activate their operation.
-    let sign_message_active = match &args.sign_message {
-        Some(None) => true,
-        Some(Some(text)) => !text.is_empty(),
-        None => false,
-    };
-    let op_count = [
+    // validate_args (rnid.py:84-101)
+    let ops = [
         paths_active(&args.encrypt),
         paths_active(&args.decrypt),
         paths_active(&args.validate),
         paths_active(&args.sign),
-        sign_message_active,
-    ]
-    .into_iter()
-    .filter(|op| *op)
-    .count();
-    if op_count > 1 {
-        eprintln!(
+        nonempty(&args.sign_message).is_some(),
+    ];
+    if ops.iter().filter(|o| **o).count() > 1 {
+        println!(
             "This utility currently only supports one of the encrypt, decrypt, sign or verify operations per invocation"
         );
-        return ExitCode::from(1);
+        return 1;
     }
-    let identity_source_count = [
-        args.import_pub.is_some(),
-        args.import_prv.is_some(),
-        args.identity.is_some(),
-        args.generate.is_some(),
-    ]
-    .into_iter()
-    .filter(|source| *source)
-    .count();
-    if identity_source_count > 1 {
-        eprintln!("The -i, -g, -m and -M args are mutually exclusive");
-        return ExitCode::from(1);
+    let sources = [
+        nonempty(&args.import_pub).is_some(),
+        nonempty(&args.import_prv).is_some(),
+        nonempty(&args.identity).is_some(),
+        nonempty(&args.generate).is_some(),
+    ];
+    if sources.iter().filter(|o| **o).count() > 1 {
+        println!("The -i, -g, -m and -M args are mutually exclusive");
+        return 1;
     }
-    let encoding_count = [args.base64, args.base32, args.base256, args.hex]
-        .into_iter()
-        .filter(|flag| *flag)
-        .count();
-    if encoding_count > 1 {
-        eprintln!("The -b, -B, --hex and --base256 args are mutually exclusive");
-        return ExitCode::from(1);
+    if [args.base64, args.base32, args.base256, args.hex]
+        .iter()
+        .filter(|o| **o)
+        .count()
+        > 1
+    {
+        println!("The -b, -B, --hex and --base256 args are mutually exclusive");
+        return 1;
     }
 
     let op_requires_identity = paths_active(&args.sign)
-        || sign_message_active
+        || nonempty(&args.sign_message).is_some()
         || paths_active(&args.encrypt)
         || paths_active(&args.decrypt)
-        || args.announce.is_some()
-        || args.write.is_some()
+        || nonempty(&args.announce).is_some()
+        || nonempty(&args.write).is_some()
         || args.print_identity
         || args.export_pub
         || args.export_prv;
 
-    let identity = match get_operating_identity(&args, !op_requires_identity).await {
+    let identity = match get_operating_identity(args, ctx, !op_requires_identity).await {
         Ok(identity) => identity,
-        Err((code, msg)) => {
-            eprintln!("{msg}");
-            return ExitCode::from(code);
-        }
+        Err(code) => return code,
     };
-    if op_requires_identity && identity.is_none() {
-        eprintln!("Could not get working identity");
-        return ExitCode::from(2);
+    if identity.is_none() && op_requires_identity {
+        println!("Could not get working identity");
+        return R_NO_IDENTITY;
     }
+    match run_ops(args, ctx, identity.as_ref()).await {
+        Ok(()) => 0,
+        Err(code) => code,
+    }
+}
 
-    let mut op = args.generate.is_some();
+async fn run_ops(args: &Args, ctx: &mut Ctx, identity: Option<&Identity>) -> Step {
+    let target = || match (identity, nonempty(&args.identity)) {
+        (Some(identity), _) => Target::Identity(identity),
+        (None, Some(text)) => Target::Text(text),
+        (None, None) => Target::None,
+    };
+    let mut op = false;
     if args.print_identity {
-        print_identity(identity.as_ref().expect("identity checked"), &args);
+        print_identity_information(args, identity.expect("required"));
         op = true;
     }
     if args.export_pub {
-        let code = export_public_identity(identity.as_ref().expect("identity checked"), &args);
-        if code != ExitCode::SUCCESS {
-            return code;
-        }
+        export_pub_identity(args, identity.expect("required"))?;
         op = true;
     }
     if args.export_prv {
-        let code = export_private_identity(identity.as_ref().expect("identity checked"), &args);
-        if code != ExitCode::SUCCESS {
-            return code;
-        }
+        export_prv_identity(args, identity.expect("required"))?;
         op = true;
     }
-    if let Some(aspects) = args.hash.as_deref() {
-        let identity_ref = identity.as_ref();
-        let identity_hash_arg = args.identity.as_deref();
-        let code = hash_destination(identity_ref, identity_hash_arg, aspects);
-        if code != ExitCode::SUCCESS {
-            return code;
-        }
+    if let Some(aspects) = nonempty(&args.hash) {
+        print_hash_information(aspects, target())?;
         op = true;
     }
-    if let Some(aspects) = args.announce.as_deref() {
-        return announce_destination(identity.as_ref().expect("identity checked"), aspects, &args)
-            .await;
+    if let Some(aspects) = nonempty(&args.announce) {
+        announce(args, ctx, aspects, identity.expect("required")).await?;
+        op = true;
     }
-    // Multi-path ops iterate like Python 1.3.8's recursive list dispatch
-    // (rnid.py:606-617 etc.): first failing path terminates with its own code.
     if paths_active(&args.validate) {
-        for path in args.validate.clone().expect("validate active") {
-            let code =
-                validate_signature(identity.as_ref(), args.identity.as_deref(), &path, &args);
-            if code != ExitCode::SUCCESS {
-                return code;
-            }
+        let target = target();
+        for path in args.validate.as_ref().expect("active") {
+            validate(args, path, &target)?;
         }
-        return ExitCode::SUCCESS;
+        return Err(0);
     }
     if paths_active(&args.sign) {
-        for path in args.sign.clone().expect("sign active") {
-            let code = sign_file(identity.as_ref().expect("identity checked"), &path, &args);
-            if code != ExitCode::SUCCESS {
-                return code;
-            }
+        for path in args.sign.as_ref().expect("active") {
+            sign(args, path, identity.expect("required"))?;
         }
-        return ExitCode::SUCCESS;
+        return Err(0);
     }
-    if sign_message_active {
-        return sign_message(identity.as_ref().expect("identity checked"), &args);
+    if nonempty(&args.sign_message).is_some() {
+        sign_message(args, identity.expect("required"))?;
+        return Err(0);
     }
     if paths_active(&args.encrypt) {
-        for path in args.encrypt.clone().expect("encrypt active") {
-            let code = encrypt_file(identity.as_ref().expect("identity checked"), &path, &args);
-            if code != ExitCode::SUCCESS {
-                return code;
-            }
+        for path in args.encrypt.as_ref().expect("active") {
+            encrypt(args, path, identity.expect("required"))?;
         }
-        return ExitCode::SUCCESS;
+        return Err(0);
     }
     if paths_active(&args.decrypt) {
-        for path in args.decrypt.clone().expect("decrypt active") {
-            let code = decrypt_file(identity.as_ref().expect("identity checked"), &path, &args);
-            if code != ExitCode::SUCCESS {
-                return code;
-            }
+        for path in args.decrypt.as_ref().expect("active") {
+            decrypt(args, path, identity.expect("required"))?;
         }
-        return ExitCode::SUCCESS;
+        return Err(0);
     }
-    if args.write.is_some() {
-        let code = write_identity(identity.as_ref().expect("identity checked"), &args);
-        if code != ExitCode::SUCCESS {
-            return code;
-        }
+    if let Some(write) = nonempty(&args.write) {
+        write_identity(args, write, identity.expect("required"))?;
         op = true;
     }
-
-    if !op {
-        let mut cmd = Args::command();
-        let _ = cmd.print_help();
-        println!();
+    if nonempty(&args.generate).is_some() {
+        op = true;
     }
-    ExitCode::SUCCESS
+    if !op {
+        print!("{HELP}");
+    }
+    Ok(())
 }
 
-fn generate_identity(path: &Path, force: bool) -> Result<Identity, (u8, String)> {
-    if let Err(e) = ensure_output_allowed(path, force) {
-        return Err((11, e));
-    }
-    let identity = Identity::new();
-    match identity.to_file(path) {
-        Ok(()) => {
-            println!(
-                "New identity {} written to {}",
-                hex::encode(identity.hash),
-                path.display()
-            );
-            Ok(identity)
+// ---------------------------------------------------------------------------
+// Python helpers
+// ---------------------------------------------------------------------------
+
+/// `os.path.expanduser`.
+fn expanduser(path: &str) -> String {
+    let Some(rest) = path.strip_prefix('~') else {
+        return path.to_string();
+    };
+    let (user, tail) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let home = if user.is_empty() {
+        std::env::var("HOME").ok()
+    } else {
+        std::fs::read_to_string("/etc/passwd")
+            .ok()
+            .and_then(|passwd| {
+                passwd.lines().find_map(|line| {
+                    let fields: Vec<&str> = line.split(':').collect();
+                    (fields.len() >= 6 && fields[0] == user).then(|| fields[5].to_string())
+                })
+            })
+    };
+    match home {
+        Some(home) => {
+            let home = if home.len() > 1 {
+                home.trim_end_matches('/')
+            } else {
+                &home
+            };
+            format!("{home}{tail}")
         }
-        Err(e) => Err((
-            253,
-            format!("An error occurred while saving the generated Identity: {e}"),
-        )),
+        None => path.to_string(),
     }
+}
+
+fn is_file(path: &str) -> bool {
+    Path::new(path).is_file()
+}
+
+/// Python `str(OSError)` for a failed file operation.
+fn py_os_error(error: &std::io::Error, path: &str) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!(
+            "[Errno {code}] {}: {}",
+            nix::errno::Errno::from_raw(code).desc(),
+            pyfmt::py_str_repr(path)
+        ),
+        None => error.to_string(),
+    }
+}
+
+/// `bytes.fromhex`.
+fn py_fromhex(text: &str) -> Result<Vec<u8>, String> {
+    let chars: Vec<char> = text.chars().collect();
+    let err =
+        |pos: usize| format!("non-hexadecimal number found in fromhex() arg at position {pos}");
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if matches!(chars[i], ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r') {
+            i += 1;
+            continue;
+        }
+        let hi = chars[i].to_digit(16).ok_or_else(|| err(i))?;
+        let lo = chars
+            .get(i + 1)
+            .and_then(|c| c.to_digit(16))
+            .ok_or_else(|| err(i + 1))?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Ok(out)
+}
+
+/// `base64.b32decode` (strict alphabet and padding).
+fn py_b32decode(text: &str) -> Option<Vec<u8>> {
+    if !text.is_ascii() || !text.len().is_multiple_of(8) {
+        return None;
+    }
+    let stripped = text.trim_end_matches('=');
+    let padchars = text.len() - stripped.len();
+    let mut decoded = Vec::new();
+    let mut acc: u64 = 0;
+    for quanta in stripped.as_bytes().chunks(8) {
+        acc = 0;
+        for &c in quanta {
+            let v = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'2'..=b'7' => c - b'2' + 26,
+                _ => return None,
+            };
+            acc = (acc << 5) + u64::from(v);
+        }
+        decoded.extend_from_slice(&acc.to_be_bytes()[3..]);
+    }
+    if ![0, 1, 3, 4, 6].contains(&padchars) {
+        return None;
+    }
+    if padchars > 0 && !decoded.is_empty() {
+        acc <<= 5 * padchars;
+        let last = acc.to_be_bytes();
+        let leftover = (43 - 5 * padchars) / 8;
+        let n = decoded.len();
+        decoded.truncate(n - 5);
+        decoded.extend_from_slice(&last[3..3 + leftover]);
+    }
+    Some(decoded)
+}
+
+/// `base64.urlsafe_b64decode` (`binascii.a2b_base64`, non-strict).
+fn py_urlsafe_b64decode(text: &str) -> Option<Vec<u8>> {
+    if !text.is_ascii() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut quad = 0;
+    let mut left = 0u8;
+    let mut trailing_pad = 0;
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => {
+                trailing_pad += 1;
+                continue;
+            }
+            _ => continue,
+        };
+        trailing_pad = 0;
+        match quad {
+            0 => {
+                left = v;
+                quad = 1;
+            }
+            1 => {
+                out.push((left << 2) | (v >> 4));
+                left = v & 0x0f;
+                quad = 2;
+            }
+            2 => {
+                out.push((left << 4) | (v >> 2));
+                left = v & 0x03;
+                quad = 3;
+            }
+            _ => {
+                out.push((left << 6) | v);
+                quad = 0;
+            }
+        }
+    }
+    match quad {
+        1 => None,
+        2 if trailing_pad < 2 => None,
+        3 if trailing_pad < 1 => None,
+        _ => Some(out),
+    }
+}
+
+fn pretty_hash(hash: &[u8]) -> String {
+    format!("<{}>", hex::encode(hash))
+}
+
+fn identity_str(identity: &Identity) -> String {
+    pretty_hash(&identity.hash)
+}
+
+/// `RNS.log` line printed to stdout before Reticulum is configured.
+fn rns_log(level: &str, message: &str) {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    println!(
+        "[{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}] {level} {message}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    );
+}
+
+fn output_format(args: &Args) -> &'static str {
+    if args.base32 {
+        "base32"
+    } else if args.base64 {
+        "base64"
+    } else if args.base256 {
+        "base256"
+    } else if args.hex {
+        "hex"
+    } else {
+        "bin"
+    }
+}
+
+fn encode_key_text(bytes: &[u8], args: &Args) -> String {
+    if args.base64 {
+        URL_SAFE.encode(bytes)
+    } else if args.base32 {
+        encode_base32(bytes)
+    } else {
+        hex::encode(bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime
+// ---------------------------------------------------------------------------
+
+async fn ensure_reticulum<'a>(
+    args: &Args,
+    ctx: &'a mut Ctx,
+) -> Result<&'a ReticulumHandle, String> {
+    if ctx.handle.is_none() {
+        let foreground = Arc::new(AtomicBool::new(true));
+        let handle = rns_runtime::reticulum::init(
+            args.config.as_deref(),
+            None,
+            ctx.shutdown.clone(),
+            foreground,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        ctx.started.store(true, Ordering::SeqCst);
+        ctx.handle = Some(handle);
+    }
+    Ok(ctx.handle.as_ref().expect("started"))
+}
+
+/// Known `(destination hash, public key)` pairs visible to this process: the
+/// runtime's restored and live announce table, the announce packets a running
+/// instance has cached in storage, and a legacy Python `known_destinations`.
+async fn known_identities(args: &Args, handle: &ReticulumHandle) -> Result<Vec<Known>, String> {
+    let mut known = legacy_known_destinations(args)?;
+    if let Some(TransportQueryResponse::Announces(announces)) = handle
+        .query_transport(TransportQuery::GetRecentAnnounces)
+        .await
+    {
+        known.extend(
+            announces
+                .into_iter()
+                .filter_map(|a| a.public_key.map(|k| (a.dest_hash, k))),
+        );
+    }
+    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
+    let cache_dir = config_dir.join("storage").join("cache").join("announces");
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(hash) = name
+                .to_str()
+                .and_then(|n| hex::decode(n).ok())
+                .and_then(|h| <[u8; 32]>::try_from(h).ok())
+            else {
+                continue;
+            };
+            let Ok(Some(cached)) =
+                rns_transport::persistence::load_python_cached_announce(&cache_dir, &hash)
+            else {
+                continue;
+            };
+            let Ok(packet) = rns_wire::packet::Packet::from_raw_owned(cached.raw_packet) else {
+                continue;
+            };
+            if packet.header.flags.packet_type != rns_wire::flags::PacketType::Announce {
+                continue;
+            }
+            let dest = packet.header.destination_hash;
+            let Ok(announce) = rns_identity::announce::AnnounceData::unpack(
+                packet.data(),
+                packet.header.flags.context_flag,
+            ) else {
+                continue;
+            };
+            if announce.validate(&dest).is_ok() {
+                known.push((dest, announce.public_key));
+            }
+        }
+    }
+    Ok(known)
+}
+
+/// Legacy (pre-1.6) Python msgpack `storage/known_destinations`.
+fn legacy_known_destinations(args: &Args) -> Result<Vec<Known>, String> {
+    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
+    let Ok(data) = std::fs::read(config_dir.join("storage/known_destinations")) else {
+        return Ok(Vec::new());
+    };
+    let Ok(Value::Map(entries)) = rmpv::decode::read_value(&mut std::io::Cursor::new(data)) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (key, value) in entries {
+        let Some(dest) = key.as_slice().and_then(|k| <[u8; 16]>::try_from(k).ok()) else {
+            continue;
+        };
+        let Some(items) = value.as_array().filter(|items| items.len() >= 3) else {
+            continue;
+        };
+        let Some(public_key) = items[2].as_slice() else {
+            continue;
+        };
+        match <[u8; 64]>::try_from(public_key) {
+            Ok(key) if Identity::from_public_key(&key).is_ok() => out.push((dest, key)),
+            _ => {
+                return Err(format!(
+                    "Can't remember {}, the public key size of {} is not valid.",
+                    pretty_hash(&dest),
+                    public_key.len()
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `Identity.recall(h) or Identity.recall(h, from_identity_hash=True)`.
+async fn recall(
+    args: &Args,
+    handle: &ReticulumHandle,
+    hash: &[u8; 16],
+) -> Result<Option<Identity>, String> {
+    let known = known_identities(args, handle).await?;
+    let found = known.iter().find(|(dest, _)| dest == hash).or_else(|| {
+        known
+            .iter()
+            .find(|(_, key)| rns_crypto::sha::truncated_hash(key) == *hash)
+    });
+    let Some((dest, key)) = found else {
+        return Ok(None);
+    };
+    // Identity.recall marks the matched destination used (Identity.py:148,158).
+    let _ = handle
+        .query_control(TransportQuery::UseDestination { dest: *dest })
+        .await;
+    Ok(Identity::from_public_key(key).ok())
+}
+
+/// `spin()`: animated wait until `done` or the timeout.
+async fn spin(
+    args: &Args,
+    handle: &ReticulumHandle,
+    hash: &[u8; 16],
+    msg: &str,
+    timeout: f64,
+) -> Option<Identity> {
+    const SYMS: [char; 7] = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout.max(0.0));
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{msg}   ");
+    let _ = out.flush();
+    let mut i = 0;
+    let mut found = None;
+    while Instant::now() < deadline {
+        if let Ok(Some(identity)) = recall(args, handle, hash).await {
+            found = Some(identity);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = write!(out, "\x08\x08{} ", SYMS[i]);
+        let _ = out.flush();
+        i = (i + 1) % SYMS.len();
+    }
+    let _ = write!(out, "\r{}  \r", " ".repeat(msg.chars().count()));
+    let _ = out.flush();
+    match found {
+        Some(identity) => Some(identity),
+        None => recall(args, handle, hash).await.ok().flatten(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Identity loading and resolution (rnid.py:200-370)
+// ---------------------------------------------------------------------------
+
+/// `RNS.Identity.from_file`: the file always holds a 64-byte private key.
+/// Rust's msgpack identity envelope is also accepted.
+fn identity_from_file(path: &str) -> Option<Identity> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(e) => {
+            rns_log(
+                "[Error]   ",
+                &format!("Error while loading identity from {path}"),
+            );
+            rns_log(
+                "[Error]   ",
+                &format!("The contained exception was: {}", py_os_error(&e, path)),
+            );
+            return None;
+        }
+    };
+    if data.len() == 64 {
+        return Identity::from_private_key(&data).ok();
+    }
+    if let Ok(identity) = Identity::from_file(Path::new(path)) {
+        return Some(identity);
+    }
+    let reason = if data.len() < 32 {
+        "An X25519 private key is 32 bytes long"
+    } else {
+        "An Ed25519 private key is 32 bytes long"
+    };
+    rns_log(
+        "[Error]   ",
+        &format!("Failed to load identity key, the contained exception was: {reason}"),
+    );
+    None
 }
 
 async fn get_operating_identity(
     args: &Args,
+    ctx: &mut Ctx,
     allow_none: bool,
-) -> Result<Option<Identity>, (u8, String)> {
-    if let Some(path) = args.generate.as_ref() {
-        return generate_identity(path, args.force).map(Some);
-    }
-    if let Some(import_pub) = args.import_pub.as_deref() {
-        return import_public_identity(import_pub).map(Some);
-    }
-    if let Some(import_prv) = args.import_prv.as_deref() {
-        return import_private_identity(import_prv).map(Some);
-    }
-    let Some(identity_arg) = args.identity.as_deref() else {
-        return Ok(None);
-    };
-
-    let path = Path::new(identity_arg);
-    if path.is_file() {
-        let identity = load_identity_file(path).map_err(|e| (8, e))?;
-        return Ok(Some(identity));
-    }
-
-    if args.no_cache {
-        if allow_none {
-            return Ok(None);
+) -> Result<Option<Identity>, u8> {
+    if let Some(path) = nonempty(&args.generate) {
+        let identity = Identity::new();
+        if !args.force && is_file(path) {
+            println!("Identity file {path} already exists. Not overwriting.");
+            return Err(R_FILE_EXISTS);
         }
-        return Err((2, "Could not resolve identity".to_string()));
-    }
-
-    if identity_arg.len() == 32 {
-        let hash = parse_hash16(identity_arg)
-            .ok_or((8, "Invalid hexadecimal hash provided".to_string()))?;
-        match recall_identity_from_python_known_destinations(hash, args) {
-            Ok(Some(identity)) => {
-                if identity.hash == hash {
-                    println!("Recalled Identity {}", pretty_hash(&identity.hash));
-                } else {
-                    println!(
-                        "Recalled Identity {} for destination {}",
-                        pretty_hash(&identity.hash),
-                        pretty_hash(&hash)
-                    );
-                }
-                retain_identity_hash(args, identity.hash).await;
-                return Ok(Some(identity));
-            }
-            Ok(None) => {}
-            Err(msg) => return Err((8, msg)),
-        }
-        if allow_none && !args.request {
-            return Ok(None);
-        }
-        if !args.request {
-            return Err((
-                2,
-                format!(
-                    "Could not recall Identity for {}.\nYou can query the network for unknown Identities with the -R option.",
-                    pretty_hash(&hash)
-                ),
-            ));
-        }
-        let identity = request_identity(hash, args).await?;
-        retain_identity_hash(args, identity.hash).await;
-        return Ok(Some(identity));
-    }
-
-    Err((2, "Could not get working identity".to_string()))
-}
-
-fn import_public_identity(input: &str) -> Result<Identity, (u8, String)> {
-    let identity_bytes = decode_import_identity_data(input, 64).ok_or((
-        8,
-        "Could not decode specified data to a valid public Reticulum Identity".to_string(),
-    ))?;
-    let identity = Identity::from_public_key(&identity_bytes).map_err(|e| {
-        (
-            8,
-            format!("Could not create Reticulum identity from specified data: {e}"),
-        )
-    })?;
-    println!("Reticulum Identity imported");
-    Ok(identity)
-}
-
-fn import_private_identity(input: &str) -> Result<Identity, (u8, String)> {
-    let identity_bytes = decode_import_identity_data(input, 64).ok_or((
-        8,
-        "Could not decode specified data to a valid private Reticulum Identity".to_string(),
-    ))?;
-    let identity = Identity::from_private_key(&identity_bytes).map_err(|e| {
-        (
-            8,
-            format!("Could not create Reticulum identity from specified data: {e}"),
-        )
-    })?;
-    println!("Reticulum Identity imported");
-    Ok(identity)
-}
-
-fn decode_import_identity_data(input: &str, expected_len: usize) -> Option<Vec<u8>> {
-    let path = Path::new(input);
-    if path.is_file()
-        && let Ok(data) = std::fs::read(path)
-        && data.len() == expected_len
-    {
-        return Some(data);
-    }
-    if input.len() == expected_len * 2
-        && let Ok(data) = hex::decode(input)
-        && data.len() == expected_len
-    {
-        return Some(data);
-    }
-    if let Ok(data) = decode_base32(input)
-        && data.len() == expected_len
-    {
-        return Some(data);
-    }
-    if let Ok(data) = URL_SAFE.decode(input)
-        && data.len() == expected_len
-    {
-        return Some(data);
-    }
-    None
-}
-
-async fn retain_identity_hash(args: &Args, identity_hash: [u8; 16]) {
-    retain_identity_in_known_destinations_file(args, identity_hash);
-
-    let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
-    let foreground = Arc::new(AtomicBool::new(true));
-    let Ok(handle) =
-        rns_runtime::reticulum::init(args.config.as_deref(), None, shutdown.clone(), foreground)
-            .await
-    else {
-        return;
-    };
-    let _ = handle
-        .query_transport(TransportQuery::RetainIdentity { identity_hash })
-        .await;
-    shutdown.trigger();
-}
-
-fn retain_identity_in_known_destinations_file(args: &Args, identity_hash: [u8; 16]) {
-    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
-    let path = config_dir.join("storage/known_destinations");
-    let Ok(mut known) = KnownDestinations::load(&path) else {
-        return;
-    };
-    if known.retain_identity(&identity_hash) > 0 {
-        let _ = known.save(&path);
-    }
-}
-
-fn load_identity_file(path: &Path) -> Result<Identity, String> {
-    if path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case(PUB_EXT))
-    {
-        let data = std::fs::read(path)
-            .map_err(|e| format!("Could not decode Identity from specified file: {e}"))?;
-        return Identity::from_public_key(&data)
-            .map_err(|e| format!("Could not decode public Identity from specified file: {e}"));
-    }
-
-    match Identity::from_file(path) {
-        Ok(identity) => Ok(identity),
-        Err(private_err) => {
-            let data = std::fs::read(path).map_err(|_| {
-                format!("Could not decode Identity from specified file: {private_err}")
-            })?;
-            Identity::from_public_key(&data).map_err(|public_err| {
-                format!(
-                    "Could not decode Identity from specified file: {private_err}; public key: {public_err}"
-                )
-            })
-        }
-    }
-}
-
-async fn request_identity(hash: [u8; 16], args: &Args) -> Result<Identity, (u8, String)> {
-    let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
-    let foreground = Arc::new(AtomicBool::new(true));
-    let handle =
-        rns_runtime::reticulum::init(args.config.as_deref(), None, shutdown.clone(), foreground)
-            .await
-            .map_err(|e| (1, format!("Failed to initialize Reticulum runtime: {e}")))?;
-
-    let id_destination_hash =
-        Destination::hash_from_name_and_identity(DEFAULT_ASPECTS, Some(&hash));
-    for destination_hash in [hash, id_destination_hash] {
-        handle
-            .transport_tx
-            .send(TransportMessage::RequestPath { destination_hash })
-            .await
-            .map_err(|_| (1, "Transport closed while requesting path".to_string()))?;
-    }
-
-    let timeout = Duration::from_secs_f64(args.timeout.max(0.0));
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Some(identity) = query_recent_announces_for_hash(&handle, hash).await {
-            shutdown.trigger();
-            println!(
-                "Received Identity {} for destination {} from the network",
-                pretty_hash(&identity.hash),
-                pretty_hash(&hash)
+        // Identity.to_file logs and swallows write errors.
+        if let Err(e) = identity.to_file(Path::new(path)) {
+            rns_log(
+                "[Error]   ",
+                &format!("Error while saving identity to {path}"),
             );
-            return Ok(identity);
+            rns_log("[Notice]  ", &format!("The contained exception was: {e}"));
         }
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let sleep_for = remaining.min(Duration::from_millis(100));
-        tokio::time::sleep(sleep_for).await;
+        println!("New identity {} written to {path}", identity_str(&identity));
+        return Ok(Some(identity));
     }
 
-    let identity = query_recent_announces_for_hash(&handle, hash).await;
-    shutdown.trigger();
-    identity.ok_or((2, "Identity request timed out".to_string()))
-}
-
-async fn query_recent_announces_for_hash(
-    handle: &rns_runtime::reticulum::ReticulumHandle,
-    hash: [u8; 16],
-) -> Option<Identity> {
-    let response = handle
-        .query_transport(TransportQuery::GetRecentAnnounces)
-        .await?;
-    let TransportQueryResponse::Announces(announces) = response else {
-        return None;
-    };
-
-    for announce in announces {
-        let public_key = announce.public_key?;
-        if announce.dest_hash == hash {
-            return Identity::from_public_key(&public_key).ok();
-        }
-        let identity_hash = rns_crypto::sha::truncated_hash(&public_key);
-        if identity_hash == hash {
-            return Identity::from_public_key(&public_key).ok();
-        }
-    }
-    None
-}
-
-fn recall_identity_from_python_known_destinations(
-    hash: [u8; 16],
-    args: &Args,
-) -> Result<Option<Identity>, String> {
-    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
-    let path = config_dir.join("storage/known_destinations");
-    let data = match std::fs::read(path) {
-        Ok(data) => data,
-        Err(_) => return Ok(None),
-    };
-    let mut cursor = std::io::Cursor::new(data);
-    let value = match rmpv::decode::read_value(&mut cursor) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    let rmpv::Value::Map(entries) = value else {
-        return Ok(None);
-    };
-
-    for (key, value) in entries {
-        let dest_hash = value_bytes(&key).and_then(hash16_from_slice);
-        let Some(items) = value.as_array() else {
-            continue;
-        };
-        if items.len() < 3 {
-            continue;
-        }
-        let Some(public_key_vec) = value_bytes(&items[2]) else {
-            continue;
-        };
-        let identity = match Identity::from_public_key(&public_key_vec) {
-            Ok(identity) => identity,
-            Err(e) if dest_hash == Some(hash) => {
-                return Err(format!("Invalid hexadecimal hash provided: {e}"));
+    if let Some(arg) = nonempty(&args.identity) {
+        let load_path = expanduser(arg);
+        if is_file(&load_path) {
+            let identity = identity_from_file(&load_path);
+            match identity {
+                Some(identity) => {
+                    println!(
+                        "Loaded Identity {} from {load_path}",
+                        identity_str(&identity)
+                    );
+                    if !identity.has_private_key() {
+                        println!(
+                            "Could not load Identity from specified file: Missing key data in loaded identity"
+                        );
+                        return Err(R_INVALID_IDENTITY);
+                    }
+                    return Ok(Some(identity));
+                }
+                None => {
+                    println!("Loaded Identity None from {load_path}");
+                    println!(
+                        "Could not load Identity from specified file: 'NoneType' object has no attribute 'get_private_key'"
+                    );
+                    return Err(R_INVALID_IDENTITY);
+                }
             }
-            Err(_) => continue,
-        };
-        if dest_hash == Some(hash) || identity.hash == hash {
-            return Ok(Some(identity));
         }
+        if args.no_cache {
+            if allow_none {
+                return Ok(None);
+            }
+            println!("Could not resolve identity");
+            return Err(R_NO_IDENTITY);
+        }
+        if arg.chars().count() == 32 {
+            return recall_from_hash(args, ctx, arg, allow_none).await;
+        }
+        return Ok(None);
+    }
+
+    if let Some(import) = nonempty(&args.import_pub).or(nonempty(&args.import_prv)) {
+        let public = nonempty(&args.import_pub).is_some();
+        let kind = if public { "public" } else { "private" };
+        let import_path = expanduser(import);
+        let mut identity_bytes: Option<Vec<u8>> = None;
+        if is_file(&import_path)
+            && let Ok(data) = std::fs::read(&import_path)
+            && data.len() == 64
+        {
+            println!("Reticulum Identity imported from {import_path}");
+            identity_bytes = Some(data);
+        }
+        if identity_bytes.is_none()
+            && import.chars().count() == 128
+            && let Ok(data) = py_fromhex(import)
+        {
+            println!("Reticulum Identity imported from hex input");
+            identity_bytes = Some(data);
+        }
+        if identity_bytes.is_none()
+            && let Some(data) = py_b32decode(import).filter(|d| d.len() == 64)
+        {
+            println!("Reticulum Identity imported from base32 input");
+            identity_bytes = Some(data);
+        }
+        if identity_bytes.is_none()
+            && let Some(data) = py_urlsafe_b64decode(import).filter(|d| d.len() == 64)
+        {
+            println!("Reticulum Identity imported from base64 input");
+            identity_bytes = Some(data);
+        }
+        let Some(bytes) = identity_bytes else {
+            println!("Could not decode specified data to a valid {kind} Reticulum Identity");
+            return Err(R_INVALID_IDENTITY);
+        };
+        let identity = if public {
+            Identity::from_public_key(&bytes)
+        } else {
+            Identity::from_private_key(&bytes)
+        };
+        return match identity {
+            Ok(identity) => Ok(Some(identity)),
+            Err(e) => {
+                println!("Could not create Reticulum identity from specified data: {e}");
+                Err(R_INVALID_IDENTITY)
+            }
+        };
     }
     Ok(None)
 }
 
-fn value_bytes(value: &rmpv::Value) -> Option<Vec<u8>> {
-    match value {
-        rmpv::Value::Binary(bytes) => Some(bytes.clone()),
-        rmpv::Value::String(s) => s.as_str().map(|s| s.as_bytes().to_vec()),
-        _ => None,
-    }
-}
-
-fn hash16_from_slice(bytes: Vec<u8>) -> Option<[u8; 16]> {
-    if bytes.len() != 16 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&bytes);
-    Some(out)
-}
-
-fn hash_destination(
-    identity: Option<&Identity>,
-    identity_hash_arg: Option<&str>,
-    aspects: &str,
-) -> ExitCode {
-    if aspects.trim().is_empty() {
-        eprintln!("Invalid destination aspects specified");
-        return ExitCode::from(9);
-    }
-    let identity_hash = if let Some(identity) = identity {
-        identity.hash
-    } else if let Some(identity_hash_arg) = identity_hash_arg {
-        match parse_hash16(identity_hash_arg) {
-            Some(hash) => hash,
-            None => {
-                eprintln!("Invalid identity hash length");
-                return ExitCode::from(8);
+async fn recall_from_hash(
+    args: &Args,
+    ctx: &mut Ctx,
+    arg: &str,
+    allow_none: bool,
+) -> Result<Option<Identity>, u8> {
+    let invalid = |e: String| {
+        println!("Invalid hexadecimal hash provided: {e}");
+        R_INVALID_IDENTITY
+    };
+    let handle = ensure_reticulum(args, ctx).await.map_err(invalid)?.clone();
+    let requested = py_fromhex(arg).map_err(invalid)?;
+    let Ok(requested) = <[u8; 16]>::try_from(requested.as_slice()) else {
+        return Err(invalid("Invalid identity hash length".to_string()));
+    };
+    let mut identity = recall(args, &handle, &requested).await.map_err(invalid)?;
+    match &identity {
+        None if allow_none && !args.request => return Ok(None),
+        None if !args.request => {
+            println!("Could not recall Identity for {}.", pretty_hash(&requested));
+            println!("You can query the network for unknown Identities with the -R option.");
+            return Err(R_NO_IDENTITY);
+        }
+        None => {
+            let id_destination =
+                Destination::hash_from_name_and_identity(DEFAULT_ASPECTS, Some(&requested));
+            for destination_hash in [requested, id_destination] {
+                let _ = handle
+                    .transport_tx
+                    .send(TransportMessage::RequestPath { destination_hash })
+                    .await;
+            }
+            let msg = format!(
+                "Requesting unknown Identity for {}",
+                pretty_hash(&requested)
+            );
+            identity = spin(args, &handle, &requested, &msg, args.timeout).await;
+            match &identity {
+                None => {
+                    println!("Identity request timed out");
+                    if !allow_none {
+                        return Err(R_NO_IDENTITY);
+                    }
+                    return Ok(None);
+                }
+                Some(found) => println!(
+                    "Received Identity {} for destination {} from the network",
+                    identity_str(found),
+                    pretty_hash(&requested)
+                ),
             }
         }
-    } else {
-        eprintln!("Invalid identity");
-        return ExitCode::from(8);
-    };
-
-    let hash = Destination::hash_from_name_and_identity(aspects, Some(&identity_hash));
-    println!(
-        "The {aspects} destination for this Identity is {}",
-        pretty_hash(&hash)
-    );
-    if identity.is_some() {
-        println!(
-            "The full destination specifier is {}.{}",
-            aspects,
-            hex::encode(identity_hash)
-        );
-    }
-    ExitCode::SUCCESS
-}
-
-async fn announce_destination(identity: &Identity, aspects: &str, args: &Args) -> ExitCode {
-    if aspects.split('.').count() <= 1 {
-        eprintln!("Invalid destination aspects specified");
-        return ExitCode::from(9);
-    }
-    if !identity.has_private_key() {
-        let hash = Destination::hash_from_name_and_identity(aspects, Some(&identity.hash));
-        println!(
-            "The {aspects} destination for this Identity is {}",
-            pretty_hash(&hash)
-        );
-        println!(
-            "The full destination specifier is {}.{}",
-            aspects,
-            hex::encode(identity.hash)
-        );
-        println!("Cannot announce this destination, since the private key is not held");
-        return ExitCode::from(4);
-    }
-
-    let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
-    let foreground = Arc::new(AtomicBool::new(true));
-    let handle = match rns_runtime::reticulum::init(
-        args.config.as_deref(),
-        None,
-        shutdown.clone(),
-        foreground,
-    )
-    .await
-    {
-        Ok(handle) => handle,
-        Err(e) => {
-            eprintln!("Failed to initialize Reticulum runtime: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let mut destination =
-        match Destination::new(Some(identity), Direction::In, DestType::Single, aspects) {
-            Ok(destination) => destination,
-            Err(e) => {
-                eprintln!("Could not create destination: {e}");
-                shutdown.trigger();
-                return ExitCode::from(1);
+        Some(found) => {
+            let ident = identity_str(found);
+            let hash = pretty_hash(&requested);
+            if ident == hash {
+                println!("Recalled Identity {ident}");
+            } else {
+                println!("Recalled Identity {ident} for destination {hash}");
             }
-        };
-    println!("Created destination {aspects}");
-    println!("Announcing destination {}", pretty_hash(&destination.hash));
-
-    // Destination construction is intentionally side-effect free in the Rust
-    // implementation. Register this short-lived destination explicitly so
-    // the transport recognises its announce as locally originated and allows
-    // it through the announce egress gates.
-    let dest_hash = destination.hash;
-    if handle
-        .transport_tx
-        .send(TransportMessage::RegisterDestination {
-            hash: dest_hash,
-            app_name: aspects.to_string(),
-            delivery_tx: None,
-        })
-        .await
-        .is_err()
-    {
-        eprintln!("An error occurred while attempting to register the announce destination");
-        shutdown.trigger();
-        return ExitCode::from(1);
-    }
-
-    rns_runtime::destination_stamper::load_stored_stamp(&mut destination, identity);
-    let raw = match rns_runtime::destination_stamper::announce_packet(
-        &mut destination,
-        identity,
-        None,
-        None,
-        false,
-        None,
-    )
-    .await
-    {
-        Ok(Some(raw)) => raw,
-        Ok(None) => {
-            eprintln!("Could not generate a destination stamp, announce not sent");
-            shutdown.trigger();
-            return ExitCode::from(1);
         }
-        Err(e) => {
-            eprintln!("An error occurred while attempting to send the announce: {e}");
-            shutdown.trigger();
-            return ExitCode::from(1);
-        }
-    };
-    if handle
-        .transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: raw.into(),
-            destination_hash: dest_hash,
-        }))
-        .await
-        .is_err()
-    {
-        eprintln!("An error occurred while attempting to queue the announce");
-        shutdown.trigger();
-        return ExitCode::from(1);
     }
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    shutdown.trigger();
-    ExitCode::SUCCESS
+    if let Some(found) = &identity {
+        let _ = handle
+            .query_control(TransportQuery::RetainIdentity {
+                identity_hash: found.hash,
+            })
+            .await;
+    }
+    Ok(identity)
 }
 
-fn print_identity(identity: &Identity, args: &Args) {
+// ---------------------------------------------------------------------------
+// Operations
+// ---------------------------------------------------------------------------
+
+fn print_identity_information(args: &Args, identity: &Identity) {
     println!("Identity Hash : {}", pretty_hash(&identity.hash));
     println!(
         "Public Key    : {}",
@@ -946,804 +1116,750 @@ fn print_identity(identity: &Identity, args: &Args) {
     }
 }
 
-fn export_public_identity(identity: &Identity, args: &Args) -> ExitCode {
+fn export_pub_identity(args: &Args, identity: &Identity) -> Step {
     println!(
         "Public Identity Keys  : {}",
         encode_key_text(&identity.get_public_key(), args)
     );
-    ExitCode::SUCCESS
+    Ok(())
 }
 
-fn export_private_identity(identity: &Identity, args: &Args) -> ExitCode {
-    let Some(private_key) = identity.get_private_key() else {
-        eprintln!("Identity doesn't hold a private key, cannot export");
-        return ExitCode::from(4);
+fn export_prv_identity(args: &Args, identity: &Identity) -> Step {
+    let Some(key) = identity.get_private_key() else {
+        println!("Identity doesn't hold a private key, cannot export");
+        return Err(R_NO_PRVKEY);
     };
-    println!(
-        "Private Identity Keys : {}",
-        encode_key_text(&*private_key, args)
-    );
-    ExitCode::SUCCESS
+    println!("Private Identity Keys : {}", encode_key_text(&*key, args));
+    Ok(())
 }
 
-fn sign_file(identity: &Identity, input_path: &Path, args: &Args) -> ExitCode {
-    if !identity.has_private_key() {
-        eprintln!("Specified Identity does not hold a private key. Cannot sign.");
-        return ExitCode::from(4);
-    }
-    let input = match std::fs::File::open(input_path) {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!("The file \"{}\" does not exist: {e}", input_path.display());
-            return ExitCode::from(6);
-        }
-    };
-    let signature = if args.raw {
-        match rsg::create_raw_signature(identity, input) {
-            Ok(signature) => signature.to_vec(),
-            Err(e) => {
-                eprintln!("Could not sign {}: {e}", input_path.display());
-                return ExitCode::from(254);
+fn print_hash_information(aspects: &str, target: Target<'_>) -> Step {
+    let (identity_hash, identity) = match target {
+        Target::Identity(identity) => (identity.hash, Some(identity)),
+        Target::Text(text) => {
+            if text.chars().count() != 32 {
+                println!("Invalid identity hash length");
+                return Err(R_INVALID_IDENTITY);
             }
-        }
-    } else {
-        match rsg::create_rsg(identity, input, false, None) {
-            Ok(rsg) => rsg,
-            Err(e) => {
-                eprintln!("Could not sign {}: {e}", input_path.display());
-                return ExitCode::from(254);
-            }
-        }
-    };
-
-    if !args.raw && (args.base64 || args.base32 || args.base256 || args.hex) {
-        let wrapped = if args.base256 {
-            wrap_rsg_str(&b256::b256rep(&signature))
-        } else if args.base64 {
-            wrap_rsg(URL_SAFE.encode(&signature).as_bytes())
-        } else if args.base32 {
-            wrap_rsg(encode_base32(&signature).as_bytes())
-        } else {
-            wrap_rsg(hex::encode(&signature).as_bytes())
-        };
-        println!("\n{wrapped}\n");
-        println!(
-            "Signed file {} with {}",
-            input_path.display(),
-            pretty_hash(&identity.hash)
-        );
-        return ExitCode::SUCCESS;
-    }
-
-    let Some(output_path) = args
-        .write
-        .clone()
-        .or_else(|| Some(append_extension(input_path, SIG_EXT)))
-    else {
-        eprintln!("Signing requested, but no output specified");
-        return ExitCode::from(253);
-    };
-    if let Err(e) = ensure_output_allowed(&output_path, args.force) {
-        eprintln!("{e}");
-        return ExitCode::from(11);
-    }
-
-    if let Err(e) = write_output(&output_path, &signature, args.stdout) {
-        eprintln!("{e}");
-        return ExitCode::from(253);
-    }
-
-    if !args.stdout {
-        println!(
-            "Signed file {} with {} to {}",
-            input_path.display(),
-            pretty_hash(&identity.hash),
-            output_path.display()
-        );
-    }
-    ExitCode::SUCCESS
-}
-
-/// Python ref: 1.3.8 rnid.py:788-841 sign_message (-S): message from CLI arg,
-/// `-r` file, or $EDITOR; optional `-E` metadata embedding; writes `<name>.rsm`
-/// for binary output, armored print otherwise.
-fn sign_message(identity: &Identity, args: &Args) -> ExitCode {
-    let binary_output = !(args.base32 || args.base64 || args.base256 || args.hex);
-    if binary_output && args.write.is_none() {
-        eprintln!("No write path specified");
-        return ExitCode::from(250);
-    }
-    if !identity.has_private_key() {
-        eprintln!("Cannot sign, the identity does not hold a private key");
-        return ExitCode::from(4);
-    }
-
-    let message_arg = args.sign_message.as_ref().expect("sign_message active");
-    let message: Vec<u8> = if let Some(read_path) = args.read.as_ref() {
-        if message_arg.is_some() {
-            eprintln!(
-                "Both an input file and command-line provided message was specified, aborting"
-            );
-            return ExitCode::from(250);
-        }
-        if !read_path.is_file() {
-            eprintln!("The file {} does not exist", read_path.display());
-            return ExitCode::from(6);
-        }
-        // Python opens the file as utf-8 text (rnid.py:806).
-        match std::fs::read_to_string(read_path) {
-            Ok(text) => text.into_bytes(),
-            Err(e) => {
-                eprintln!("Could not read message from {}: {e}", read_path.display());
-                return ExitCode::from(252);
-            }
-        }
-    } else if let Some(text) = message_arg {
-        text.clone().into_bytes()
-    } else {
-        match get_editor_content() {
-            Ok(content) => content,
-            Err(code) => return code,
-        }
-    };
-    if message.is_empty() {
-        eprintln!("No message specified");
-        return ExitCode::from(250);
-    }
-
-    let mut meta_values: Option<Vec<(String, rmpv::Value)>> = None;
-    if let Some(meta_path) = args.embed_meta.as_ref() {
-        // Default spec path is `<meta path>.spec` unless --meta-spec is given;
-        // a missing spec file disables validation (rnid.py:812-815).
-        let spec_path = args
-            .meta_spec
-            .clone()
-            .flatten()
-            .unwrap_or_else(|| PathBuf::from(format!("{}.spec", meta_path.to_string_lossy())));
-        if !meta_path.is_file() {
-            eprintln!("Metadata file {} does not exist", meta_path.display());
-            return ExitCode::from(6);
-        }
-        let spec_path = spec_path.is_file().then_some(spec_path);
-        let spec_info = spec_path
-            .as_ref()
-            .map(|p| format!(" using spec from {}", p.display()))
-            .unwrap_or_default();
-        println!("Embedding metadata from {}{spec_info}", meta_path.display());
-
-        match meta::rsg_meta_from_file(meta_path, spec_path.as_deref()) {
-            Ok(values) => meta_values = Some(values),
-            Err(e) => {
-                eprintln!("Could not load metadata from {}: {e}", meta_path.display());
-                return ExitCode::from(254);
-            }
-        }
-    }
-
-    let rsg = match rsg::create_rsg(identity, &message[..], true, meta_values.as_deref()) {
-        Ok(rsg) => rsg,
-        Err(e) => {
-            eprintln!("Could not sign message: {e}");
-            return ExitCode::from(254);
-        }
-    };
-
-    if binary_output {
-        let write_path = args.write.as_ref().expect("write path checked");
-        let write_str = write_path.to_string_lossy();
-        let rsg_path = if write_str.ends_with(&format!(".{MSG_EXT}")) {
-            write_path.clone()
-        } else {
-            append_extension(write_path, MSG_EXT)
-        };
-        if rsg_path.is_file() && !args.force {
-            eprintln!(
-                "The signature file \"{}\" already exists, not overwriting",
-                rsg_path.display()
-            );
-            return ExitCode::from(11);
-        }
-        if let Err(e) = std::fs::write(&rsg_path, &rsg) {
-            eprintln!("Could not sign message: {e}");
-            return ExitCode::from(254);
-        }
-        println!(
-            "Message signed with {} saved to {}",
-            pretty_hash(&identity.hash),
-            rsg_path.display()
-        );
-        return ExitCode::SUCCESS;
-    }
-
-    let wrapped = if args.base256 {
-        wrap_rsg_str(&b256::b256rep(&rsg))
-    } else if args.base32 {
-        wrap_rsg(encode_base32(&rsg).as_bytes())
-    } else if args.base64 {
-        wrap_rsg(URL_SAFE.encode(&rsg).as_bytes())
-    } else {
-        wrap_rsg(hex::encode(&rsg).as_bytes())
-    };
-    println!("\n{wrapped}\n");
-    println!("Message signed with {}", pretty_hash(&identity.hash));
-    ExitCode::SUCCESS
-}
-
-fn validate_signature(
-    identity: Option<&Identity>,
-    identity_arg: Option<&str>,
-    validate_path: &Path,
-    args: &Args,
-) -> ExitCode {
-    let validate_str = validate_path.to_string_lossy();
-    if validate_str
-        .to_lowercase()
-        .ends_with(&format!(".{MSG_EXT}"))
-    {
-        return validate_message_file(identity, identity_arg, validate_path, args);
-    }
-    let path_is_sigfile = validate_str
-        .to_lowercase()
-        .ends_with(&format!(".{SIG_EXT}"));
-    let (sig_path, input_path) = if path_is_sigfile {
-        let stripped = &validate_str[..validate_str.len() - SIG_EXT.len() - 1];
-        (validate_path.to_path_buf(), PathBuf::from(stripped))
-    } else {
-        (
-            append_extension(validate_path, SIG_EXT),
-            validate_path.to_path_buf(),
-        )
-    };
-
-    let sig_bytes = match std::fs::read(&sig_path) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!(
-                "An error occurred while opening {}: {e}",
-                sig_path.display()
-            );
-            return ExitCode::from(6);
-        }
-    };
-    let input = match std::fs::File::open(&input_path) {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!(
-                "The validation target \"{}\" does not exist: {e}",
-                input_path.display()
-            );
-            return ExitCode::from(6);
-        }
-    };
-
-    if rsg::is_legacy_format(&sig_bytes) {
-        let Some(identity) = identity else {
-            eprintln!(
-                "Cannot validate legacy rsg signatures without an explicit required identity"
-            );
-            return ExitCode::from(2);
-        };
-        match rsg::validate_legacy_signature(&sig_bytes, input, identity) {
-            Ok(()) => {
-                println!(
-                    "Signature is valid, the file {} was signed by {}",
-                    input_path.display(),
-                    pretty_hash(&identity.hash)
-                );
-                ExitCode::SUCCESS
-            }
-            Err(_) => {
-                eprintln!(
-                    "Invalid signature {} for file {}\nThis file was NOT signed by {}",
-                    sig_path.display(),
-                    input_path.display(),
-                    pretty_hash(&identity.hash)
-                );
-                ExitCode::from(10)
-            }
-        }
-    } else {
-        let required = if let Some(identity) = identity {
-            Some(rsg::RequiredSigner::Identity(identity))
-        } else if let Some(identity_arg) = identity_arg {
-            match parse_hash16(identity_arg) {
-                Some(hash) => Some(rsg::RequiredSigner::Hash(hash)),
-                None => {
-                    eprintln!("Invalid identity hash length");
-                    return ExitCode::from(8);
+            match py_fromhex(text).map(<[u8; 16]>::try_from) {
+                Ok(Ok(hash)) => (hash, None),
+                Ok(Err(_)) => {
+                    println!(
+                        "An error ocurred while attempting to get hash information: Invalid material supplied for destination hash calculation"
+                    );
+                    return Err(R_UNKNOWN_ERROR);
+                }
+                Err(e) => {
+                    println!("Invalid identity: {e}");
+                    return Err(R_INVALID_IDENTITY);
                 }
             }
-        } else {
-            None
-        };
-        match rsg::validate_rsg(&sig_bytes, input, required) {
-            Ok(validated) => {
-                let _ = (&validated.file_hash, &validated.public_key);
-                println!(
-                    "Signature is valid, the file {} was signed by {}",
-                    input_path.display(),
-                    pretty_hash(&validated.signer_hash)
-                );
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                let signer_description = required
-                    .map(|required| match required {
-                        rsg::RequiredSigner::Identity(identity) => pretty_hash(&identity.hash),
-                        rsg::RequiredSigner::Hash(hash) => pretty_hash(&hash),
-                    })
-                    .map(|s| format!("\nThis file was NOT signed by {s}"))
-                    .unwrap_or_default();
-                eprintln!(
-                    "Invalid signature {} for file {}{signer_description}: {e}",
-                    sig_path.display(),
-                    input_path.display()
-                );
-                ExitCode::from(10)
-            }
         }
-    }
-}
-
-/// Python ref: 1.3.8 rnid.py:673-737 validate_message: verifies an .rsm's
-/// embedded message, prints it, and with --meta renders the typed recursive
-/// metadata dump.
-fn validate_message_file(
-    identity: Option<&Identity>,
-    identity_arg: Option<&str>,
-    path: &Path,
-    args: &Args,
-) -> ExitCode {
-    if !path.is_file() {
-        eprintln!("The signature file \"{}\" does not exist", path.display());
-        return ExitCode::from(6);
-    }
-    let rsg_bytes = match std::fs::read(path) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("Could not read rsg: {e}");
-            return ExitCode::from(252);
+        Target::None => {
+            println!("Invalid identity");
+            return Err(R_INVALID_IDENTITY);
         }
     };
-
-    let required = if let Some(identity) = identity {
-        Some(rsg::RequiredSigner::Identity(identity))
-    } else if let Some(identity_arg) = identity_arg {
-        match parse_hash16(identity_arg) {
-            Some(hash) => Some(rsg::RequiredSigner::Hash(hash)),
-            None => {
-                eprintln!("Invalid identity hash length");
-                return ExitCode::from(8);
-            }
-        }
-    } else {
-        None
-    };
-
-    let Some(rmpv::Value::Map(envelope)) = rsg::extract_signed_rsg_data(&rsg_bytes) else {
-        // Python hits a TypeError on the None envelope -> R_UNKNOWN_ERROR.
-        eprintln!(
-            "Error while validating {}: could not decode rsm envelope",
-            path.display()
-        );
-        return ExitCode::from(254);
-    };
-    let message_entry = envelope
-        .iter()
-        .find(|(k, _)| k.as_str() == Some("message"))
-        .map(|(_, v)| v);
-    let Some(message_entry) = message_entry else {
-        eprintln!("No embedded message in {}", path.display());
-        return ExitCode::from(10);
-    };
-    let message: Vec<u8> = match message_entry {
-        rmpv::Value::Binary(bytes) => bytes.clone(),
-        rmpv::Value::String(s) => s.as_bytes().to_vec(),
-        _ => {
-            eprintln!(
-                "Error while validating {}: invalid embedded message type",
-                path.display()
-            );
-            return ExitCode::from(254);
-        }
-    };
-
-    let validated = match rsg::validate_rsg(&rsg_bytes, &message[..], required) {
-        Ok(validated) => validated,
-        Err(e) => {
-            let signer_description = required
-                .map(|required| match required {
-                    rsg::RequiredSigner::Identity(identity) => pretty_hash(&identity.hash),
-                    rsg::RequiredSigner::Hash(hash) => pretty_hash(&hash),
-                })
-                .map(|s| format!("\nThe message was NOT signed by {s}"))
-                .unwrap_or_default();
-            eprintln!(
-                "Invalid signature in {}{signer_description}: {e}",
-                path.display()
-            );
-            return ExitCode::from(10);
-        }
-    };
-
-    if args.meta {
-        println!("RSM Metadata\n============\n");
-        let mut dump = String::new();
-        for (key, entry) in &validated.meta {
-            let key = key
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{key}"));
-            format_meta_entry(&mut dump, entry, &key, 1);
-        }
-        print!("{dump}");
-        println!("\nValidation\n==========");
-    }
-    let c = if args.meta { "" } else { ":" };
-    let f = if args.meta { "" } else { " following" };
+    let destination_hash = Destination::hash_from_name_and_identity(aspects, Some(&identity_hash));
     println!(
-        "\nSignature is valid, the{f} message was signed by {}{c}\n",
-        pretty_hash(&validated.signer_hash)
+        "The {aspects} destination for this Identity is {}",
+        pretty_hash(&destination_hash)
     );
-    if args.meta {
-        println!("Message\n=======\n");
-    }
-    match String::from_utf8(message) {
-        Ok(text) => println!("{text}"),
-        Err(e) => {
-            eprintln!("Error while validating {}: {e}", path.display());
-            return ExitCode::from(254);
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-fn encrypt_file(identity: &Identity, input_path: &Path, args: &Args) -> ExitCode {
-    let mut input: Box<dyn Read> = match std::fs::File::open(input_path) {
-        Ok(file) => Box::new(file),
-        Err(e) => {
-            eprintln!("Input file {} not found: {e}", input_path.display());
-            return ExitCode::from(6);
-        }
-    };
-    let Some(output_path) = args
-        .write
-        .clone()
-        .or_else(|| Some(append_extension(input_path, ENCRYPT_EXT)))
-    else {
-        eprintln!("Encryption requested, but no output specified");
-        return ExitCode::from(253);
-    };
-    if let Err(e) = ensure_output_allowed(&output_path, args.force) {
-        eprintln!("{e}");
-        return ExitCode::from(11);
-    };
-    let mut output = match create_output(&output_path, args.stdout) {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(253);
-        }
-    };
-
-    let mut buffer = vec![0u8; ENC_CHUNK];
-    loop {
-        let n = match input.read(&mut buffer) {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("Could not read input file: {e}");
-                return ExitCode::from(252);
-            }
-        };
-        if n == 0 {
-            break;
-        }
-        let ciphertext = match identity.encrypt(&buffer[..n], None) {
-            Ok(ciphertext) => ciphertext,
-            Err(e) => {
-                eprintln!("An error occurred while encrypting data: {e}");
-                return ExitCode::from(254);
-            }
-        };
-        if let Err(e) = output.write_all(&ciphertext) {
-            eprintln!("Could not write encrypted output: {e}");
-            return ExitCode::from(253);
-        }
-    }
-
-    if !args.stdout {
+    if identity.is_some() {
         println!(
-            "File {} encrypted for {} to {}",
-            input_path.display(),
-            pretty_hash(&identity.hash),
-            output_path.display()
+            "The full destination specifier is <{aspects}.{}:{}>",
+            hex::encode(identity_hash),
+            hex::encode(destination_hash)
         );
-    }
-    ExitCode::SUCCESS
-}
-
-fn decrypt_file(identity: &Identity, input_path: &Path, args: &Args) -> ExitCode {
-    if !identity.has_private_key() {
-        eprintln!("Specified Identity does not hold a private key. Cannot decrypt.");
-        return ExitCode::from(4);
-    }
-    if !input_path
-        .to_string_lossy()
-        .to_lowercase()
-        .ends_with(&format!(".{ENCRYPT_EXT}"))
-    {
-        eprintln!(
-            "The file {} does not appear to be a Reticulum encrypted file",
-            input_path.display()
-        );
-        return ExitCode::from(7);
-    }
-    let ciphertext = match read_input(input_path, args.stdin) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(6);
-        }
-    };
-    let Some(output_path) = args
-        .write
-        .clone()
-        .or_else(|| default_decrypt_output_path(input_path))
-    else {
-        eprintln!("Decryption requested, but no output specified");
-        return ExitCode::from(7);
-    };
-    if let Err(e) = ensure_output_allowed(&output_path, args.force) {
-        eprintln!("{e}");
-        return ExitCode::from(11);
-    }
-
-    let plaintext = match decrypt_ciphertext(identity, &ciphertext) {
-        Ok(plaintext) => plaintext,
-        Err(()) => {
-            eprintln!("Data could not be decrypted with the specified Identity");
-            return ExitCode::from(12);
-        }
-    };
-
-    if let Err(e) = write_output(&output_path, &plaintext, args.stdout) {
-        eprintln!("{e}");
-        return ExitCode::from(253);
-    }
-    if !args.stdout {
-        println!(
-            "File {} decrypted with {} to {}",
-            input_path.display(),
-            pretty_hash(&identity.hash),
-            output_path.display()
-        );
-    }
-    ExitCode::SUCCESS
-}
-
-fn decrypt_ciphertext(identity: &Identity, ciphertext: &[u8]) -> Result<Vec<u8>, ()> {
-    if ciphertext.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if let Ok(plaintext) = identity.decrypt(ciphertext, None, false) {
-        return Ok(plaintext);
-    }
-
-    if ciphertext.len() > ENC_CHUNK {
-        if let Ok(plaintext) = decrypt_ciphertext_chunks(identity, ciphertext, DEC_CHUNK) {
-            return Ok(plaintext);
-        }
-        if let Ok(plaintext) =
-            decrypt_ciphertext_chunks(identity, ciphertext, FULL_CHUNK_TOKEN_SIZE)
-        {
-            return Ok(plaintext);
-        }
-        if let Ok(plaintext) = decrypt_ciphertext_chunks(identity, ciphertext, ENC_CHUNK) {
-            return Ok(plaintext);
-        }
-    }
-
-    Err(())
-}
-
-fn decrypt_ciphertext_chunks(
-    identity: &Identity,
-    ciphertext: &[u8],
-    chunk_size: usize,
-) -> Result<Vec<u8>, ()> {
-    let mut plaintext = Vec::new();
-    let mut pos = 0usize;
-    while pos < ciphertext.len() {
-        let end = (pos + chunk_size).min(ciphertext.len());
-        let chunk = identity
-            .decrypt(&ciphertext[pos..end], None, false)
-            .map_err(|_| ())?;
-        plaintext.extend_from_slice(&chunk);
-        pos = end;
-    }
-    Ok(plaintext)
-}
-
-fn write_identity(identity: &Identity, args: &Args) -> ExitCode {
-    let Some(path) = args.write.as_ref() else {
-        return ExitCode::SUCCESS;
-    };
-    let mut path = path.clone();
-
-    if identity.has_private_key() && args.export_prv {
-        if let Err(e) = ensure_output_allowed(&path, args.force) {
-            eprintln!("{e}");
-            return ExitCode::from(11);
-        }
-        match identity.to_file(&path) {
-            Ok(()) => {
-                println!("Wrote private identity to {}", path.display());
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("Error while writing private identity to file: {e}");
-                ExitCode::from(253)
-            }
-        }
-    } else {
-        if !path
-            .to_string_lossy()
-            .to_lowercase()
-            .ends_with(&format!(".{PUB_EXT}"))
-        {
-            path = PathBuf::from(format!("{}.{}", path.to_string_lossy(), PUB_EXT));
-        }
-        if let Err(e) = ensure_output_allowed(&path, args.force) {
-            eprintln!("{e}");
-            return ExitCode::from(11);
-        }
-        match identity.pub_to_file(&path) {
-            Ok(()) => {
-                println!("Wrote public identity to {}", path.display());
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("Error while writing public identity to file: {e}");
-                ExitCode::from(253)
-            }
-        }
-    }
-}
-
-fn read_input(path: &Path, _use_stdin: bool) -> Result<Vec<u8>, String> {
-    std::fs::read(path).map_err(|e| format!("Input file {} not found: {e}", path.display()))
-}
-
-fn create_output(path: &Path, _use_stdout: bool) -> Result<Box<dyn Write>, String> {
-    let file = std::fs::File::create(path).map_err(|e| {
-        format!(
-            "Could not open output file {} for writing: {e}",
-            path.display()
-        )
-    })?;
-    Ok(Box::new(file))
-}
-
-fn write_output(path: &Path, data: &[u8], use_stdout: bool) -> Result<(), String> {
-    let mut output = create_output(path, use_stdout)?;
-    output
-        .write_all(data)
-        .map_err(|e| format!("Could not write output: {e}"))
-}
-
-fn ensure_output_allowed(path: &Path, force: bool) -> Result<(), String> {
-    if path.exists() && !force {
-        return Err(format!(
-            "Output file {} already exists. Not overwriting.",
-            path.display()
-        ));
     }
     Ok(())
 }
 
-fn append_extension(path: &Path, ext: &str) -> PathBuf {
-    PathBuf::from(format!("{}.{}", path.to_string_lossy(), ext))
+async fn announce(args: &Args, ctx: &mut Ctx, aspects: &str, identity: &Identity) -> Step {
+    let fail = |e: String| {
+        println!("An error ocurred while attempting to send the announce: {e}");
+        R_UNKNOWN_ERROR
+    };
+    let handle = ensure_reticulum(args, ctx).await.map_err(fail)?.clone();
+    if aspects.split('.').count() <= 1 {
+        println!("Invalid destination aspects specified");
+        return Err(R_INVALID_ASPECTS);
+    }
+    if !identity.has_private_key() {
+        println!("Cannot announce this destination, since the private key is not held");
+        return Err(R_NO_PRVKEY);
+    }
+    let mut destination =
+        Destination::new(Some(identity), Direction::In, DestType::Single, aspects)
+            .map_err(|e| fail(e.to_string()))?;
+    println!(
+        "Announcing {aspects} destination {} for identity {}",
+        pretty_hash(&destination.hash),
+        identity_str(identity)
+    );
+    // Rust destinations are side-effect free: register this one so transport
+    // treats its announce as locally originated.
+    let dest_hash = destination.hash;
+    handle
+        .transport_tx
+        .send(TransportMessage::RegisterDestination {
+            hash: dest_hash,
+            app_name: aspects.to_string(),
+            delivery_tx: None,
+        })
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+    rns_runtime::destination_stamper::load_stored_stamp(&mut destination, identity);
+    let raw = rns_runtime::destination_stamper::announce_packet(
+        &mut destination,
+        identity,
+        None,
+        None,
+        false,
+        None,
+    )
+    .await
+    .map_err(|e| fail(e.to_string()))?;
+    // A dropped stamp job sends nothing, as Destination.announce returns None.
+    let Some(raw) = raw else {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        return Ok(());
+    };
+    handle
+        .transport_tx
+        .send(TransportMessage::Outbound(OutboundRequest {
+            raw: raw.into(),
+            destination_hash: dest_hash,
+        }))
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    Ok(())
 }
 
-fn default_decrypt_output_path(path: &Path) -> Option<PathBuf> {
-    let s = path.to_string_lossy();
-    if s.to_lowercase().ends_with(&format!(".{ENCRYPT_EXT}")) {
-        Some(PathBuf::from(s.replace(&format!(".{ENCRYPT_EXT}"), "")))
+/// `validate()` for one path (rnid.py:606-671). Unlike upstream, the legacy
+/// branch checks every listed file before succeeding.
+fn validate(args: &Args, path: &str, target: &Target<'_>) -> Step {
+    let validate_path = expanduser(path);
+    let lower = validate_path.to_lowercase();
+    if lower.ends_with(".rsm") {
+        return validate_message(args, &validate_path, target);
+    }
+    let (signature_path, file_path) = if lower.ends_with(".rsg") {
+        let chars: Vec<char> = validate_path.chars().collect();
+        (
+            validate_path.clone(),
+            chars[..chars.len() - 4].iter().collect::<String>(),
+        )
     } else {
-        None
+        (format!("{validate_path}.rsg"), validate_path.clone())
+    };
+    if !is_file(&file_path) {
+        println!("The validation target \"{file_path}\" does not exist");
+        return Err(R_NO_FILE);
     }
-}
-
-fn parse_hash16(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
-        return None;
+    if !is_file(&signature_path) {
+        println!("No signature file exists for \"{file_path}\"");
+        return Err(R_NO_FILE);
     }
-    let bytes = hex::decode(s).ok()?;
-    hash16_from_slice(bytes)
-}
+    let rsg_data = match std::fs::read(&signature_path) {
+        Ok(data) => data,
+        Err(e) => {
+            println!(
+                "Could not detect rsg format: {}",
+                py_os_error(&e, &signature_path)
+            );
+            return Err(R_UNKNOWN_ERROR);
+        }
+    };
 
-fn encode_key_text(bytes: &[u8], args: &Args) -> String {
-    if args.base64 {
-        URL_SAFE.encode(bytes)
-    } else if args.base32 {
-        encode_base32(bytes)
+    if !rsg::is_legacy_format(&rsg_data) {
+        let required = required_signer(target)?;
+        let mut file = match std::fs::File::open(&file_path) {
+            Ok(file) => file,
+            Err(e) => {
+                println!(
+                    "Could not read {file_path}: {}",
+                    py_os_error(&e, &file_path)
+                );
+                return Err(R_READ_ERROR);
+            }
+        };
+        let required_ref = required.as_ref().map(|r| match r {
+            Required::Identity(identity) => rsg::RequiredSigner::Identity(identity),
+            Required::Hash(hash) => rsg::RequiredSigner::Hash(hash),
+        });
+        match rsg::validate_rsg(&rsg_data, rsg::Message::File(&mut file), required_ref) {
+            Ok(Some(valid)) => {
+                println!(
+                    "Signature is valid, the file {file_path} was signed by {}",
+                    pretty_hash(&valid.signer_hash)
+                );
+                Ok(())
+            }
+            Ok(None) => {
+                let description = required
+                    .as_ref()
+                    .map(|r| format!("\nThis file was NOT signed by {}", r.describe()))
+                    .unwrap_or_default();
+                println!("Invalid signature {signature_path} for file {file_path}{description}");
+                Err(R_INVALID_SIGNATURE)
+            }
+            Err(e) => {
+                println!("Error while validating {signature_path}: {e}");
+                Err(R_UNKNOWN_ERROR)
+            }
+        }
     } else {
-        hex::encode(bytes)
-    }
-}
-
-fn wrap_rsg(rsg: &[u8]) -> String {
-    const HEADER: &[u8] = b"#### Start of rsg data ";
-    const FOOTER: &[u8] = b" End of rsg data ####";
-    const ROW_WIDTH: usize = 64;
-
-    let mut header = String::from_utf8_lossy(HEADER).into_owned();
-    while header.len() < ROW_WIDTH {
-        header.push('#');
-    }
-
-    let mut footer = String::new();
-    while footer.len() + FOOTER.len() < ROW_WIDTH {
-        footer.push('#');
-    }
-    footer.push_str(&String::from_utf8_lossy(FOOTER));
-
-    let mut wrapped = String::new();
-    wrapped.push_str(&header);
-    wrapped.push('\n');
-    for chunk in rsg.chunks(ROW_WIDTH) {
-        wrapped.push_str(&String::from_utf8_lossy(chunk));
-        for _ in chunk.len()..ROW_WIDTH {
-            wrapped.push('=');
+        let Target::Identity(identity) = target else {
+            println!("Cannot validate legacy rsg signatures without an explicit required identity");
+            return Err(R_NO_IDENTITY);
+        };
+        let data = match std::fs::read(&file_path) {
+            Ok(data) => data,
+            Err(e) => {
+                println!(
+                    "Could not validate signature: {}",
+                    py_os_error(&e, &file_path)
+                );
+                return Err(R_READ_ERROR);
+            }
+        };
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&rsg_data);
+        if identity.verify(&data, &signature) {
+            println!(
+                "Signature is valid, the file {file_path} was signed by {}",
+                identity_str(identity)
+            );
+            Ok(())
+        } else {
+            println!(
+                "Invalid signature {signature_path} for file {file_path}\nThis file was NOT signed by {}",
+                identity_str(identity)
+            );
+            Err(R_INVALID_SIGNATURE)
         }
-        wrapped.push('\n');
     }
-    wrapped.push_str(&footer);
-    wrapped
 }
 
-/// Python nargs="*" truthiness: `-s` with no values yields an empty list,
-/// which does not activate the operation.
-fn paths_active(paths: &Option<Vec<PathBuf>>) -> bool {
-    paths.as_ref().is_some_and(|paths| !paths.is_empty())
+enum Required<'a> {
+    Identity(&'a Identity),
+    Hash(Vec<u8>),
 }
 
-/// Python ref: 1.3.8 rnid.py:522-536 wrap_rsg_str — like wrap_rsg but chunks
-/// by characters (base256 armor is multi-byte UTF-8).
-fn wrap_rsg_str(rsg: &str) -> String {
-    const HEADER: &str = "#### Start of rsg data ";
-    const FOOTER: &str = " End of rsg data ####";
-    const ROW_WIDTH: usize = 64;
-
-    let mut header = HEADER.to_string();
-    while header.chars().count() < ROW_WIDTH {
-        header.push('#');
-    }
-    let mut footer = String::new();
-    while footer.chars().count() + FOOTER.chars().count() < ROW_WIDTH {
-        footer.push('#');
-    }
-    footer.push_str(FOOTER);
-
-    let mut wrapped = String::new();
-    wrapped.push_str(&header);
-    wrapped.push('\n');
-    let chars: Vec<char> = rsg.chars().collect();
-    for chunk in chars.chunks(ROW_WIDTH) {
-        wrapped.extend(chunk);
-        for _ in chunk.len()..ROW_WIDTH {
-            wrapped.push('=');
+impl Required<'_> {
+    fn describe(&self) -> String {
+        match self {
+            Required::Identity(identity) => identity_str(identity),
+            Required::Hash(hash) => pretty_hash(hash),
         }
-        wrapped.push('\n');
     }
-    wrapped.push_str(&footer);
-    wrapped
 }
 
-/// Python ref: 1.3.8 rnid.py:1034-1059 get_editor_content. Errors are printed
-/// here; the returned code is R_READ_ERROR (252).
-fn get_editor_content() -> Result<Vec<u8>, ExitCode> {
+/// The `identity` argument of `validate()`: a hash string is decoded first.
+fn required_signer<'a>(target: &Target<'a>) -> Result<Option<Required<'a>>, u8> {
+    match target {
+        Target::Identity(identity) => Ok(Some(Required::Identity(identity))),
+        Target::None => Ok(None),
+        Target::Text(text) => {
+            if text.chars().count() != 32 {
+                println!("Invalid identity hash length");
+                return Err(R_INVALID_IDENTITY);
+            }
+            match py_fromhex(text) {
+                Ok(hash) => Ok(Some(Required::Hash(hash))),
+                Err(e) => {
+                    println!("Invalid identity hash: {e}");
+                    Err(R_INVALID_IDENTITY)
+                }
+            }
+        }
+    }
+}
+
+fn validate_message(args: &Args, signature_path: &str, target: &Target<'_>) -> Step {
+    if !is_file(signature_path) {
+        println!("The signature file \"{signature_path}\" does not exist");
+        return Err(R_NO_FILE);
+    }
+    let rsg_data = match std::fs::read(signature_path) {
+        Ok(data) => data,
+        Err(e) => {
+            println!("Could not read rsg: {}", py_os_error(&e, signature_path));
+            return Err(R_READ_ERROR);
+        }
+    };
+    let required = required_signer(target)?;
+    let fail = |e: String| {
+        println!("Error while validating {signature_path}: {e}");
+        R_UNKNOWN_ERROR
+    };
+    let contents = rsg::extract_signed_rsg_data(&rsg_data);
+    if !rsg::py_contains(contents.as_ref(), "message").map_err(fail)? {
+        println!("No embedded message in {signature_path}");
+        return Err(R_INVALID_SIGNATURE);
+    }
+    let contents = contents.expect("contains message");
+    let message = rsg::py_index(&contents, "message").map_err(fail)?.clone();
+    let required_ref = required.as_ref().map(|r| match r {
+        Required::Identity(identity) => rsg::RequiredSigner::Identity(identity),
+        Required::Hash(hash) => rsg::RequiredSigner::Hash(hash),
+    });
+    let valid = match rsg::validate_rsg(&rsg_data, rsg::Message::Unpacked(&message), required_ref)
+        .map_err(fail)?
+    {
+        Some(valid) => valid,
+        None => {
+            let description = required
+                .as_ref()
+                .map(|r| format!("\nThe message was NOT signed by {}", r.describe()))
+                .unwrap_or_default();
+            println!("Invalid signature in {signature_path}{description}");
+            return Err(R_INVALID_SIGNATURE);
+        }
+    };
+    if args.meta {
+        println!("RSM Metadata\n============\n");
+        let meta = rsg::py_index(&valid.signed_data, "meta").map_err(fail)?;
+        let Value::Map(entries) = meta else {
+            return Err(fail(
+                rsg::py_index(meta, "signer").err().unwrap_or_default(),
+            ));
+        };
+        let mut dump = String::new();
+        for (key, entry) in entries {
+            format_meta_entry(&mut dump, entry, &pyfmt::py_str(key), 1);
+        }
+        print!("{dump}");
+        println!("\nValidation\n==========");
+    }
+    let (f, c) = if args.meta {
+        ("", "")
+    } else {
+        (" following", ":")
+    };
+    println!(
+        "\nSignature is valid, the{f} message was signed by {}{c}\n",
+        pretty_hash(&valid.signer_hash)
+    );
+    if args.meta {
+        println!("Message\n=======\n");
+    }
+    let message = rsg::py_index(&valid.signed_data, "message").map_err(fail)?;
+    match message {
+        Value::Binary(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => println!("{text}"),
+            Err(_) => return Err(fail(pyfmt::py_utf8_error(bytes).unwrap_or_default())),
+        },
+        other => {
+            return Err(fail(format!(
+                "'{}' object has no attribute 'decode'",
+                rsg::py_type_name(other)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The `recurse()` metadata printer of `validate_message` (rnid.py:701-723).
+fn format_meta_entry(out: &mut String, entry: &Value, key: &str, level: usize) {
+    const MAX_WIDTH: usize = 64;
+    let indent = "  ".repeat(level);
+    if let Value::Map(entries) = entry {
+        out.push_str(&format!("d{indent}{key}:\n"));
+        for (sub_key, sub_entry) in entries {
+            format_meta_entry(out, sub_entry, &pyfmt::py_str(sub_key), level + 1);
+        }
+        return;
+    }
+    let etype = match entry {
+        Value::String(_) => 's',
+        Value::Binary(_) => 'b',
+        Value::Array(_) => 'l',
+        Value::Integer(_) => 'i',
+        Value::F32(_) | Value::F64(_) => 'f',
+        Value::Nil => 'N',
+        _ => 'u',
+    };
+    if key == "note" && entry.is_nil() {
+        return;
+    }
+    let text = match entry {
+        Value::Binary(bytes) => hex::encode(bytes),
+        other => pyfmt::py_str(other),
+    };
+    let leadin = format!("{etype}{indent}{key}=");
+    let leadln = leadin.chars().count();
+    let chars: Vec<char> = text.chars().collect();
+    let first: String = chars.iter().take(MAX_WIDTH).collect();
+    out.push_str(&format!("{leadin}{first}\n"));
+    for chunk in chars.chunks(MAX_WIDTH).skip(1) {
+        out.push_str(&" ".repeat(leadln));
+        out.extend(chunk);
+        out.push('\n');
+    }
+}
+
+fn sign(args: &Args, path: &str, identity: &Identity) -> Step {
+    let sign_path = expanduser(path);
+    let rsg_path = format!("{sign_path}.rsg");
+    let output = output_format(args);
+    if !identity.has_private_key() {
+        println!("Cannot sign \"{sign_path}\", the identity does not hold a private key");
+        return Err(R_NO_PRVKEY);
+    }
+    if !is_file(&sign_path) {
+        println!("The file \"{sign_path}\" does not exist");
+        return Err(R_NO_FILE);
+    }
+    if output == "bin" && is_file(&rsg_path) && !args.force {
+        println!("The signature file \"{rsg_path}\" already exists, not overwriting");
+        return Err(R_FILE_EXISTS);
+    }
+    let fail = |e: String| {
+        println!("Could not sign {sign_path}: {e}");
+        R_UNKNOWN_ERROR
+    };
+    let input = std::fs::File::open(&sign_path).map_err(|e| fail(py_os_error(&e, &sign_path)))?;
+    if args.raw {
+        let signature = rsg::create_raw_signature(identity, input).map_err(fail)?;
+        std::fs::write(&rsg_path, signature).map_err(|e| fail(py_os_error(&e, &rsg_path)))?;
+    } else {
+        let rsg_data = rsg::create_rsg(identity, input, false, None).map_err(fail)?;
+        if output == "bin" {
+            std::fs::write(&rsg_path, &rsg_data).map_err(|e| fail(py_os_error(&e, &rsg_path)))?;
+        } else {
+            println!("\n{}\n", armor(&rsg_data, output));
+        }
+    }
+    println!("Signed file {sign_path} with {}", identity_str(identity));
+    Ok(())
+}
+
+fn armor(data: &[u8], output: &str) -> String {
+    match output {
+        "base32" => wrap_rsg(encode_base32(data).as_bytes()),
+        "base64" => wrap_rsg(URL_SAFE.encode(data).as_bytes()),
+        "base256" => wrap_rsg_str(&b256::b256rep(data)),
+        _ => wrap_rsg(hex::encode(data).as_bytes()),
+    }
+}
+
+/// Python text-mode read: universal newlines.
+fn universal_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn sign_message(args: &Args, identity: &Identity) -> Step {
+    let output = output_format(args);
+    let write = nonempty(&args.write);
+    if output == "bin" && write.is_none() {
+        println!("No write path specified");
+        return Err(R_INVALID_ARGS);
+    }
+    if !identity.has_private_key() {
+        println!("Cannot sign, the identity does not hold a private key");
+        return Err(R_NO_PRVKEY);
+    }
+    let arg = args.sign_message.as_deref().expect("active");
+    let mut message: Vec<u8> = if arg == NO_MESSAGE {
+        Vec::new()
+    } else {
+        arg.as_bytes().to_vec()
+    };
+    let mut from_editor = arg == NO_MESSAGE;
+    if let Some(read) = nonempty(&args.read) {
+        if arg != NO_MESSAGE {
+            println!(
+                "Both an input file and command-line provided message was specified, aborting"
+            );
+            return Err(R_INVALID_ARGS);
+        }
+        let sign_path = expanduser(read);
+        if !is_file(&sign_path) {
+            println!("The file {sign_path} does not exist");
+            return Err(R_NO_FILE);
+        }
+        let data = std::fs::read(&sign_path).map_err(|e| {
+            eprintln!("{}", py_os_error(&e, &sign_path));
+            1u8
+        })?;
+        match std::str::from_utf8(&data) {
+            Ok(text) => message = universal_newlines(text).into_bytes(),
+            Err(_) => {
+                // Uncaught in rnid.py: Python prints a traceback and exits 1.
+                eprintln!(
+                    "UnicodeDecodeError: {}",
+                    pyfmt::py_utf8_error(&data).unwrap_or_default()
+                );
+                return Err(1);
+            }
+        }
+        from_editor = false;
+    }
+    if from_editor {
+        message = get_editor_content()?;
+    }
+    if message.is_empty() {
+        println!("No message specified");
+        return Err(R_INVALID_ARGS);
+    }
+
+    let mut meta_values = None;
+    if let Some(embed) = nonempty(&args.embed_meta) {
+        if embed == NO_META {
+            // `os.path.expanduser(NO_META)` raises outside any handler.
+            eprintln!("TypeError: expected str, bytes or os.PathLike object, not int");
+            return Err(1);
+        }
+        let meta_path = expanduser(embed);
+        let spec = match args
+            .meta_spec
+            .as_ref()
+            .and_then(|s| s.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            Some(spec) => spec.to_string(),
+            None => format!("{meta_path}.spec"),
+        };
+        if !is_file(&meta_path) {
+            println!("Metadata file {meta_path} does not exist");
+            return Err(R_NO_FILE);
+        }
+        let spec_path = is_file(&spec).then_some(spec);
+        let spec_info = spec_path
+            .as_ref()
+            .map(|p| format!(" using spec from {p}"))
+            .unwrap_or_default();
+        println!("Embedding metadata from {meta_path}{spec_info}");
+        match meta::rsg_meta_from_file(Path::new(&meta_path), spec_path.as_deref().map(Path::new)) {
+            Ok(values) => meta_values = Some(values),
+            Err(e) => {
+                println!("Could not load metadata from {meta_path}: {e}");
+                return Err(R_UNKNOWN_ERROR);
+            }
+        }
+    }
+
+    let fail = |e: String| {
+        println!("Could not sign message: {e}");
+        R_UNKNOWN_ERROR
+    };
+    let packed = meta_values
+        .as_deref()
+        .map(meta::meta_entries)
+        .transpose()
+        .map_err(fail)?;
+    let rsg_data =
+        rsg::create_rsg(identity, &message[..], true, packed.as_deref()).map_err(fail)?;
+    if output == "bin" {
+        let mut rsg_path = expanduser(write.expect("checked"));
+        if !rsg_path.ends_with(".rsm") {
+            rsg_path.push_str(".rsm");
+        }
+        if is_file(&rsg_path) && !args.force {
+            println!("The signature file \"{rsg_path}\" already exists, not overwriting");
+            return Err(R_FILE_EXISTS);
+        }
+        std::fs::write(&rsg_path, &rsg_data).map_err(|e| fail(py_os_error(&e, &rsg_path)))?;
+        println!(
+            "Message signed with {} saved to {rsg_path}",
+            identity_str(identity)
+        );
+        return Err(0);
+    }
+    println!("\n{}\n", armor(&rsg_data, output));
+    println!("Message signed with {}", identity_str(identity));
+    Err(0)
+}
+
+fn encrypt(args: &Args, path: &str, identity: &Identity) -> Step {
+    let encrypt_path = expanduser(path);
+    let rfe_path = match nonempty(&args.write) {
+        Some(write) => write.to_string(),
+        None => format!("{encrypt_path}.rfe"),
+    };
+    if !is_file(&encrypt_path) {
+        println!("The file \"{encrypt_path}\" does not exist");
+        return Err(R_NO_FILE);
+    }
+    if is_file(&rfe_path) && !args.force {
+        println!("The encryption output file \"{rfe_path}\" already exists, not overwriting");
+        return Err(R_FILE_EXISTS);
+    }
+    let mut input = std::fs::File::open(&encrypt_path).map_err(|e| {
+        println!(
+            "\nError reading {encrypt_path} for encryption: {}",
+            py_os_error(&e, &encrypt_path)
+        );
+        R_WRITE_ERROR
+    })?;
+    let write_error = |e: String| {
+        println!("\nError writing encrypted output to {rfe_path}: {e}");
+        R_WRITE_ERROR
+    };
+    let mut output =
+        std::fs::File::create(&rfe_path).map_err(|e| write_error(py_os_error(&e, &rfe_path)))?;
+    let mut buffer = vec![0u8; ENC_CHUNK];
+    let mut wrote = 0usize;
+    loop {
+        let n = read_full(&mut input, &mut buffer).map_err(|e| write_error(e.to_string()))?;
+        if n > 0 {
+            let token = identity
+                .encrypt(&buffer[..n], None)
+                .map_err(|e| write_error(e.to_string()))?;
+            output
+                .write_all(&token)
+                .map_err(|e| write_error(e.to_string()))?;
+            wrote += token.len();
+        }
+        print!("\rWrote {} to {rfe_path}   ", pretty_size(wrote as u64));
+        if n == 0 {
+            break;
+        }
+    }
+    println!(
+        "\nFile {encrypt_path} encrypted for {} to {rfe_path}",
+        identity_str(identity)
+    );
+    Ok(())
+}
+
+/// Python `fh.read(n)` on a regular file: up to `n` bytes, short only at EOF.
+fn read_full(input: &mut std::fs::File, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match input.read(&mut buffer[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
+}
+
+fn decrypt(args: &Args, path: &str, identity: &Identity) -> Step {
+    let rfe_path = expanduser(path);
+    // Case-sensitive, and only the final suffix is stripped (rnid.py:903-908).
+    let Some(stem) = rfe_path.strip_suffix(".rfe") else {
+        println!("The file {rfe_path} does not appear to be a Reticulum encrypted file");
+        return Err(R_INVALID_FILE);
+    };
+    let decrypt_path = match nonempty(&args.write) {
+        Some(write) => expanduser(write),
+        None => stem.to_string(),
+    };
+    if decrypt_path.is_empty() {
+        println!("Invalid output filename");
+        return Err(R_INVALID_FILE);
+    }
+    if !identity.has_private_key() {
+        println!("Cannot decrypt \"{rfe_path}\", the identity does not hold a private key");
+        return Err(R_NO_PRVKEY);
+    }
+    if !is_file(&rfe_path) {
+        println!("The file \"{rfe_path}\" does not exist");
+        return Err(R_NO_FILE);
+    }
+    if is_file(&decrypt_path) && !args.force {
+        println!("The decryption output file \"{decrypt_path}\" already exists, not overwriting");
+        return Err(R_FILE_EXISTS);
+    }
+    let mut input = std::fs::File::open(&rfe_path).map_err(|e| {
+        println!(
+            "\nError reading {rfe_path} for decryption: {}",
+            py_os_error(&e, &rfe_path)
+        );
+        R_WRITE_ERROR
+    })?;
+    let write_error = |e: String| {
+        println!("\nError writing decrypted output to {decrypt_path}: {e}");
+        R_WRITE_ERROR
+    };
+    let mut output = std::fs::File::create(&decrypt_path)
+        .map_err(|e| write_error(py_os_error(&e, &decrypt_path)))?;
+    let chunk_size =
+        decrypt_chunk_size(identity, &mut input).map_err(|e| write_error(e.to_string()))?;
+    let mut buffer = vec![0u8; chunk_size];
+    let mut wrote = 0usize;
+    loop {
+        let n = read_full(&mut input, &mut buffer).map_err(|e| write_error(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        match identity.decrypt(&buffer[..n], None, false) {
+            Ok(plaintext) if !plaintext.is_empty() => {
+                output
+                    .write_all(&plaintext)
+                    .map_err(|e| write_error(e.to_string()))?;
+                wrote += plaintext.len();
+            }
+            _ => {
+                println!("The provided identity could not decrypt the file");
+                return Err(R_DECRYPT_FAILED);
+            }
+        }
+        print!("\rWrote {} to {decrypt_path}   ", pretty_size(wrote as u64));
+    }
+    println!("\nFile {rfe_path} decrypted to {decrypt_path}");
+    Ok(())
+}
+
+/// Token size of the file's chunks: `DEC_CHUNK`, or `ENC_CHUNK` for files
+/// written by rnid-rs before 1.2.4.
+fn decrypt_chunk_size(identity: &Identity, input: &mut std::fs::File) -> std::io::Result<usize> {
+    let len = input.metadata()?.len() as usize;
+    if len <= ENC_CHUNK {
+        return Ok(DEC_CHUNK);
+    }
+    let mut first = vec![0u8; DEC_CHUNK.min(len)];
+    read_full(input, &mut first)?;
+    let legacy = identity.decrypt(&first, None, false).is_err()
+        && identity.decrypt(&first[..ENC_CHUNK], None, false).is_ok();
+    input.seek(SeekFrom::Start(0))?;
+    Ok(if legacy { ENC_CHUNK } else { DEC_CHUNK })
+}
+
+fn write_identity(args: &Args, write: &str, identity: &Identity) -> Step {
+    let mut wp = expanduser(write);
+    if identity.has_private_key() && args.export_prv {
+        if is_file(&wp) && !args.force {
+            println!("File {wp} already exists, not overwriting");
+            return Err(R_FILE_EXISTS);
+        }
+        if let Err(e) = identity.to_file(Path::new(&wp)) {
+            rns_log(
+                "[Error]   ",
+                &format!("Error while saving identity to {wp}"),
+            );
+            rns_log("[Notice]  ", &format!("The contained exception was: {e}"));
+        }
+        println!("Wrote private identity to {wp}");
+        return Ok(());
+    }
+    if identity.get_public_key().len() != 64 {
+        println!("Identity holds neither a public nor private key");
+        return Err(R_NO_KEYS);
+    }
+    if !wp.to_lowercase().ends_with(".pub") {
+        wp.push_str(".pub");
+    }
+    if is_file(&wp) && !args.force {
+        println!("File {wp} already exists, not overwriting");
+        return Err(R_FILE_EXISTS);
+    }
+    if let Err(e) = identity.pub_to_file(Path::new(&wp)) {
+        rns_log(
+            "[Error]   ",
+            &format!("Error while saving identity to {wp}"),
+        );
+        rns_log("[Notice]  ", &format!("The contained exception was: {e}"));
+    }
+    println!("Wrote public identity to {wp}");
+    Ok(())
+}
+
+fn get_editor_content() -> Result<Vec<u8>, u8> {
     let mut editor = std::env::var("EDITOR").unwrap_or_default();
     if editor.is_empty() {
         for fallback in ["nano", "vim", "vi"] {
@@ -1760,14 +1876,16 @@ fn get_editor_content() -> Result<Vec<u8>, ExitCode> {
         }
     }
     if editor.is_empty() {
-        eprintln!("Could not launch editor");
-        return Err(ExitCode::from(252));
+        println!("Could not launch editor");
+        return Err(R_READ_ERROR);
     }
-
     let tmp_path = std::env::temp_dir().join(format!(
         "rnid-message-{}-{}.tmp",
         std::process::id(),
-        now_epoch() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     ));
     let run = || -> Result<Vec<u8>, String> {
         std::fs::write(&tmp_path, "").map_err(|e| e.to_string())?;
@@ -1782,112 +1900,36 @@ fn get_editor_content() -> Result<Vec<u8>, ExitCode> {
             ));
         }
         std::fs::read_to_string(&tmp_path)
-            .map(String::into_bytes)
+            .map(|text| universal_newlines(&text).into_bytes())
             .map_err(|e| e.to_string())
     };
     let result = run();
     let _ = std::fs::remove_file(&tmp_path);
     result.map_err(|e| {
-        eprintln!("Could not get content from editor: {e}");
-        ExitCode::from(252)
+        println!("Could not get content from editor: {e}");
+        R_READ_ERROR
     })
 }
 
-/// Python ref: 1.3.8 rnid.py:700-727 --meta recursive typed dump. Type chars:
-/// s str, b bytes (hex), l list, i int, f float, N nil, u unknown (incl.
-/// bool, matching Python where type(True) != int); values wrap at 64 chars
-/// with continuation lines indented to the lead-in width.
-fn format_meta_entry(out: &mut String, entry: &rmpv::Value, key: &str, level: usize) {
-    const MAX_WIDTH: usize = 64;
-    let indent = "  ".repeat(level);
-    if let rmpv::Value::Map(entries) = entry {
-        out.push_str(&format!("d{indent}{key}:\n"));
-        for (sub_key, sub_entry) in entries {
-            let sub_key = sub_key
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{sub_key}"));
-            format_meta_entry(out, sub_entry, &sub_key, level + 1);
-        }
-        return;
-    }
-
-    let etype = match entry {
-        rmpv::Value::String(_) => 's',
-        rmpv::Value::Binary(_) => 'b',
-        rmpv::Value::Array(_) => 'l',
-        rmpv::Value::Integer(_) => 'i',
-        rmpv::Value::F32(_) | rmpv::Value::F64(_) => 'f',
-        rmpv::Value::Nil => 'N',
-        _ => 'u',
-    };
-    // Python 1.3.8 rnid.py:717 skips note=None entries (pre-1.3.2 shim).
-    if key == "note" && entry.is_nil() {
-        return;
-    }
-    let text = match entry {
-        rmpv::Value::Binary(bytes) => hex::encode(bytes),
-        _ => py_str_value(entry),
-    };
-    let leadin = format!("{etype}{indent}{key}=");
-    let leadln = leadin.chars().count();
-    let chars: Vec<char> = text.chars().collect();
-    let mut first = true;
-    let mut chunks = chars.chunks(MAX_WIDTH);
-    loop {
-        let Some(chunk) = chunks.next() else {
-            if first {
-                out.push_str(&leadin);
-                out.push('\n');
-            }
-            break;
-        };
-        if first {
-            out.push_str(&leadin);
-            first = false;
-        } else {
-            out.push_str(&" ".repeat(leadln));
-        }
-        out.extend(chunk);
-        out.push('\n');
-    }
+fn wrap_rsg(rsg: &[u8]) -> String {
+    wrap_rsg_str(&String::from_utf8_lossy(rsg))
 }
 
-/// Python str() rendering of msgpack values for the --meta dump.
-fn py_str_value(value: &rmpv::Value) -> String {
-    match value {
-        rmpv::Value::String(s) => s.as_str().map(str::to_string).unwrap_or_default(),
-        rmpv::Value::Integer(i) => format!("{i}"),
-        rmpv::Value::F32(f) => py_float(*f as f64),
-        rmpv::Value::F64(f) => py_float(*f),
-        rmpv::Value::Boolean(b) => if *b { "True" } else { "False" }.to_string(),
-        rmpv::Value::Nil => "None".to_string(),
-        rmpv::Value::Array(items) => {
-            let rendered: Vec<String> = items.iter().map(py_repr_value).collect();
-            format!("[{}]", rendered.join(", "))
-        }
-        other => format!("{other}"),
+/// `wrap_rsg_str` (rnid.py:524-536): 64-character rows padded with `=`.
+fn wrap_rsg_str(rsg: &str) -> String {
+    const HEADER: &str = "#### Start of rsg data ";
+    const FOOTER: &str = " End of rsg data ####";
+    const ROW_WIDTH: usize = 64;
+    let mut wrapped = format!("{HEADER}{}\n", "#".repeat(ROW_WIDTH - HEADER.len()));
+    let chars: Vec<char> = rsg.chars().collect();
+    for chunk in chars.chunks(ROW_WIDTH) {
+        wrapped.extend(chunk);
+        wrapped.push_str(&"=".repeat(ROW_WIDTH - chunk.len()));
+        wrapped.push('\n');
     }
-}
-
-/// Python repr() rendering for list members.
-fn py_repr_value(value: &rmpv::Value) -> String {
-    match value {
-        rmpv::Value::String(s) => {
-            let s = s.as_str().unwrap_or_default();
-            format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
-        }
-        _ => py_str_value(value),
-    }
-}
-
-/// Python str() float formatting: whole floats keep one decimal ("2.0").
-fn py_float(value: f64) -> String {
-    if value.is_finite() && value.fract() == 0.0 && value.abs() < 1e16 {
-        format!("{value:.1}")
-    } else {
-        format!("{value}")
-    }
+    wrapped.push_str(&"#".repeat(ROW_WIDTH - FOOTER.len()));
+    wrapped.push_str(FOOTER);
+    wrapped
 }
 
 fn encode_base32(bytes: &[u8]) -> String {
@@ -1899,331 +1941,15 @@ fn encode_base32(bytes: &[u8]) -> String {
         buffer = (buffer << 8) | (*byte as u16);
         bits += 8;
         while bits >= 5 {
-            let index = ((buffer >> (bits - 5)) & 0x1f) as usize;
-            out.push(ALPHABET[index] as char);
+            out.push(ALPHABET[((buffer >> (bits - 5)) & 0x1f) as usize] as char);
             bits -= 5;
         }
     }
     if bits > 0 {
-        let index = ((buffer << (5 - bits)) & 0x1f) as usize;
-        out.push(ALPHABET[index] as char);
+        out.push(ALPHABET[((buffer << (5 - bits)) & 0x1f) as usize] as char);
     }
     while !out.len().is_multiple_of(8) {
         out.push('=');
     }
     out
-}
-
-fn decode_base32(input: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    let mut buffer = 0u32;
-    let mut bits = 0u8;
-    for ch in input.chars() {
-        if ch == '=' {
-            break;
-        }
-        let val = match ch {
-            'A'..='Z' => ch as u8 - b'A',
-            'a'..='z' => ch as u8 - b'a',
-            '2'..='7' => ch as u8 - b'2' + 26,
-            c if c.is_whitespace() => continue,
-            _ => return Err(format!("invalid base32 character {ch:?}")),
-        };
-        buffer = (buffer << 5) | u32::from(val);
-        bits += 5;
-        while bits >= 8 {
-            out.push(((buffer >> (bits - 8)) & 0xff) as u8);
-            bits -= 8;
-        }
-    }
-    Ok(out)
-}
-
-fn pretty_hash(hash: &[u8; 16]) -> String {
-    format!("<{}>", hex::encode(hash))
-}
-
-fn now_epoch() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rmpv::Value;
-
-    // Shared with the fixtures in rsg.rs: generated by running the verbatim
-    // Python 1.3.8 rnid.py create_rsg/rsg_meta code with vendored
-    // umsgpack/configobj and the 1.3.8 vendor/validate.py.
-    const FIXTURE_PRV_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
-    const FIXTURE_MESSAGE: &str = "Hello Reticulum 1.3.8 signed message test.\nSecond line æø.";
-    const FIXTURE_META_INI: &str = concat!(
-        "title = Test Release\n",
-        "tags = alpha, beta, gamma\n",
-        "quoted = \"hello # world\"\n",
-        "inline = value # trailing comment\n",
-        "[origin]\n",
-        "name = Origins\n",
-        "path = pkg/data\n",
-        "[[nested]]\n",
-        "deep = yes\n",
-    );
-    const FIXTURE_META_RSM_HEX: &str = "270dbe3b2ea3d7c96adca079a25521e938fe9c9d6b617644fa3088af6f254bf2afa70e867fafd411a79834f3d10d80c7f95b782fbf0ebec74a8b91f797bf390484a86861736874797065a6736861323536a468617368c420322779176317ebc50102a216a56a68d41c8e9aa1c849f4d4eded5c31ba542795a46d65746187a67369676e6572c410aca31af0441d81dbec71e82da0b4b5f5a67075626b6579c4408f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7a57469746c65ac546573742052656c65617365a47461677393a5616c706861a462657461a567616d6d61a671756f746564ad68656c6c6f202320776f726c64a6696e6c696e65a576616c7565a66f726967696e83a46e616d65a74f726967696e73a470617468a8706b672f64617461a66e657374656481a464656570a3796573a76d657373616765c43c48656c6c6f205265746963756c756d20312e332e38207369676e6564206d65737361676520746573742e0a5365636f6e64206c696e6520c3a6c3b82e";
-    const FIXTURE_SPEC_META_INI: &str = "name = pkg\nversion = 7\nweight = 2.5\nactive = yes\n";
-    const FIXTURE_SPEC: &str = concat!(
-        "name = string(max=64)\n",
-        "version = integer(max=100)\n",
-        "weight = float(min=0)\n",
-        "active = boolean\n",
-        "extra = string(default=filled)\n",
-    );
-    const FIXTURE_SPEC_RSM_HEX: &str = "f53a7788db14455a9f489bf742082c1f8e3dbd330e832511522073f7af422ef4055a04f093f34c06c1c4364c64de25dd00d63f720dde22f43ae223bc24fcf90184a86861736874797065a6736861323536a468617368c420322779176317ebc50102a216a56a68d41c8e9aa1c849f4d4eded5c31ba542795a46d65746187a67369676e6572c410aca31af0441d81dbec71e82da0b4b5f5a67075626b6579c4408f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7a46e616d65a3706b67a776657273696f6e07a6776569676874cb4004000000000000a6616374697665c3a56578747261a666696c6c6564a76d657373616765c43c48656c6c6f205265746963756c756d20312e332e38207369676e6564206d65737361676520746573742e0a5365636f6e64206c696e6520c3a6c3b82e";
-
-    fn fixture_identity() -> Identity {
-        Identity::from_private_key(&hex::decode(FIXTURE_PRV_HEX).unwrap()).unwrap()
-    }
-
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rnid-rs-test-{label}-{}-{}",
-            std::process::id(),
-            now_epoch().to_bits()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn ini_meta_rsm_is_byte_exact_with_python_138() {
-        let dir = unique_temp_dir("meta");
-        let meta_path = dir.join("meta.ini");
-        std::fs::write(&meta_path, FIXTURE_META_INI).unwrap();
-
-        let values = meta::rsg_meta_from_file(&meta_path, None).unwrap();
-        let rsm = rsg::create_rsg(
-            &fixture_identity(),
-            FIXTURE_MESSAGE.as_bytes(),
-            true,
-            Some(&values),
-        )
-        .unwrap();
-        assert_eq!(hex::encode(&rsm), FIXTURE_META_RSM_HEX);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn spec_validated_meta_rsm_is_byte_exact_with_python_138() {
-        let dir = unique_temp_dir("spec");
-        let meta_path = dir.join("meta.ini");
-        let spec_path = dir.join("meta.ini.spec");
-        std::fs::write(&meta_path, FIXTURE_SPEC_META_INI).unwrap();
-        std::fs::write(&spec_path, FIXTURE_SPEC).unwrap();
-
-        let values = meta::rsg_meta_from_file(&meta_path, Some(&spec_path)).unwrap();
-        let rsm = rsg::create_rsg(
-            &fixture_identity(),
-            FIXTURE_MESSAGE.as_bytes(),
-            true,
-            Some(&values),
-        )
-        .unwrap();
-        assert_eq!(hex::encode(&rsm), FIXTURE_SPEC_RSM_HEX);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn meta_dump_matches_python_138_output() {
-        // Golden output captured from the verbatim 1.3.8 rnid.py recurse fn
-        // (:700-727) over this meta map; note=None entries are skipped.
-        let identity = fixture_identity();
-        let entries: Vec<(Value, Value)> = vec![
-            (Value::from("signer"), Value::Binary(identity.hash.to_vec())),
-            (
-                Value::from("pubkey"),
-                Value::Binary(identity.get_public_key().to_vec()),
-            ),
-            (Value::from("title"), Value::from("Test Release")),
-            (
-                Value::from("tags"),
-                Value::Array(vec![
-                    Value::from("alpha"),
-                    Value::from("beta"),
-                    Value::from("gamma"),
-                ]),
-            ),
-            (Value::from("version"), Value::from(7)),
-            (Value::from("weight"), Value::F64(2.5)),
-            (Value::from("active"), Value::Boolean(true)),
-            (Value::from("note"), Value::Nil),
-            (
-                Value::from("origin"),
-                Value::Map(vec![
-                    (Value::from("name"), Value::from("Origins")),
-                    (
-                        Value::from("nested"),
-                        Value::Map(vec![(Value::from("deep"), Value::from("yes"))]),
-                    ),
-                ]),
-            ),
-        ];
-
-        let mut dump = String::new();
-        for (key, entry) in &entries {
-            format_meta_entry(&mut dump, entry, key.as_str().unwrap(), 1);
-        }
-        let expected = concat!(
-            "b  signer=aca31af0441d81dbec71e82da0b4b5f5\n",
-            "b  pubkey=8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f\n",
-            "          29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7\n",
-            "s  title=Test Release\n",
-            "l  tags=['alpha', 'beta', 'gamma']\n",
-            "i  version=7\n",
-            "f  weight=2.5\n",
-            "u  active=True\n",
-            "d  origin:\n",
-            "s    name=Origins\n",
-            "d    nested:\n",
-            "s      deep=yes\n",
-        );
-        assert_eq!(dump, expected);
-    }
-
-    #[test]
-    fn wrap_rsg_str_matches_python_138_output() {
-        let sample = format!("αβγ{}{}", "a".repeat(63), "Ω".repeat(4));
-        let expected = concat!(
-            "#### Start of rsg data #########################################\n",
-            "αβγaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
-            "aaΩΩΩΩ==========================================================\n",
-            "########################################### End of rsg data ####",
-        );
-        assert_eq!(wrap_rsg_str(&sample), expected);
-    }
-
-    #[test]
-    fn multifile_sign_validate_and_rsm_round_trip() {
-        let dir = unique_temp_dir("multi");
-        let identity_path = dir.join("identity");
-        fixture_identity().to_file(&identity_path).unwrap();
-        let file_a = dir.join("a.txt");
-        let file_b = dir.join("b.txt");
-        std::fs::write(&file_a, b"first payload").unwrap();
-        std::fs::write(&file_b, b"second payload").unwrap();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let identity_arg = identity_path.to_string_lossy().to_string();
-        let run_args = |argv: Vec<String>| {
-            let args = Args::parse_from(argv);
-            rt.block_on(run(args))
-        };
-
-        // Multi-path sign creates one .rsg per input.
-        let code = run_args(vec![
-            "rnid-rs".into(),
-            "-i".into(),
-            identity_arg.clone(),
-            "-s".into(),
-            file_a.to_string_lossy().into(),
-            file_b.to_string_lossy().into(),
-        ]);
-        assert_eq!(code, ExitCode::SUCCESS);
-        assert!(dir.join("a.txt.rsg").is_file());
-        assert!(dir.join("b.txt.rsg").is_file());
-
-        // Multi-path validate succeeds across both.
-        let code = run_args(vec![
-            "rnid-rs".into(),
-            "-V".into(),
-            file_a.to_string_lossy().into(),
-            file_b.to_string_lossy().into(),
-        ]);
-        assert_eq!(code, ExitCode::SUCCESS);
-
-        // First failing path terminates with its own code (missing file -> 6).
-        let code = run_args(vec![
-            "rnid-rs".into(),
-            "-V".into(),
-            dir.join("missing.txt").to_string_lossy().into(),
-            file_a.to_string_lossy().into(),
-        ]);
-        assert_eq!(code, ExitCode::from(6));
-
-        // -S message to .rsm, then validate through the -V dispatch.
-        let rsm_path = dir.join("message");
-        let code = run_args(vec![
-            "rnid-rs".into(),
-            "-i".into(),
-            identity_arg.clone(),
-            "-S".into(),
-            "signed message body".into(),
-            "-w".into(),
-            rsm_path.to_string_lossy().into(),
-        ]);
-        assert_eq!(code, ExitCode::SUCCESS);
-        let rsm_file = dir.join("message.rsm");
-        assert!(rsm_file.is_file());
-        let code = run_args(vec![
-            "rnid-rs".into(),
-            "-V".into(),
-            rsm_file.to_string_lossy().into(),
-        ]);
-        assert_eq!(code, ExitCode::SUCCESS);
-
-        // Wrong required signer on an .rsm is an invalid signature (10).
-        let other_identity_path = dir.join("other-identity");
-        Identity::new().to_file(&other_identity_path).unwrap();
-        let code = run_args(vec![
-            "rnid-rs".into(),
-            "-i".into(),
-            other_identity_path.to_string_lossy().into(),
-            "-V".into(),
-            rsm_file.to_string_lossy().into(),
-        ]);
-        assert_eq!(code, ExitCode::from(10));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn sign_message_requires_write_path_for_binary_output() {
-        let dir = unique_temp_dir("nowrite");
-        let identity_path = dir.join("identity");
-        fixture_identity().to_file(&identity_path).unwrap();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let args = Args::parse_from([
-            "rnid-rs",
-            "-i",
-            identity_path.to_string_lossy().as_ref(),
-            "-S",
-            "some message",
-        ]);
-        let code = rt.block_on(run(args));
-        assert_eq!(code, ExitCode::from(250));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn decrypt_accepts_pre_1_2_4_rnid_rs_chunking() {
-        let identity = Identity::new();
-        let legacy_plaintext_chunk =
-            ENC_CHUNK - rns_identity::identity::IDENTITY_OVERHEAD - BLOCK_SIZE;
-        let plaintext = vec![0xA5; legacy_plaintext_chunk + 1];
-        let mut ciphertext = Vec::new();
-        for chunk in plaintext.chunks(legacy_plaintext_chunk) {
-            ciphertext.extend(identity.encrypt(chunk, None).unwrap());
-        }
-
-        let decrypted = decrypt_ciphertext(&identity, &ciphertext).unwrap();
-        assert_eq!(decrypted, plaintext);
-    }
 }

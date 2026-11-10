@@ -86,10 +86,10 @@ fn assert_failure(output: &Output, expected_code: Option<i32>, needle: &str, con
             stderr(output)
         );
     }
-    let err = stderr(output);
+    let out = stdout(output);
     assert!(
-        err.contains(needle),
-        "{context} stderr did not contain {needle:?}\n--- stderr ---\n{err}"
+        out.contains(needle),
+        "{context} stdout did not contain {needle:?}\n--- stdout ---\n{out}"
     );
 }
 
@@ -219,7 +219,7 @@ fn rnid_public_private_import_export_and_pub_write_behaviour() {
     assert_success(&output, "import private and write private");
     assert_eq!(fs::read(&private_out).unwrap(), private);
 
-    let export_public = rnid(&tmp, ["-i".as_ref(), public_out.as_os_str(), "-x".as_ref()]);
+    let export_public = rnid(&tmp, ["-m".as_ref(), public_out.as_os_str(), "-x".as_ref()]);
     assert_success(&export_public, "export public from .pub");
     assert!(stdout(&export_public).contains(&public_hex));
 
@@ -257,9 +257,18 @@ fn rnid_encoding_import_export_roundtrips() {
     assert_success(&output, "import private hex and export base32");
     assert!(stdout(&output).contains(&private_b32));
 
-    let output = rnid(&tmp, ["-m", &public_b32.to_ascii_lowercase(), "-x"]);
-    assert_success(&output, "import public lowercase base32 and export hex");
+    let output = rnid(&tmp, ["-m", &public_b32, "-x"]);
+    assert_success(&output, "import public base32 and export hex");
     assert!(stdout(&output).contains(&public_hex));
+
+    // base64.b32decode is case-sensitive.
+    let output = rnid(&tmp, ["-m", &public_b32.to_ascii_lowercase(), "-x"]);
+    assert_failure(
+        &output,
+        Some(8),
+        "Could not decode specified data",
+        "import public lowercase base32",
+    );
 
     let public_b64_arg = format!("--import-pub={public_b64}");
     let output = rnid(&tmp, [public_b64_arg.as_str(), "-x", "-B"]);
@@ -282,7 +291,7 @@ fn rnid_public_key_only_private_operations_fail() {
 
     let output = rnid(
         &tmp,
-        ["-i".as_ref(), public_file.as_os_str(), "-X".as_ref()],
+        ["-m".as_ref(), public_file.as_os_str(), "-X".as_ref()],
     );
     assert_failure(
         &output,
@@ -294,7 +303,7 @@ fn rnid_public_key_only_private_operations_fail() {
     let output = rnid(
         &tmp,
         [
-            "-i".as_ref(),
+            "-m".as_ref(),
             public_file.as_os_str(),
             "-s".as_ref(),
             message.as_os_str(),
@@ -313,7 +322,7 @@ fn rnid_public_key_only_private_operations_fail() {
     let output = rnid(
         &tmp,
         [
-            "-i".as_ref(),
+            "-m".as_ref(),
             public_file.as_os_str(),
             "-d".as_ref(),
             ciphertext.as_os_str(),
