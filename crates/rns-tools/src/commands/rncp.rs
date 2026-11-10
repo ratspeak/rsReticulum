@@ -3,7 +3,7 @@
 //! Modes:
 //! * `rncp-rs <file> <destination_hash>` — send
 //! * `rncp-rs -l [-s <dir>] [-a <hash>] [-F [-j <jail>]]` — listen (optionally serving fetch)
-//! * `rncp-rs -f <destination_hash> <remote_path> [-s <dir>]` — fetch
+//! * `rncp-rs -f <remote_path> <destination_hash> [-s <dir>]` — fetch
 //!
 //! Exit codes follow rncp: 0 success, an answered fetch failure or an
 //! interrupt; 1 generic failure; 2 identity unreadable; 3 output dir missing;
@@ -14,15 +14,18 @@
 //! also leaves push reception enabled. Use `-j <jail>` to constrain fetched
 //! paths to a directory under trusted local control; it is not an OS sandbox.
 
+use std::collections::VecDeque;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use clap::Parser;
 use rns_identity::destination::{DestType, Destination, Direction};
 use rns_transport::messages::{OutboundRequest, TransportMessage};
-use tokio::io::AsyncWriteExt;
 
 fn expand_tilde(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/")
@@ -38,14 +41,14 @@ use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
 use rns_runtime::platform::StoragePaths;
 use rns_runtime::reticulum::{InstanceMode, ReticulumHandle, SharedInstanceRpcEndpoint};
 use rns_runtime::rncp::{
-    DEFAULT_RNCP_APP_NAME, RncpError, RncpEvent, RncpFetchOutcome, RncpFetchRequest,
-    RncpListenerConfig, RncpOutcome, RncpSendRequest, default_rncp_app_name, rncp_fetch_file,
-    rncp_send_file, spawn_rncp_listener,
+    DEFAULT_RNCP_APP_NAME, RncpError, RncpEvent, RncpFetchRequest, RncpListenerConfig,
+    RncpSendRequest, default_rncp_app_name, rncp_fetch_file, rncp_send_file, spawn_rncp_listener,
 };
 use rns_runtime::rpc::{RpcRequest, RpcResponse};
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
 use rns_tools::RS_RETICULUM_VERSION;
+use rns_tools::format::pretty_hex_rep;
 
 #[derive(Parser)]
 #[command(
@@ -83,8 +86,7 @@ struct Args {
     #[arg(short = 'F', long)]
     allow_fetch: bool,
 
-    /// Fetch file from remote listener instead of sending. Positional args
-    /// become `<destination_hash> <remote_path>`.
+    /// Fetch file from remote listener instead of sending
     #[arg(short = 'f', long)]
     fetch: bool,
 
@@ -126,7 +128,7 @@ struct Args {
     #[arg(short = 'w', value_name = "seconds", default_value_t = DEFAULT_TIMEOUT_SECS)]
     timeout: f64,
 
-    /// Request physical-layer rates (currently unsupported; exits with an error).
+    /// Display physical layer transfer rates
     #[arg(short = 'P', long = "phy-rates")]
     phy_rates: bool,
 
@@ -134,17 +136,18 @@ struct Args {
     #[arg(long)]
     version: bool,
 
-    /// File to be transferred (send mode)
+    /// File to be transferred (the remote path with -f)
     file: Option<String>,
 
-    /// Hexadecimal hash of the receiver (send mode, 32 hex chars)
+    /// Hexadecimal hash of the receiver
     destination: Option<String>,
 }
 
+// rncp.py:376-385 and :615-624 share this text for send and fetch.
 fn parse_dest_hash(hex_str: &str) -> Result<[u8; 16], String> {
-    if hex_str.len() != 32 {
+    if hex_str.chars().count() != 32 {
         return Err(
-            "Destination length is invalid, must be 32 hexadecimal characters (16 bytes)."
+            "Allowed destination length is invalid, must be 32 hexadecimal characters (16 bytes)."
                 .to_string(),
         );
     }
@@ -154,47 +157,273 @@ fn parse_dest_hash(hex_str: &str) -> Result<[u8; 16], String> {
         .map_err(|_| "Invalid destination entered. Check your input.".to_string())
 }
 
-// Default path: `<storage>/identities/rncp`; `-i` overrides.
-fn load_or_create_identity(
-    identity_path: Option<&str>,
-    default_dir: &std::path::Path,
-) -> Result<Identity, (i32, String)> {
+const ERASE: &str = "\x1b[2K\r";
+const SYMS: [char; 7] = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
+
+/// rncp.py:54-68 (`prepare_identity`): `-i` is used as given, and an identity
+/// that cannot be saved is still used for this run.
+fn prepare_identity(identity_path: Option<&str>, default_dir: &std::path::Path) -> Identity {
     let path = match identity_path {
-        Some(p) => expand_tilde(p),
+        Some(p) => PathBuf::from(p),
         None => default_dir.join("rncp"),
     };
-
     if path.is_file() {
         match Identity::from_file(&path) {
-            Ok(id) => Ok(id),
-            Err(e) => Err((
-                2,
-                format!(
-                    "Could not load identity for rncp. The identity file at \"{}\" may be corrupt or unreadable: {e}",
+            Ok(id) => return id,
+            Err(_) => {
+                tracing::error!(
+                    "Could not load identity for rncp. The identity file at \"{}\" may be corrupt or unreadable.",
                     path.display()
-                ),
-            )),
+                );
+                process::exit(2);
+            }
         }
+    }
+    tracing::info!("No valid saved identity found, creating new...");
+    let id = Identity::new();
+    if let Err(e) = id.to_file(&path) {
+        tracing::error!("Error while saving identity to {}", path.display());
+        tracing::info!("The contained exception was: {e}");
+    }
+    id
+}
+
+/// rncp.py:891-908 (`size_str`).
+fn size_str(num: f64, suffix: char) -> String {
+    let mut num = if suffix == 'b' { num * 8.0 } else { num };
+    for unit in ["", "K", "M", "G", "T", "P", "E", "Z"] {
+        if num.abs() < 1000.0 {
+            return if unit.is_empty() {
+                format!("{num:.0} {unit}{suffix}")
+            } else {
+                format!("{num:.2} {unit}{suffix}")
+            };
+        }
+        num /= 1000.0;
+    }
+    format!("{num:.2}Y{suffix}")
+}
+
+/// `RNS.prettytime` (RNS/__init__.py:239-290) for the float durations rncp prints.
+fn prettytime(time: f64) -> String {
+    let neg = time < 0.0;
+    let mut time = time.abs();
+    let days = (time / 86400.0).floor() as u64;
+    time %= 86400.0;
+    let hours = (time / 3600.0).floor() as u64;
+    time %= 3600.0;
+    let minutes = (time / 60.0).floor() as u64;
+    time %= 60.0;
+    // Python round() and Rust's formatter both round the exact binary value.
+    let seconds: f64 = format!("{time:.2}").parse().unwrap_or(0.0);
+    let mut components = Vec::new();
+    if days > 0 {
+        components.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        components.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        components.push(format!("{minutes}m"));
+    }
+    if seconds > 0.0 {
+        components.push(format!("{}s", python_float(seconds)));
+    }
+    let mut out = String::new();
+    for (i, c) in components.iter().enumerate() {
+        if i > 0 {
+            out.push_str(if i + 1 < components.len() {
+                ", "
+            } else {
+                " and "
+            });
+        }
+        out.push_str(c);
+    }
+    if out.is_empty() {
+        "0s".into()
+    } else if neg {
+        format!("-{out}")
     } else {
-        if let Some(parent) = path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            return Err((
-                2,
-                format!(
-                    "Could not create identity directory \"{}\": {e}",
-                    parent.display()
-                ),
-            ));
+        out
+    }
+}
+
+/// Python `str(float)` for the short values rncp prints.
+fn python_float(v: f64) -> String {
+    if v.fract() == 0.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v}")
+    }
+}
+
+/// `str(round(prg * 100.0, 1))` (rncp.py:582, :746).
+fn percent_str(progress: f64) -> String {
+    python_float(format!("{:.1}", progress * 100.0).parse().unwrap_or(0.0))
+}
+
+/// Resource `total_size`: data plus the 3-byte length and msgpack of
+/// `{"name": <basename>}` (Resource.py:263-271, rncp.py:629).
+fn resource_total_size(data_size: u64, file_name: &str) -> f64 {
+    let meta = rmpv::Value::Map(vec![(
+        rmpv::Value::String("name".into()),
+        rmpv::Value::Binary(file_name.as_bytes().to_vec()),
+    )]);
+    let mut packed = Vec::new();
+    let _ = rmpv::encode::write_value(&mut packed, &meta);
+    (data_size + 3 + packed.len() as u64) as f64
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tick {
+    Off,
+    Spin,
+    Transfer,
+}
+
+struct UiState {
+    tick: Tick,
+    sym: usize,
+    total_size: Option<f64>,
+    started: Option<Instant>,
+    progress: f64,
+    stats: VecDeque<(Instant, f64)>,
+    speed: f64,
+}
+
+impl UiState {
+    /// rncp.py:323-356 (`sender_progress`): speed over the last 32 updates.
+    fn update(&mut self, progress: f64) {
+        let now = Instant::now();
+        self.started.get_or_insert(now);
+        self.progress = progress;
+        let got = progress * self.total_size.unwrap_or(0.0);
+        self.stats.push_back((now, got));
+        while self.stats.len() > 32 {
+            self.stats.pop_front();
         }
-        let id = Identity::new();
-        if let Err(e) = id.to_file(&path) {
-            return Err((
-                2,
-                format!("Could not persist identity to \"{}\": {e}", path.display()),
-            ));
+        let (first_at, first_got) = self.stats[0];
+        let span = now.duration_since(first_at).as_secs_f64();
+        self.speed = if span == 0.0 {
+            0.0
+        } else {
+            (got - first_got) / span
+        };
+    }
+
+    fn stat_str(&self, elapsed: Option<f64>) -> String {
+        let percent = percent_str(self.progress);
+        let Some(total) = self.total_size else {
+            return format!("{percent}%");
+        };
+        let cs = size_str((self.progress * total).trunc(), 'B');
+        let ts = size_str(total, 'B');
+        let ss = size_str(self.speed, 'b');
+        match elapsed {
+            Some(dt) => format!("{percent}% - {cs} of {ts} in {} - {ss}ps", prettytime(dt)),
+            None => format!("{percent}% - {cs} of {ts} - {ss}ps"),
         }
-        Ok(id)
+    }
+}
+
+/// rncp's status lines on stdout: one line per step with `-S`, otherwise
+/// erase-and-rewrite lines with a spinner and the progress line.
+#[derive(Clone)]
+struct Ui {
+    silent: bool,
+    fetch: bool,
+    state: Arc<Mutex<UiState>>,
+}
+
+impl Ui {
+    fn new(silent: bool, fetch: bool) -> Self {
+        let ui = Self {
+            silent,
+            fetch,
+            state: Arc::new(Mutex::new(UiState {
+                tick: Tick::Off,
+                sym: 0,
+                total_size: None,
+                started: None,
+                progress: 0.0,
+                stats: VecDeque::new(),
+                speed: 0.0,
+            })),
+        };
+        if !silent {
+            let ticker = ui.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    ticker.tick();
+                }
+            });
+        }
+        ui
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, UiState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn tick(&self) {
+        let mut st = self.lock();
+        let sym = SYMS[st.sym];
+        match st.tick {
+            Tick::Off => return,
+            Tick::Spin => print!("\x08\x08{sym} "),
+            Tick::Transfer if self.fetch && st.started.is_none() => {
+                print!("{ERASE}Waiting for transfer to start {sym} ")
+            }
+            Tick::Transfer => {
+                let es = if self.fetch { " " } else { "  " };
+                print!("{ERASE}Transferring file {sym} {}{es}", st.stat_str(None));
+            }
+        }
+        let _ = std::io::stdout().flush();
+        st.sym = (st.sym + 1) % SYMS.len();
+    }
+
+    /// Print a step and keep the spinner (or progress) running after it.
+    fn step(&self, silent: &str, loud: &str, tick: Tick) {
+        let mut st = self.lock();
+        if self.silent {
+            println!("{silent}");
+        } else {
+            print!("{loud}");
+            let _ = std::io::stdout().flush();
+        }
+        st.tick = tick;
+    }
+
+    /// Print a final line and stop the spinner.
+    fn finish(&self, silent: &str, loud: &str) {
+        let mut st = self.lock();
+        st.tick = Tick::Off;
+        if self.silent {
+            println!("{silent}");
+        } else {
+            println!("{loud}");
+        }
+    }
+
+    /// rncp.py:576-577: the erase before the fetch progress, without a line under `-S`.
+    fn transfer_started(&self) {
+        let mut st = self.lock();
+        if !self.silent {
+            print!("{ERASE}");
+            let _ = std::io::stdout().flush();
+        }
+        st.tick = Tick::Transfer;
+    }
+
+    fn set_total(&self, total: f64) {
+        self.lock().total_size = Some(total);
+    }
+
+    fn progress(&self, progress: f32) {
+        self.lock().update(f64::from(progress));
     }
 }
 
@@ -205,12 +434,6 @@ pub(crate) async fn main() {
         println!("rncp-rs {RS_RETICULUM_VERSION}");
         return;
     }
-    if args.phy_rates {
-        eprintln!(
-            "rncp-rs: -P/--phy-rates is not implemented yet; the Rust resource layer currently exposes logical transfer progress only."
-        );
-        process::exit(2);
-    }
 
     let level = rns_tools::Utility::Rncp.loglevel(None, args.verbose, args.quiet, false);
     let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
@@ -220,39 +443,92 @@ pub(crate) async fn main() {
         true,
         std::io::stderr,
     );
-
-    if args.fetch {
-        run_fetch(args).await;
-    } else if args.listen {
-        run_listen(args).await;
-    } else {
-        run_send(args).await;
+    if args.phy_rates {
+        tracing::debug!(
+            "Physical layer rates are not available, -P adds nothing to the progress line"
+        );
     }
+
+    // rncp.py:824-880.
+    let positionals = args.file.is_some() && args.destination.is_some();
+    if args.listen || args.print_identity {
+        run_listen(args).await;
+    } else if args.fetch && positionals {
+        run_fetch(args).await;
+    } else if !args.fetch && positionals {
+        run_send(args).await;
+    } else {
+        println!();
+        let mut cmd = <Args as clap::CommandFactory>::command();
+        cmd.print_help().ok();
+        println!();
+        process::exit(0);
+    }
+}
+
+/// rncp.py:394-430 / :640-676: request a path unless one is known, wait
+/// `max(-w, medium path timeout)` for it, and return the time left for the
+/// link, which rncp waits for until the later of that deadline and the link
+/// establishment timeout.
+async fn wait_for_path(
+    handle: &ReticulumHandle,
+    dest_hash: [u8; 16],
+    timeout: f64,
+    ui: &Ui,
+    interrupt: &ShutdownSignal,
+    link_tail: &str,
+) -> Duration {
+    let deadline = Instant::now() + path_timeout(handle, timeout).await;
+    let h = pretty_hex_rep(&dest_hash);
+    let has_path = || async { handle.has_path(dest_hash).await.unwrap_or(false) };
+    if !has_path().await {
+        let _ = handle
+            .transport_tx
+            .send(TransportMessage::RequestPath {
+                destination_hash: dest_hash,
+            })
+            .await;
+        ui.step(
+            &format!("Path to {h} requested"),
+            &format!("Path to {h} requested   "),
+            Tick::Spin,
+        );
+        while !has_path().await && Instant::now() < deadline {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                _ = interrupt.wait() => {
+                    println!();
+                    process::exit(0);
+                }
+            }
+        }
+    }
+    if !has_path().await {
+        ui.finish("Path not found", &format!("{ERASE}Path not found"));
+        process::exit(1);
+    }
+    ui.step(
+        &format!("Establishing link with {h}"),
+        &format!("{ERASE}Establishing link with {h}{link_tail} "),
+        Tick::Spin,
+    );
+    deadline.saturating_duration_since(Instant::now())
 }
 
 async fn run_fetch(args: Args) -> ! {
     // Register before any slow init so an early SIGINT exits cleanly.
     let interrupt = ShutdownSignal::new();
     let _signal_rx = install_signal_handlers(interrupt.clone());
-    // In fetch mode the positionals are `<destination_hash> <remote_path>`.
-    let (Some(dest_arg), Some(path_arg)) = (args.file.as_ref(), args.destination.as_ref()) else {
-        eprintln!("rncp-rs: fetch mode requires <destination_hash> <remote_path>");
-        process::exit(1);
+    let (Some(path_arg), Some(dest_arg)) = (args.file.as_ref(), args.destination.as_ref()) else {
+        process::exit(0);
     };
 
-    let dest_hash = match parse_dest_hash(dest_arg) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("{e}");
-            process::exit(1);
-        }
-    };
-
+    // rncp.py:364-374: the save directory is checked before the hash.
     let save_dir = match args.save.as_deref() {
         Some(p) => {
             let path = expand_tilde(p);
             if !path.is_dir() {
-                eprintln!("Output directory not found");
+                tracing::error!("Output directory not found");
                 process::exit(3);
             }
             let probe = path.join(".rncp_write_test");
@@ -261,7 +537,7 @@ async fn run_fetch(args: Args) -> ! {
                     let _ = std::fs::remove_file(&probe);
                 }
                 Err(_) => {
-                    eprintln!("Output directory not writable");
+                    tracing::error!("Output directory not writable");
                     process::exit(4);
                 }
             }
@@ -270,46 +546,56 @@ async fn run_fetch(args: Args) -> ! {
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
 
-    let handle = start_interruptible(args.config.as_deref(), &interrupt).await;
-    let paths = StoragePaths::from_config_dir(&handle.config_dir);
-    let identity = match load_or_create_identity(args.identity_path.as_deref(), &paths.identity_dir)
-    {
-        Ok(id) => id,
-        Err((code, msg)) => {
-            eprintln!("{msg}");
-            process::exit(code);
+    let dest_hash = match parse_dest_hash(dest_arg) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("{e}");
+            process::exit(1);
         }
     };
 
-    if !args.silent {
-        println!("Fetching \"{path_arg}\" from <{}>", hex::encode(dest_hash));
-    }
+    let handle = start_interruptible(args.config.as_deref(), &interrupt).await;
+    handle.wants_destination_type(DEFAULT_RNCP_APP_NAME).await;
+    let paths = StoragePaths::from_config_dir(&handle.config_dir);
+    let identity = prepare_identity(args.identity_path.as_deref(), &paths.identity_dir);
 
-    let path_timeout = path_timeout(&handle, args.timeout).await;
+    let ui = Ui::new(args.silent, true);
+    let h = pretty_hex_rep(&dest_hash);
+    let link_wait = wait_for_path(&handle, dest_hash, args.timeout, &ui, &interrupt, "  ").await;
+
+    // The request goes out once the link is up; it is shown when the first
+    // answer or Resource progress arrives.
+    let requesting = Arc::new(std::sync::Once::new());
+    let show_requesting = {
+        let ui = ui.clone();
+        let requesting = requesting.clone();
+        move || {
+            requesting.call_once(|| {
+                ui.step(
+                    "Requesting file from remote...",
+                    &format!("{ERASE}Requesting file from remote   "),
+                    Tick::Spin,
+                )
+            })
+        }
+    };
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f32>(32);
-    let silent = args.silent;
-    let progress_task = tokio::spawn(async move {
-        let mut last = -1.0_f32;
-        while let Some(p) = progress_rx.recv().await {
-            if silent {
-                continue;
+    let progress_task = {
+        let ui = ui.clone();
+        let show_requesting = show_requesting.clone();
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Some(p) = progress_rx.recv().await {
+                if first {
+                    first = false;
+                    show_requesting();
+                    ui.transfer_started();
+                }
+                ui.progress(p);
             }
-            if (p - last).abs() < 0.01 && p < 1.0 {
-                continue;
-            }
-            last = p;
-            let pct = (p * 100.0).clamp(0.0, 100.0);
-            let mut stderr = tokio::io::stderr();
-            let _ = stderr
-                .write_all(format!("\rfetch: {pct:5.1}%   ").as_bytes())
-                .await;
-            let _ = stderr.flush().await;
-        }
-        if !silent {
-            let _ = tokio::io::stderr().write_all(b"\n").await;
-        }
-    });
+        })
+    };
 
     let result = rncp_fetch_file(RncpFetchRequest {
         transport_tx: handle.transport_tx.clone(),
@@ -318,7 +604,7 @@ async fn run_fetch(args: Args) -> ! {
         remote_path: path_arg,
         save_dir: &save_dir,
         overwrite: args.overwrite,
-        path_timeout,
+        path_timeout: link_wait,
         progress_tx: Some(progress_tx),
         shutdown: Some(interrupt.clone()),
     })
@@ -326,72 +612,88 @@ async fn run_fetch(args: Args) -> ! {
 
     let _ = progress_task.await;
 
+    let fail = |line: &str, code: i32| -> ! {
+        ui.finish(line, &format!("{ERASE}{line}"));
+        process::exit(code);
+    };
+    let link_failed = || -> ! {
+        fail(&format!("Could not establish link with {h}"), 1);
+    };
+    let transfer_failed = |preface: &str| -> ! {
+        println!("{preface}");
+        fail("The transfer failed", 1);
+    };
+
     // rncp.py:543-567: every answered request failure exits 0.
     match result {
-        Ok(outcome) => {
-            if !args.silent {
-                print_fetch_summary(&outcome);
-            }
-            process::exit(0);
-        }
         Err(RncpError::Interrupted) => {
             println!();
             process::exit(0);
         }
-        Err(RncpError::Denied) => {
-            println!(
+        Err(
+            RncpError::PathTimeout
+            | RncpError::NoIdentity
+            | RncpError::Timeout(_)
+            | RncpError::HandshakeFailed(_)
+            | RncpError::ProofInvalid(_)
+            | RncpError::RequestDispatch(_),
+        ) => link_failed(),
+        _ => {}
+    }
+    show_requesting();
+    match result {
+        Ok(outcome) => {
+            let total = resource_total_size(outcome.bytes as u64, &outcome.file_name);
+            let line = {
+                let mut st = ui.lock();
+                st.tick = Tick::Off;
+                st.total_size = Some(total);
+                st.progress = 1.0;
+                let started = st
+                    .started
+                    .unwrap_or_else(|| Instant::now() - outcome.duration);
+                let dt = started.elapsed().as_secs_f64();
+                st.speed = if dt > 0.0 { total / dt } else { 0.0 };
+                st.stat_str(Some(dt))
+            };
+            if args.silent {
+                println!("{path_arg} fetched from {h}");
+            } else {
+                print!("{ERASE}Transfer complete  {line} ");
+                println!("\n{path_arg} fetched from {h}");
+            }
+            process::exit(0);
+        }
+        Err(RncpError::Denied) => fail(
+            &format!(
                 "Fetch request failed, fetching the file {path_arg} was not allowed by the remote"
-            );
-            process::exit(0);
+            ),
+            0,
+        ),
+        Err(RncpError::NotFound) => fail(
+            &format!("Fetch request failed, the file {path_arg} was not found on the remote"),
+            0,
+        ),
+        Err(RncpError::RemoteError) => fail(
+            "Fetch request failed due to an error on the remote system",
+            0,
+        ),
+        Err(RncpError::RequestFailed) => fail(
+            "Fetch request failed due to an unknown error (probably not authorised)",
+            0,
+        ),
+        Err(RncpError::ResourceFailed(reason)) if reason == "invalid data received" => {
+            transfer_failed("Invalid data received, ignoring resource")
         }
-        Err(RncpError::NotFound) => {
-            println!("Fetch request failed, the file {path_arg} was not found on the remote");
-            process::exit(0);
-        }
-        Err(RncpError::RemoteError) => {
-            println!("Fetch request failed due to an error on the remote system");
-            process::exit(0);
-        }
-        Err(RncpError::RequestFailed) => {
-            println!("Fetch request failed due to an unknown error (probably not authorised)");
-            process::exit(0);
-        }
-        Err(RncpError::PathTimeout) => {
-            eprintln!("Path not found");
-            process::exit(1);
-        }
-        Err(RncpError::NoIdentity) => {
-            eprintln!("Destination's identity is not known.");
-            process::exit(1);
-        }
-        Err(RncpError::Timeout(what)) => {
-            eprintln!("Timed out waiting for {what}");
-            process::exit(1);
-        }
-        Err(RncpError::ResourceFailed(reason)) => {
-            eprintln!("Fetch failed: {reason}");
-            process::exit(1);
-        }
+        Err(RncpError::ResourceFailed(_)) => transfer_failed("Resource failed"),
+        Err(RncpError::Io(e)) => transfer_failed(&format!(
+            "An error occurred while saving received resource: {e}"
+        )),
         Err(e) => {
-            eprintln!("rncp-rs: fetch failed: {e}");
-            process::exit(1);
+            tracing::debug!("Fetch failed: {e}");
+            fail("The transfer failed", 1)
         }
     }
-}
-
-fn print_fetch_summary(outcome: &RncpFetchOutcome) {
-    let elapsed = outcome.duration.as_secs_f64().max(1e-6);
-    let throughput_bps = (outcome.bytes as f64) * 8.0 / elapsed;
-    let (t_value, t_unit) = human_rate(throughput_bps);
-    println!(
-        "Fetched \"{}\" ({} bytes) in {:.2}s ({:.2} {}) → {}",
-        outcome.file_name,
-        outcome.bytes,
-        elapsed,
-        t_value,
-        t_unit,
-        outcome.saved_path.display()
-    );
 }
 
 async fn run_send(args: Args) -> ! {
@@ -399,24 +701,20 @@ async fn run_send(args: Args) -> ! {
     let interrupt = ShutdownSignal::new();
     let _signal_rx = install_signal_handlers(interrupt.clone());
     let (Some(file_arg), Some(dest_arg)) = (args.file.as_ref(), args.destination.as_ref()) else {
-        // Bare `rncp` prints help and exits 0.
-        let mut cmd = <Args as clap::CommandFactory>::command();
-        cmd.print_help().ok();
-        println!();
         process::exit(0);
     };
 
     let dest_hash = match parse_dest_hash(dest_arg) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("{e}");
+            println!("{e}");
             process::exit(1);
         }
     };
 
     let file_path = expand_tilde(file_arg);
     if !file_path.is_file() {
-        eprintln!("File not found");
+        println!("File not found");
         process::exit(1);
     }
 
@@ -426,57 +724,68 @@ async fn run_send(args: Args) -> ! {
         .map(|s| s.to_string())
         .unwrap_or_else(|| "file".to_string());
 
+    print!("{ERASE}");
+    let _ = std::io::stdout().flush();
+
+    let handle = start_interruptible(args.config.as_deref(), &interrupt).await;
+    handle.wants_destination_type(DEFAULT_RNCP_APP_NAME).await;
+    let paths = StoragePaths::from_config_dir(&handle.config_dir);
+    let identity = prepare_identity(args.identity_path.as_deref(), &paths.identity_dir);
+
+    let ui = Ui::new(args.silent, false);
+    let h = pretty_hex_rep(&dest_hash);
+    let link_wait = wait_for_path(&handle, dest_hash, args.timeout, &ui, &interrupt, " ").await;
+
     let file = match std::fs::File::open(&file_path) {
         Ok(f) => f,
         Err(e) => {
-            println!("Could not start transfer: {e}");
+            ui.finish(
+                &format!("Could not start transfer: {e}"),
+                &format!("Could not start transfer: {e}"),
+            );
             process::exit(1);
         }
     };
-    let bytes_total = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let data_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    ui.set_total(resource_total_size(data_size, &file_name));
 
-    let handle = start_interruptible(args.config.as_deref(), &interrupt).await;
-
-    let paths = StoragePaths::from_config_dir(&handle.config_dir);
-    let identity = match load_or_create_identity(args.identity_path.as_deref(), &paths.identity_dir)
-    {
-        Ok(id) => id,
-        Err((code, msg)) => {
-            eprintln!("{msg}");
-            process::exit(code);
+    // The first update follows the advertisement; the next one follows the
+    // receiver's first part request, which is where rncp starts transferring.
+    let transferring = Arc::new(AtomicBool::new(false));
+    let show_transferring = {
+        let ui = ui.clone();
+        let transferring = transferring.clone();
+        move || {
+            if !transferring.swap(true, Ordering::SeqCst) {
+                ui.step(
+                    "Transferring file...",
+                    &format!("{ERASE}Transferring file   "),
+                    Tick::Transfer,
+                );
+            }
         }
     };
-
-    if !args.silent {
-        println!("Sending \"{file_name}\" to <{}>", hex::encode(dest_hash));
-    }
-
-    let path_timeout = path_timeout(&handle, args.timeout).await;
-    let auto_compress = !args.no_compress;
-
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f32>(32);
-    let silent = args.silent;
-    let progress_task = tokio::spawn(async move {
-        let mut last = -1.0_f32;
-        while let Some(p) = progress_rx.recv().await {
-            if silent {
-                continue;
+    let progress_task = {
+        let ui = ui.clone();
+        let show_transferring = show_transferring.clone();
+        tokio::spawn(async move {
+            let mut updates = 0usize;
+            while let Some(p) = progress_rx.recv().await {
+                match updates {
+                    0 => ui.step(
+                        "Advertising file resource...",
+                        &format!("{ERASE}Advertising file resource   "),
+                        Tick::Spin,
+                    ),
+                    1 => show_transferring(),
+                    _ => {}
+                }
+                updates += 1;
+                ui.progress(p);
             }
-            if (p - last).abs() < 0.01 && p < 1.0 {
-                continue;
-            }
-            last = p;
-            let pct = (p * 100.0).clamp(0.0, 100.0);
-            let mut stderr = tokio::io::stderr();
-            let _ = stderr
-                .write_all(format!("\rtransfer: {pct:5.1}%   ").as_bytes())
-                .await;
-            let _ = stderr.flush().await;
-        }
-        if !silent {
-            let _ = tokio::io::stderr().write_all(b"\n").await;
-        }
-    });
+        })
+    };
 
     let result = rncp_send_file(RncpSendRequest {
         transport_tx: handle.transport_tx.clone(),
@@ -484,8 +793,8 @@ async fn run_send(args: Args) -> ! {
         dest_hash,
         file_name: &file_name,
         source: Box::new(file),
-        auto_compress,
-        path_timeout,
+        auto_compress: !args.no_compress,
+        path_timeout: link_wait,
         progress_tx: Some(progress_tx),
         shutdown: Some(interrupt.clone()),
     })
@@ -493,10 +802,29 @@ async fn run_send(args: Args) -> ! {
 
     let _ = progress_task.await;
 
+    let fail = |line: &str| -> ! {
+        ui.finish(line, &format!("{ERASE}{line}"));
+        process::exit(1);
+    };
+
     match result {
-        Ok(outcome) => {
-            if !args.silent {
-                print_send_summary(&outcome, bytes_total);
+        Ok(_) => {
+            show_transferring();
+            let line = {
+                let mut st = ui.lock();
+                st.tick = Tick::Off;
+                st.progress = 1.0;
+                let total = st.total_size.unwrap_or(0.0);
+                let dt = st.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+                st.speed = if dt > 0.0 { total / dt } else { 0.0 };
+                st.stat_str(None)
+            };
+            let path = file_path.display();
+            if args.silent {
+                println!("{path} copied to {h}");
+            } else {
+                print!("{ERASE}Transfer complete  {line}  ");
+                println!("\n{path} copied to {h}");
             }
             process::exit(0);
         }
@@ -504,53 +832,24 @@ async fn run_send(args: Args) -> ! {
             println!();
             process::exit(0);
         }
-        Err(RncpError::PathTimeout) => {
-            eprintln!("Path not found");
-            process::exit(1);
+        Err(RncpError::PathTimeout | RncpError::NoIdentity) => {
+            fail(&format!("No path found to {h}"))
         }
-        Err(RncpError::NoIdentity) => {
-            eprintln!(
-                "Destination's identity is not known — wait for an announce or use rnstatus to verify the destination has been seen."
-            );
-            process::exit(1);
-        }
-        Err(RncpError::Timeout(what)) => {
-            eprintln!("Timed out waiting for {what}");
-            process::exit(1);
-        }
-        Err(RncpError::ResourceFailed(reason)) => {
-            eprintln!(
-                "File was not accepted by <{}>: {reason}",
-                hex::encode(dest_hash)
-            );
-            process::exit(1);
+        Err(
+            RncpError::Timeout(_)
+            | RncpError::HandshakeFailed(_)
+            | RncpError::ProofInvalid(_)
+            | RncpError::RequestDispatch(_),
+        ) => fail(&format!("Link establishment with {h} timed out")),
+        Err(RncpError::ResourceCreate(e)) => fail(&format!("Could not start transfer: {e}")),
+        Err(e) if !transferring.load(Ordering::SeqCst) => {
+            tracing::debug!("Transfer failed: {e}");
+            fail(&format!("File was not accepted by {h}"))
         }
         Err(e) => {
-            eprintln!("rncp-rs: transfer failed: {e}");
-            process::exit(1);
+            tracing::debug!("Transfer failed: {e}");
+            fail("The transfer failed")
         }
-    }
-}
-
-fn print_send_summary(outcome: &RncpOutcome, bytes: usize) {
-    let elapsed = outcome.duration.as_secs_f64().max(1e-6);
-    let throughput_bps = (bytes as f64) * 8.0 / elapsed;
-    let (t_value, t_unit) = human_rate(throughput_bps);
-    println!(
-        "Transferred {} bytes in {:.2}s ({:.2} {})",
-        bytes, elapsed, t_value, t_unit
-    );
-}
-
-fn human_rate(bps: f64) -> (f64, &'static str) {
-    if bps >= 1_000_000_000.0 {
-        (bps / 1_000_000_000.0, "Gbps")
-    } else if bps >= 1_000_000.0 {
-        (bps / 1_000_000.0, "Mbps")
-    } else if bps >= 1_000.0 {
-        (bps / 1_000.0, "kbps")
-    } else {
-        (bps, "bps")
     }
 }
 
@@ -558,15 +857,22 @@ async fn run_listen(args: Args) -> ! {
     // Register before any slow init so an early SIGINT exits cleanly.
     let shutdown = ShutdownSignal::new();
     let _signal_rx = install_signal_handlers(shutdown.clone());
+    let handle = start_reticulum(args.config.as_deref(), shutdown.clone()).await;
+
+    let fetch_jail = args.jail.as_deref().map(|jail| {
+        let jail = expand_tilde(jail);
+        tracing::debug!(
+            "Restricting fetch requests to paths under \"{}\"",
+            jail.display()
+        );
+        jail
+    });
+
     let save_dir = match args.save.as_deref() {
         Some(p) => {
             let path = expand_tilde(p);
-            if !path.exists() {
-                eprintln!("Output directory not found");
-                process::exit(3);
-            }
             if !path.is_dir() {
-                eprintln!("Output directory not found");
+                tracing::error!("Output directory not found");
                 process::exit(3);
             }
             // Probe-file write test (no portable W_OK check on all platforms).
@@ -576,34 +882,27 @@ async fn run_listen(args: Args) -> ! {
                     let _ = std::fs::remove_file(&probe);
                 }
                 Err(_) => {
-                    eprintln!("Output directory not writable");
+                    tracing::error!("Output directory not writable");
                     process::exit(4);
                 }
             }
+            tracing::debug!("Saving received files in \"{}\"", path.display());
             path
         }
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
 
-    let handle = start_reticulum(args.config.as_deref(), shutdown.clone()).await;
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
-    let identity = match load_or_create_identity(args.identity_path.as_deref(), &paths.identity_dir)
-    {
-        Ok(id) => id,
-        Err((code, msg)) => {
-            eprintln!("{msg}");
-            process::exit(code);
-        }
-    };
+    let identity = prepare_identity(args.identity_path.as_deref(), &paths.identity_dir);
     let announce_identity = identity
         .get_private_key()
         .and_then(|key| Identity::from_private_key(&*key).ok());
 
     if args.print_identity {
-        let dest = match rns_identity::destination::Destination::new(
+        let dest = match Destination::new(
             Some(&identity),
-            rns_identity::destination::Direction::In,
-            rns_identity::destination::DestType::Single,
+            Direction::In,
+            DestType::Single,
             DEFAULT_RNCP_APP_NAME,
         ) {
             Ok(d) => d,
@@ -612,8 +911,8 @@ async fn run_listen(args: Args) -> ! {
                 process::exit(2);
             }
         };
-        println!("Identity     : {}", hex::encode(identity.hash));
-        println!("Listening on : {}", hex::encode(dest.hash));
+        println!("Identity     : {}", pretty_hex_rep(&identity.hash));
+        println!("Listening on : {}", pretty_hex_rep(&dest.hash));
         process::exit(0);
     }
 
@@ -625,16 +924,17 @@ async fn run_listen(args: Args) -> ! {
         match allowed_identities(&args.allowed, &rncp_allowed_identity_file_candidates()) {
             Ok(allowed) => allowed,
             Err(e) => {
-                eprintln!("Could not apply allowed identity: {e}");
+                tracing::error!("Could not apply allowed identity: {e}");
                 process::exit(1);
             }
         }
     };
     if allowed.is_empty() && !allow_all {
-        eprintln!("No allowed identities configured, rncp will not accept any files!");
+        tracing::warn!("No allowed identities configured, rncp will not accept any files!");
     }
-
-    let fetch_jail = args.jail.as_deref().map(PathBuf::from);
+    if args.allow_fetch && allow_all {
+        tracing::warn!("Allowing unauthenticated fetch requests");
+    }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<RncpEvent>(64);
     let cfg = RncpListenerConfig {
@@ -642,7 +942,7 @@ async fn run_listen(args: Args) -> ! {
         app_name: default_rncp_app_name().to_string(),
         save_dir,
         allow_all,
-        allowed,
+        allowed: allowed.clone(),
         overwrite: args.overwrite,
         allow_fetch: args.allow_fetch,
         fetch_jail,
@@ -651,7 +951,7 @@ async fn run_listen(args: Args) -> ! {
     let listener = match spawn_rncp_listener(handle.transport_tx.clone(), cfg, event_tx).await {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("rncp-rs: failed to start listener: {e}");
+            tracing::error!("rncp-rs: failed to start listener: {e}");
             process::exit(1);
         }
     };
@@ -662,61 +962,38 @@ async fn run_listen(args: Args) -> ! {
         args.announce_interval,
     );
 
-    if !args.silent {
-        println!(
-            "rncp-rs listening on <{}> — waiting for transfers. Ctrl-C to stop.",
-            hex::encode(listener.destination_hash())
-        );
-    }
+    tracing::info!(
+        "rncp listening on {}",
+        pretty_hex_rep(&listener.destination_hash())
+    );
 
     loop {
         tokio::select! {
             ev = event_rx.recv() => {
                 let Some(ev) = ev else { break };
                 match ev {
-                    RncpEvent::LinkEstablished { link_id } => {
-                        if !args.silent {
-                            println!("link established: <{}>", hex::encode(link_id));
+                    RncpEvent::LinkEstablished { .. } => {
+                        tracing::debug!("Incoming link established");
+                    }
+                    RncpEvent::SenderIdentified { identity_hash, .. } => {
+                        if allowed.contains(&identity_hash) {
+                            tracing::debug!("Authenticated sender");
                         }
                     }
-                    RncpEvent::SenderIdentified { link_id, identity_hash } => {
-                        if !args.silent {
-                            println!(
-                                "sender identified on <{}>: <{}>",
-                                hex::encode(link_id),
-                                hex::encode(identity_hash)
-                            );
-                        }
+                    RncpEvent::SenderDenied { .. } => {
+                        tracing::debug!("Sender not allowed, tearing down link");
                     }
-                    RncpEvent::SenderDenied { link_id, identity_hash } => {
-                        eprintln!(
-                            "denied sender <{}> on <{}> (not in allow-list)",
-                            hex::encode(identity_hash),
-                            hex::encode(link_id)
-                        );
+                    RncpEvent::Completed { saved_path, .. } => {
+                        rns_transport::notice!("Saved received file to {}", saved_path.display());
                     }
-                    RncpEvent::Completed { file_name, saved_path, bytes, .. } => {
-                        println!(
-                            "received \"{file_name}\" ({bytes} bytes) → {}",
-                            saved_path.display()
-                        );
+                    RncpEvent::WriteFailed { reason, .. } => {
+                        tracing::error!("An error occurred while saving received resource: {reason}");
                     }
-                    RncpEvent::WriteFailed { file_name, reason, .. } => {
-                        eprintln!("write failed for \"{file_name}\": {reason}");
+                    RncpEvent::FetchServing { file_name, .. } => {
+                        tracing::debug!("Sending file {file_name} to client");
                     }
-                    RncpEvent::FetchServing { link_id, file_name, bytes } => {
-                        if !args.silent {
-                            println!(
-                                "serving fetch \"{file_name}\" ({bytes} bytes) on <{}>",
-                                hex::encode(link_id)
-                            );
-                        }
-                    }
-                    RncpEvent::FetchDenied { link_id, reason } => {
-                        eprintln!(
-                            "denied fetch on <{}>: {reason}",
-                            hex::encode(link_id)
-                        );
+                    RncpEvent::FetchDenied { reason, .. } => {
+                        tracing::warn!("Disallowing fetch request: {reason}");
                     }
                 }
             }
@@ -821,7 +1098,7 @@ fn allowed_identities(cli: &[String], candidates: &[PathBuf]) -> Result<Vec<[u8;
                     .filter(|line| line.chars().count() == 32)
                     .map(str::to_string)
                     .collect();
-                tracing::info!(
+                tracing::debug!(
                     "Loaded {} allowed identit{} from {}",
                     lines.len(),
                     if lines.len() == 1 { "y" } else { "ies" },
@@ -956,6 +1233,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    const PROGRESS_VECTORS: &str =
+        include_str!("../../tests/fixtures/rncp_progress/rncp_progress.tsv");
+
+    #[test]
+    fn progress_fields_match_upstream_size_str_prettytime_and_percent() {
+        let mut checked = 0;
+        for line in PROGRESS_VECTORS.lines().filter(|l| !l.starts_with('#')) {
+            let row: Vec<&str> = line.split('\t').collect();
+            let input: f64 = row[1].parse().unwrap();
+            let got = match row[0] {
+                "size" => size_str(input, row[2].chars().next().unwrap()),
+                "time" => prettytime(input),
+                "percent" => percent_str(input),
+                other => panic!("unknown vector kind {other}"),
+            };
+            assert_eq!(got, row[3], "{line}");
+            checked += 1;
+        }
+        assert!(checked > 30);
     }
 
     #[test]
