@@ -291,38 +291,15 @@ impl TransportActor {
         };
         self.last_discovery_pr_tx = now;
 
-        if let Some(blocked_interface) = request.blocked_interface {
-            // Transport.py:4072-4081: one tag for every interface but the blocked one.
-            let request_tag = rns_crypto::random::random_bytes(16);
-            let ids: Vec<InterfaceId> = self
-                .interfaces
-                .iter()
-                .filter_map(|(&id, entry)| {
-                    if id == blocked_interface || !entry.direction.outbound {
-                        None
-                    } else {
-                        Some(id)
-                    }
-                })
-                .collect();
-            for id in ids {
-                self.send_path_request(request.destination_hash, id, Some(&request_tag), false);
-            }
-        } else {
-            let mut request_tag = [0u8; 16];
-            {
-                use rand::RngCore;
-                rand::thread_rng().fill_bytes(&mut request_tag);
-            }
-            let ids: Vec<InterfaceId> = self
-                .interfaces
-                .iter()
-                .filter_map(|(&id, entry)| entry.direction.outbound.then_some(id))
-                .collect();
-            for id in ids {
-                self.send_path_request(request.destination_hash, id, Some(&request_tag), false);
-            }
-        }
+        // Transport.py:4061-4080: one tag, stamped once when stamping is on,
+        // on every interface but the blocked one.
+        let request_tag = rns_crypto::random::random_bytes(16);
+        self.forward_path_request(
+            request.destination_hash,
+            request.blocked_interface,
+            Some(&request_tag),
+            false,
+        );
     }
 
     #[cfg(test)]

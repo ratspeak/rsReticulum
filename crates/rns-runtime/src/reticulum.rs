@@ -501,6 +501,10 @@ pub struct RecalledDestination {
     pub ratchet: Option<[u8; 32]>,
     pub hops: u8,
     pub last_heard: std::time::SystemTime,
+    /// Python `Identity.recall_stamp_value`: 0 for a known unstamped destination.
+    pub stamp_value: Option<f64>,
+    /// Python `Identity.recall_link_cost`: the announced link-request cost, if any.
+    pub link_cost: Option<f64>,
 }
 
 /// Owned, bounded stream of validated announce-handler events.
@@ -1110,6 +1114,8 @@ impl std::fmt::Debug for RecalledDestination {
             .field("ratchet_present", &self.ratchet.is_some())
             .field("hops", &self.hops)
             .field("last_heard", &self.last_heard)
+            .field("stamp_value", &self.stamp_value)
+            .field("link_cost", &self.link_cost)
             .finish()
     }
 }
@@ -1505,7 +1511,7 @@ impl ReticulumHandle {
         let create_receipt = options.create_receipt && destination.dest_type != DestType::Plain;
         let recalled = if destination.dest_type == DestType::Single || create_receipt {
             Some(
-                self.recall(destination.hash)
+                self.recall_identity(destination.hash)
                     .await?
                     .ok_or_else(|| SendError::IdentityUnavailable(hex::encode(destination.hash)))?,
             )
@@ -1663,17 +1669,69 @@ impl ReticulumHandle {
         &self,
         destination_hash: [u8; 16],
     ) -> Result<Option<RecalledDestination>, ControlError> {
-        let response = self
+        let mut recalled = self.recall_identity(destination_hash).await?;
+        if let Some(recalled) = recalled.as_mut() {
+            recalled.stamp_value = self.recall_stamp_value(destination_hash).await?;
+            recalled.link_cost = self.recall_link_cost(destination_hash).await?;
+        }
+        Ok(recalled)
+    }
+
+    /// `recall` without the stamp fields, for callers that need only the identity.
+    async fn recall_identity(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Option<RecalledDestination>, ControlError> {
+        match self
             .query_transport_result(TransportQuery::RecallDestination {
                 dest: destination_hash,
             })
-            .await?;
-        match response {
+            .await?
+        {
             TransportQueryResponse::RecalledDestination(entry) => {
                 entry.map(recalled_destination_from_rpc).transpose()
             }
             _ => Err(ControlError::UnexpectedResponse {
                 operation: "destination recall",
+            }),
+        }
+    }
+
+    /// Python `Identity.recall_stamp_value`: the last heard announce stamp
+    /// value, 0 when the destination announced without a stamp, `None` when
+    /// it is unknown. Local to this process, like `recall`.
+    pub async fn recall_stamp_value(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Option<f64>, ControlError> {
+        match self
+            .query_transport_result(TransportQuery::RecallStampValue {
+                dest: destination_hash,
+            })
+            .await?
+        {
+            TransportQueryResponse::FloatResult(value) => Ok(value),
+            _ => Err(ControlError::UnexpectedResponse {
+                operation: "stamp value recall",
+            }),
+        }
+    }
+
+    /// Python `Identity.recall_link_cost`: the link-request stamp cost the
+    /// destination announced, `None` when unknown or not announced.
+    pub async fn recall_link_cost(
+        &self,
+        destination_hash: [u8; 16],
+    ) -> Result<Option<f64>, ControlError> {
+        match self
+            .query_transport_result(TransportQuery::RecallLinkCost {
+                dest: destination_hash,
+            })
+            .await?
+        {
+            TransportQueryResponse::FloatResult(value) => Ok(value),
+            _ => Err(ControlError::UnexpectedResponse {
+                operation: "link cost recall",
             }),
         }
     }
@@ -2109,6 +2167,8 @@ fn recalled_destination_from_rpc(
         ratchet: entry.ratchet,
         hops: entry.hops,
         last_heard,
+        stamp_value: None,
+        link_cost: None,
     })
 }
 
@@ -11260,6 +11320,29 @@ loglevel = 7
                     },
                 )))
                 .expect("recall response receiver");
+            for expected in ["stamp value", "link cost"] {
+                let TransportMessage::Rpc { query, response_tx } =
+                    transport_rx.recv().await.expect("stamp query")
+                else {
+                    panic!("expected transport RPC");
+                };
+                let value = match (expected, query) {
+                    ("stamp value", TransportQuery::RecallStampValue { dest })
+                        if dest == destination_hash =>
+                    {
+                        Some(25.5)
+                    }
+                    ("link cost", TransportQuery::RecallLinkCost { dest })
+                        if dest == destination_hash =>
+                    {
+                        Some(12.5)
+                    }
+                    (_, other) => panic!("expected {expected} query, got {other:?}"),
+                };
+                response_tx
+                    .send(TransportQueryResponse::FloatResult(value))
+                    .expect("stamp response receiver");
+            }
         });
 
         let mut handle = dummy_handle();
@@ -11276,6 +11359,8 @@ loglevel = 7
             Some(b"display name".as_slice())
         );
         assert_eq!(recalled.ratchet, Some([0xA5; 32]));
+        assert_eq!(recalled.stamp_value, Some(25.5));
+        assert_eq!(recalled.link_cost, Some(12.5));
         assert_eq!(recalled.hops, 4);
         assert_eq!(
             recalled

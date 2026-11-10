@@ -42,6 +42,7 @@ pub mod path_discovery;
 pub mod path_recovery;
 pub mod path_table;
 pub mod persistence;
+pub mod pr_stamper;
 pub mod rate_limit;
 pub mod reverse_table;
 pub mod stamps;

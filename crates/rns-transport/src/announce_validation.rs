@@ -1,18 +1,8 @@
-//! Network stamp receive defaults and the announce validation caches
-//! (Identity.py:676-790, Transport.py:191-206).
+//! The announce validation caches (Identity.py:676-790).
 
 use std::collections::{HashMap, VecDeque};
 
 use rns_identity::stamps::{NETWORK_STAMP_SIZE, cost_to_fp};
-
-/// Announce and path-request stamps are parsed and validated.
-pub const STAMPS_ENABLED: bool = true;
-/// Unstamped or under-value announces and path requests are dropped.
-pub const STAMPS_ENFORCED: bool = false;
-/// Required announce stamp value when no interface cost is configured.
-pub const DESTINATION_COST: f64 = 23.5;
-/// Required path-request stamp value when no interface cost is configured.
-pub const PR_COST: f64 = 15.8;
 
 const VALID_CACHE_MAX: usize = 128;
 const INVALID_CACHE_MAX: usize = 128;
@@ -32,6 +22,8 @@ pub enum InvalidAnnounce {
 #[derive(Debug, Clone)]
 pub struct ValidatedAnnounce {
     pub public_key: [u8; 64],
+    /// Truncated hash of `public_key`, kept so a cache hit needs no key decoding.
+    pub identity_hash: [u8; 16],
     pub app_data: Option<Vec<u8>>,
     pub ratchet: Option<[u8; 32]>,
     pub stamp: Option<[u8; NETWORK_STAMP_SIZE]>,
@@ -160,6 +152,7 @@ mod tests {
     fn result(stamp_value: Option<f64>) -> ValidatedAnnounce {
         ValidatedAnnounce {
             public_key: [1; 64],
+            identity_hash: [2; 16],
             app_data: None,
             ratchet: None,
             stamp: None,

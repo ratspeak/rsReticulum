@@ -21,6 +21,19 @@ enum TransitProof {
     Refused,
 }
 
+/// The app_data upstream remembers: `b""` for a ratchet announce with nothing
+/// after the signature, since its `None` threshold ignores the ratchet
+/// (Identity.py:815-834), and `None` once a valid stamp strip leaves nothing (:867).
+pub(super) fn remembered_app_data(
+    announce: &rns_identity::announce::AnnounceData,
+    stamp: &rns_identity::announce::AnnounceStampCheck,
+) -> Option<Vec<u8>> {
+    match announce.app_data.as_deref() {
+        None if announce.ratchet.is_some() => Some(Vec::new()),
+        raw => stamp.app_data(raw).map(<[u8]>::to_vec),
+    }
+}
+
 impl TransportActor {
     #[tracing::instrument(
         level = "trace",
@@ -76,6 +89,24 @@ impl TransportActor {
         if reason == InvalidAnnounce::Invalid {
             self.protocol_violation(interface_id);
         }
+    }
+
+    /// Python `Interface.destination_cost`, or the global without an interface.
+    pub(super) fn interface_destination_cost(&self, interface_id: InterfaceId) -> f64 {
+        self.stamp_policy.interface_destination_cost(
+            self.interfaces
+                .get(&interface_id)
+                .and_then(|entry| entry.destination_cost),
+        )
+    }
+
+    /// Python `Interface.pr_cost`, or the global without an interface.
+    pub(super) fn interface_pr_cost(&self, interface_id: InterfaceId) -> f64 {
+        self.stamp_policy.interface_pr_cost(
+            self.interfaces
+                .get(&interface_id)
+                .and_then(|entry| entry.pr_cost),
+        )
     }
 
     fn ifac_violation(&mut self, interface_id: InterfaceId) {
@@ -384,34 +415,25 @@ impl TransportActor {
         // Identity.validate_announce (Identity.py:749-889): the cache, then
         // the stamp, then the blackhole check, then the signature.
         let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
-        let cost_target = crate::announce_validation::DESTINATION_COST;
-        let cached = self.announce_validation.lookup(
-            &announce_packet_hash,
-            cost_target,
-            crate::announce_validation::STAMPS_ENFORCED,
-        );
+        let stamps_enabled = self.stamp_policy.stamps_enabled;
+        let stamps_enforced = stamps_enabled && self.stamp_policy.stamps_enforced;
+        let cost_target = self.interface_destination_cost(interface_id);
+        let cached =
+            self.announce_validation
+                .lookup(&announce_packet_hash, cost_target, stamps_enforced);
         let (validated, validated_identity, cache_hit) = match cached {
             CachedAnnounce::Rejected(reason) => {
                 self.reject_announce(header, interface_id, announce_packet_hash, reason, false);
                 return;
             }
-            CachedAnnounce::Valid(validated) => {
-                let Ok(identity) =
-                    rns_identity::identity::Identity::from_public_key(&validated.public_key)
-                else {
-                    return;
-                };
-                (validated, identity, true)
-            }
+            CachedAnnounce::Valid(validated) => (validated, None, true),
             CachedAnnounce::Miss => {
-                let stamp = if crate::announce_validation::STAMPS_ENABLED {
+                let stamp = if stamps_enabled {
                     announce_data.check_stamp(&header.destination_hash, cost_target)
                 } else {
                     rns_identity::announce::AnnounceStampCheck::default()
                 };
-                if crate::announce_validation::STAMPS_ENABLED
-                    && crate::announce_validation::STAMPS_ENFORCED
-                {
+                if stamps_enforced {
                     let reason = if !stamp.stamped {
                         Some(InvalidAnnounce::NoStamp)
                     } else if !stamp.validated {
@@ -474,15 +496,14 @@ impl TransportActor {
                     };
                 let validated = ValidatedAnnounce {
                     public_key: announce_data.public_key,
-                    app_data: stamp
-                        .app_data(announce_data.app_data.as_deref())
-                        .map(<[u8]>::to_vec),
+                    identity_hash: validated_identity.hash,
+                    app_data: remembered_app_data(&announce_data, &stamp),
                     ratchet: announce_data.ratchet,
                     stamp: stamp.stamp,
                     stamp_value: stamp.value,
                     lr_cost: stamp.lr_cost,
                 };
-                (validated, validated_identity, false)
+                (validated, Some(validated_identity), false)
             }
         };
 
@@ -518,14 +539,14 @@ impl TransportActor {
             }
         }
 
-        if !cache_hit {
+        if let Some(validated_identity) = validated_identity.as_ref() {
             let known_public_key = self
                 .recent_announces
                 .get(&header.destination_hash)
                 .and_then(|entry| entry.public_key);
             if let Err(e) = announce_data.validate_destination_binding(
                 &header.destination_hash,
-                &validated_identity,
+                validated_identity,
                 known_public_key.as_ref(),
             ) {
                 tracing::warn!(
@@ -557,10 +578,10 @@ impl TransportActor {
         }
 
         let announce_app_data = validated.app_data.clone();
-        let announce_public_key = Some(validated_identity.get_public_key());
+        let announce_public_key = Some(validated.public_key);
         let announce_ratchet = announce_data.ratchet;
         let announce_name_hash = announce_data.name_hash;
-        let announce_identity_hash = Some(validated_identity.hash);
+        let announce_identity_hash = Some(validated.identity_hash);
         let announce_random_hash = announce_data.random_hash;
         let announce_stamp_value = validated.stamp_value.unwrap_or(0.0);
 

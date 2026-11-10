@@ -222,6 +222,8 @@ pub struct TransportActor {
     pub blackholed_snapshot: Arc<std::sync::RwLock<HashSet<[u8; 16]>>>,
     /// Per-packet announce validation results (Identity.py:676-715).
     pub announce_validation: crate::announce_validation::AnnounceValidationCache,
+    /// Path-request stamp worker and generated-stamp cache (Transport.py:209-217).
+    pub pr_stamper: crate::pr_stamper::PathRequestStamper,
 
     /// Whether this actor currently uses a shared-instance peer. Routing policy
     /// uses that peer and reconnect handling invalidates prior routing state.
@@ -470,6 +472,7 @@ impl TransportActor {
             stamp_policy: crate::stamps::StampPolicy::default(),
             blackholed_snapshot: Arc::new(std::sync::RwLock::new(HashSet::new())),
             announce_validation: crate::announce_validation::AnnounceValidationCache::new(),
+            pr_stamper: crate::pr_stamper::PathRequestStamper::new(),
             is_shared_instance: false,
             shared_instance_client_mode: false,
             storage_dir: None,
@@ -558,6 +561,9 @@ impl TransportActor {
                 }
                 Some(request) = self.link_endpoint_dispatch_rx.recv() => {
                     self.handle_link_endpoint_dispatch(request);
+                }
+                Some(result) = self.pr_stamper.next_result() => {
+                    self.on_path_request_stamp_ready(result);
                 }
                 _ = tick_interval.tick() => {
                     let is_fg = self.is_foreground.load(std::sync::atomic::Ordering::Relaxed);

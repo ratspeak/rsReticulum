@@ -12,6 +12,7 @@ fn recent_announce_from_cached_packet(
     hops: u8,
     timestamp: f64,
     raw_packet: Vec<u8>,
+    destination_cost: f64,
 ) -> RecentAnnounce {
     let mut recent = RecentAnnounce {
         dest_hash,
@@ -44,11 +45,9 @@ fn recent_announce_from_cached_packet(
             &raw_packet[offset..],
             header.flags.context_flag,
         ) {
-            let stamp =
-                announce.check_stamp(&dest_hash, crate::announce_validation::DESTINATION_COST);
-            recent.app_data = stamp
-                .app_data(announce.app_data.as_deref())
-                .map(<[u8]>::to_vec);
+            // Python validates without a receiving interface against the global cost.
+            let stamp = announce.check_stamp(&dest_hash, destination_cost);
+            recent.app_data = super::inbound::remembered_app_data(&announce, &stamp);
             recent.stamp = stamp.stamp;
             recent.stamp_value = stamp.value.unwrap_or(0.0);
             recent.lr_cost = stamp.lr_cost;
@@ -630,6 +629,7 @@ impl TransportActor {
     /// path entries lacking an interface name or hash (pre-v3) are dropped.
     /// Tunnels load unbound.
     pub(super) fn load_state(&mut self) {
+        let destination_cost = self.stamp_policy.destination_cost;
         let Some(dir) = self.storage_dir.clone() else {
             return;
         };
@@ -697,6 +697,7 @@ impl TransportActor {
                                     pe.hops,
                                     pe.timestamp,
                                     cached.raw_packet,
+                                    destination_cost,
                                 )
                             });
                         pending += 1;
@@ -845,6 +846,7 @@ impl TransportActor {
                                         tp.hops,
                                         tp.timestamp,
                                         cached.raw_packet,
+                                        destination_cost,
                                     )
                                 });
                         }

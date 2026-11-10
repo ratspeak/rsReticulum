@@ -21,6 +21,24 @@ pub(super) const PR_EXT_HEADER_LENGTH: usize = 2;
 pub(super) const PR_EXT_PAYLOAD_LENGTH: usize = 16;
 
 /// Transport.validate_pr_stamp (Transport.py:4011-4016): material `dst || tag`.
+/// `0xC1 0x00` followed by the stamp (Transport.py:3720, :4049).
+fn stamped_path_request_ext(
+    stamp: &crate::pr_stamper::PathRequestStamp,
+) -> [u8; PR_EXT_PAYLOAD_LENGTH] {
+    let mut ext = [0u8; PR_EXT_PAYLOAD_LENGTH];
+    ext[0] = rns_identity::announce::ANNOUNCE_EXT_MARKER;
+    ext[PR_EXT_HEADER_LENGTH..].copy_from_slice(stamp);
+    ext
+}
+
+/// Transport.py:3930-3936: marks a relayed unstamped request from a stamping node.
+const LENIENT_PATH_REQUEST_EXT: [u8; PR_EXT_PAYLOAD_LENGTH] = {
+    let mut ext = [0u8; PR_EXT_PAYLOAD_LENGTH];
+    ext[0] = rns_identity::announce::ANNOUNCE_EXT_MARKER;
+    ext[1] = 0xFF;
+    ext
+};
+
 fn path_request_stamp_valid(destination: &[u8; 16], tag: &[u8], stamp: &[u8], cost: f64) -> bool {
     if stamp.len() != rns_identity::stamps::NETWORK_STAMP_SIZE {
         return false;
@@ -630,19 +648,27 @@ impl TransportActor {
             return;
         }
         self.discovery_pr_tags.insert(unique_tag, now);
-        if crate::announce_validation::STAMPS_ENABLED {
+        // Transport.py:2099-2129: the flags byte is not consulted, so the
+        // lenient 0xC1 0xFF marker fails like any invalid stamp.
+        if self.stamp_policy.stamps_enabled {
+            let required_value = self.interface_pr_cost(interface_id);
             let stamp_ok = ext.as_ref().is_some_and(|ext| {
                 ext[0] == rns_identity::announce::ANNOUNCE_EXT_MARKER
                     && path_request_stamp_valid(
                         &requested_dest,
                         tag,
                         &ext[PR_EXT_HEADER_LENGTH..],
-                        crate::announce_validation::PR_COST,
+                        required_value,
                     )
             });
             if !stamp_ok {
-                trace!(dest = %hex::encode(requested_dest), stamped = ext.is_some(), "path request without a valid stamp");
-                if crate::announce_validation::STAMPS_ENFORCED {
+                trace!(
+                    dest = %hex::encode(requested_dest),
+                    stamped = ext.is_some(),
+                    lenient = ext.as_ref().is_some_and(|ext| ext[1] == 0xFF),
+                    "path request without a valid stamp"
+                );
+                if self.stamp_policy.stamps_enforced {
                     return;
                 }
             }
@@ -807,10 +833,15 @@ impl TransportActor {
 
             // Transport.py:3893-3897: never reached while enforcement drops
             // unstamped requests above.
-            if ext.is_none() && crate::announce_validation::STAMPS_ENFORCED {
+            if ext.is_none() && self.stamp_policy.stamps_enforced {
+                tracing::error!(
+                    dest = %hex::encode(requested_dest),
+                    "reached rebroadcast decision for unstamped path request under stamp enforcement"
+                );
                 return;
             }
             if self.begin_or_join_recursive_discovery(requested_dest, interface_id, now) {
+                let ext = self.lenient_relay_ext(ext);
                 self.forward_path_request_ext(
                     requested_dest,
                     Some(interface_id),
@@ -825,6 +856,7 @@ impl TransportActor {
                 dest = %hex::encode(requested_dest),
                 "forwarding path request to local shared clients"
             );
+            let ext = self.lenient_relay_ext(ext);
             for local_id in self.local_client_interface_ids_except(Some(interface_id)) {
                 self.send_path_request_ext(
                     requested_dest,
@@ -841,6 +873,18 @@ impl TransportActor {
                 interface_id,
                 "ignoring unknown path request on non-discovery interface"
             );
+        }
+    }
+
+    /// Transport.py:3930-3936, :3955-3956: a stamping node relays someone
+    /// else's unstamped request with the lenient marker instead of a stamp.
+    fn lenient_relay_ext(
+        &self,
+        ext: Option<[u8; PR_EXT_PAYLOAD_LENGTH]>,
+    ) -> Option<[u8; PR_EXT_PAYLOAD_LENGTH]> {
+        match ext {
+            None if self.stamp_policy.stamp_prs => Some(LENIENT_PATH_REQUEST_EXT),
+            ext => ext,
         }
     }
 
@@ -900,6 +944,9 @@ impl TransportActor {
         self.send_path_request_ext(destination_hash, interface_id, tag, None, recursive);
     }
 
+    /// Python `request_path` on one interface (Transport.py:3685-3745): a
+    /// supplied extension is sent unchanged; otherwise, under `stamp_prs`, a
+    /// cached stamp is appended or generation is queued and nothing is sent yet.
     pub(super) fn send_path_request_ext(
         &mut self,
         destination_hash: [u8; 16],
@@ -908,8 +955,93 @@ impl TransportActor {
         ext: Option<&[u8; PR_EXT_PAYLOAD_LENGTH]>,
         recursive: bool,
     ) {
-        let raw = self.build_path_request_packet(destination_hash, tag, ext);
+        let Some((tag, ext)) = self.stamp_path_request_or_queue(
+            destination_hash,
+            tag,
+            ext,
+            crate::pr_stamper::PathRequestTarget::Interface(interface_id),
+            recursive,
+        ) else {
+            return;
+        };
+        let raw = self.build_path_request_packet(destination_hash, Some(&tag), ext.as_ref());
         self.admit_path_request(destination_hash, interface_id, raw, recursive);
+    }
+
+    /// Resolve the request tag and extension. `None` means the request waits
+    /// for the stamper (Transport.py:3707-3720).
+    #[allow(clippy::type_complexity)]
+    fn stamp_path_request_or_queue(
+        &mut self,
+        destination_hash: [u8; 16],
+        tag: Option<&[u8]>,
+        ext: Option<&[u8; PR_EXT_PAYLOAD_LENGTH]>,
+        target: crate::pr_stamper::PathRequestTarget,
+        recursive: bool,
+    ) -> Option<(Vec<u8>, Option<[u8; PR_EXT_PAYLOAD_LENGTH]>)> {
+        let tag = match tag {
+            Some(tag) => tag[..tag.len().min(16)].to_vec(),
+            None => rns_crypto::random::random_bytes(16),
+        };
+        if let Some(ext) = ext {
+            return Some((tag, Some(*ext)));
+        }
+        if !self.stamp_policy.stamp_prs {
+            return Some((tag, None));
+        }
+        if let Some(stamp) = self.pr_stamper.cached(&destination_hash, &tag) {
+            return Some((tag, Some(stamped_path_request_ext(&stamp))));
+        }
+        self.path_requests.insert(destination_hash, now_f64());
+        let job = crate::pr_stamper::PathRequestStampJob {
+            destination_hash,
+            tag,
+            target,
+            recursive,
+            value: self.stamp_policy.pr_value,
+            timeout: self.stamp_policy.pr_stamp_timeout,
+        };
+        if self.pr_stamper.enqueue(job).is_err() {
+            debug!(
+                dest = hex::encode(destination_hash),
+                "stamp queue full, dropping path request"
+            );
+        }
+        None
+    }
+
+    /// Python `stamp_path_request` after generation (Transport.py:4038-4051).
+    pub(super) fn on_path_request_stamp_ready(
+        &mut self,
+        result: crate::pr_stamper::PathRequestStampResult,
+    ) {
+        let job = result.job;
+        let Some(stamp) = result.stamp else {
+            warn!(
+                dest = hex::encode(job.destination_hash),
+                "could not generate path request stamp, path request emission cancelled"
+            );
+            return;
+        };
+        let ext = stamped_path_request_ext(&stamp);
+        match job.target {
+            crate::pr_stamper::PathRequestTarget::Interface(interface_id) => self
+                .send_path_request_ext(
+                    job.destination_hash,
+                    interface_id,
+                    Some(&job.tag),
+                    Some(&ext),
+                    job.recursive,
+                ),
+            crate::pr_stamper::PathRequestTarget::AllExcept(except) => self
+                .forward_path_request_ext(
+                    job.destination_hash,
+                    except,
+                    Some(&job.tag),
+                    Some(&ext),
+                    job.recursive,
+                ),
+        }
     }
 
     pub(super) fn forward_path_request(
@@ -922,6 +1054,7 @@ impl TransportActor {
         self.forward_path_request_ext(destination_hash, except, tag, None, recursive);
     }
 
+    /// One request, stamped once, offered on every outbound interface but `except`.
     pub(super) fn forward_path_request_ext(
         &mut self,
         destination_hash: [u8; 16],
@@ -930,6 +1063,15 @@ impl TransportActor {
         ext: Option<&[u8; PR_EXT_PAYLOAD_LENGTH]>,
         recursive: bool,
     ) {
+        let Some((tag, ext)) = self.stamp_path_request_or_queue(
+            destination_hash,
+            tag,
+            ext,
+            crate::pr_stamper::PathRequestTarget::AllExcept(except),
+            recursive,
+        ) else {
+            return;
+        };
         let ids: Vec<InterfaceId> = self
             .interfaces
             .iter()
@@ -942,7 +1084,7 @@ impl TransportActor {
             })
             .collect();
         for id in ids {
-            self.send_path_request_ext(destination_hash, id, tag, ext, recursive);
+            self.send_path_request_ext(destination_hash, id, Some(&tag), ext.as_ref(), recursive);
         }
     }
 
@@ -1154,5 +1296,201 @@ mod cache_miss_tests {
             );
             assert!(actor.announce_table.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod path_request_stamp_tests {
+    use super::*;
+    use crate::constants::InterfaceDirection;
+    use crate::messages::InterfaceEntry;
+
+    // Upstream 1.6.0 `Transport.stamp_path_request` output ("stamped tag-1", value 17.0).
+    const STAMPED_TAG_1: &str = "2d4bc0819eb94f7589f484fe08c644d9efbbc5b835ded256c2da654648f0abf43e5555f7572f4391cc8a6af12c94c36ec100a01772d007a30bd60135e4c63127";
+
+    fn actor_with_two_interfaces(
+        transport: bool,
+    ) -> (
+        TransportActor,
+        tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = transport;
+        actor.transport_identity_hash = Some([0x42; 16]);
+        let (a_tx, a_rx) = tokio::sync::mpsc::channel(8);
+        let (b_tx, b_rx) = tokio::sync::mpsc::channel(8);
+        for (id, tx) in [(1, a_tx), (2, b_tx)] {
+            let mut entry = InterfaceEntry::new(
+                format!("if{id}"),
+                InterfaceMode::Gateway,
+                InterfaceDirection::bidirectional(),
+                1_000_000_000,
+                500,
+                tx,
+            );
+            entry.ingress = crate::ingress::IngressController::disabled();
+            actor.interfaces.insert(id, entry);
+        }
+        (actor, a_rx, b_rx)
+    }
+
+    fn received(actor: &TransportActor, id: InterfaceId) -> u64 {
+        actor.interfaces[&id].ingress.path_requests_received()
+    }
+
+    fn violations(actor: &TransportActor, id: InterfaceId) -> u64 {
+        actor.interfaces[&id].protocol_violations
+    }
+
+    fn payload(frame: &[u8]) -> Vec<u8> {
+        frame[rns_wire::constants::HEADER_MINSIZE..].to_vec()
+    }
+
+    fn with_ext(ext: &[u8]) -> Vec<u8> {
+        let mut data = hex::decode(STAMPED_TAG_1).unwrap();
+        data.truncate(PR_LENGTH);
+        data.extend_from_slice(ext);
+        data
+    }
+
+    #[test]
+    fn enforcement_drops_unstamped_lenient_and_invalid_requests_silently() {
+        let mut lenient = vec![0xC1, 0xFF];
+        lenient.extend_from_slice(&[0; 14]);
+        let mut zero = vec![0xC1, 0x00];
+        zero.extend_from_slice(&[0; 14]);
+        let mut unknown = hex::decode(STAMPED_TAG_1).unwrap()[PR_LENGTH..].to_vec();
+        unknown[0] = 0xC2;
+        let unstamped = hex::decode(STAMPED_TAG_1).unwrap()[..PR_LENGTH].to_vec();
+        for data in [
+            unstamped,
+            with_ext(&lenient),
+            with_ext(&zero),
+            with_ext(&unknown),
+        ] {
+            let (mut actor, _a, mut b) = actor_with_two_interfaces(true);
+            actor.stamp_policy.enforce();
+            actor.handle_inbound_path_request(&data, 1);
+            assert_eq!(received(&actor, 1), 0);
+            assert_eq!(violations(&actor, 1), 0);
+            assert!(b.try_recv().is_err(), "dropped request must not be relayed");
+            assert!(actor.discovery_path_requests.is_empty());
+        }
+    }
+
+    #[test]
+    fn enforcement_accepts_a_valid_stamp_and_relays_it_unchanged() {
+        let (mut actor, _a, mut b) = actor_with_two_interfaces(true);
+        actor.stamp_policy.enforce();
+        let data = hex::decode(STAMPED_TAG_1).unwrap();
+        actor.handle_inbound_path_request(&data, 1);
+        assert_eq!(received(&actor, 1), 1);
+        assert_eq!(violations(&actor, 1), 0);
+        let mut expected = data.clone();
+        expected[16..32].copy_from_slice(&[0x42; 16]);
+        assert_eq!(payload(&b.try_recv().expect("relayed")), expected);
+    }
+
+    #[test]
+    fn receiving_interface_pr_cost_decides_validity() {
+        let data = hex::decode(STAMPED_TAG_1).unwrap();
+        for (cost, accepted) in [(Some(20.0), false), (Some(17.0), true), (None, true)] {
+            let (mut actor, _a, _b) = actor_with_two_interfaces(true);
+            actor.stamp_policy.enforce();
+            actor.stamp_policy.pr_cost = 30.0;
+            actor.interfaces.get_mut(&1).unwrap().pr_cost = cost;
+            if cost.is_none() {
+                actor.stamp_policy.pr_cost = 15.8;
+            }
+            actor.handle_inbound_path_request(&data, 1);
+            assert_eq!(received(&actor, 1), u64::from(accepted), "cost {cost:?}");
+        }
+    }
+
+    #[test]
+    fn without_enforcement_unstamped_requests_are_counted_and_relayed_as_received() {
+        let (mut actor, _a, mut b) = actor_with_two_interfaces(true);
+        let data = hex::decode(STAMPED_TAG_1).unwrap()[..PR_LENGTH].to_vec();
+        actor.handle_inbound_path_request(&data, 1);
+        assert_eq!(received(&actor, 1), 1);
+        assert_eq!(payload(&b.try_recv().expect("relayed")).len(), PR_LENGTH);
+    }
+
+    #[test]
+    fn a_stamping_transport_relays_unstamped_requests_with_the_lenient_marker() {
+        let (mut actor, _a, mut b) = actor_with_two_interfaces(true);
+        actor.stamp_policy.stamp_prs = true;
+        let data = hex::decode(STAMPED_TAG_1).unwrap()[..PR_LENGTH].to_vec();
+        actor.handle_inbound_path_request(&data, 1);
+        let relayed = payload(&b.try_recv().expect("relayed without waiting for a stamp"));
+        assert_eq!(relayed.len(), PR_STAMPED_LENGTH);
+        assert_eq!(&relayed[32..48], &data[32..48]);
+        assert_eq!(&relayed[48..], &LENIENT_PATH_REQUEST_EXT[..]);
+        assert!(actor.pr_stamper.cache_len() == 0);
+    }
+
+    #[test]
+    fn unstamped_emission_carries_the_transport_id_on_a_leaf() {
+        let (mut actor, mut a, _b) = actor_with_two_interfaces(false);
+        actor.on_path_request([0x77; 16]);
+        let sent = payload(&a.try_recv().expect("sent"));
+        assert_eq!(sent.len(), PR_LENGTH);
+        assert_eq!(&sent[16..32], &[0x42; 16]);
+    }
+
+    #[test]
+    fn stamped_emission_waits_for_the_stamper_then_uses_the_cached_stamp() {
+        let (mut actor, mut a, _b) = actor_with_two_interfaces(false);
+        actor.stamp_policy.stamp_prs = true;
+        actor.stamp_policy.pr_value = 4.0;
+        let dest = [0x77; 16];
+        let tag = [0x55; 16];
+        actor.forward_path_request(dest, None, Some(&tag), false);
+        assert!(
+            a.try_recv().is_err(),
+            "nothing is sent before the stamp exists"
+        );
+        assert!(actor.path_requests.contains_key(&dest));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let result = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    actor.pr_stamper.next_result(),
+                )
+                .await
+            })
+            .unwrap()
+            .unwrap();
+        actor.on_path_request_stamp_ready(result);
+        let sent = payload(&a.try_recv().expect("stamped request sent"));
+        assert_eq!(sent.len(), PR_STAMPED_LENGTH);
+        assert_eq!(&sent[32..48], &tag);
+        assert_eq!(&sent[48..50], &[0xC1, 0x00]);
+        assert!(path_request_stamp_valid(&dest, &tag, &sent[50..], 4.0));
+        // A second request with the same tag reuses the cached stamp at once.
+        actor.send_path_request(dest, 1, Some(&tag), false);
+        assert_eq!(payload(&a.try_recv().expect("sent from cache")), sent);
+    }
+
+    #[test]
+    fn stamp_generation_failure_sends_nothing() {
+        let (mut actor, mut a, _b) = actor_with_two_interfaces(false);
+        actor.on_path_request_stamp_ready(crate::pr_stamper::PathRequestStampResult {
+            job: crate::pr_stamper::PathRequestStampJob {
+                destination_hash: [0x77; 16],
+                tag: vec![0x55; 16],
+                target: crate::pr_stamper::PathRequestTarget::AllExcept(None),
+                recursive: false,
+                value: 15.8,
+                timeout: 15.0,
+            },
+            stamp: None,
+        });
+        assert!(a.try_recv().is_err());
     }
 }
