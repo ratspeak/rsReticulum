@@ -1078,7 +1078,7 @@ impl RNodeSnapshotPublisher {
         self.session_lost(false);
     }
 
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
     pub(crate) fn connection_failed(&self) {
         self.session_lost(true);
     }
@@ -2964,10 +2964,10 @@ pub struct RNodeConfig {
     pub flow_control: bool,
     /// Short-term airtime cap, percent (0.0..=100.0). `None` sends no command
     /// and leaves the device's corresponding setting unchanged.
-    pub st_alock: Option<f32>,
+    pub st_alock: Option<f64>,
     /// Long-term airtime cap, percent (0.0..=100.0). `None` sends no command
     /// and leaves the device's corresponding setting unchanged.
-    pub lt_alock: Option<f32>,
+    pub lt_alock: Option<f64>,
     /// Station-ID beacon: seconds between IDs, armed by data TX
     /// (Python `id_interval`/`id_callsign`, callsign max 32 bytes).
     pub id_interval: Option<u64>,
@@ -3018,7 +3018,7 @@ pub enum RNodeConfigValidationError {
         maximum: f64,
     },
     #[error("must be finite, got {value}")]
-    NonFinite { field: RNodeConfigField, value: f32 },
+    NonFinite { field: RNodeConfigField, value: f64 },
 }
 
 impl RNodeConfigValidationError {
@@ -3097,7 +3097,7 @@ where
 
 fn validate_airtime(
     field: RNodeConfigField,
-    value: Option<f32>,
+    value: Option<f64>,
 ) -> Result<(), RNodeConfigValidationError> {
     let Some(value) = value else {
         return Ok(());
@@ -3108,7 +3108,7 @@ fn validate_airtime(
     if !(0.0..=100.0).contains(&value) {
         return Err(RNodeConfigValidationError::OutOfRange {
             field,
-            value: f64::from(value),
+            value,
             minimum: 0.0,
             maximum: 100.0,
         });
@@ -3158,20 +3158,20 @@ pub(crate) fn build_persist_bluetooth_enabled_sequence() -> Vec<u8> {
     build_command_stage(CMD_BT_CTRL, &[0x01])
 }
 
-/// Airtime-lock commands. Percent is encoded as `(percent * 100)` big-endian u16.
+/// Airtime-lock command word: Python `int(percent * 100)` in double
+/// precision, truncated toward zero, sent as a big-endian u16.
+pub fn airtime_lock_word(percent: f64) -> u16 {
+    (percent * 100.0) as u16
+}
+
+/// Airtime-lock commands, one `CMD_ST_ALOCK`/`CMD_LT_ALOCK` frame per limit.
 pub fn build_airtime_sequence(config: &RNodeConfig) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
     if let Some(st) = config.st_alock {
-        let at = (st * 100.0) as u16;
-        let c1 = (at >> 8) as u8;
-        let c2 = (at & 0xFF) as u8;
-        kiss::frame_with_command_into(CMD_ST_ALOCK, &[c1, c2], &mut out);
+        kiss::frame_with_command_into(CMD_ST_ALOCK, &airtime_lock_word(st).to_be_bytes(), &mut out);
     }
     if let Some(lt) = config.lt_alock {
-        let at = (lt * 100.0) as u16;
-        let c1 = (at >> 8) as u8;
-        let c2 = (at & 0xFF) as u8;
-        kiss::frame_with_command_into(CMD_LT_ALOCK, &[c1, c2], &mut out);
+        kiss::frame_with_command_into(CMD_LT_ALOCK, &airtime_lock_word(lt).to_be_bytes(), &mut out);
     }
     out
 }
@@ -3263,13 +3263,13 @@ pub(crate) fn build_ble_radio_reassertion_stages(config: &RNodeConfig) -> Vec<Ve
     if let Some(st) = config.st_alock {
         stages.push(build_command_stage(
             CMD_ST_ALOCK,
-            &((st * 100.0) as u16).to_be_bytes(),
+            &airtime_lock_word(st).to_be_bytes(),
         ));
     }
     if let Some(lt) = config.lt_alock {
         stages.push(build_command_stage(
             CMD_LT_ALOCK,
-            &((lt * 100.0) as u16).to_be_bytes(),
+            &airtime_lock_word(lt).to_be_bytes(),
         ));
     }
 
@@ -5050,21 +5050,21 @@ mod tests {
         assert_invalid_config_field(&config, RNodeConfigField::TxPower);
         config.tx_power = 14;
 
-        config.st_alock = Some(-f32::EPSILON);
+        config.st_alock = Some(-f64::EPSILON);
         assert_invalid_config_field(&config, RNodeConfigField::ShortTermAirtime);
-        config.st_alock = Some(100.0 + f32::EPSILON * 100.0);
+        config.st_alock = Some(100.0 + f64::EPSILON * 100.0);
         assert_invalid_config_field(&config, RNodeConfigField::ShortTermAirtime);
         config.st_alock = None;
 
-        config.lt_alock = Some(-f32::EPSILON);
+        config.lt_alock = Some(-f64::EPSILON);
         assert_invalid_config_field(&config, RNodeConfigField::LongTermAirtime);
-        config.lt_alock = Some(100.0 + f32::EPSILON * 100.0);
+        config.lt_alock = Some(100.0 + f64::EPSILON * 100.0);
         assert_invalid_config_field(&config, RNodeConfigField::LongTermAirtime);
     }
 
     #[test]
     fn test_rnode_config_validation_rejects_non_finite_airtime() {
-        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut config = RNodeConfig::new("rnode0", "/dev/ttyACM0");
             config.st_alock = Some(invalid);
             assert_invalid_config_field(&config, RNodeConfigField::ShortTermAirtime);

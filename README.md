@@ -312,7 +312,8 @@ parity with a later Python release.
 
 Known gaps and intentional limits:
 
-- `rnx`, `rnir`, `rnpkg`, `rngit`, and `git-remote-rns` are not implemented.
+- `rnx`, `rnir`, `rnpkg`, `rngit`, and `git-remote-rns` are not implemented;
+  of the rngit tools only the `rngcs-rs` commit signer exists.
 - `rnodeconf-rs` is partial; safe inspection/configuration and EEPROM
   dump/backup are furthest along. Firmware flashing, autoinstall/update, ROM
   bootstrap, destructive EEPROM wipe, and full signing-key management are not

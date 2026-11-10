@@ -20,13 +20,13 @@ pub enum AwaitPathError {
     #[error("transport actor is not running")]
     TransportDown,
     /// The caller's deadline elapsed, the actor replied `false`, or the reply
-    /// sender was dropped. Actor maintenance expires parked waiters after
-    /// at least 15 seconds; this is not a guaranteed sweep completion time.
+    /// sender was dropped.
     #[error("timed out waiting for path")]
     Timeout,
 }
 
 /// Wait up to `timeout` for a cached or newly learned path to `destination_hash`.
+/// A zero `timeout` means `PATH_REQUEST_TIMEOUT`, as Python's `await_path` (Transport.py:3678).
 /// The deadline includes waiting to submit the command, not just its reply.
 /// Success reflects actor path state and does not probe the remote application.
 ///
@@ -56,6 +56,11 @@ pub async fn await_path(
         }
     };
 
+    let timeout = if timeout.is_zero() {
+        Duration::from_secs_f64(crate::constants::PATH_REQUEST_TIMEOUT)
+    } else {
+        timeout
+    };
     match tokio::time::timeout(timeout, operation).await {
         Ok(result) => result,
         // The deadline covers both actor-channel admission and the reply.
@@ -111,6 +116,18 @@ mod tests {
 
         let out = await_path(&tx, [0x33; 16], Duration::from_millis(50)).await;
         assert_eq!(out, Err(AwaitPathError::Timeout));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_timeout_waits_for_the_default_path_request_timeout() {
+        let (tx, mut rx) = mpsc::channel::<TransportMessage>(4);
+        tokio::spawn(async move {
+            if let Some(TransportMessage::AwaitPath { reply, .. }) = rx.recv().await {
+                tokio::time::sleep(Duration::from_secs(14)).await;
+                let _ = reply.send(true);
+            }
+        });
+        assert!(await_path(&tx, [0x77; 16], Duration::ZERO).await.is_ok());
     }
 
     #[tokio::test]

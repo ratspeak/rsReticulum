@@ -125,29 +125,6 @@ fn a_wire_announce_without_valid_ifac_is_dropped_and_never_held() {
     assert!(!actor.path_table.has_path(&unsigned_destination));
 }
 
-#[test]
-fn a_replayed_cached_announce_is_not_counted_as_received_traffic() {
-    let (mut actor, _) = TransportActor::new();
-    let (entry, _rx) = make_test_interface("cache_replay");
-    actor.interfaces.insert(1, entry);
-    let (announce, destination) = make_valid_announce("held.cache.replay", 1);
-
-    actor.on_cached_announce(InboundPacket {
-        raw: announce,
-        interface_id: 1,
-        rssi: None,
-        snr: None,
-        q: None,
-    });
-
-    assert!(actor.path_table.has_path(&destination));
-    assert_eq!(
-        rx_bytes(&actor, 1),
-        0,
-        "a cached announce never crossed the wire"
-    );
-}
-
 /// Python's 5 s interface job re-evaluates the limiter (Transport.py:1329-1337),
 /// so a burst clears on a quiet interface without another announce.
 #[test]

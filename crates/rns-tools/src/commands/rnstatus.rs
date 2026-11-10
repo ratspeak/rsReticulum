@@ -18,7 +18,7 @@ use rns_runtime::lifecycle::ShutdownSignal;
 use rns_runtime::link_client::{LinkClient, LinkClientError};
 use rns_runtime::platform::StoragePaths;
 use rns_runtime::platform::resolve_config_dir;
-use rns_runtime::reticulum::{ReticulumConfig, SharedInstanceRpcEndpoint, init};
+use rns_runtime::reticulum::{ReticulumConfig, ReticulumHandle, SharedInstanceRpcEndpoint, init};
 use rns_runtime::rpc::{self, RpcRequest, RpcResponse};
 use rns_tools::{format, hash};
 use rns_transport::discovery::{DiscoveredInterface, DiscoveryStatus, DiscoveryStore};
@@ -175,7 +175,22 @@ async fn run_monitor(args: Args) -> ExitCode {
     } else {
         None
     };
+    let registration = match session {
+        Some(_) => None,
+        None => local_registration(&args).await,
+    };
+    let interrupt = ShutdownSignal::new();
+    let _signal_rx = rns_runtime::lifecycle::install_signal_handlers(interrupt.clone());
     loop {
+        if interrupt.is_triggered() {
+            if let Some(session) = &session {
+                rns_tools::shut_down(&session.handle).await;
+            }
+            if let Some(registration) = registration {
+                registration.release().await;
+            }
+            return ExitCode::SUCCESS;
+        }
         let started = std::time::Instant::now();
         print!("\x1b[2J\x1b[H");
         let exit = match &session {
@@ -184,11 +199,17 @@ async fn run_monitor(args: Args) -> ExitCode {
         };
         if exit != ExitCode::SUCCESS {
             if let Some(session) = &session {
-                session.shutdown.trigger();
+                rns_tools::shut_down(&session.handle).await;
+            }
+            if let Some(registration) = registration {
+                registration.release().await;
             }
             return exit;
         }
-        tokio::time::sleep(monitor_sleep(args.monitor_interval, started.elapsed())).await;
+        tokio::select! {
+            _ = tokio::time::sleep(monitor_sleep(args.monitor_interval, started.elapsed())) => {}
+            _ = interrupt.wait() => {}
+        }
     }
 }
 
@@ -198,7 +219,30 @@ fn monitor_sleep(interval_secs: f64, elapsed: Duration) -> Duration {
 }
 
 async fn run_local(args: Args) -> ExitCode {
-    run_local_once(&args).await
+    let registration = local_registration(&args).await;
+    let exit = run_local_once(&args).await;
+    if let Some(registration) = registration {
+        registration.release().await;
+    }
+    exit
+}
+
+/// The type registration upstream rnstatus makes on the shared instance it
+/// reads (rnstatus.py:174, 928); released again before the tool exits.
+async fn local_registration(args: &Args) -> Option<rns_tools::RpcRegistration> {
+    let config_dir = resolve_config_dir(args.config.as_deref());
+    let config = Config::from_file(&config_dir.join("config")).ok()?;
+    let rc = ReticulumConfig::from_config(&config);
+    let rpc_key = local_rpc_key(&config_dir, &rc)?;
+    Some(
+        rns_tools::RpcRegistration::want(
+            rc.shared_rpc_endpoint(&std::env::temp_dir()),
+            rpc_key,
+            &[MGMT_APP],
+            Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS)),
+        )
+        .await,
+    )
 }
 
 async fn run_local_once(args: &Args) -> ExitCode {
@@ -1220,7 +1264,7 @@ async fn run_remote(args: Args) -> ExitCode {
         Err(code) => return code,
     };
     let exit = session.query_and_print(&args).await;
-    session.shutdown.trigger();
+    rns_tools::shut_down(&session.handle).await;
     exit
 }
 
@@ -1229,7 +1273,7 @@ async fn run_remote(args: Args) -> ExitCode {
 struct RemoteSession {
     remote_hash: [u8; 16],
     client: LinkClient,
-    shutdown: ShutdownSignal,
+    handle: ReticulumHandle,
     timeout: Duration,
 }
 
@@ -1272,10 +1316,12 @@ impl RemoteSession {
             }
         };
 
+        // rnstatus.py:174, 928
+        handle.wants_destination_type(MGMT_APP).await;
         Ok(Self {
             remote_hash,
             client: LinkClient::new(handle.transport_tx.clone(), identity),
-            shutdown,
+            handle,
             timeout: Duration::from_secs(args.timeout.unwrap_or(REMOTE_TIMEOUT_SECS)),
         })
     }

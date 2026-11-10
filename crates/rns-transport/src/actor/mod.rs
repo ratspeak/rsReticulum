@@ -123,10 +123,11 @@ pub struct TransportActor {
     pub traffic: TrafficCounter,
     /// Python's interface traffic count and top-level stats counters.
     traffic_count: rpc::TrafficCount,
-    /// Optional driver observations keyed by packet hash. Actor insertion keeps
-    /// at most 512 entries; metrics are not normalized or independently validated.
-    pub packet_metrics: HashMap<[u8; 32], PacketMetrics>,
-    pub packet_metrics_order: VecDeque<[u8; 32]>,
+    /// Python's `local_client_rssi_cache`, `_snr_cache` and `_q_cache`: one
+    /// 512-entry list per metric, first match wins (Transport.py:320-324).
+    pub packet_rssi_cache: VecDeque<([u8; 32], f32)>,
+    pub packet_snr_cache: VecDeque<([u8; 32], f32)>,
+    pub packet_q_cache: VecDeque<([u8; 32], f32)>,
 
     pub receipt_table: HashMap<[u8; 16], PacketReceipt>,
     /// Truncated packet hash to caller-supplied message ID for proof notifications.
@@ -147,6 +148,12 @@ pub struct TransportActor {
     pub local_destination_keys: HashMap<[u8; 16], [u8; 64]>,
     pub destination_channels:
         HashMap<[u8; 16], mpsc::Sender<crate::link_messages::DestinationEvent>>,
+    /// App names of registered destinations; link-id channel aliases are not here.
+    registered_destination_names: HashMap<[u8; 16], String>,
+    /// RESOURCE_PRF packets this instance sent, which Python force-caches
+    /// (Resource.py:775-777), with the time each was stored.
+    proof_cache: HashMap<[u8; 32], (Bytes, f64)>,
+    proof_cache_order: VecDeque<[u8; 32]>,
     /// Duplex routes for Links whose initiator and responder are registered
     /// on this same transport actor. Keeping both endpoints here avoids the
     /// single `destination_channels[link_id]` slot aliasing one side over the
@@ -510,8 +517,9 @@ impl TransportActor {
             blackhole_table: BlackholeTable::new(),
             traffic: TrafficCounter::new(),
             traffic_count: rpc::TrafficCount::default(),
-            packet_metrics: HashMap::new(),
-            packet_metrics_order: VecDeque::new(),
+            packet_rssi_cache: VecDeque::new(),
+            packet_snr_cache: VecDeque::new(),
+            packet_q_cache: VecDeque::new(),
             receipt_table: HashMap::new(),
             receipt_msg_ids: HashMap::new(),
             receipt_proof_txs: HashMap::new(),
@@ -520,6 +528,9 @@ impl TransportActor {
             local_destinations: HashSet::new(),
             local_destination_keys: HashMap::new(),
             destination_channels: HashMap::new(),
+            registered_destination_names: HashMap::new(),
+            proof_cache: HashMap::new(),
+            proof_cache_order: VecDeque::new(),
             local_link_routes: HashMap::new(),
             pending_local_link_requests: HashMap::new(),
             pending_local_link_hops: HashMap::new(),
@@ -888,11 +899,9 @@ impl TransportActor {
                         let mut packet_receipt = PacketReceipt::new(
                             registration.full_hash,
                             registration.truncated_hash,
-                            Some(
-                                registration
-                                    .timeout
-                                    .unwrap_or(std::time::Duration::from_secs(180)),
-                            ),
+                            Some(registration.timeout.unwrap_or_else(|| {
+                                self.default_receipt_timeout(&registration.destination_hash)
+                            })),
                         );
                         packet_receipt.set_destination_identity(
                             registration.destination_hash,
@@ -961,6 +970,8 @@ impl TransportActor {
                 self.local_destinations.insert(hash);
                 if let Some(tx) = delivery_tx {
                     self.destination_channels.insert(hash, tx.clone());
+                    self.registered_destination_names
+                        .insert(hash, app_name.clone());
                     // On a shared-instance connection, the destination is
                     // brand new to the shared peer; fire an announce so it
                     // learns the path immediately instead of waiting for the
@@ -993,53 +1004,7 @@ impl TransportActor {
             TransportMessage::CacheRequest {
                 packet_hash,
                 destination_hash,
-            } => {
-                // Serve straight from the disk announce cache, then replay
-                // through our own inbound path on the interface the file
-                // names (Transport.py:3083-3087, :3119). Id 0, which no
-                // interface registers, stands for Python's missing interface.
-                if let Some(cached) = self.cached_announce(&packet_hash) {
-                    debug!(hash = %hex::encode(&packet_hash[..8]), "cache request: local hit, replaying");
-                    let interface_id = cached
-                        .interface_reference
-                        .as_deref()
-                        .and_then(|name| self.replay_interface(name))
-                        .unwrap_or(0);
-                    let inbound = crate::messages::InboundPacket {
-                        raw: Bytes::from(cached.raw_packet),
-                        interface_id,
-                        rssi: None,
-                        snr: None,
-                        q: None,
-                    };
-                    self.on_cached_announce(inbound);
-                    self.process_background_starts();
-                    return;
-                }
-
-                // Local miss: only transport nodes forward the request
-                // outward — a leaf can't usefully relay a cache query.
-                if self.is_transport_enabled {
-                    debug!(hash = %hex::encode(&packet_hash[..8]), "cache request: local miss, querying network");
-                    let flags = rns_wire::flags::PacketFlags {
-                        header_type: rns_wire::flags::HeaderType::Header1,
-                        context_flag: false,
-                        transport_type: rns_wire::flags::TransportType::Broadcast,
-                        destination_type: rns_wire::flags::DestinationType::Single,
-                        packet_type: rns_wire::flags::PacketType::Data,
-                    };
-                    let header = rns_wire::header::PacketHeader {
-                        flags,
-                        hops: 0,
-                        transport_id: None,
-                        destination_hash,
-                        context: rns_wire::context::PacketContext::CacheRequest,
-                    };
-                    let mut raw = header.pack();
-                    raw.extend_from_slice(&packet_hash);
-                    self.broadcast_on_interfaces(&raw, None);
-                }
-            }
+            } => self.send_cache_request(packet_hash, destination_hash),
             TransportMessage::RequestPath { destination_hash } => {
                 self.on_path_request(destination_hash);
             }
@@ -1283,7 +1248,9 @@ impl TransportActor {
                 let mut receipt = PacketReceipt::new(
                     full_hash,
                     truncated_hash,
-                    Some(timeout.unwrap_or(std::time::Duration::from_secs(180))),
+                    Some(
+                        timeout.unwrap_or_else(|| self.default_receipt_timeout(&destination_hash)),
+                    ),
                 );
                 receipt.set_destination_identity(destination_hash, Some(destination_public_key));
                 self.receipt_table.insert(truncated_hash, receipt);
@@ -1306,7 +1273,9 @@ impl TransportActor {
                 let mut receipt = PacketReceipt::new(
                     full_hash,
                     truncated_hash,
-                    Some(timeout.unwrap_or(std::time::Duration::from_secs(180))),
+                    Some(
+                        timeout.unwrap_or_else(|| self.default_receipt_timeout(&destination_hash)),
+                    ),
                 );
                 receipt.set_destination_identity(destination_hash, Some(destination_public_key));
                 self.receipt_table.insert(truncated_hash, receipt);
@@ -1387,16 +1356,6 @@ impl TransportActor {
         self.interfaces
             .get(&id)
             .is_some_and(|entry| entry.role == InterfaceRole::LocalClient)
-    }
-
-    /// The registered interface a cached packet names, as Python matches
-    /// `str(interface)` against the cache file's interface reference. An
-    /// accepted client's name may belong to another peer by now.
-    fn replay_interface(&self, name: &str) -> Option<InterfaceId> {
-        self.interfaces
-            .iter()
-            .find(|(_, entry)| !entry.accepted && entry.name == name)
-            .map(|(&id, _)| id)
     }
 
     fn allocate_announce_handler_id(&mut self) -> crate::messages::AnnounceHandlerId {
@@ -1514,8 +1473,9 @@ impl TransportActor {
         self.pending_path_entries.clear();
         self.path_requests.clear();
         self.path_states.clear();
-        self.packet_metrics.clear();
-        self.packet_metrics_order.clear();
+        self.packet_rssi_cache.clear();
+        self.packet_snr_cache.clear();
+        self.packet_q_cache.clear();
         self.receipt_proof_txs.clear();
         self.discovery_path_requests.clear();
         self.pending_local_path_requests.clear();
@@ -1571,32 +1531,45 @@ impl TransportActor {
     }
 
     fn record_packet_metrics(&mut self, packet_hash: [u8; 32], metrics: PacketMetrics) {
-        if metrics.rssi.is_none() && metrics.snr.is_none() && metrics.q.is_none() {
-            return;
-        }
-        if !self.packet_metrics.contains_key(&packet_hash) {
-            self.packet_metrics_order.push_back(packet_hash);
-        }
-        self.packet_metrics.insert(packet_hash, metrics);
-        while self.packet_metrics_order.len() > LOCAL_CLIENT_CACHE_MAXSIZE {
-            if let Some(old_hash) = self.packet_metrics_order.pop_front() {
-                self.packet_metrics.remove(&old_hash);
+        for (cache, value) in [
+            (&mut self.packet_rssi_cache, metrics.rssi),
+            (&mut self.packet_snr_cache, metrics.snr),
+            (&mut self.packet_q_cache, metrics.q),
+        ] {
+            if let Some(value) = value {
+                cache.push_back((packet_hash, value));
+                while cache.len() > LOCAL_CLIENT_CACHE_MAXSIZE {
+                    cache.pop_front();
+                }
             }
         }
     }
 
+    /// Python `shared_connection_reappeared`: each registered destination
+    /// announces as a path response (Transport.py:4203-4207); owners of
+    /// non-SINGLE destinations refuse to build an announce.
     fn request_announces_from_local_destinations(&mut self) {
         let destinations: Vec<(
             [u8; 16],
+            String,
             mpsc::Sender<crate::link_messages::DestinationEvent>,
         )> = self
-            .destination_channels
+            .registered_destination_names
             .iter()
-            .map(|(hash, tx)| (*hash, tx.clone()))
+            .filter_map(|(hash, app_name)| {
+                self.destination_channels
+                    .get(hash)
+                    .map(|tx| (*hash, app_name.clone(), tx.clone()))
+            })
             .collect();
-        for (hash, tx) in destinations {
+        for (hash, app_name, tx) in destinations {
             if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::AnnounceRequested(
-                crate::link_messages::AnnounceRequest::normal(String::new()),
+                crate::link_messages::AnnounceRequest {
+                    app_name,
+                    path_response: true,
+                    tag: None,
+                    attached_interface: None,
+                },
             )) {
                 self.channel_drops += 1;
                 warn!(dest = hex::encode(hash), drops = self.channel_drops, err = %e,
@@ -1732,33 +1705,13 @@ impl TransportActor {
         }
     }
 
-    /// Send `false` to any waiter that has been parked longer than
-    /// `PATH_WAITER_TIMEOUT`, so a caller that lost its chance to race with
-    /// a learned path doesn't wait forever.
-    fn expire_path_waiters(&mut self, now: f64) {
-        const PATH_WAITER_TIMEOUT: f64 = 15.0;
-
-        // Remove-then-reinsert dodges the simultaneous mutable borrow that
-        // would otherwise happen when partitioning in place.
-        let keys: Vec<[u8; 16]> = self.path_waiters.keys().copied().collect();
-        for dest in keys {
-            if let Some(waiters) = self.path_waiters.remove(&dest) {
-                let mut kept = Vec::new();
-                for (reply, created_at) in waiters {
-                    if reply.is_closed() {
-                        continue;
-                    }
-                    if now - created_at >= PATH_WAITER_TIMEOUT {
-                        let _ = reply.send(false);
-                    } else {
-                        kept.push((reply, created_at));
-                    }
-                }
-                if !kept.is_empty() {
-                    self.path_waiters.insert(dest, kept);
-                }
-            }
-        }
+    /// Reap waiters whose caller gave up. The caller owns the deadline, as
+    /// Python `await_path(timeout)` does (Transport.py:3666-3683).
+    fn expire_path_waiters(&mut self, _now: f64) {
+        self.path_waiters.retain(|_, waiters| {
+            waiters.retain(|(reply, _)| !reply.is_closed());
+            !waiters.is_empty()
+        });
     }
 
     /// Drop `id` from the interface table and unwind tunnels + paths bound
@@ -1898,6 +1851,7 @@ impl TransportActor {
         self.local_destinations.remove(&hash);
         self.local_destination_keys.remove(&hash);
         self.destination_channels.remove(&hash);
+        self.registered_destination_names.remove(&hash);
         if self.local_link_routes.remove(&hash).is_some() {
             self.terminate_link_endpoints_for_link(
                 hash,
@@ -5885,7 +5839,7 @@ mod tests {
         });
 
         assert!(actor.packet_hashlist.is_empty());
-        assert!(actor.packet_metrics.is_empty());
+        assert!(actor.packet_rssi_cache.is_empty());
         assert!(actor.path_table.is_empty());
     }
 
@@ -9307,138 +9261,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_request_handler() {
-        let dir = std::env::temp_dir().join("rns_cache_request_handler");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let (mut actor, _tx) = TransportActor::new();
-        actor.is_transport_enabled = true; // cache request broadcast requires transport
-        actor.storage_dir = Some(dir.clone()); // announce receive writes the disk cache
-
-        // Register an outbound interface to receive the replayed announce
-        let (iface, mut rx) = make_test_interface("out1");
-        actor.interfaces.insert(1, iface);
-
-        // Create and inject a valid announce
-        let (announce_raw, dest_hash) = make_valid_announce("test.cache", 0);
-
-        // Compute the packet hash (this is what the cache request will contain)
-        let packet_hash =
-            rns_wire::hash::packet_hash(&announce_raw, rns_wire::flags::HeaderType::Header1);
-
-        // Process the announce through inbound — populates path_table + recent_announces
-        let inbound = crate::messages::InboundPacket {
-            raw: announce_raw.clone(),
-            interface_id: 1,
-            rssi: None,
-            snr: None,
-            q: None,
-        };
-        actor.on_inbound(inbound);
-
-        // Verify metadata cached and raw bytes written to the disk announce cache
-        assert_eq!(actor.recent_announces.len(), 1);
-        let cached = actor
-            .recent_announces
-            .get(&dest_hash)
-            .expect("announce should be cached under its dest_hash");
-        assert_eq!(cached.packet_hash, Some(packet_hash));
-        let on_disk = crate::persistence::load_python_cached_announce(
-            &dir.join("cache").join("announces"),
-            &packet_hash,
-        )
-        .unwrap()
-        .expect("announce receive should write the disk cache file");
-        assert_eq!(on_disk.raw_packet, announce_raw.to_vec());
-
-        // Verify path_table has the packet_hash
-        let path_entry = actor.path_table.get(&dest_hash);
-        assert!(path_entry.is_some());
-        assert_eq!(path_entry.unwrap().packet_hash, Some(packet_hash));
-
-        // Build a CacheRequest: Data packet with context=CacheRequest, payload=32-byte packet hash
-        let cr_flags = rns_wire::flags::PacketFlags {
-            header_type: rns_wire::flags::HeaderType::Header1,
-            context_flag: false,
-            transport_type: rns_wire::flags::TransportType::Broadcast,
-            destination_type: rns_wire::flags::DestinationType::Single,
-            packet_type: rns_wire::flags::PacketType::Data,
-        };
-        let cr_header = rns_wire::header::PacketHeader {
-            flags: cr_flags,
-            hops: 0,
-            transport_id: None,
-            destination_hash: [0x00; 16], // CacheRequest dest doesn't matter for lookup
-            context: rns_wire::context::PacketContext::CacheRequest,
-        };
-        let mut cr_raw = cr_header.pack();
-        cr_raw.extend_from_slice(&packet_hash); // 32-byte payload
-
-        // Process the cache request
-        actor.handle_cache_request(&cr_raw, &cr_header, 1);
-        actor.flush_announce_queues();
-
-        // The output interface should have received the replayed announce
-        let replayed = rx.try_recv();
-        assert!(
-            replayed.is_ok(),
-            "expected replayed announce on output interface"
-        );
-        assert_eq!(replayed.unwrap(), announce_raw);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_cache_request_miss() {
-        let (mut actor, _tx) = TransportActor::new();
-
-        let cr_flags = rns_wire::flags::PacketFlags {
-            header_type: rns_wire::flags::HeaderType::Header1,
-            context_flag: false,
-            transport_type: rns_wire::flags::TransportType::Broadcast,
-            destination_type: rns_wire::flags::DestinationType::Single,
-            packet_type: rns_wire::flags::PacketType::Data,
-        };
-        let cr_header = rns_wire::header::PacketHeader {
-            flags: cr_flags,
-            hops: 0,
-            transport_id: None,
-            destination_hash: [0x00; 16],
-            context: rns_wire::context::PacketContext::CacheRequest,
-        };
-        let mut cr_raw = cr_header.pack();
-        cr_raw.extend_from_slice(&[0xFF; 32]);
-
-        actor.handle_cache_request(&cr_raw, &cr_header, 1);
-    }
-
-    #[test]
-    fn test_cache_request_invalid_payload_length() {
-        let (mut actor, _tx) = TransportActor::new();
-
-        let cr_flags = rns_wire::flags::PacketFlags {
-            header_type: rns_wire::flags::HeaderType::Header1,
-            context_flag: false,
-            transport_type: rns_wire::flags::TransportType::Broadcast,
-            destination_type: rns_wire::flags::DestinationType::Single,
-            packet_type: rns_wire::flags::PacketType::Data,
-        };
-        let cr_header = rns_wire::header::PacketHeader {
-            flags: cr_flags,
-            hops: 0,
-            transport_id: None,
-            destination_hash: [0x00; 16],
-            context: rns_wire::context::PacketContext::CacheRequest,
-        };
-        let mut cr_raw = cr_header.pack();
-        cr_raw.extend_from_slice(&[0xFF; 16]);
-
-        actor.handle_cache_request(&cr_raw, &cr_header, 1);
-    }
-
-    #[test]
     fn load_state_drops_expired_paths_and_stages_others() {
         let dir = std::env::temp_dir().join("rns_load_drop_expired");
         let _ = std::fs::remove_dir_all(&dir);
@@ -10993,6 +10815,7 @@ mod tests {
 
         let (mut shared, _rx) = make_test_interface("shared_server");
         shared.role = InterfaceRole::SharedServer;
+        shared.packet_capacity = crate::InterfacePacketCapacity::new(500, 500, true);
         actor.interfaces.insert(5, shared);
         match actor.handle_query(TransportQuery::GetNextHopIfName { dest }) {
             TransportQueryResponse::StringResult(name) => {
@@ -12586,15 +12409,19 @@ mod tests {
             q: None,
         });
 
+        assert!(
+            external_rx.try_recv().is_err(),
+            "the path response is not sent straight to the requester"
+        );
+        assert!(!actor.pending_local_path_requests.contains_key(&dest));
+        actor.last_announces_check = 0.0;
+        actor.on_tick();
         let response = external_rx
             .try_recv()
-            .expect("local-client path response should be returned to the external requester");
+            .expect("the announce table rebroadcasts the local-client path response");
         let (header, _) = rns_wire::header::PacketHeader::unpack(&response).unwrap();
         assert_eq!(header.destination_hash, dest);
-        assert_eq!(
-            header.context,
-            rns_wire::context::PacketContext::PathResponse
-        );
+        assert_eq!(header.context, rns_wire::context::PacketContext::None);
         assert_eq!(
             header.flags.header_type,
             rns_wire::flags::HeaderType::Header2

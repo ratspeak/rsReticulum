@@ -39,12 +39,11 @@ fn expand_tilde(p: &str) -> PathBuf {
 use rns_identity::identity::Identity;
 use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
 use rns_runtime::platform::StoragePaths;
-use rns_runtime::reticulum::{InstanceMode, ReticulumHandle, SharedInstanceRpcEndpoint};
+use rns_runtime::reticulum::ReticulumHandle;
 use rns_runtime::rncp::{
     DEFAULT_RNCP_APP_NAME, RncpError, RncpEvent, RncpFetchRequest, RncpListenerConfig,
     RncpSendRequest, default_rncp_app_name, rncp_fetch_file, rncp_send_file, spawn_rncp_listener,
 };
-use rns_runtime::rpc::{RpcRequest, RpcResponse};
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
 use rns_tools::RS_RETICULUM_VERSION;
@@ -162,7 +161,11 @@ const SYMS: [char; 7] = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
 
 /// rncp.py:54-68 (`prepare_identity`): `-i` is used as given, and an identity
 /// that cannot be saved is still used for this run.
-fn prepare_identity(identity_path: Option<&str>, default_dir: &std::path::Path) -> Identity {
+async fn prepare_identity(
+    handle: &ReticulumHandle,
+    identity_path: Option<&str>,
+    default_dir: &std::path::Path,
+) -> Identity {
     let path = match identity_path {
         Some(p) => PathBuf::from(p),
         None => default_dir.join("rncp"),
@@ -175,7 +178,7 @@ fn prepare_identity(identity_path: Option<&str>, default_dir: &std::path::Path) 
                     "Could not load identity for rncp. The identity file at \"{}\" may be corrupt or unreadable.",
                     path.display()
                 );
-                process::exit(2);
+                rns_tools::exit(handle, 2).await;
             }
         }
     }
@@ -498,14 +501,14 @@ async fn wait_for_path(
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                 _ = interrupt.wait() => {
                     println!();
-                    process::exit(0);
+                    rns_tools::exit(handle, 0).await;
                 }
             }
         }
     }
     if !has_path().await {
         ui.finish("Path not found", &format!("{ERASE}Path not found"));
-        process::exit(1);
+        rns_tools::exit(handle, 1).await;
     }
     ui.step(
         &format!("Establishing link with {h}"),
@@ -557,7 +560,8 @@ async fn run_fetch(args: Args) -> ! {
     let handle = start_interruptible(args.config.as_deref(), &interrupt).await;
     handle.wants_destination_type(DEFAULT_RNCP_APP_NAME).await;
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
-    let identity = prepare_identity(args.identity_path.as_deref(), &paths.identity_dir);
+    let identity =
+        prepare_identity(&handle, args.identity_path.as_deref(), &paths.identity_dir).await;
 
     let ui = Ui::new(args.silent, true);
     let h = pretty_hex_rep(&dest_hash);
@@ -612,23 +616,17 @@ async fn run_fetch(args: Args) -> ! {
 
     let _ = progress_task.await;
 
-    let fail = |line: &str, code: i32| -> ! {
-        ui.finish(line, &format!("{ERASE}{line}"));
-        process::exit(code);
-    };
-    let link_failed = || -> ! {
-        fail(&format!("Could not establish link with {h}"), 1);
-    };
-    let transfer_failed = |preface: &str| -> ! {
+    let fail = |line: &str| ui.finish(line, &format!("{ERASE}{line}"));
+    let transfer_failed = |preface: &str| {
         println!("{preface}");
-        fail("The transfer failed", 1);
+        fail("The transfer failed");
     };
 
     // rncp.py:543-567: every answered request failure exits 0.
     match result {
         Err(RncpError::Interrupted) => {
             println!();
-            process::exit(0);
+            rns_tools::exit(&handle, 0).await;
         }
         Err(
             RncpError::PathTimeout
@@ -637,11 +635,14 @@ async fn run_fetch(args: Args) -> ! {
             | RncpError::HandshakeFailed(_)
             | RncpError::ProofInvalid(_)
             | RncpError::RequestDispatch(_),
-        ) => link_failed(),
+        ) => {
+            fail(&format!("Could not establish link with {h}"));
+            rns_tools::exit(&handle, 1).await;
+        }
         _ => {}
     }
     show_requesting();
-    match result {
+    let code = match result {
         Ok(outcome) => {
             let total = resource_total_size(outcome.bytes as u64, &outcome.file_name);
             let line = {
@@ -662,38 +663,49 @@ async fn run_fetch(args: Args) -> ! {
                 print!("{ERASE}Transfer complete  {line} ");
                 println!("\n{path_arg} fetched from {h}");
             }
-            process::exit(0);
+            0
         }
-        Err(RncpError::Denied) => fail(
-            &format!(
+        Err(RncpError::Denied) => {
+            fail(&format!(
                 "Fetch request failed, fetching the file {path_arg} was not allowed by the remote"
-            ),
-            0,
-        ),
-        Err(RncpError::NotFound) => fail(
-            &format!("Fetch request failed, the file {path_arg} was not found on the remote"),
-            0,
-        ),
-        Err(RncpError::RemoteError) => fail(
-            "Fetch request failed due to an error on the remote system",
-            0,
-        ),
-        Err(RncpError::RequestFailed) => fail(
-            "Fetch request failed due to an unknown error (probably not authorised)",
-            0,
-        ),
-        Err(RncpError::ResourceFailed(reason)) if reason == "invalid data received" => {
-            transfer_failed("Invalid data received, ignoring resource")
+            ));
+            0
         }
-        Err(RncpError::ResourceFailed(_)) => transfer_failed("Resource failed"),
-        Err(RncpError::Io(e)) => transfer_failed(&format!(
-            "An error occurred while saving received resource: {e}"
-        )),
+        Err(RncpError::NotFound) => {
+            fail(&format!(
+                "Fetch request failed, the file {path_arg} was not found on the remote"
+            ));
+            0
+        }
+        Err(RncpError::RemoteError) => {
+            fail("Fetch request failed due to an error on the remote system");
+            0
+        }
+        Err(RncpError::RequestFailed) => {
+            fail("Fetch request failed due to an unknown error (probably not authorised)");
+            0
+        }
+        Err(RncpError::ResourceFailed(reason)) if reason == "invalid data received" => {
+            transfer_failed("Invalid data received, ignoring resource");
+            1
+        }
+        Err(RncpError::ResourceFailed(_)) => {
+            transfer_failed("Resource failed");
+            1
+        }
+        Err(RncpError::Io(e)) => {
+            transfer_failed(&format!(
+                "An error occurred while saving received resource: {e}"
+            ));
+            1
+        }
         Err(e) => {
             tracing::debug!("Fetch failed: {e}");
-            fail("The transfer failed", 1)
+            fail("The transfer failed");
+            1
         }
-    }
+    };
+    rns_tools::exit(&handle, code).await;
 }
 
 async fn run_send(args: Args) -> ! {
@@ -730,7 +742,8 @@ async fn run_send(args: Args) -> ! {
     let handle = start_interruptible(args.config.as_deref(), &interrupt).await;
     handle.wants_destination_type(DEFAULT_RNCP_APP_NAME).await;
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
-    let identity = prepare_identity(args.identity_path.as_deref(), &paths.identity_dir);
+    let identity =
+        prepare_identity(&handle, args.identity_path.as_deref(), &paths.identity_dir).await;
 
     let ui = Ui::new(args.silent, false);
     let h = pretty_hex_rep(&dest_hash);
@@ -743,7 +756,7 @@ async fn run_send(args: Args) -> ! {
                 &format!("Could not start transfer: {e}"),
                 &format!("Could not start transfer: {e}"),
             );
-            process::exit(1);
+            rns_tools::exit(&handle, 1).await;
         }
     };
     let data_size = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -802,10 +815,7 @@ async fn run_send(args: Args) -> ! {
 
     let _ = progress_task.await;
 
-    let fail = |line: &str| -> ! {
-        ui.finish(line, &format!("{ERASE}{line}"));
-        process::exit(1);
-    };
+    let fail = |line: &str| ui.finish(line, &format!("{ERASE}{line}"));
 
     match result {
         Ok(_) => {
@@ -826,14 +836,14 @@ async fn run_send(args: Args) -> ! {
                 print!("{ERASE}Transfer complete  {line}  ");
                 println!("\n{path} copied to {h}");
             }
-            process::exit(0);
+            rns_tools::exit(&handle, 0).await;
         }
         Err(RncpError::Interrupted) => {
             println!();
-            process::exit(0);
+            rns_tools::exit(&handle, 0).await;
         }
         Err(RncpError::PathTimeout | RncpError::NoIdentity) => {
-            fail(&format!("No path found to {h}"))
+            fail(&format!("No path found to {h}"));
         }
         Err(
             RncpError::Timeout(_)
@@ -844,13 +854,14 @@ async fn run_send(args: Args) -> ! {
         Err(RncpError::ResourceCreate(e)) => fail(&format!("Could not start transfer: {e}")),
         Err(e) if !transferring.load(Ordering::SeqCst) => {
             tracing::debug!("Transfer failed: {e}");
-            fail(&format!("File was not accepted by {h}"))
+            fail(&format!("File was not accepted by {h}"));
         }
         Err(e) => {
             tracing::debug!("Transfer failed: {e}");
-            fail("The transfer failed")
+            fail("The transfer failed");
         }
     }
+    rns_tools::exit(&handle, 1).await;
 }
 
 async fn run_listen(args: Args) -> ! {
@@ -893,7 +904,8 @@ async fn run_listen(args: Args) -> ! {
     };
 
     let paths = StoragePaths::from_config_dir(&handle.config_dir);
-    let identity = prepare_identity(args.identity_path.as_deref(), &paths.identity_dir);
+    let identity =
+        prepare_identity(&handle, args.identity_path.as_deref(), &paths.identity_dir).await;
     let announce_identity = identity
         .get_private_key()
         .and_then(|key| Identity::from_private_key(&*key).ok());
@@ -1009,7 +1021,7 @@ async fn run_listen(args: Args) -> ! {
     }
     listener.shutdown().await;
 
-    process::exit(0);
+    rns_tools::exit(&handle, 0).await;
 }
 
 fn spawn_listen_announcer(
@@ -1154,57 +1166,13 @@ async fn start_interruptible(
 
 /// `max(-w, reticulum.get_medium_path_timeout())` (rncp.py:405, 662).
 async fn path_timeout(handle: &ReticulumHandle, timeout: f64) -> Duration {
-    let medium = medium_path_timeout(handle).await;
+    let medium = rns_tools::medium_path_timeout(handle).await;
     let secs = if timeout.is_finite() {
         timeout.max(medium)
     } else {
         medium
     };
     Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(Duration::MAX)
-}
-
-/// Reticulum.get_medium_path_timeout (Reticulum.py:2011-2029): ask the shared
-/// instance, or compute Transport.medium_path_timeout (Transport.py:3550-3553)
-/// from the lowest online interface bitrate. 0 when unknown or on error.
-async fn medium_path_timeout(handle: &ReticulumHandle) -> f64 {
-    if handle.instance_mode == InstanceMode::Client {
-        let Some(rpc_key) = handle.config.rpc_key.as_deref() else {
-            return 0.0;
-        };
-        let request = RpcRequest::GetMediumPathTimeout;
-        let timeout = Duration::from_secs(5);
-        let response = match handle.config.shared_rpc_endpoint(&handle.socket_base) {
-            SharedInstanceRpcEndpoint::Tcp(port) => {
-                rns_runtime::rpc::connect_and_request(port, rpc_key, &request, timeout).await
-            }
-            SharedInstanceRpcEndpoint::Unix(path) => {
-                rns_runtime::rpc::connect_unix_and_request(&path, rpc_key, &request, timeout).await
-            }
-        };
-        return match response {
-            Ok(RpcResponse::FloatResult(Some(v))) if v.is_finite() => v,
-            _ => 0.0,
-        };
-    }
-    let lowest = match handle
-        .query_transport(rns_transport::messages::TransportQuery::GetInterfaceStats)
-        .await
-    {
-        Some(rns_transport::messages::TransportQueryResponse::InterfaceStats(entries)) => entries
-            .iter()
-            .filter(|entry| entry.online && entry.bitrate > 0)
-            .map(|entry| entry.bitrate)
-            .min(),
-        _ => None,
-    };
-    match lowest {
-        Some(bitrate) => {
-            let bits = (rns_wire::constants::MTU * 8) as f64;
-            2.0 * (bits / bitrate.max(rns_runtime::constants::MINIMUM_BITRATE) as f64)
-                + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
-        }
-        None => 0.0,
-    }
 }
 
 async fn start_reticulum(

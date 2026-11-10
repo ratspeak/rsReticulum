@@ -4802,19 +4802,22 @@ struct OwnedInterfaceHandle {
 /// `panic_on_interface_error` is set.
 #[derive(Clone)]
 enum HardwareFailureWatch {
-    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
     RNode(rns_interface::rnode::RNodeDriverSubscription),
     #[cfg(feature = "serial")]
     RNodeMulti(rns_interface::rnode_multi::RNodeMultiFailures),
     /// TCP or Backbone client teardown (TCPInterface.py:437-442).
     ClientTeardown(rns_interface::tcp::ClientTeardown),
+    /// Serial, KISS or AX.25 KISS runtime port error (SerialInterface.py:203-210).
+    #[cfg(feature = "serial")]
+    Serial(rns_interface::serial::SerialFailures),
 }
 
 impl HardwareFailureWatch {
     /// True at the first failure, false if the driver ends without one.
     async fn failed(&mut self) -> bool {
         match self {
-            #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+            #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
             Self::RNode(state) => loop {
                 if state.snapshot().hardware_failure_total > 0 {
                     return true;
@@ -4833,6 +4836,15 @@ impl HardwareFailureWatch {
                 }
             },
             Self::ClientTeardown(teardown) => teardown.torn_down().await,
+            #[cfg(feature = "serial")]
+            Self::Serial(failures) => loop {
+                if failures.total() > 0 {
+                    return true;
+                }
+                if failures.changed().await.is_none() {
+                    return false;
+                }
+            },
         }
     }
 }
@@ -4842,6 +4854,16 @@ fn client_with_teardown(
 ) -> Vec<OwnedInterfaceHandle> {
     vec![OwnedInterfaceHandle {
         hardware_failures: Some(HardwareFailureWatch::ClientTeardown(spawned.teardown)),
+        ..spawned.interface.into()
+    }]
+}
+
+#[cfg(feature = "serial")]
+fn serial_with_failures(
+    spawned: rns_interface::serial::SpawnedSerialInterface,
+) -> Vec<OwnedInterfaceHandle> {
+    vec![OwnedInterfaceHandle {
+        hardware_failures: Some(HardwareFailureWatch::Serial(spawned.failures)),
         ..spawned.interface.into()
     }]
 }
@@ -9041,10 +9063,10 @@ pub struct BleRnodeRuntimeArgs<'a> {
     pub mode: rns_interface::traits::InterfaceMode,
     /// Short-term airtime limit in percent (0.0..=100.0). `None` sends no
     /// limit command and does not clear a limit retained on the radio.
-    pub st_alock: Option<f32>,
+    pub st_alock: Option<f64>,
     /// Long-term airtime limit in percent (0.0..=100.0). `None` sends no
     /// limit command and does not clear a limit retained on the radio.
-    pub lt_alock: Option<f32>,
+    pub lt_alock: Option<f64>,
     /// Enable KISS flow control.
     pub flow_control: bool,
 }
@@ -9184,10 +9206,10 @@ pub struct RnodeRuntimeArgs<'a> {
     pub mode: rns_interface::traits::InterfaceMode,
     /// Short-term airtime limit in percent (0.0..=100.0). `None` sends no
     /// limit command and does not clear a limit retained on the radio.
-    pub st_alock: Option<f32>,
+    pub st_alock: Option<f64>,
     /// Long-term airtime limit in percent (0.0..=100.0). `None` sends no
     /// limit command and does not clear a limit retained on the radio.
-    pub lt_alock: Option<f32>,
+    pub lt_alock: Option<f64>,
     /// Enable KISS flow control.
     pub flow_control: bool,
 }
@@ -9376,6 +9398,7 @@ pub async fn spawn_ble_rnode_runtime_native_observed_with_options(
             lt_alock,
             id_interval: None,
             id_callsign: None,
+            pair_unbonded: false,
         },
         tcp_port,
         rnode_startup_options,
@@ -9405,6 +9428,7 @@ fn native_ble_driver_config(
     config.flow_control = source.flow_control;
     config.id_interval = source.id_interval;
     config.id_callsign = source.id_callsign.map(String::into_bytes);
+    config.pair_unbonded = source.pair_unbonded;
     config.validate().map_err(|error| {
         RNodeRuntimeSpawnError::InvalidConfiguration(format!(
             "invalid value for '{name}.{}': {error}",
@@ -9630,8 +9654,8 @@ pub async fn spawn_android_usb_rnode_runtime(
     coding_rate: u8,
     tx_power: i8,
     mode: rns_interface::traits::InterfaceMode,
-    st_alock: Option<f32>,
-    lt_alock: Option<f32>,
+    st_alock: Option<f64>,
+    lt_alock: Option<f64>,
     flow_control: bool,
 ) -> Result<u64, String> {
     let spawned = spawn_android_usb_rnode_runtime_observed(
@@ -9667,8 +9691,8 @@ pub async fn spawn_android_usb_rnode_runtime_observed(
     coding_rate: u8,
     tx_power: i8,
     mode: rns_interface::traits::InterfaceMode,
-    st_alock: Option<f32>,
-    lt_alock: Option<f32>,
+    st_alock: Option<f64>,
+    lt_alock: Option<f64>,
     flow_control: bool,
 ) -> Result<SpawnedRNodeRuntime, String> {
     spawn_android_usb_rnode_runtime_observed_with_options(
@@ -9703,8 +9727,8 @@ pub async fn spawn_android_usb_rnode_runtime_observed_with_options(
     coding_rate: u8,
     tx_power: i8,
     mode: rns_interface::traits::InterfaceMode,
-    st_alock: Option<f32>,
-    lt_alock: Option<f32>,
+    st_alock: Option<f64>,
+    lt_alock: Option<f64>,
     flow_control: bool,
     rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
 ) -> Result<SpawnedRNodeRuntime, RNodeRuntimeSpawnError> {
@@ -9985,9 +10009,9 @@ async fn spawn_interface_with_rnode_startup_options(
             serial_config.data_bits = data;
             serial_config.parity = parity;
             serial_config.stop_bits = stop;
-            rns_interface::serial::spawn_serial_interface(serial_config, id, transport_tx)
+            rns_interface::serial::spawn_serial_interface_observed(serial_config, id, transport_tx)
                 .await
-                .map(|h| vec![h.into()])
+                .map(serial_with_failures)
                 .map_err(|e| format!("Serial: {e}"))
         }
         #[cfg(feature = "serial")]
@@ -10010,9 +10034,9 @@ async fn spawn_interface_with_rnode_startup_options(
             kiss_config.flow_control = c.flow_control;
             kiss_config.id_interval = c.id_interval;
             kiss_config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
-            rns_interface::kiss_iface::spawn_kiss_interface(kiss_config, id, transport_tx)
+            rns_interface::kiss_iface::spawn_kiss_interface_observed(kiss_config, id, transport_tx)
                 .await
-                .map(|h| vec![h.into()])
+                .map(serial_with_failures)
                 .map_err(|e| format!("KISS: {e}"))
         }
         interface_factory::InterfaceConfig::Auto(c) => {
@@ -10079,7 +10103,13 @@ async fn spawn_interface_with_rnode_startup_options(
                     rnode_startup_options,
                 )
                 .await
-                .map(|spawned| vec![spawned.into()])
+                .map(|spawned| {
+                    let failures = HardwareFailureWatch::RNode(spawned.driver.watch());
+                    vec![OwnedInterfaceHandle {
+                        hardware_failures: Some(failures),
+                        ..spawned.into()
+                    }]
+                })
                 .map_err(|error| format!("Android USB RNode: {error}"));
             }
 
@@ -10268,10 +10298,14 @@ async fn spawn_interface_with_rnode_startup_options(
             ax25_config.slottime = c.slottime as u16;
             ax25_config.flow_control = c.flow_control;
             ax25_config.mode = c.mode;
-            rns_interface::ax25kiss::spawn_ax25kiss_interface(ax25_config, id, transport_tx)
-                .await
-                .map(|h| vec![h.into()])
-                .map_err(|e| format!("AX25KISS: {e}"))
+            rns_interface::ax25kiss::spawn_ax25kiss_interface_observed(
+                ax25_config,
+                id,
+                transport_tx,
+            )
+            .await
+            .map(serial_with_failures)
+            .map_err(|e| format!("AX25KISS: {e}"))
         }
         #[cfg(feature = "ble")]
         interface_factory::InterfaceConfig::BleRNode(c) => {
@@ -10287,6 +10321,7 @@ async fn spawn_interface_with_rnode_startup_options(
             config.lt_alock = c.lt_alock;
             config.id_interval = c.id_interval;
             config.id_callsign = c.id_callsign.as_ref().map(|s| s.as_bytes().to_vec());
+            config.pair_unbonded = c.pair_unbonded;
             rns_interface::ble_rnode::spawn_ble_rnode_interface_with_driver_and_options(
                 config,
                 id,
@@ -11908,6 +11943,7 @@ mod tests {
             lt_alock: Some(3.25),
             id_interval: Some(900),
             id_callsign: Some("N0CALL".into()),
+            pair_unbonded: false,
         })
         .expect("valid typed native BLE config");
 
@@ -16888,6 +16924,7 @@ listen_port = 5556
                     lt_alock: Some(3.25),
                     id_interval: Some(900),
                     id_callsign: Some("N0CALL".into()),
+                    pair_unbonded: false,
                 },
             )
         };

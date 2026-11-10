@@ -2327,6 +2327,18 @@ async fn send_resource_action(
                 rns_wire::flags::PacketType::Data,
             )
         }
+        TransferAction::QueryProofCache(proof_data) => {
+            return transport_tx
+                .send(TransportMessage::CacheRequest {
+                    packet_hash: rns_protocol::resource::resource_proof_packet_hash(
+                        &link.link_id,
+                        &proof_data,
+                    ),
+                    destination_hash: link.link_id,
+                })
+                .await
+                .map_err(|_| LinkSessionResourceError::TransportUnavailable);
+        }
         TransferAction::None | TransferAction::Complete | TransferAction::Failed(_) => {
             return Ok(());
         }
@@ -3510,7 +3522,8 @@ async fn handle_inbound_resource_part(
         TransferAction::None
         | TransferAction::SendAdvertisement(_)
         | TransferAction::SendPart(_, _)
-        | TransferAction::SendProof(_) => {}
+        | TransferAction::SendProof(_)
+        | TransferAction::QueryProofCache(_) => {}
     }
     if complete {
         complete_inbound_segment(

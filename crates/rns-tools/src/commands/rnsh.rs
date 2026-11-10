@@ -267,7 +267,7 @@ async fn stop_reticulum(
     runtime_shutdown: &ShutdownSignal,
 ) {
     runtime_shutdown.trigger();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.shutdown_and_wait()).await;
+    rns_tools::shut_down(handle).await;
 }
 
 async fn run_initiator(args: Args, config_dir: PathBuf) -> ExitCode {
@@ -367,6 +367,8 @@ async fn run_initiator(args: Args, config_dir: PathBuf) -> ExitCode {
         progress_tx: Some(progress_tx),
     };
 
+    // initiator.py:156
+    handle.wants_destination_type(APP_NAME).await;
     let result = rnsh_client_execute(handle.transport_tx.clone(), cfg).await;
     terminate_task.abort();
     let _ = progress_task.await;

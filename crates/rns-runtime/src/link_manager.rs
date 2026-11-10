@@ -5708,6 +5708,19 @@ impl LinkManager {
                     rns_wire::flags::PacketType::Data,
                 )
             }
+            TransferAction::QueryProofCache(proof_data) => {
+                return Self::stage_link_control(
+                    transport_tx,
+                    pending_link_control,
+                    TransportMessage::CacheRequest {
+                        packet_hash: rns_protocol::resource::resource_proof_packet_hash(
+                            link_id,
+                            &proof_data,
+                        ),
+                        destination_hash: *link_id,
+                    },
+                );
+            }
             TransferAction::None | TransferAction::Complete | TransferAction::Failed(_) => {
                 return false;
             }

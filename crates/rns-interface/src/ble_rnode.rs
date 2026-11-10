@@ -25,7 +25,6 @@ use bytes::Bytes;
 #[cfg(test)]
 use futures::FutureExt;
 use futures::StreamExt;
-use rand::RngCore;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -74,13 +73,14 @@ pub const NUS_RX_CHAR_UUID: Uuid = Uuid::from_u128(0x6E400002_B5A3_F393_E0A9_E50
 /// Device notifies the host here.
 pub const NUS_TX_CHAR_UUID: Uuid = Uuid::from_u128(0x6E400003_B5A3_F393_E0A9_E50E24DCCA9E);
 
-const RECONNECT_WAIT: u64 = 1;
-/// Fast early recovery, then indefinite low-duty retries. A two-minute cap made
-/// a reachable radio appear dead long after returning to range.
-const RECONNECT_WAIT_MAX: u64 = 30;
+/// Python `RNodeInterface.reconnect_port` sleeps a fixed 5 s between attempts.
+const RECONNECT_WAIT: u64 = 5;
+const RECONNECT_WAIT_MAX: u64 = RECONNECT_WAIT;
 /// `None` retries forever; teardown goes via `stop_ble_rnode_interface`.
 const MAX_RECONNECT_TRIES: Option<usize> = None;
-const SCAN_TIMEOUT: u64 = 3;
+/// Python `BLEConnection.SCAN_TIMEOUT`; the scan returns on the first match.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(2);
+const SCAN_POLL: Duration = Duration::from_millis(250);
 /// Bounds disable-while-offline teardown latency to ~1s.
 const RUNNING_POLL: Duration = Duration::from_secs(1);
 /// No CoreBluetooth or GATT operation may hold the generation owner forever.
@@ -93,8 +93,6 @@ const BLE_POST_INIT_SETTLE: Duration = Duration::from_secs(1);
 /// response pacing through dependency upgrades. Increasing that size requires
 /// separate radio/firmware validation even though btleplug now exposes MTU.
 const BLE_DEFAULT_ATT_WRITE_PAYLOAD: usize = 20;
-/// RNode's reviewed high-throughput ATT MTU is 247 (247 - 3 ATT bytes).
-const BLE_RNODE_ATT_WRITE_PAYLOAD: usize = 244;
 #[cfg(target_os = "linux")]
 const RNODE_POST_BOND_SETTLE: Duration = Duration::from_millis(2600);
 const RNODE_NATIVE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
@@ -207,22 +205,19 @@ fn reconnect_try_exhausted(tries: &mut usize) -> bool {
     }
 }
 
-fn reconnect_delay_with_jitter(seconds: u64, random: u64) -> Duration {
-    let base = Duration::from_secs(seconds.max(1));
-    let jitter_cap_ms = seconds.max(1).saturating_mul(200); // 0..20%
-    let jitter_ms = random % jitter_cap_ms.saturating_add(1);
-    base + Duration::from_millis(jitter_ms)
-}
-
 fn ble_reconnect_delay(seconds: u64) -> Duration {
-    reconnect_delay_with_jitter(seconds, rand::rngs::OsRng.next_u64())
+    Duration::from_secs(seconds)
 }
 
-const fn ble_write_chunk_size() -> usize {
+/// Python writes `max_write_without_response_size` bytes, the negotiated ATT
+/// MTU less 3 (20 at the 23-byte default MTU).
+fn ble_write_chunk_size(negotiated_mtu: u16) -> usize {
     if cfg!(any(target_os = "ios", target_os = "macos")) {
         BLE_DEFAULT_ATT_WRITE_PAYLOAD
     } else {
-        BLE_RNODE_ATT_WRITE_PAYLOAD
+        usize::from(negotiated_mtu)
+            .saturating_sub(3)
+            .max(BLE_DEFAULT_ATT_WRITE_PAYLOAD)
     }
 }
 
@@ -1262,12 +1257,15 @@ pub struct BleRNodeConfig {
     pub tx_power: u8,
     pub mode: InterfaceMode,
     pub flow_control: bool,
-    pub st_alock: Option<f32>,
-    pub lt_alock: Option<f32>,
+    pub st_alock: Option<f64>,
+    pub lt_alock: Option<f64>,
     /// Station-ID beacon: seconds between IDs, armed by data TX
     /// (Python `id_interval`/`id_callsign`, callsign max 32 bytes).
     pub id_interval: Option<u64>,
     pub id_callsign: Option<Vec<u8>>,
+    /// Pair an unbonded RNode on Linux instead of refusing it. Python only
+    /// connects to devices that are already bonded; default off.
+    pub pair_unbonded: bool,
 }
 
 impl BleRNodeConfig {
@@ -1287,6 +1285,7 @@ impl BleRNodeConfig {
             lt_alock: None,
             id_interval: None,
             id_callsign: None,
+            pair_unbonded: false,
         }
     }
 
@@ -1484,53 +1483,65 @@ async fn resolve_ble_target(
     adapter: &Adapter,
     ble_uri: &str,
     generation_stable_name: Option<&str>,
+    pair_unbonded: bool,
 ) -> Result<(Peripheral, BleTargetResolutionClass), InterfaceError> {
-    let target = ble_uri.strip_prefix("ble://").unwrap_or(ble_uri);
+    let target = ble_uri
+        .get(.."ble://".len())
+        .filter(|scheme| scheme.eq_ignore_ascii_case("ble://"))
+        .map_or(ble_uri, |_| &ble_uri["ble://".len()..]);
     ble_diag(format!("[ble] resolve_ble_target target='{target}'"));
 
     bounded_ble_operation("scan start", adapter.start_scan(ble_scan_filter()))
         .await
         .inspect_err(|error| ble_diag(format!("[ble] start_scan err: {error}")))?;
-    tokio::time::sleep(Duration::from_secs(SCAN_TIMEOUT)).await;
+    // Like bleak's `find_device_by_filter`, return on the first match.
+    let scan_deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
+    let selection = loop {
+        tokio::time::sleep(SCAN_POLL).await;
+        let peripherals = bounded_ble_operation("peripheral list", adapter.peripherals()).await?;
+        let mut candidates = Vec::with_capacity(peripherals.len());
+        for p in &peripherals {
+            let props = bounded_ble_operation("properties", p.properties())
+                .await
+                .ok()
+                .flatten();
+            let bonded = pair_unbonded || peripheral_bonded(p).await;
+            candidates.push(BleTargetCandidate {
+                id: p.id().to_string(),
+                name: props.as_ref().and_then(|props| props.local_name.clone()),
+                services: props.map(|props| props.services),
+                bonded,
+            });
+        }
+        let selection = select_ble_target(target, generation_stable_name, &candidates);
+        if let BleTargetSelection::Selected(index, class) = selection {
+            break Some((peripherals[index].clone(), class));
+        }
+        if tokio::time::Instant::now() >= scan_deadline {
+            ble_diag(format!(
+                "[ble] scan found {} peripherals",
+                peripherals.len()
+            ));
+            if selection == BleTargetSelection::NotBonded {
+                bounded_ble_operation("scan stop", adapter.stop_scan())
+                    .await
+                    .ok();
+                tracing::error!(
+                    "Can't connect to target device {target} over BLE, device is not bonded"
+                );
+                return Err(InterfaceError::SendFailed(format!(
+                    "BLE device {target} is not bonded"
+                )));
+            }
+            break None;
+        }
+    };
     bounded_ble_operation("scan stop", adapter.stop_scan())
         .await
         .ok();
-
-    let peripherals = bounded_ble_operation("peripheral list", adapter.peripherals()).await?;
-    ble_diag(format!(
-        "[ble] scan found {} peripherals",
-        peripherals.len()
-    ));
-
-    if target.is_empty() {
-        for p in &peripherals {
-            if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await {
-                if props.services.contains(&NUS_SERVICE_UUID) {
-                    return Ok((p.clone(), BleTargetResolutionClass::FirstRnode));
-                }
-                // A populated list without NUS means a different device;
-                // only fall back to the name on empty service lists.
-                if props.services.is_empty()
-                    && let Some(ref name) = props.local_name
-                    && name.starts_with("RNode ")
-                {
-                    return Ok((p.clone(), BleTargetResolutionClass::FirstRnode));
-                }
-            }
-        }
-        return Err(InterfaceError::SendFailed(
-            "No RNode BLE device found".into(),
-        ));
-    }
-
-    // `peripheral.id().to_string()` is MAC on Linux/Android, CB UUID on
-    // iOS/macOS — same string the scanner exposes.
-    for p in &peripherals {
-        let addr = p.id().to_string();
-        if addr.eq_ignore_ascii_case(target) {
-            ble_diag(format!("[ble] resolve matched by address: {addr}"));
-            return Ok((p.clone(), BleTargetResolutionClass::PrimaryId));
-        }
+    if let Some((peripheral, class)) = selection {
+        ble_diag(format!("[ble] resolve matched {}", class.label()));
+        return Ok((peripheral, class));
     }
 
     // Windows can create a peripheral from an explicit MAC even when this
@@ -1546,31 +1557,118 @@ async fn resolve_ble_target(
         return Ok((peripheral, BleTargetResolutionClass::PrimaryId));
     }
 
+    ble_diag(format!(
+        "[ble] resolve failed: no peripheral matches '{target}'"
+    ));
+    if target.is_empty() {
+        return Err(InterfaceError::SendFailed(
+            "No RNode BLE device found".into(),
+        ));
+    }
+    Err(InterfaceError::SendFailed(format!(
+        "BLE device not found: {target}. Ensure it is powered on and paired."
+    )))
+}
+
+/// One scanned peripheral as target selection sees it.
+struct BleTargetCandidate {
+    id: String,
+    name: Option<String>,
+    /// Advertised services; `None` when the platform had no properties.
+    services: Option<Vec<Uuid>>,
+    bonded: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BleTargetSelection {
+    Selected(usize, BleTargetResolutionClass),
+    /// A named or addressed target matched only unbonded devices.
+    NotBonded,
+    None,
+}
+
+/// Python `BLEConnection.find_target_device`: only bonded devices are
+/// selectable, and a configured address or name that matches an unbonded
+/// device is refused rather than paired.
+fn select_ble_target(
+    target: &str,
+    generation_stable_name: Option<&str>,
+    candidates: &[BleTargetCandidate],
+) -> BleTargetSelection {
+    let mut unbonded_match = false;
+    if target.is_empty() {
+        for (index, candidate) in candidates.iter().enumerate() {
+            let Some(services) = &candidate.services else {
+                continue;
+            };
+            // A populated list without NUS means a different device; only
+            // fall back to the name on empty service lists.
+            let is_rnode = services.contains(&NUS_SERVICE_UUID)
+                || (services.is_empty()
+                    && candidate
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with("RNode ")));
+            if is_rnode && candidate.bonded {
+                return BleTargetSelection::Selected(index, BleTargetResolutionClass::FirstRnode);
+            }
+        }
+        return BleTargetSelection::None;
+    }
+    // `peripheral.id().to_string()` is MAC on Linux/Android, CB UUID on
+    // iOS/macOS — same string the scanner exposes.
+    for (index, candidate) in candidates.iter().enumerate() {
+        if candidate.id.eq_ignore_ascii_case(target) {
+            if candidate.bonded {
+                return BleTargetSelection::Selected(index, BleTargetResolutionClass::PrimaryId);
+            }
+            unbonded_match = true;
+        }
+    }
     // Friendly-name resolution remains a fallback behind the configured
     // platform ID. After an exact first generation, its verified RNode name is
     // retained in memory so a post-bond CoreBluetooth handle replacement can
     // be resolved without changing the public/configured identity.
-    for p in &peripherals {
-        if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await
-            && let Some(ref name) = props.local_name
-            && let Some(resolution_class) =
-                ble_name_resolution_class(target, generation_stable_name, name)
+    for (index, candidate) in candidates.iter().enumerate() {
+        if let Some(name) = candidate.name.as_deref()
+            && let Some(class) = ble_name_resolution_class(target, generation_stable_name, name)
         {
-            if resolution_class == BleTargetResolutionClass::PrimaryName {
-                ble_diag(format!("[ble] resolve matched by name: {name}"));
-            } else {
-                ble_diag("[ble] resolve matched by generation-stable advertised name");
+            if candidate.bonded {
+                return BleTargetSelection::Selected(index, class);
             }
-            return Ok((p.clone(), resolution_class));
+            unbonded_match = true;
         }
     }
+    if unbonded_match {
+        BleTargetSelection::NotBonded
+    } else {
+        BleTargetSelection::None
+    }
+}
 
-    ble_diag(format!(
-        "[ble] resolve failed: no peripheral matches '{target}'"
-    ));
-    Err(InterfaceError::SendFailed(format!(
-        "BLE device not found: {target}. Ensure it is powered on and paired."
-    )))
+/// Bond state as Python `BLEConnection.device_bonded` reads it on Linux
+/// (BlueZ). Other platforms report bonded: Windows needs a paired-device
+/// query this crate does not build, and CoreBluetooth exposes no bond state.
+#[cfg(target_os = "linux")]
+async fn peripheral_bonded(peripheral: &Peripheral) -> bool {
+    let Ok(address) = parse_linux_ble_address(&peripheral.address().to_string()) else {
+        return false;
+    };
+    let Ok(session) = linux_bluer_session().await else {
+        return false;
+    };
+    let Ok(adapter) = session.default_adapter().await else {
+        return false;
+    };
+    match adapter.device(address) {
+        Ok(device) => device.is_paired().await.unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn peripheral_bonded(_peripheral: &Peripheral) -> bool {
+    true
 }
 
 struct BleRNodeConnection {
@@ -1742,6 +1840,7 @@ fn reduce_native_startup_bytes(
 async fn connect_rnode(
     adapter: &Adapter,
     ble_uri: &str,
+    pair_unbonded: bool,
     generation_stable_name: &mut Option<String>,
     running: &AtomicBool,
     generation_id: BleGenerationId,
@@ -1753,7 +1852,7 @@ async fn connect_rnode(
         None
     };
     let (peripheral, resolution_class) =
-        match resolve_ble_target(adapter, ble_uri, alternate_name).await {
+        match resolve_ble_target(adapter, ble_uri, alternate_name, pair_unbonded).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 trace_ble_lifecycle(generation_id, "target_resolution", "failed", None, None);
@@ -1776,7 +1875,7 @@ async fn connect_rnode(
         bounded_ble_operation("adapter event stream", adapter.events()).await?;
 
     #[cfg(target_os = "linux")]
-    {
+    if pair_unbonded {
         // BlueZ needs explicit pairing before we open a btleplug GATT
         // connection. If this creates a fresh bond, RNode intentionally
         // disconnects shortly afterwards; wait through that before connect().
@@ -2006,7 +2105,7 @@ async fn connect_rnode(
     trace_ble_lifecycle(generation_id, "subscribe", "accepted", None, None);
     ble_diag("[ble] subscribe TX ok");
 
-    let write_mtu = ble_write_chunk_size();
+    let write_mtu = ble_write_chunk_size(peripheral.mtu());
     tracing::info!(write_mtu, "BLE RNode write chunk size");
     ble_diag(format!("[ble] write chunk size={write_mtu}"));
 
@@ -2788,6 +2887,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
     let flow_control = config.flow_control;
     let beacon = beacon_from_config(&config);
     let ble_uri = config.ble_uri.clone();
+    let pair_unbonded = config.pair_unbonded;
     let log_name = name.clone();
     let running_task = running.clone();
 
@@ -2862,6 +2962,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             let mut conn = match connect_rnode(
                 &adapter,
                 &ble_uri,
+                pair_unbonded,
                 &mut generation_stable_target_name,
                 &running_task,
                 generation_id,
@@ -4941,10 +5042,52 @@ mod tests {
     }
 
     #[test]
-    fn ble_reconnect_jitter_stays_within_twenty_percent() {
-        assert_eq!(reconnect_delay_with_jitter(1, 0), Duration::from_secs(1));
-        assert!(reconnect_delay_with_jitter(1, u64::MAX) <= Duration::from_millis(1_200));
-        assert!(reconnect_delay_with_jitter(30, u64::MAX) <= Duration::from_secs(36));
+    fn ble_target_selection_admits_only_bonded_devices() {
+        let rnode = |id: &str, name: &str, bonded: bool| BleTargetCandidate {
+            id: id.into(),
+            name: Some(name.into()),
+            services: Some(vec![NUS_SERVICE_UUID]),
+            bonded,
+        };
+        let unbonded = [rnode("AA:BB:CC:DD:EE:01", "RNode 1111", false)];
+        assert_eq!(
+            select_ble_target("", None, &unbonded),
+            BleTargetSelection::None
+        );
+        assert_eq!(
+            select_ble_target("AA:BB:CC:DD:EE:01", None, &unbonded),
+            BleTargetSelection::NotBonded
+        );
+        assert_eq!(
+            select_ble_target("RNode 1111", None, &unbonded),
+            BleTargetSelection::NotBonded
+        );
+        let mixed = [
+            rnode("AA:BB:CC:DD:EE:01", "RNode 1111", false),
+            rnode("AA:BB:CC:DD:EE:02", "RNode 2222", true),
+        ];
+        assert_eq!(
+            select_ble_target("", None, &mixed),
+            BleTargetSelection::Selected(1, BleTargetResolutionClass::FirstRnode)
+        );
+        assert_eq!(
+            select_ble_target("aa:bb:cc:dd:ee:02", None, &mixed),
+            BleTargetSelection::Selected(1, BleTargetResolutionClass::PrimaryId)
+        );
+        assert_eq!(
+            select_ble_target("RNode 2222", None, &mixed),
+            BleTargetSelection::Selected(1, BleTargetResolutionClass::PrimaryName)
+        );
+        assert_eq!(
+            select_ble_target("RNode 3333", None, &mixed),
+            BleTargetSelection::None
+        );
+    }
+
+    #[test]
+    fn ble_reconnect_waits_a_fixed_five_seconds() {
+        assert_eq!(ble_reconnect_delay(RECONNECT_WAIT), Duration::from_secs(5));
+        assert_eq!(RECONNECT_WAIT_MAX, RECONNECT_WAIT);
     }
 
     #[test]
@@ -4970,16 +5113,18 @@ mod tests {
     }
 
     #[test]
-    fn ble_write_chunk_size_matches_platform_transport_guarantee() {
+    fn ble_write_chunk_follows_negotiated_mtu() {
         #[cfg(any(target_os = "ios", target_os = "macos"))]
         {
-            assert_eq!(ble_write_chunk_size(), BLE_DEFAULT_ATT_WRITE_PAYLOAD);
+            assert_eq!(ble_write_chunk_size(247), BLE_DEFAULT_ATT_WRITE_PAYLOAD);
             assert!(matches!(ble_write_type(), WriteType::WithResponse));
         }
 
         #[cfg(not(any(target_os = "ios", target_os = "macos")))]
         {
-            assert_eq!(ble_write_chunk_size(), BLE_RNODE_ATT_WRITE_PAYLOAD);
+            assert_eq!(ble_write_chunk_size(23), 20);
+            assert_eq!(ble_write_chunk_size(185), 182);
+            assert_eq!(ble_write_chunk_size(247), 244);
             assert!(matches!(ble_write_type(), WriteType::WithoutResponse));
         }
     }
@@ -5216,7 +5361,7 @@ mod tests {
         ));
 
         cfg = BleRNodeConfig::new("validated", "ble://RNode");
-        cfg.st_alock = Some(f32::NAN);
+        cfg.st_alock = Some(f64::NAN);
         assert!(matches!(
             cfg.validate(),
             Err(rnode::RNodeConfigValidationError::NonFinite {
@@ -6550,7 +6695,7 @@ mod tests {
             "TCP write alone must neither clear nor count payload"
         );
 
-        let second_ready = tokio::time::timeout(Duration::from_secs(4), async {
+        let second_ready = tokio::time::timeout(Duration::from_secs(RECONNECT_WAIT + 4), async {
             loop {
                 let snapshot = snapshots
                     .changed()
@@ -7801,6 +7946,7 @@ mod tests {
         let conn = connect_rnode(
             &adapter,
             "ble://",
+            false,
             &mut generation_stable_name,
             &running,
             BleGenerationId::default().next(),

@@ -121,10 +121,10 @@ pub struct RNodeInterfaceConfig {
     pub flow_control: bool,
     /// Short-term airtime cap, percent (0.0..=100.0). `None` sends no
     /// command for this setting; it does not explicitly clear a prior limit.
-    pub st_alock: Option<f32>,
+    pub st_alock: Option<f64>,
     /// Long-term airtime cap, percent (0.0..=100.0). `None` sends no
     /// command for this setting; it does not explicitly clear a prior limit.
-    pub lt_alock: Option<f32>,
+    pub lt_alock: Option<f64>,
     /// Station-ID beacon: seconds between IDs, sent only after data TX.
     pub id_interval: Option<u64>,
     pub id_callsign: Option<String>,
@@ -188,13 +188,16 @@ pub struct BleRNodeInterfaceConfig {
     pub flow_control: bool,
     /// Short-term airtime cap, percent (0.0..=100.0). `None` sends no
     /// command for this setting; it does not explicitly clear a prior limit.
-    pub st_alock: Option<f32>,
+    pub st_alock: Option<f64>,
     /// Long-term airtime cap, percent (0.0..=100.0). `None` sends no
     /// command for this setting; it does not explicitly clear a prior limit.
-    pub lt_alock: Option<f32>,
+    pub lt_alock: Option<f64>,
     /// Station-ID beacon: seconds between IDs, sent only after data TX.
     pub id_interval: Option<u64>,
     pub id_callsign: Option<String>,
+    /// Rust-only `ble_auto_pair`: pair an unbonded RNode on Linux. Python
+    /// only connects to bonded devices, so the default is off.
+    pub pair_unbonded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,8 +262,8 @@ pub struct RNodeSubInterfaceConfig {
     /// The subsection's own key only; Python has no parent fallback.
     pub flow_control: bool,
     pub outgoing: bool,
-    pub st_alock: Option<f32>,
-    pub lt_alock: Option<f32>,
+    pub st_alock: Option<f64>,
+    pub lt_alock: Option<f64>,
 }
 
 /// AX.25-framed packets carried over a KISS serial TNC, with a configured
@@ -648,11 +651,33 @@ pub fn synthesize_interface(
         "TCPClientInterface" => synthesize_tcp_client(name, section, mode),
         "TCPServerInterface" => synthesize_tcp_server(name, section, mode),
         "UDPInterface" => synthesize_udp(name, section, mode),
+        #[cfg(all(feature = "serial", not(target_os = "android")))]
+        "SerialInterface" | "KISSInterface" | "AX25KISSInterface"
+            if section
+                .get("port")
+                .is_some_and(|port| port.starts_with("androidusb://")) =>
+        {
+            Err(InterfaceFactoryError::Disabled(format!(
+                "{iface_type} '{name}' uses an Android USB-OTG port on a non-Android build"
+            )))
+        }
         #[cfg(feature = "serial")]
         "SerialInterface" => synthesize_serial(name, section, mode),
         #[cfg(feature = "serial")]
         "KISSInterface" => synthesize_kiss_serial(name, section, mode),
         "AutoInterface" => synthesize_auto(name, section, mode),
+        #[cfg(target_os = "android")]
+        "RNodeInterface" if !section.has("port") => match android_rnode_port(name, section)? {
+            Some(port) => {
+                let mut section = section.clone();
+                section.set("port", &port);
+                synthesize_interface(name, &section)
+            }
+            None => Err(InterfaceFactoryError::MissingField {
+                name: name.to_string(),
+                field: "port".to_string(),
+            }),
+        },
         "RNodeInterface" => {
             let port = section
                 .get("port")
@@ -660,7 +685,10 @@ pub fn synthesize_interface(
                     name: name.to_string(),
                     field: "port".to_string(),
                 })?;
-            if port.starts_with("ble://") {
+            if port
+                .get(.."ble://".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ble://"))
+            {
                 #[cfg(feature = "ble")]
                 {
                     return synthesize_ble_rnode(name, section, mode);
@@ -895,6 +923,29 @@ fn synthesize_udp(
     Ok(InterfaceConfig::Udp(config))
 }
 
+/// Python `int(c[key]) if key in c else default` for the serial line keys of
+/// Serial, KISS and AX.25 KISS; the first present key of `keys` is used.
+#[cfg(feature = "serial")]
+fn parse_serial_line_value<T: TryFrom<i64>>(
+    name: &str,
+    section: &ConfigSection,
+    keys: &[&str],
+    default: T,
+) -> Result<T, InterfaceFactoryError> {
+    let Some((key, raw)) = keys
+        .iter()
+        .find_map(|key| section.get(key).map(|value| (*key, value)))
+    else {
+        return Ok(default);
+    };
+    let invalid = |message: String| InterfaceFactoryError::InvalidValue {
+        field: format!("{name}.{key}"),
+        message,
+    };
+    let value = python_int(raw).ok_or_else(|| invalid(format!("'{raw}' is not an integer")))?;
+    T::try_from(value).map_err(|_| invalid(format!("{value} is out of range")))
+}
+
 #[cfg(feature = "serial")]
 fn synthesize_serial(
     name: &str,
@@ -909,22 +960,10 @@ fn synthesize_serial(
         })?
         .to_string();
 
-    let baud_rate = section
-        .get_uint("speed")
-        .or_else(|| section.get_uint("baud_rate"))
-        .unwrap_or(9600) as u32;
-
-    let data_bits = section
-        .get_uint("databits")
-        .or_else(|| section.get_uint("data_bits"))
-        .unwrap_or(8) as u8;
-
+    let baud_rate = parse_serial_line_value(name, section, &["speed", "baud_rate"], 9600u32)?;
+    let data_bits = parse_serial_line_value(name, section, &["databits", "data_bits"], 8u8)?;
     let parity = section.get("parity").unwrap_or("N").to_string();
-
-    let stop_bits = section
-        .get_uint("stopbits")
-        .or_else(|| section.get_uint("stop_bits"))
-        .unwrap_or(1) as u8;
+    let stop_bits = parse_serial_line_value(name, section, &["stopbits", "stop_bits"], 1u8)?;
 
     Ok(InterfaceConfig::Serial(SerialInterfaceConfig {
         name: name.to_string(),
@@ -936,6 +975,43 @@ fn synthesize_serial(
         mode,
     }))
 }
+
+/// Python's Android `RNodeInterface` has no `port` URI schemes: it selects
+/// BLE from `force_ble`, `ble_name` or `ble_addr` and TCP from `force_tcp` or
+/// `tcp_host`, and Bluetooth Classic from `allow_bluetooth`. Map those to the
+/// `ble://` and `tcp://` ports the shared RNode path understands.
+#[cfg(any(target_os = "android", test))]
+fn android_rnode_port(
+    name: &str,
+    section: &ConfigSection,
+) -> Result<Option<String>, InterfaceFactoryError> {
+    // Upstream reads force_ble/force_tcp without as_bool, so any value is set.
+    let force_ble = section.has("force_ble");
+    let force_tcp = section.has("force_tcp");
+    let ble_target = section.get("ble_addr").or_else(|| section.get("ble_name"));
+    if force_ble || ble_target.is_some() {
+        return Ok(Some(format!("ble://{}", ble_target.unwrap_or(""))));
+    }
+    if force_tcp || section.has("tcp_host") {
+        return Ok(Some(format!(
+            "tcp://{}",
+            section.get("tcp_host").unwrap_or("")
+        )));
+    }
+    if section.get_bool("allow_bluetooth") == Some(true) {
+        return Err(InterfaceFactoryError::Disabled(format!(
+            "RNodeInterface '{name}' uses Bluetooth Classic (allow_bluetooth), which is not supported"
+        )));
+    }
+    Ok(None)
+}
+
+/// Python's Android `KISSInterface` names the station-ID keys
+/// `beacon_interval`/`beacon_data`; the desktop class uses `id_*`.
+#[cfg(all(feature = "serial", target_os = "android"))]
+const KISS_BEACON_KEYS: (&str, &str) = ("beacon_interval", "beacon_data");
+#[cfg(all(feature = "serial", not(target_os = "android")))]
+const KISS_BEACON_KEYS: (&str, &str) = ("id_interval", "id_callsign");
 
 #[cfg(feature = "serial")]
 fn synthesize_kiss_serial(
@@ -951,10 +1027,7 @@ fn synthesize_kiss_serial(
         })?
         .to_string();
 
-    let baud_rate = section
-        .get_uint("speed")
-        .or_else(|| section.get_uint("baud_rate"))
-        .unwrap_or(9600) as u32;
+    let baud_rate = parse_serial_line_value(name, section, &["speed", "baud_rate"], 9600u32)?;
 
     // Python KISSInterface.py:86-97 — TNC timing defaults 350/20/64/20,
     // serial 8N1, flow_control off, optional station-ID beacon.
@@ -963,17 +1036,27 @@ fn synthesize_kiss_serial(
         name: name.to_string(),
         port,
         baud_rate,
-        data_bits: section.get_uint("databits").unwrap_or(8) as u8,
+        data_bits: parse_serial_line_value(name, section, &["databits"], 8u8)?,
         parity: section.get("parity").unwrap_or("N").to_string(),
-        stop_bits: section.get_uint("stopbits").unwrap_or(1) as u8,
+        stop_bits: parse_serial_line_value(name, section, &["stopbits"], 1u8)?,
         mode,
         preamble_ms: u32::from(tnc.preamble_ms),
         txtail_ms: u32::from(tnc.txtail_ms),
         persistence: tnc.persistence,
         slottime_ms: u32::from(tnc.slottime_ms),
         flow_control: section.get_bool("flow_control").unwrap_or(false),
-        id_interval: section.get_uint("id_interval"),
-        id_callsign: section.get("id_callsign").map(|s| s.to_string()),
+        id_interval: match section.get(KISS_BEACON_KEYS.0) {
+            None => None,
+            Some(raw) => Some(
+                python_int(raw)
+                    .ok_or_else(|| InterfaceFactoryError::InvalidValue {
+                        field: format!("{name}.{}", KISS_BEACON_KEYS.0),
+                        message: format!("'{raw}' is not an integer"),
+                    })?
+                    .max(0) as u64,
+            ),
+        },
+        id_callsign: section.get(KISS_BEACON_KEYS.1).map(|s| s.to_string()),
     }))
 }
 
@@ -1054,6 +1137,7 @@ fn synthesize_rnode(
         require_generic_rnode_radio_params(name, section)?;
 
     let (flow_control, st_alock, lt_alock) = parse_generic_rnode_airtime(name, section)?;
+    let (id_interval, id_callsign) = parse_rnode_station_id(name, section)?;
     let usb_vendor_id = parse_optional_u16(name, section, "usb_vendor_id")?;
     let usb_product_id = parse_optional_u16(name, section, "usb_product_id")?;
     if usb_vendor_id.is_some() != usb_product_id.is_some() {
@@ -1079,8 +1163,8 @@ fn synthesize_rnode(
         flow_control,
         st_alock,
         lt_alock,
-        id_interval: section.get_uint("id_interval"),
-        id_callsign: section.get("id_callsign").map(|s| s.to_string()),
+        id_interval,
+        id_callsign,
     };
     // Report invalid user configuration here with its exact section field.
     // The lower driver repeats this check before any endpoint I/O so manually
@@ -1252,11 +1336,16 @@ where
     Ok(value)
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
+#[cfg(any(
+    feature = "serial",
+    feature = "rnode-tcp",
+    feature = "ble",
+    target_os = "android"
+))]
 fn parse_generic_rnode_airtime(
     name: &str,
     section: &ConfigSection,
-) -> Result<(bool, Option<f32>, Option<f32>), InterfaceFactoryError> {
+) -> Result<(bool, Option<f64>, Option<f64>), InterfaceFactoryError> {
     let flow_control = section.get_bool("flow_control").unwrap_or(false);
     let st_alock =
         parse_generic_rnode_airtime_value(name, section, &["airtime_limit_short", "st_alock"])?;
@@ -1265,21 +1354,27 @@ fn parse_generic_rnode_airtime(
     Ok((flow_control, st_alock, lt_alock))
 }
 
-#[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
+/// Python `float(c[key])`, kept in double precision for the lock word.
+#[cfg(any(
+    feature = "serial",
+    feature = "rnode-tcp",
+    feature = "ble",
+    target_os = "android"
+))]
 fn parse_generic_rnode_airtime_value(
     name: &str,
     section: &ConfigSection,
     keys: &[&str],
-) -> Result<Option<f32>, InterfaceFactoryError> {
+) -> Result<Option<f64>, InterfaceFactoryError> {
     let Some((key, raw)) = keys
         .iter()
         .find_map(|key| section.get(key).map(|value| (*key, value)))
     else {
         return Ok(None);
     };
-    let value = raw
-        .parse::<f64>()
-        .map_err(|_| InterfaceFactoryError::InvalidValue {
+    let value = section
+        .get_float(key)
+        .ok_or_else(|| InterfaceFactoryError::InvalidValue {
             field: format!("{name}.{key}"),
             message: format!("'{raw}' is not a valid percentage"),
         })?;
@@ -1289,7 +1384,45 @@ fn parse_generic_rnode_airtime_value(
             message: format!("{value} must be finite and within 0..=100 percent"),
         });
     }
-    Ok(Some(value as f32))
+    Ok(Some(value))
+}
+
+/// Station ID as Python `RNodeInterface`/`RNodeMultiInterface` read it:
+/// `int(id_interval)` raises on a malformed value, and a callsign longer than
+/// `CALLSIGN_MAX_LEN` UTF-8 bytes makes the configuration invalid when both
+/// keys are set. A negative interval behaves as zero upstream.
+#[cfg(any(
+    feature = "serial",
+    feature = "rnode-tcp",
+    feature = "ble",
+    target_os = "android"
+))]
+fn parse_rnode_station_id(
+    name: &str,
+    section: &ConfigSection,
+) -> Result<(Option<u64>, Option<String>), InterfaceFactoryError> {
+    let id_interval = match section.get("id_interval") {
+        None => None,
+        Some(raw) => Some(
+            python_int(raw).ok_or_else(|| InterfaceFactoryError::InvalidValue {
+                field: format!("{name}.id_interval"),
+                message: format!("'{raw}' is not an integer"),
+            })?,
+        ),
+    };
+    let id_callsign = section.get("id_callsign").map(str::to_string);
+    if let (Some(_), Some(callsign)) = (id_interval, id_callsign.as_ref())
+        && callsign.len() > rns_interface::rnode::CALLSIGN_MAX_LEN
+    {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.id_callsign"),
+            message: format!(
+                "the encoded ID callsign exceeds the max length of {} bytes",
+                rns_interface::rnode::CALLSIGN_MAX_LEN
+            ),
+        });
+    }
+    Ok((id_interval.map(|v| v.max(0) as u64), id_callsign))
 }
 
 /// Radio parameters are deliberately required: Python errors when they are
@@ -1336,42 +1469,6 @@ fn require_rnode_radio_params(
     ))
 }
 
-/// Shared RNode airtime/flow-control parsing. Python `RNodeInterface.py:156-160`:
-/// `flow_control` defaults off, `airtime_limit_short`/`airtime_limit_long` are
-/// duty-cycle percentages validated to 0..=100.
-#[cfg(feature = "ble")]
-fn parse_rnode_airtime(
-    name: &str,
-    section: &ConfigSection,
-) -> Result<(bool, Option<f32>, Option<f32>), InterfaceFactoryError> {
-    let flow_control = section.get_bool("flow_control").unwrap_or(false);
-    let st_alock = section
-        .get_float("airtime_limit_short")
-        .or_else(|| section.get_float("st_alock"))
-        .map(|v| v as f32);
-    let lt_alock = section
-        .get_float("airtime_limit_long")
-        .or_else(|| section.get_float("lt_alock"))
-        .map(|v| v as f32);
-    if let Some(v) = st_alock
-        && !(0.0..=100.0).contains(&v)
-    {
-        return Err(InterfaceFactoryError::InvalidValue {
-            field: format!("{name}.airtime_limit_short"),
-            message: format!("{v} is outside 0..=100 percent"),
-        });
-    }
-    if let Some(v) = lt_alock
-        && !(0.0..=100.0).contains(&v)
-    {
-        return Err(InterfaceFactoryError::InvalidValue {
-            field: format!("{name}.airtime_limit_long"),
-            message: format!("{v} is outside 0..=100 percent"),
-        });
-    }
-    Ok((flow_control, st_alock, lt_alock))
-}
-
 #[cfg(feature = "ble")]
 fn synthesize_ble_rnode(
     name: &str,
@@ -1389,7 +1486,8 @@ fn synthesize_ble_rnode(
     let (frequency, bandwidth, spreading_factor, coding_rate, tx_power) =
         require_rnode_radio_params(name, section)?;
 
-    let (flow_control, st_alock, lt_alock) = parse_rnode_airtime(name, section)?;
+    let (flow_control, st_alock, lt_alock) = parse_generic_rnode_airtime(name, section)?;
+    let (id_interval, id_callsign) = parse_rnode_station_id(name, section)?;
 
     Ok(InterfaceConfig::BleRNode(BleRNodeInterfaceConfig {
         name: name.to_string(),
@@ -1403,8 +1501,9 @@ fn synthesize_ble_rnode(
         flow_control,
         st_alock,
         lt_alock,
-        id_interval: section.get_uint("id_interval"),
-        id_callsign: section.get("id_callsign").map(|s| s.to_string()),
+        id_interval,
+        id_callsign,
+        pair_unbonded: parse_bool_strict(name, "ble_auto_pair", section, false)?,
     }))
 }
 
@@ -1514,6 +1613,8 @@ fn synthesize_rnode_multi(
         .or_else(|| section.get_uint("baud_rate"))
         .unwrap_or(115200) as u32;
 
+    let (id_interval, id_callsign) = parse_rnode_station_id(name, section)?;
+
     let mut subinterfaces = Vec::new();
     let mut seen_vports = std::collections::HashSet::new();
     for (sub_name, sub_section) in &section.subsections {
@@ -1564,14 +1665,16 @@ fn synthesize_rnode_multi(
             require_rnode_radio_params(&sub_full_name, sub_section)?;
         let flow_control = sub_section.get_bool("flow_control").unwrap_or(false);
         let outgoing = sub_section.get_bool("outgoing").unwrap_or(true);
-        let st_alock = sub_section
-            .get_float("airtime_limit_short")
-            .or_else(|| sub_section.get_float("st_alock"))
-            .map(|v| v as f32);
-        let lt_alock = sub_section
-            .get_float("airtime_limit_long")
-            .or_else(|| sub_section.get_float("lt_alock"))
-            .map(|v| v as f32);
+        let st_alock = parse_generic_rnode_airtime_value(
+            sub_name,
+            sub_section,
+            &["airtime_limit_short", "st_alock"],
+        )?;
+        let lt_alock = parse_generic_rnode_airtime_value(
+            sub_name,
+            sub_section,
+            &["airtime_limit_long", "lt_alock"],
+        )?;
 
         let parsed = RNodeSubInterfaceConfig {
             name: sub_name.clone(),
@@ -1616,8 +1719,8 @@ fn synthesize_rnode_multi(
         baud_rate,
         subinterfaces,
         mode,
-        id_interval: section.get_uint("id_interval"),
-        id_callsign: section.get("id_callsign").map(|s| s.to_string()),
+        id_interval,
+        id_callsign,
     }))
 }
 
@@ -1699,10 +1802,7 @@ fn synthesize_ax25kiss(
         })?
         .to_string();
 
-    let baud_rate = section
-        .get_uint("speed")
-        .or_else(|| section.get_uint("baud_rate"))
-        .unwrap_or(9600) as u32;
+    let baud_rate = parse_serial_line_value(name, section, &["speed", "baud_rate"], 9600u32)?;
 
     // Python AX25KISSInterface requires an explicit 0..=15 SSID
     // (default -1 fails validation, AX25KISSInterface.py:138-139).
@@ -1732,9 +1832,9 @@ fn synthesize_ax25kiss(
         name: name.to_string(),
         port,
         baud_rate,
-        data_bits: section.get_uint("databits").unwrap_or(8) as u8,
+        data_bits: parse_serial_line_value(name, section, &["databits"], 8u8)?,
         parity: section.get("parity").unwrap_or("N").to_string(),
-        stop_bits: section.get_uint("stopbits").unwrap_or(1) as u8,
+        stop_bits: parse_serial_line_value(name, section, &["stopbits"], 1u8)?,
         callsign,
         ssid,
         preamble,
@@ -2033,6 +2133,65 @@ pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn android_usb_serial_ports_are_refused_off_android() {
+        for kind in ["SerialInterface", "KISSInterface", "AX25KISSInterface"] {
+            let mut s = ConfigSection::new();
+            for (k, v) in [
+                ("type", kind),
+                ("enabled", "yes"),
+                ("port", "androidusb:///dev/bus/usb/001/002"),
+                ("callsign", "N0CALL"),
+                ("ssid", "0"),
+            ] {
+                s.set(k, v);
+            }
+            let parsed = synthesize_interface("usb", &s);
+            assert!(
+                matches!(parsed, Err(InterfaceFactoryError::Disabled(_))),
+                "{kind}: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn android_rnode_keys_select_the_transport_like_upstream() {
+        let section = |keys: &[(&str, &str)]| {
+            let mut s = ConfigSection::new();
+            for (k, v) in keys {
+                s.set(k, v);
+            }
+            s
+        };
+        let port = |keys: &[(&str, &str)]| android_rnode_port("rn", &section(keys)).unwrap();
+        assert_eq!(
+            port(&[("ble_name", "RNode A1B2")]),
+            Some("ble://RNode A1B2".into())
+        );
+        assert_eq!(
+            port(&[
+                ("ble_name", "RNode A1B2"),
+                ("ble_addr", "AA:BB:CC:DD:EE:FF")
+            ]),
+            Some("ble://AA:BB:CC:DD:EE:FF".into())
+        );
+        assert_eq!(port(&[("force_ble", "no")]), Some("ble://".into()));
+        assert_eq!(
+            port(&[("tcp_host", "10.0.0.2")]),
+            Some("tcp://10.0.0.2".into())
+        );
+        assert_eq!(
+            port(&[("tcp_host", "10.0.0.2"), ("ble_name", "RNode A1B2")]),
+            Some("ble://RNode A1B2".into())
+        );
+        assert_eq!(port(&[]), None);
+        assert!(matches!(
+            android_rnode_port("rn", &section(&[("allow_bluetooth", "yes")])),
+            Err(InterfaceFactoryError::Disabled(_))
+        ));
+    }
     use super::*;
 
     /// Fixtures are enabled unless a test says otherwise; upstream skips a

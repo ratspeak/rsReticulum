@@ -437,7 +437,35 @@ fn parse_config(content: &[u8]) -> Result<Tree, String> {
             std::str::from_utf8(raw).map_err(|_| pyfmt::py_utf8_error(raw).unwrap_or_default())?;
         lines.push(text.trim_end_matches(['\r', '\n']).to_string());
     }
+    parse_lines(lines)
+}
 
+/// Python `str.splitlines()`.
+fn py_splitlines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\x0b' | '\x0c' | '\x1c' | '\x1d' | '\x1e' | '\u{85}' | '\u{2028}'
+            | '\u{2029}' => lines.push(std::mem::take(&mut current)),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                lines.push(std::mem::take(&mut current));
+            }
+            other => current.push(other),
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// `ConfigObj._parse` over a list of decoded lines.
+fn parse_lines(lines: Vec<String>) -> Result<Tree, String> {
     let p = Patterns::new();
     let mut tree = Tree::new();
     let mut errors: Vec<ParseErr> = Vec::new();
@@ -1239,6 +1267,23 @@ pub fn rsg_meta_from_file(
 ) -> Result<Vec<(String, Obj)>, String> {
     let spec = spec_path.map(read_config).transpose()?;
     let mut parsed = read_config(path)?;
+    if let Some(spec) = spec {
+        parsed.nodes[0].configspec = Some(0);
+        if !validate(&mut parsed, &spec, 0)? {
+            return Err("Metadata did not pass spec validation".to_string());
+        }
+    }
+    parsed.dict(0)
+}
+
+/// `rsg_meta_from_str(meta, spec)`: the text is split with `str.splitlines`
+/// and, unlike a file, a leading BOM is kept.
+pub fn rsg_meta_from_str(meta: &str, spec: Option<&str>) -> Result<Vec<(String, Obj)>, String> {
+    let spec = spec
+        .filter(|spec| !spec.is_empty())
+        .map(|spec| parse_lines(py_splitlines(spec)))
+        .transpose()?;
+    let mut parsed = parse_lines(py_splitlines(meta))?;
     if let Some(spec) = spec {
         parsed.nodes[0].configspec = Some(0);
         if !validate(&mut parsed, &spec, 0)? {

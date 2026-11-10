@@ -231,12 +231,31 @@ pub fn parse_callsign_ssid(input: &str) -> Result<(String, u8), String> {
     Ok((call, ssid))
 }
 
+/// Python `AX25KISSInterface.configure_device` sleeps this long after opening
+/// the port, before reading and before sending the TNC configuration.
+#[cfg(feature = "serial")]
+const CONFIGURE_SETTLE: Duration = Duration::from_secs(2);
+
+/// Spawn an AX.25 KISS interface. An unopenable port does not fail the spawn:
+/// as in Python, the interface stays offline and the port is retried every
+/// `RECONNECT_WAIT` seconds, also after a runtime port error.
 #[cfg(feature = "serial")]
 pub async fn spawn_ax25kiss_interface(
     config: AX25KISSConfig,
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    Ok(spawn_ax25kiss_interface_observed(config, id, transport_tx)
+        .await?
+        .interface)
+}
+
+#[cfg(feature = "serial")]
+pub async fn spawn_ax25kiss_interface_observed(
+    config: AX25KISSConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+) -> Result<crate::serial::SpawnedSerialInterface, crate::traits::InterfaceError> {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
     config.validate().map_err(|e| {
@@ -245,145 +264,211 @@ pub async fn spawn_ax25kiss_interface(
 
     let (data_bits, parity, stop_bits) =
         crate::serial::serial_params_from(config.data_bits, &config.parity, config.stop_bits);
-    let port = crate::serial::open_port(
-        serialport::new(&config.port, config.baud_rate)
-            .data_bits(data_bits)
-            .parity(parity)
-            .stop_bits(stop_bits)
-            .timeout(Duration::from_millis(AX25_READ_TIMEOUT_MS)),
-    )
-    .map_err(|e| {
-        crate::traits::InterfaceError::SendFailed(format!("ax25kiss serial open: {}", e))
-    })?;
-
-    rns_transport::notice!(
-        name = %config.name,
-        port = %config.port,
-        baud = config.baud_rate,
-        src_call = %config.src_call,
-        src_ssid = config.src_ssid,
-        "AX.25 KISS interface opened"
-    );
-
-    let online = Arc::new(AtomicBool::new(true));
+    let online = Arc::new(AtomicBool::new(false));
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
-    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+    let (tx, rx) = mpsc::channel::<Bytes>(256);
     let background = crate::background_announce::register(&tx)?;
     let name = config.name.clone();
     let python_identity =
         rns_transport::messages::InterfaceIdentity::bracketed("AX25KISSInterface", &name);
     let mode = config.mode;
-    let flow_control = config.flow_control;
+    let (failures_tx, failures) = crate::serial_io::SerialFailures::channel();
 
-    let src_call_bytes: Vec<u8> = config.src_call.as_bytes().to_vec();
-    let dst_call_bytes: Vec<u8> = config.dst_call.as_bytes().to_vec();
-    let src_ssid = config.src_ssid;
-    let dst_ssid = config.dst_ssid;
+    let supervisor = crate::serial_io::Supervisor {
+        identity: format!("AX25KISSInterface[{name}]"),
+        opener: crate::serial::port_opener(
+            &config.port,
+            config.baud_rate,
+            data_bits,
+            parity,
+            stop_bits,
+            Duration::from_millis(AX25_READ_TIMEOUT_MS),
+        ),
+        settle: CONFIGURE_SETTLE,
+        online: online.clone(),
+        failures: failures_tx,
+    };
+    let generation = Ax25Generation {
+        id,
+        init_frames: build_ax25_kiss_init(&config),
+        flow_control: config.flow_control,
+        src_call: config.src_call.as_bytes().to_vec(),
+        dst_call: config.dst_call.as_bytes().to_vec(),
+        src_ssid: config.src_ssid,
+        dst_ssid: config.dst_ssid,
+        rx,
+        background,
+        transport_tx,
+        online: online.clone(),
+        rxb: shared_rxb.clone(),
+        txb: shared_txb.clone(),
+    };
+    let read_task = tokio::spawn(supervisor.run(generation, None));
 
-    let port_write = port
-        .try_clone()
-        .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("ax25kiss clone: {}", e)))?;
+    Ok(crate::serial::SpawnedSerialInterface {
+        interface: InterfaceHandle {
+            id,
+            owner,
+            packet_capacity: InterfacePacketCapacity::new(500, 564, false),
+            parent_id: None,
+            name,
+            mode,
+            direction: InterfaceDirection {
+                inbound: true,
+                outbound: true,
+                forward: false,
+                repeat: false,
+            },
+            bitrate: BITRATE_GUESS,
+            mtu: HW_MTU as u32,
+            online,
+            rxb: Some(shared_rxb),
+            txb: Some(shared_txb),
+            inspection: Some(
+                rns_transport::messages::InterfaceInspectionSource::identified(python_identity),
+            ),
+            tx,
+            read_task,
+        },
+        failures,
+    })
+}
 
-    {
-        let mut init_port = port_write.try_clone().map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("ax25kiss init clone: {}", e))
-        })?;
-        let init_seq = build_ax25_kiss_init(&config);
-        use std::io::Write;
-        let _ = init_port.write_all(&init_seq);
-        let _ = init_port.flush();
-        tracing::debug!(name = %config.name, "AX.25 KISS init commands sent");
+#[cfg(feature = "serial")]
+struct Ax25Generation {
+    id: InterfaceId,
+    init_frames: Vec<u8>,
+    flow_control: bool,
+    src_call: Vec<u8>,
+    dst_call: Vec<u8>,
+    src_ssid: u8,
+    dst_ssid: u8,
+    rx: mpsc::Receiver<Bytes>,
+    background: crate::background_announce::BackgroundAnnounceReceiver,
+    transport_tx: InterfaceTransportSender,
+    online: Arc<AtomicBool>,
+    rxb: Arc<AtomicU64>,
+    txb: Arc<AtomicU64>,
+}
+
+#[cfg(feature = "serial")]
+impl crate::serial_io::SerialGeneration for Ax25Generation {
+    fn outbound(&mut self) -> &mut mpsc::Receiver<Bytes> {
+        &mut self.rx
     }
 
-    let ready = Arc::new(AtomicBool::new(true));
+    fn background(&self) -> &crate::background_announce::BackgroundAnnounceReceiver {
+        &self.background
+    }
 
-    let online_w = online.clone();
-    let ready_w = ready.clone();
-    let txb_w = shared_txb.clone();
-    tokio::spawn(async move {
-        let mut port_w = port_write;
-        let mut flow_control_locked = tokio::time::Instant::now();
-        let take_permit = |locked: tokio::time::Instant| {
-            if ready_w
-                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return true;
-            }
-            if locked.elapsed() > crate::kiss_iface::FLOW_CONTROL_TIMEOUT {
-                tracing::warn!(
-                    "AX.25 KISS interface is unlocking flow control due to time-out. This should not happen. Your hardware might have missed a flow-control READY command, or maybe it does not support flow-control."
-                );
-                return true;
-            }
-            false
-        };
-        loop {
-            if !online_w.load(Ordering::SeqCst) {
-                break;
-            }
-            let background_packet = if rx.is_empty() {
-                background.try_start_when(rns_transport::now_f64(), || {
-                    !flow_control || take_permit(flow_control_locked)
-                })
-            } else {
-                None
+    fn run(
+        &mut self,
+        port: crate::serial_io::Port,
+    ) -> impl std::future::Future<Output = crate::serial_io::GenerationEnd> + Send {
+        use crate::serial_io::GenerationEnd;
+        let Self {
+            id,
+            init_frames,
+            flow_control,
+            src_call,
+            dst_call,
+            src_ssid,
+            dst_ssid,
+            rx,
+            background,
+            transport_tx,
+            online,
+            rxb,
+            txb,
+        } = self;
+        let (id, flow_control, src_ssid, dst_ssid) = (*id, *flow_control, *src_ssid, *dst_ssid);
+        async move {
+            let port_write = match port.try_clone() {
+                Ok(port) => port,
+                Err(e) => return GenerationEnd::ReadFailed(e.into()),
             };
-            let data = if let Some(packet) = &background_packet {
-                packet.raw().clone()
-            } else {
-                match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
-                    Ok(Some(data)) => data,
-                    Ok(None) => break,
-                    Err(_) => continue,
-                }
-            };
-            if flow_control && background_packet.is_none() {
-                while !take_permit(flow_control_locked) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    if !online_w.load(Ordering::SeqCst) {
-                        return;
+            let ready = AtomicBool::new(true);
+            let writer = async {
+                // Python starts the read loop and goes online before the TNC config.
+                let mut port_w =
+                    match crate::serial_io::blocking_write_all(port_write, init_frames.clone())
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => return GenerationEnd::WriteFailed(e),
+                    };
+                let mut flow_control_locked = tokio::time::Instant::now();
+                let take_permit = |locked: tokio::time::Instant| {
+                    if ready
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                    if locked.elapsed() > crate::kiss_iface::FLOW_CONTROL_TIMEOUT {
+                        tracing::warn!(
+                            "AX.25 KISS interface is unlocking flow control due to time-out. This should not happen. Your hardware might have missed a flow-control READY command, or maybe it does not support flow-control."
+                        );
+                        return true;
+                    }
+                    false
+                };
+                loop {
+                    if !online.load(Ordering::SeqCst) {
+                        return GenerationEnd::Closed;
+                    }
+                    let background_packet = if rx.is_empty() {
+                        background.try_start_when(rns_transport::now_f64(), || {
+                            !flow_control || take_permit(flow_control_locked)
+                        })
+                    } else {
+                        None
+                    };
+                    let data = if let Some(packet) = &background_packet {
+                        packet.raw().clone()
+                    } else {
+                        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                            Ok(Some(data)) => data,
+                            Ok(None) => return GenerationEnd::Closed,
+                            Err(_) => continue,
+                        }
+                    };
+                    if flow_control && background_packet.is_none() {
+                        while !take_permit(flow_control_locked) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            if !online.load(Ordering::SeqCst) {
+                                return GenerationEnd::Closed;
+                            }
+                        }
+                    }
+                    if flow_control {
+                        flow_control_locked = tokio::time::Instant::now();
+                    }
+                    let framed = frame_ax25_kiss(&data, dst_call, dst_ssid, src_call, src_ssid);
+                    match crate::serial_io::blocking_write_all(port_w, framed).await {
+                        Ok(p) => {
+                            port_w = p;
+                            // Python counts the payload without AX.25 header or framing.
+                            txb.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => return GenerationEnd::WriteFailed(e),
                     }
                 }
-            }
-            if flow_control {
-                flow_control_locked = tokio::time::Instant::now();
-            }
-
-            let framed =
-                frame_ax25_kiss(&data, &dst_call_bytes, dst_ssid, &src_call_bytes, src_ssid);
-
-            match crate::serial_io::blocking_write_all(port_w, framed).await {
-                Ok(p) => {
-                    port_w = p;
-                    // Python counts the payload without AX.25 header or framing.
-                    txb_w.fetch_add(data.len() as u64, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "AX.25 KISS write error");
-                    online_w.store(false, Ordering::SeqCst);
-                    break;
-                }
-            }
-        }
-    });
-
-    let online_r = online.clone();
-    let ready_r = ready;
-    let rxb_r = shared_rxb.clone();
-    let read_task = tokio::spawn(async move {
-        let mut port_r = port;
-        let mut deframer = kiss::KissByteDeframer::new(HW_MTU as usize + AX25_HEADER_SIZE);
-        let mut buf = [0u8; 1024];
-        let mut last_read = std::time::Instant::now();
-
-        loop {
-            if !online_r.load(Ordering::SeqCst) {
-                break;
-            }
-            match crate::serial_io::poll_read(port_r, buf).await {
-                Ok((p, b, n)) => {
+            };
+            let reader = async {
+                let mut port_r = port;
+                let mut deframer = kiss::KissByteDeframer::new(HW_MTU as usize + AX25_HEADER_SIZE);
+                let mut buf = [0u8; 1024];
+                let mut last_read = std::time::Instant::now();
+                loop {
+                    if !online.load(Ordering::SeqCst) {
+                        return GenerationEnd::Closed;
+                    }
+                    let (p, b, n) = match crate::serial_io::poll_read(port_r, buf).await {
+                        Ok(read) => read,
+                        Err(e) => return GenerationEnd::ReadFailed(e),
+                    };
                     port_r = p;
                     buf = b;
                     if n == 0 {
@@ -392,71 +477,44 @@ pub async fn spawn_ax25kiss_interface(
                         {
                             deframer.reset();
                         }
-                    } else {
-                        last_read = std::time::Instant::now();
-                        for event in deframer.feed(&buf[..n]) {
-                            match event {
-                                kiss::KissEvent::Data(frame) => {
-                                    let payload = match strip_ax25_header(&frame) {
-                                        Some(p) if !p.is_empty() => p.to_vec(),
-                                        _ => continue,
-                                    };
-                                    // Python counts the frame with its AX.25 header.
-                                    rxb_r.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                                    let msg = TransportMessage::Inbound(InboundPacket {
-                                        raw: Bytes::from(payload),
-                                        interface_id: id,
-                                        rssi: None,
-                                        snr: None,
-                                        q: None,
-                                    });
-                                    if transport_tx.send(msg).await.is_err() {
-                                        tracing::warn!(id, "transport channel closed");
-                                        online_r.store(false, Ordering::SeqCst);
-                                        return;
-                                    }
+                        continue;
+                    }
+                    last_read = std::time::Instant::now();
+                    for event in deframer.feed(&buf[..n]) {
+                        match event {
+                            kiss::KissEvent::Data(frame) => {
+                                let payload = match strip_ax25_header(&frame) {
+                                    Some(p) if !p.is_empty() => p.to_vec(),
+                                    _ => continue,
+                                };
+                                // Python counts the frame with its AX.25 header.
+                                rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                let msg = TransportMessage::Inbound(InboundPacket {
+                                    raw: Bytes::from(payload),
+                                    interface_id: id,
+                                    rssi: None,
+                                    snr: None,
+                                    q: None,
+                                });
+                                if transport_tx.send(msg).await.is_err() {
+                                    tracing::warn!(id, "transport channel closed");
+                                    return GenerationEnd::Closed;
                                 }
-                                kiss::KissEvent::Ready => {
-                                    ready_r.store(true, Ordering::SeqCst);
-                                    tracing::debug!(id, "AX.25 KISS flow control: ready");
-                                }
+                            }
+                            kiss::KissEvent::Ready => {
+                                ready.store(true, Ordering::SeqCst);
+                                tracing::debug!(id, "AX.25 KISS flow control: ready");
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "AX.25 KISS read error");
-                    online_r.store(false, Ordering::SeqCst);
-                    return;
-                }
+            };
+            tokio::select! {
+                end = writer => end,
+                end = reader => end,
             }
         }
-    });
-
-    Ok(InterfaceHandle {
-        id,
-        owner,
-        packet_capacity: InterfacePacketCapacity::new(500, 564, false),
-        parent_id: None,
-        name,
-        mode,
-        direction: InterfaceDirection {
-            inbound: true,
-            outbound: true,
-            forward: false,
-            repeat: false,
-        },
-        bitrate: BITRATE_GUESS,
-        mtu: HW_MTU as u32,
-        online,
-        rxb: Some(shared_rxb),
-        txb: Some(shared_txb),
-        inspection: Some(
-            rns_transport::messages::InterfaceInspectionSource::identified(python_identity),
-        ),
-        tx,
-        read_task,
-    })
+    }
 }
 
 #[cfg(test)]

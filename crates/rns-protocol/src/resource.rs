@@ -53,6 +53,8 @@ pub const PROCESSING_GRACE: f64 = 1.0;
 pub const PART_TIMEOUT_FACTOR: f64 = 4.0;
 pub const PART_TIMEOUT_FACTOR_AFTER_RTT: f64 = 2.0;
 pub const PROOF_TIMEOUT_FACTOR: f64 = 3.0;
+/// Proof-cache queries a sender makes before giving up (Resource.py:1106).
+pub const PROOF_CACHE_QUERIES: usize = 3;
 pub const RETRY_GRACE_TIME: f64 = 0.25;
 pub const PER_RETRY_DELAY: f64 = 0.5;
 /// HMU-wait multiplier in the watchdog timeout (Python `Resource.HMU_WAIT_FACTOR`).
@@ -1446,6 +1448,31 @@ pub enum TransferAction {
     Failed(String),
     /// `ICL` (initiator cancel) or `RCL` (receiver cancel), plus resource hash.
     SendCancel(CancelType, [u8; 32]),
+    /// Sender found no proof in time: ask the transport for the cached proof
+    /// whose data is `resource_hash || expected_proof`, as Python
+    /// `Transport.cache_request` (see [`resource_proof_packet_hash`]).
+    QueryProofCache(Vec<u8>),
+}
+
+/// Packet hash of the RESOURCE_PRF packet a receiver sends on `link_id`
+/// with `proof_data`, the key a CACHE_REQUEST names (Resource.py:670-673).
+pub fn resource_proof_packet_hash(link_id: &[u8; 16], proof_data: &[u8]) -> [u8; 32] {
+    let header = rns_wire::header::PacketHeader {
+        flags: rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Link,
+            packet_type: rns_wire::flags::PacketType::Proof,
+        },
+        hops: 0,
+        transport_id: None,
+        destination_hash: *link_id,
+        context: rns_wire::context::PacketContext::ResourcePrf,
+    };
+    let mut raw = header.pack();
+    raw.extend_from_slice(proof_data);
+    rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1)
 }
 
 /// Cancel message types.
@@ -1481,6 +1508,8 @@ pub struct OutboundTransfer {
     // requests and local polling are not Resource progress.
     last_progress: Instant,
     last_request_parts: usize,
+    /// Proof-cache queries left before the sender gives up (Resource.py:1106).
+    proof_queries_left: usize,
     /// Advertisement wait per attempt before PROCESSING_GRACE; `None` uses
     /// `rtt * TRAFFIC_TIMEOUT_FACTOR`, as Resource does without a timeout.
     pub advertisement_timeout: Option<Duration>,
@@ -1547,6 +1576,7 @@ impl OutboundTransfer {
             req_hashlist: HashSet::new(),
             last_progress: Instant::now(),
             last_request_parts: 0,
+            proof_queries_left: PROOF_CACHE_QUERIES,
             advertisement_timeout: None,
             advertisement_mdu: rns_wire::constants::LINK_MDU,
         }
@@ -1612,19 +1642,13 @@ impl OutboundTransfer {
             // dormant merely because it is no longer Advertised.
             return TransferAction::Failed("transfer failed".to_string());
         }
-        if matches!(
-            self.resource.state,
-            ResourceState::Transferring | ResourceState::AwaitingProof
-        ) {
-            let timeout = self.progress_timeout();
-            if self.last_progress.elapsed() > timeout {
-                let reason = if self.resource.state == ResourceState::AwaitingProof {
-                    "resource proof timed out"
-                } else {
-                    "resource part requests timed out"
-                };
+        if self.resource.state == ResourceState::AwaitingProof {
+            return self.check_proof_timeout();
+        }
+        if self.resource.state == ResourceState::Transferring {
+            if self.last_progress.elapsed() > self.progress_timeout() {
                 self.resource.state = ResourceState::Failed;
-                return TransferAction::Failed(reason.to_string());
+                return TransferAction::Failed("resource part requests timed out".to_string());
             }
             return TransferAction::None;
         }
@@ -1674,11 +1698,45 @@ impl OutboundTransfer {
                     ),
                 ))
             }
-            ResourceState::Transferring | ResourceState::AwaitingProof => {
-                Some((self.last_progress, self.progress_timeout()))
-            }
+            ResourceState::Transferring => Some((self.last_progress, self.progress_timeout())),
+            ResourceState::AwaitingProof => Some((
+                self.proof_wait_started(),
+                self.proof_wait()
+                    .saturating_mul(self.proof_queries_left.saturating_add(1) as u32),
+            )),
             _ => None,
         }
+    }
+
+    /// Python's AWAITING_PROOF watchdog (Resource.py:656-675).
+    fn check_proof_timeout(&mut self) -> TransferAction {
+        if self.proof_wait_started().elapsed() <= self.proof_wait() {
+            return TransferAction::None;
+        }
+        if self.proof_queries_left == 0 {
+            self.resource.state = ResourceState::Failed;
+            return TransferAction::Failed("resource proof timed out".to_string());
+        }
+        self.proof_queries_left -= 1;
+        self.last_part_sent = Some(Instant::now());
+        let mut proof_data = self.resource.resource_hash.to_vec();
+        proof_data.extend_from_slice(&self.resource.expected_proof);
+        TransferAction::QueryProofCache(proof_data)
+    }
+
+    fn proof_wait_started(&self) -> Instant {
+        self.last_part_sent.unwrap_or(self.last_progress)
+    }
+
+    fn proof_wait(&self) -> Duration {
+        self.rtt
+            .saturating_mul(PROOF_TIMEOUT_FACTOR as u32)
+            .saturating_add(Duration::from_secs_f64(SENDER_GRACE_TIME))
+    }
+
+    fn enter_awaiting_proof(&mut self) {
+        self.resource.state = ResourceState::AwaitingProof;
+        self.proof_queries_left = PROOF_CACHE_QUERIES;
     }
 
     /// Consume the receiver-feedback format paired with
@@ -1785,8 +1843,7 @@ impl OutboundTransfer {
             self.window_cursor = self.cursor;
             self.awaiting_hmu = false;
 
-            // Transition to awaiting proof
-            self.resource.state = ResourceState::AwaitingProof;
+            self.enter_awaiting_proof();
             self.resource.window.grow(0);
         }
     }
@@ -1975,11 +2032,11 @@ impl OutboundTransfer {
                 self.last_request_parts = sent_count;
                 self.retries = 0;
             }
-            self.resource.state = if self.sent_parts == self.resource.num_parts() {
-                ResourceState::AwaitingProof
+            if self.sent_parts == self.resource.num_parts() {
+                self.enter_awaiting_proof();
             } else {
-                ResourceState::Transferring
-            };
+                self.resource.state = ResourceState::Transferring;
+            }
         }
 
         actions
@@ -3688,9 +3745,20 @@ mod tests {
         let (received, proof) = receiver.complete(None).unwrap();
         assert_eq!(received, data);
         assert_eq!(sender.resource.state, ResourceState::AwaitingProof);
-        // Receiver has delivered, but its proof is lost. Sender must release
-        // ownership as failed, never infer success from all parts being sent.
-        sender.last_progress = ago_or_skip!(sender.progress_timeout() + Duration::from_secs(1));
+        // Receiver has delivered, but its proof is lost. The sender queries
+        // the proof cache three times, then fails; it never infers success.
+        let mut expected_query = sender.resource.resource_hash.to_vec();
+        expected_query.extend_from_slice(&sender.resource.expected_proof);
+        for _ in 0..PROOF_CACHE_QUERIES {
+            sender.last_part_sent =
+                Some(ago_or_skip!(sender.proof_wait() + Duration::from_secs(1)));
+            assert_eq!(
+                sender.tick(),
+                TransferAction::QueryProofCache(expected_query.clone())
+            );
+            assert_eq!(sender.tick(), TransferAction::None);
+        }
+        sender.last_part_sent = Some(ago_or_skip!(sender.proof_wait() + Duration::from_secs(1)));
         assert_eq!(
             sender.tick(),
             TransferAction::Failed("resource proof timed out".to_string())

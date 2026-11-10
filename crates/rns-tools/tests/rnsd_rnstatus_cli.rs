@@ -244,8 +244,17 @@ async fn answer_stats_request(
     rpc::write_mp_frame(stream, &rpc::compute_python_auth_response(rpc_key, message)).await?;
     assert_eq!(rpc::read_mp_frame(stream, 256).await?, WELCOME);
     let request = rpc::decode_request(&rpc::read_mp_frame(stream, 4096).await?)?;
-    assert!(matches!(request, rpc::RpcRequest::GetInterfaceStats));
-    let answer = rpc::encode_response(&rpc::RpcResponse::InterfaceStats(stats.to_vec()))?;
+    // rnstatus registers its destination type around the stats request.
+    let answer = match request {
+        rpc::RpcRequest::WantsDestinationType { .. }
+        | rpc::RpcRequest::UnwantsAllDestinationTypes { .. } => {
+            rpc::encode_response(&rpc::RpcResponse::BoolResult(true))?
+        }
+        rpc::RpcRequest::GetInterfaceStats => {
+            rpc::encode_response(&rpc::RpcResponse::InterfaceStats(stats.to_vec()))?
+        }
+        other => panic!("unexpected request {other:?}"),
+    };
     rpc::write_mp_frame(stream, &answer).await
 }
 

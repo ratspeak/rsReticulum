@@ -3,6 +3,11 @@
 //! Validation follows Python's control flow, including which malformed
 //! envelopes are "invalid" and which raise (rnid exits 254 for those).
 
+pub mod b256;
+pub mod meta;
+pub mod pyfmt;
+mod pyre;
+
 use std::io::{Cursor, Read};
 
 use rmpv::Value;
@@ -32,7 +37,7 @@ pub fn create_rsg<R: Read>(
         message.read_to_end(&mut data).map_err(|e| e.to_string())?;
         (rns_crypto::sha::sha256(&data), Some(data))
     } else {
-        (sha256_reader(message).map_err(|e| e.to_string())?, None)
+        (get_rsg_hash(message).map_err(|e| e.to_string())?, None)
     };
 
     let mut meta_entries = vec![
@@ -88,8 +93,55 @@ pub fn is_legacy_format(rsg_data: &[u8]) -> bool {
 /// Python `umsgpack.unpackb`: one object, trailing bytes ignored; invalid
 /// UTF-8 strings, unhashable or duplicate map keys fail.
 pub fn unpackb(data: &[u8]) -> Option<Value> {
+    no_reserved_code(data, 0, rmpv::decode::MAX_DEPTH)?;
     let value = rmpv::decode::read_value(&mut Cursor::new(data)).ok()?;
     umsgpack_acceptable(&value).then_some(value)
+}
+
+/// The end of the object at `at`, or `None` where umsgpack raises
+/// `ReservedCodeException` for 0xc1 (rmpv reads it as nil), the data ends, or
+/// nesting passes rmpv's depth limit (upstream hits its recursion limit).
+fn no_reserved_code(data: &[u8], at: usize, depth: usize) -> Option<usize> {
+    let depth = depth.checked_sub(1)?;
+    let marker = *data.get(at)?;
+    let be = |n: usize| -> Option<usize> {
+        let bytes = data.get(at + 1..at + 1 + n)?;
+        Some(
+            bytes
+                .iter()
+                .fold(0usize, |acc, b| (acc << 8) | usize::from(*b)),
+        )
+    };
+    let skip = |header: usize, len: usize| at.checked_add(header)?.checked_add(len);
+    let items = |start: usize, count: usize| -> Option<usize> {
+        (0..count).try_fold(start, |pos, _| no_reserved_code(data, pos, depth))
+    };
+    match marker {
+        0x00..=0x7f | 0xc0 | 0xc2 | 0xc3 | 0xe0..=0xff => Some(at + 1),
+        0x80..=0x8f => items(at + 1, usize::from(marker & 0x0f) * 2),
+        0x90..=0x9f => items(at + 1, usize::from(marker & 0x0f)),
+        0xa0..=0xbf => skip(1, usize::from(marker & 0x1f)),
+        0xc1 => None,
+        0xc4 | 0xd9 => skip(2, be(1)?),
+        0xc5 | 0xda => skip(3, be(2)?),
+        0xc6 | 0xdb => skip(5, be(4)?),
+        0xc7 => skip(3, be(1)?),
+        0xc8 => skip(4, be(2)?),
+        0xc9 => skip(6, be(4)?),
+        0xca | 0xce | 0xd2 => Some(at + 5),
+        0xcb | 0xcf | 0xd3 => Some(at + 9),
+        0xcc | 0xd0 => Some(at + 2),
+        0xcd | 0xd1 => Some(at + 3),
+        0xd4 => Some(at + 3),
+        0xd5 => Some(at + 4),
+        0xd6 => Some(at + 6),
+        0xd7 => Some(at + 10),
+        0xd8 => Some(at + 18),
+        0xdc => items(at + 3, be(2)?),
+        0xdd => items(at + 5, be(4)?),
+        0xde => items(at + 3, be(2)?.checked_mul(2)?),
+        0xdf => items(at + 5, be(4)?.checked_mul(2)?),
+    }
 }
 
 fn umsgpack_acceptable(value: &Value) -> bool {
@@ -254,7 +306,7 @@ pub fn validate_rsg(
         return Err("No message specified for rsg validation".to_string());
     }
     let rsg_hash: Vec<u8> = match message {
-        Message::File(reader) => sha256_reader(reader).map_err(|e| e.to_string())?.to_vec(),
+        Message::File(reader) => get_rsg_hash(reader).map_err(|e| e.to_string())?.to_vec(),
         Message::Unpacked(Value::Binary(b)) => rns_crypto::sha::sha256(b).to_vec(),
         Message::Unpacked(Value::String(s)) if s.as_str().is_some() => {
             rns_crypto::sha::sha256(s.as_bytes()).to_vec()
@@ -293,20 +345,21 @@ pub fn validate_rsg(
         return Ok(None);
     }
 
-    // `None` stands for an identity whose public key failed to load.
-    let signing_identity: Option<Identity> = match required_signer {
-        Some(RequiredSigner::Identity(identity)) => Some(identity.clone()),
-        _ => {
-            let Ok(pubkey) = py_index(meta, "pubkey") else {
-                return Ok(None);
-            };
-            match pubkey {
-                Value::Binary(b) if b.len() == 64 => Identity::from_public_key(b).ok(),
-                _ => None,
-            }
-        }
+    let signing_key = match required_signer {
+        Some(RequiredSigner::Identity(identity)) => SigningKey::Loaded {
+            hash: identity.hash,
+            identity: Some(Box::new(identity.clone())),
+        },
+        _ => match py_index(meta, "pubkey") {
+            Ok(Value::Binary(pubkey)) => SigningKey::load(pubkey),
+            Ok(_) => SigningKey::None,
+            Err(_) => return Ok(None),
+        },
     };
-    let signing_hash = signing_identity.as_ref().map(|i| i.hash.to_vec());
+    let signing_hash = match &signing_key {
+        SigningKey::Loaded { hash, .. } => Some(hash.to_vec()),
+        _ => None,
+    };
     let required_hash = match required_signer {
         Some(RequiredSigner::Identity(identity)) => Some(identity.hash.to_vec()),
         Some(RequiredSigner::Hash(hash)) => Some(hash.to_vec()),
@@ -318,21 +371,59 @@ pub fn validate_rsg(
     if !matches!(py_index(&signed_data, "hash")?, Value::Binary(h) if *h == rsg_hash) {
         return Ok(None);
     }
-    let Some(identity) = signing_identity else {
-        return Err(
-            "'Signature validation failed because identity does not hold a public key'".to_string(),
-        );
+    let (hash, identity) = match signing_key {
+        SigningKey::None => {
+            return Err(
+                "'Signature validation failed because identity does not hold a public key'"
+                    .to_string(),
+            );
+        }
+        SigningKey::NoEd25519 => return Ok(None),
+        SigningKey::Loaded { hash, identity } => (hash, identity),
     };
-    if !identity.verify(envelope, &signature) {
+    if !identity.is_some_and(|identity| identity.verify(envelope, &signature)) {
         return Ok(None);
     }
     Ok(Some(Valid {
         signed_data,
-        signer_hash: identity.hash,
+        signer_hash: hash,
     }))
 }
 
-fn sha256_reader<R: Read>(mut reader: R) -> std::io::Result<[u8; 32]> {
+/// The state `Identity.load_public_key` leaves a public-only identity in
+/// (`RNS/Identity.py:1136-1156@1.6.0`).
+enum SigningKey {
+    /// The X25519 key did not load: `validate` raises.
+    None,
+    /// The X25519 key loaded but the Ed25519 key did not: no hash, and
+    /// `validate` returns False.
+    NoEd25519,
+    /// Both keys loaded. Upstream accepts any 32 Ed25519 bytes; `identity` is
+    /// `None` when they are not a curve point, and such a key never validates.
+    Loaded {
+        hash: [u8; 16],
+        identity: Option<Box<Identity>>,
+    },
+}
+
+impl SigningKey {
+    fn load(pubkey: &[u8]) -> Self {
+        let half = pubkey.len().min(32);
+        if half != 32 {
+            return SigningKey::None;
+        }
+        if pubkey.len() != 64 {
+            return SigningKey::NoEd25519;
+        }
+        SigningKey::Loaded {
+            hash: rns_crypto::sha::truncated_hash(pubkey),
+            identity: Identity::from_public_key(pubkey).ok().map(Box::new),
+        }
+    }
+}
+
+/// Python `get_rsg_hash` for bytes, text (as its UTF-8 bytes) or a file.
+pub fn get_rsg_hash<R: Read>(mut reader: R) -> std::io::Result<[u8; 32]> {
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -343,6 +434,86 @@ fn sha256_reader<R: Read>(mut reader: R) -> std::io::Result<[u8; 32]> {
         hasher.update(&buffer[..n]);
     }
     Ok(hasher.finalize().into())
+}
+
+/// Outcome of `check_release_rsm_structure` when it does not raise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsmStructure {
+    /// Upstream returns `True`.
+    Valid,
+    /// Upstream returns this failure string.
+    Invalid(&'static str),
+}
+
+/// Python `check_release_rsm_structure` (`RNS/Utilities/rnid.py:588-600@1.6.0`)
+/// over the signed data of a valid manifest. `Err` is the exception text.
+pub fn check_release_rsm_structure(signed_data: &Value) -> Result<RsmStructure, String> {
+    let release_meta = py_get(signed_data, "meta")?;
+    if !release_meta.is_some_and(py_truthy) {
+        return Ok(RsmStructure::Invalid("No release metadata in manifest"));
+    }
+    let release_meta = release_meta.unwrap_or(&Value::Nil);
+    let name = py_get(release_meta, "name")?;
+    let version = py_get(release_meta, "version")?;
+    let origin = py_get(release_meta, "origin")?;
+    let path = py_get(release_meta, "path")?;
+    let truthy = |v: Option<&Value>| v.is_some_and(py_truthy);
+    if !truthy(name) || !truthy(version) {
+        return Ok(RsmStructure::Invalid("Incomplete package data in manifest"));
+    }
+    if !truthy(origin) || !truthy(path) {
+        return Ok(RsmStructure::Invalid(
+            "Incomplete release origin data in manifest",
+        ));
+    }
+    if py_contains(name, "/")? || py_contains(version, "/")? {
+        return Ok(RsmStructure::Invalid("Invalid data in release manifest"));
+    }
+    let origin = origin.unwrap_or(&Value::Nil);
+    if py_len(origin)? != 16 {
+        return Ok(RsmStructure::Invalid(
+            "Invalid origin hash length in manifest",
+        ));
+    }
+    if !matches!(origin, Value::Binary(_)) {
+        return Ok(RsmStructure::Invalid("Invalid origin hash in manifest"));
+    }
+    Ok(RsmStructure::Valid)
+}
+
+/// Python `container.get(key, None)`; only a dict has `get`.
+fn py_get<'a>(container: &'a Value, key: &str) -> Result<Option<&'a Value>, String> {
+    match container {
+        Value::Map(entries) => Ok(entries
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(_, v)| v)),
+        other => Err(format!(
+            "'{}' object has no attribute 'get'",
+            py_class_name(other)
+        )),
+    }
+}
+
+/// Python `len(value)`.
+fn py_len(value: &Value) -> Result<usize, String> {
+    match value {
+        Value::String(s) => Ok(s.as_str().map_or(s.as_bytes().len(), |s| s.chars().count())),
+        Value::Binary(b) => Ok(b.len()),
+        Value::Array(a) => Ok(a.len()),
+        Value::Map(m) => Ok(m.len()),
+        other => Err(format!(
+            "object of type '{}' has no len()",
+            py_class_name(other)
+        )),
+    }
+}
+
+fn py_class_name(value: &Value) -> &'static str {
+    match value {
+        Value::Ext(_, _) => "Ext",
+        other => py_type_name(other),
+    }
 }
 
 pub fn pretty_hash(hash: &[u8]) -> String {
@@ -362,6 +533,16 @@ mod tests {
 
     fn fixture_identity() -> Identity {
         Identity::from_private_key(&hex::decode(FIXTURE_PRV_HEX).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn deeply_nested_envelope_is_rejected_without_overflowing() {
+        let mut data = vec![0x91u8; 200_000];
+        data.push(0x00);
+        assert!(unpackb(&data).is_none());
+        let mut data = vec![0x91u8; 100];
+        data.push(0x00);
+        assert!(unpackb(&data).is_some());
     }
 
     #[test]

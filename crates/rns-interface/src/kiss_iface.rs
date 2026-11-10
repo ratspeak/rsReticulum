@@ -101,195 +101,275 @@ pub fn beacon_frame_payload(id_callsign: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Python `KISSInterface.configure_device` sleeps this long after opening the
+/// port, before reading and before sending the TNC configuration.
+const CONFIGURE_SETTLE: Duration = Duration::from_secs(2);
+
+/// Spawn a KISS interface. An unopenable port does not fail the spawn: as in
+/// Python, the interface stays offline and the port is retried every
+/// `RECONNECT_WAIT` seconds, also after a runtime port error.
 pub async fn spawn_kiss_interface(
     config: KissInterfaceConfig,
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    let port = crate::serial::open_port(
-        serialport::new(&config.port, config.baud_rate)
-            .data_bits(config.data_bits)
-            .parity(config.parity)
-            .stop_bits(config.stop_bits)
-            .timeout(Duration::from_millis(KISS_READ_TIMEOUT_MS)),
-    )
-    .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("kiss serial open: {}", e)))?;
+    Ok(spawn_kiss_interface_observed(config, id, transport_tx)
+        .await?
+        .interface)
+}
 
-    spawn_kiss_with_port(config, id, transport_tx, port).await
+pub async fn spawn_kiss_interface_observed(
+    config: KissInterfaceConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+) -> Result<crate::serial::SpawnedSerialInterface, crate::traits::InterfaceError> {
+    spawn_kiss_with_port(config, id, transport_tx, None).await
 }
 
 async fn spawn_kiss_with_port(
     config: KissInterfaceConfig,
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
-    port: Box<dyn serialport::SerialPort>,
-) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    port: Option<crate::serial_io::Port>,
+) -> Result<crate::serial::SpawnedSerialInterface, crate::traits::InterfaceError> {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
-    rns_transport::notice!(
-        name = %config.name,
-        port = %config.port,
-        baud = config.baud_rate,
-        "KISS interface opened"
-    );
-
-    let online = Arc::new(AtomicBool::new(true));
+    let online = Arc::new(AtomicBool::new(false));
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
-    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+    let (tx, rx) = mpsc::channel::<Bytes>(256);
     let background = crate::background_announce::register(&tx)?;
     let name = config.name.clone();
     let python_identity =
         rns_transport::messages::InterfaceIdentity::bracketed("KISSInterface", &name);
     let mode = config.mode;
-    let flow_control = config.flow_control;
+    let (failures_tx, failures) = crate::serial_io::SerialFailures::channel();
 
-    let port_write = port
-        .try_clone()
-        .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("kiss clone: {}", e)))?;
-
-    // Push TNC tuning before main loops so they take effect before first frame.
-    {
-        let mut init_port = port_write.try_clone().map_err(|e| {
-            crate::traits::InterfaceError::SendFailed(format!("kiss init clone: {}", e))
-        })?;
-        let init_frames = build_kiss_init(
-            config.txdelay,
-            config.txtail,
-            config.persistence,
-            config.slottime,
-        );
-        use std::io::Write;
-        init_port
-            .write_all(&init_frames)
-            .and_then(|()| init_port.flush())
-            .map_err(|e| {
-                crate::traits::InterfaceError::SendFailed(format!("kiss configure: {}", e))
-            })?;
-    }
-
-    let ready = Arc::new(AtomicBool::new(true));
-
-    let online_w = online.clone();
-    let ready_w = ready.clone();
-    let txb_w = shared_txb.clone();
+    let supervisor = crate::serial_io::Supervisor {
+        identity: format!("KISSInterface[{name}]"),
+        opener: crate::serial::port_opener(
+            &config.port,
+            config.baud_rate,
+            config.data_bits,
+            config.parity,
+            config.stop_bits,
+            Duration::from_millis(KISS_READ_TIMEOUT_MS),
+        ),
+        settle: CONFIGURE_SETTLE,
+        online: online.clone(),
+        failures: failures_tx,
+    };
     let beacon = config
         .id_interval
         .zip(config.id_callsign.clone())
         .map(|(interval, callsign)| (Duration::from_secs(interval), Bytes::from(callsign)));
-    let writer = tokio::spawn(async move {
-        let mut port_w = port_write;
-        // Python first_tx semantics: armed by the first data TX after a
-        // beacon; cleared when the beacon goes out.
-        let mut first_tx: Option<tokio::time::Instant> = None;
-        let mut flow_control_locked = tokio::time::Instant::now();
-        let take_permit = |locked: tokio::time::Instant| {
-            if ready_w
-                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return true;
-            }
-            if locked.elapsed() > FLOW_CONTROL_TIMEOUT {
-                tracing::warn!(
-                    "KISS interface is unlocking flow control due to time-out. This should not happen. Your hardware might have missed a flow-control READY command, or maybe it does not support flow-control."
-                );
-                return true;
-            }
-            false
-        };
-        loop {
-            if !online_w.load(Ordering::SeqCst) {
-                break;
-            }
-            let background_packet = if rx.is_empty() {
-                background.try_start_when(rns_transport::now_f64(), || {
-                    !flow_control || take_permit(flow_control_locked)
-                })
-            } else {
-                None
+    let generation = KissGeneration {
+        id,
+        init_frames: build_kiss_init(
+            config.txdelay,
+            config.txtail,
+            config.persistence,
+            config.slottime,
+        ),
+        flow_control: config.flow_control,
+        beacon,
+        rx,
+        background,
+        transport_tx,
+        online: online.clone(),
+        rxb: shared_rxb.clone(),
+        txb: shared_txb.clone(),
+    };
+    let read_task = tokio::spawn(supervisor.run(generation, port));
+
+    Ok(crate::serial::SpawnedSerialInterface {
+        interface: InterfaceHandle {
+            id,
+            owner,
+            packet_capacity: InterfacePacketCapacity::new(500, 564, false),
+            parent_id: None,
+            name,
+            mode,
+            direction: InterfaceDirection {
+                inbound: true,
+                outbound: true,
+                forward: false,
+                repeat: false,
+            },
+            bitrate: BITRATE_GUESS,
+            mtu: 564,
+            online,
+            rxb: Some(shared_rxb),
+            txb: Some(shared_txb),
+            inspection: Some(
+                rns_transport::messages::InterfaceInspectionSource::identified(python_identity),
+            ),
+            tx,
+            read_task,
+        },
+        failures,
+    })
+}
+
+struct KissGeneration {
+    id: InterfaceId,
+    init_frames: Vec<u8>,
+    flow_control: bool,
+    beacon: Option<(Duration, Bytes)>,
+    rx: mpsc::Receiver<Bytes>,
+    background: crate::background_announce::BackgroundAnnounceReceiver,
+    transport_tx: InterfaceTransportSender,
+    online: Arc<AtomicBool>,
+    rxb: Arc<AtomicU64>,
+    txb: Arc<AtomicU64>,
+}
+
+impl crate::serial_io::SerialGeneration for KissGeneration {
+    fn outbound(&mut self) -> &mut mpsc::Receiver<Bytes> {
+        &mut self.rx
+    }
+
+    fn background(&self) -> &crate::background_announce::BackgroundAnnounceReceiver {
+        &self.background
+    }
+
+    fn run(
+        &mut self,
+        port: crate::serial_io::Port,
+    ) -> impl std::future::Future<Output = crate::serial_io::GenerationEnd> + Send {
+        use crate::serial_io::GenerationEnd;
+        let Self {
+            id,
+            init_frames,
+            flow_control,
+            beacon,
+            rx,
+            background,
+            transport_tx,
+            online,
+            rxb,
+            txb,
+        } = self;
+        let flow_control = *flow_control;
+        let id = *id;
+        async move {
+            let port_write = match port.try_clone() {
+                Ok(port) => port,
+                Err(e) => return GenerationEnd::ReadFailed(e.into()),
             };
-            let data = if let Some(packet) = &background_packet {
-                packet.raw().clone()
-            } else if let Some((interval, ref callsign)) = beacon {
-                match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
-                    Ok(Some(data)) => data,
-                    Ok(None) => break,
-                    Err(_) => {
-                        let due = first_tx.is_some_and(|t| t.elapsed() >= interval);
-                        if !due {
-                            continue;
+            // Python process_queue: a new generation starts with the radio ready.
+            let ready = AtomicBool::new(true);
+            let writer = async {
+                // Python starts the read loop and goes online before the TNC config.
+                let mut port_w =
+                    match crate::serial_io::blocking_write_all(port_write, init_frames.clone())
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => return GenerationEnd::WriteFailed(e),
+                    };
+                // Python first_tx semantics: armed by the first data TX after a
+                // beacon; cleared when the beacon goes out.
+                let mut first_tx: Option<tokio::time::Instant> = None;
+                let mut flow_control_locked = tokio::time::Instant::now();
+                let take_permit = |locked: tokio::time::Instant| {
+                    if ready
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                    if locked.elapsed() > FLOW_CONTROL_TIMEOUT {
+                        tracing::warn!(
+                            "KISS interface is unlocking flow control due to time-out. This should not happen. Your hardware might have missed a flow-control READY command, or maybe it does not support flow-control."
+                        );
+                        return true;
+                    }
+                    false
+                };
+                loop {
+                    if !online.load(Ordering::SeqCst) {
+                        return GenerationEnd::Closed;
+                    }
+                    let background_packet = if rx.is_empty() {
+                        background.try_start_when(rns_transport::now_f64(), || {
+                            !flow_control || take_permit(flow_control_locked)
+                        })
+                    } else {
+                        None
+                    };
+                    let data = if let Some(packet) = &background_packet {
+                        packet.raw().clone()
+                    } else if let Some((interval, callsign)) = beacon.as_ref() {
+                        match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+                            Ok(Some(data)) => data,
+                            Ok(None) => return GenerationEnd::Closed,
+                            Err(_) => {
+                                let due = first_tx.is_some_and(|t| t.elapsed() >= *interval);
+                                if !due {
+                                    continue;
+                                }
+                                tracing::debug!("KISS transmitting station-ID beacon");
+                                first_tx = None;
+                                Bytes::from(beacon_frame_payload(callsign))
+                            }
                         }
-                        tracing::debug!("KISS transmitting station-ID beacon");
+                    } else {
+                        match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                            Ok(Some(data)) => data,
+                            Ok(None) => return GenerationEnd::Closed,
+                            Err(_) => continue,
+                        }
+                    };
+
+                    // Python compares against the unpadded callsign, so a padded beacon re-arms.
+                    let is_beacon = beacon
+                        .as_ref()
+                        .is_some_and(|(_, callsign)| data == *callsign);
+                    if is_beacon {
                         first_tx = None;
-                        Bytes::from(beacon_frame_payload(callsign))
+                    } else if first_tx.is_none() {
+                        first_tx = Some(tokio::time::Instant::now());
                     }
-                }
-            } else {
-                match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
-                    Ok(Some(data)) => data,
-                    Ok(None) => break,
-                    Err(_) => continue,
+
+                    if flow_control && background_packet.is_none() {
+                        while !take_permit(flow_control_locked) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            if !online.load(Ordering::SeqCst) {
+                                return GenerationEnd::Closed;
+                            }
+                        }
+                    }
+                    if !online.load(Ordering::SeqCst) {
+                        return GenerationEnd::Closed;
+                    }
+                    if flow_control {
+                        flow_control_locked = tokio::time::Instant::now();
+                    }
+                    let framed = kiss::frame(&data);
+                    match crate::serial_io::blocking_write_all(port_w, framed).await {
+                        Ok(p) => {
+                            port_w = p;
+                            // Python counts the unframed payload here (KISSInterface.py:275).
+                            txb.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => return GenerationEnd::WriteFailed(e),
+                    }
                 }
             };
-
-            // Python compares against the unpadded callsign, so a padded beacon re-arms.
-            let is_beacon = beacon
-                .as_ref()
-                .is_some_and(|(_, callsign)| data == *callsign);
-            if is_beacon {
-                first_tx = None;
-            } else if first_tx.is_none() {
-                first_tx = Some(tokio::time::Instant::now());
-            }
-
-            if flow_control && background_packet.is_none() {
-                while !take_permit(flow_control_locked) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    if !online_w.load(Ordering::SeqCst) {
-                        return;
+            let reader = async {
+                let mut port_r = port;
+                let mut deframer = kiss::KissByteDeframer::new(HW_MTU);
+                let mut buf = [0u8; 1024];
+                let mut last_read = std::time::Instant::now();
+                loop {
+                    if !online.load(Ordering::SeqCst) {
+                        return GenerationEnd::Closed;
                     }
-                }
-            }
-            if !online_w.load(Ordering::SeqCst) {
-                break;
-            }
-            if flow_control {
-                flow_control_locked = tokio::time::Instant::now();
-            }
-            let framed = kiss::frame(&data);
-            match crate::serial_io::blocking_write_all(port_w, framed).await {
-                Ok(p) => {
-                    port_w = p;
-                    // Python counts the unframed payload here (KISSInterface.py:275).
-                    txb_w.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "KISS write error");
-                    online_w.store(false, Ordering::SeqCst);
-                    break;
-                }
-            }
-        }
-    });
-
-    let online_r = online.clone();
-    let ready_r = ready;
-    let rxb_r = shared_rxb.clone();
-    let read_task = tokio::spawn(async move {
-        // The writer lives and dies with the read task that teardown aborts.
-        let _writer = AbortOnDrop(writer);
-        let mut port_r = port;
-        let mut deframer = kiss::KissByteDeframer::new(HW_MTU);
-        let mut buf = [0u8; 1024];
-        let mut last_read = std::time::Instant::now();
-
-        loop {
-            if !online_r.load(Ordering::SeqCst) {
-                break;
-            }
-            match crate::serial_io::poll_read(port_r, buf).await {
-                Ok((p, b, n)) => {
+                    let (p, b, n) = match crate::serial_io::poll_read(port_r, buf).await {
+                        Ok(read) => read,
+                        Err(e) => return GenerationEnd::ReadFailed(e),
+                    };
                     port_r = p;
                     buf = b;
                     if n == 0 {
@@ -298,76 +378,38 @@ async fn spawn_kiss_with_port(
                         {
                             deframer.reset();
                         }
-                    } else {
-                        last_read = std::time::Instant::now();
-                        for event in deframer.feed(&buf[..n]) {
-                            match event {
-                                kiss::KissEvent::Data(frame) => {
-                                    rxb_r.fetch_add(
-                                        frame.len() as u64,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    let msg = TransportMessage::Inbound(InboundPacket {
-                                        raw: Bytes::from(frame),
-                                        interface_id: id,
-                                        rssi: None,
-                                        snr: None,
-                                        q: None,
-                                    });
-                                    if transport_tx.send(msg).await.is_err() {
-                                        tracing::warn!(id, "transport channel closed");
-                                        online_r.store(false, Ordering::SeqCst);
-                                        return;
-                                    }
+                        continue;
+                    }
+                    last_read = std::time::Instant::now();
+                    for event in deframer.feed(&buf[..n]) {
+                        match event {
+                            kiss::KissEvent::Data(frame) => {
+                                rxb.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                let msg = TransportMessage::Inbound(InboundPacket {
+                                    raw: Bytes::from(frame),
+                                    interface_id: id,
+                                    rssi: None,
+                                    snr: None,
+                                    q: None,
+                                });
+                                if transport_tx.send(msg).await.is_err() {
+                                    tracing::warn!(id, "transport channel closed");
+                                    return GenerationEnd::Closed;
                                 }
-                                kiss::KissEvent::Ready => {
-                                    ready_r.store(true, Ordering::SeqCst);
-                                    tracing::debug!(id, "KISS flow control: ready");
-                                }
+                            }
+                            kiss::KissEvent::Ready => {
+                                ready.store(true, Ordering::SeqCst);
+                                tracing::debug!(id, "KISS flow control: ready");
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "KISS read error");
-                    online_r.store(false, Ordering::SeqCst);
-                    return;
-                }
+            };
+            tokio::select! {
+                end = writer => end,
+                end = reader => end,
             }
         }
-    });
-
-    Ok(InterfaceHandle {
-        id,
-        owner,
-        packet_capacity: InterfacePacketCapacity::new(500, 564, false),
-        parent_id: None,
-        name,
-        mode,
-        direction: InterfaceDirection {
-            inbound: true,
-            outbound: true,
-            forward: false,
-            repeat: false,
-        },
-        bitrate: BITRATE_GUESS,
-        mtu: 564,
-        online,
-        rxb: Some(shared_rxb),
-        txb: Some(shared_txb),
-        inspection: Some(
-            rns_transport::messages::InterfaceInspectionSource::identified(python_identity),
-        ),
-        tx,
-        read_task,
-    })
-}
-
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 
@@ -438,12 +480,16 @@ mod tests {
         // inject the already-open pair into the same production driver.
         // A macOS pty slave drains only as the master reads, so read the
         // configuration frames while the driver is still starting.
-        let spawning = tokio::spawn(spawn_kiss_with_port(config, 1, inbound, Box::new(slave)));
+        let driver = spawn_kiss_with_port(config, 1, inbound, Some(Box::new(slave)))
+            .await
+            .unwrap()
+            .interface;
+        master.set_timeout(CONFIGURE_SETTLE * 2).unwrap();
         let init = build_kiss_init(None, None, None, None);
         let mut actual_init = vec![0; init.len()];
         master.read_exact(&mut actual_init).unwrap();
         assert_eq!(actual_init, init);
-        let driver = spawning.await.unwrap().unwrap();
+        master.set_timeout(Duration::from_millis(300)).unwrap();
         driver.owner.mark_registered();
         // The initial permit goes to the first packet; later ones wait for READY.
         driver.tx.send(Bytes::from_static(b"first")).await.unwrap();

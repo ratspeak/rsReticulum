@@ -32,6 +32,27 @@ const MIN_TRANSFER_TIMEOUT: Duration = Duration::from_millis(1);
 const USB_READER_BOUNDARY_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const USB_PACKET_WRITE_DEADLINE: Duration = Duration::from_secs(2);
 pub(crate) const USB_PROTOCOL_READINESS_DEADLINE: Duration = Duration::from_secs(10);
+/// Python Android `RNodeInterface.PORT_IO_TIMEOUT`.
+pub(crate) const PORT_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PortIoAction {
+    None,
+    Detect,
+    Unresponsive,
+}
+
+/// Python Android `RNodeInterface.readLoop`: past one timeout without port
+/// I/O it sends DETECT, past three it treats the port as unresponsive.
+pub(crate) fn port_io_action(idle: Duration) -> PortIoAction {
+    if idle > PORT_IO_TIMEOUT * 3 {
+        PortIoAction::Unresponsive
+    } else if idle > PORT_IO_TIMEOUT {
+        PortIoAction::Detect
+    } else {
+        PortIoAction::None
+    }
+}
 
 /// Stable identity retained across Android's transient `/dev/bus/usb` names.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -582,6 +603,7 @@ struct UsbWriteQueueInner {
     state: Mutex<UsbWriteQueueState>,
     wake: Condvar,
     slots: Arc<Semaphore>,
+    last_write: Mutex<Instant>,
 }
 
 #[derive(Clone)]
@@ -601,6 +623,7 @@ impl UsbWriteQueue {
                     worker_closed: false,
                 }),
                 wake: Condvar::new(),
+                last_write: Mutex::new(Instant::now()),
                 slots: Arc::new(Semaphore::new(capacity)),
             }),
         }
@@ -1218,6 +1241,13 @@ where
         } else {
             write_request(&mut backend, &request, default_timeout)
         };
+        if result.is_ok() {
+            *queue
+                .inner
+                .last_write
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+        }
         if result.is_ok()
             && let Some(background) = &request.background
         {
@@ -1334,6 +1364,17 @@ pub(crate) struct UsbWriterHandle {
 }
 
 impl UsbWriterHandle {
+    /// When the last write request completed, Python's `last_port_io` stamp
+    /// in `write_mux`.
+    pub(crate) fn last_write(&self) -> Instant {
+        *self
+            .queue
+            .inner
+            .last_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) async fn request_before(
         &self,
         phase: UsbWritePhase,
@@ -2501,6 +2542,37 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push("quarantined");
         }
+    }
+
+    #[test]
+    fn idle_port_sends_detect_then_fails_as_unresponsive() {
+        assert_eq!(port_io_action(Duration::from_secs(3)), PortIoAction::None);
+        assert_eq!(
+            port_io_action(Duration::from_millis(3_001)),
+            PortIoAction::Detect
+        );
+        assert_eq!(port_io_action(Duration::from_secs(9)), PortIoAction::Detect);
+        assert_eq!(
+            port_io_action(Duration::from_millis(9_001)),
+            PortIoAction::Unresponsive
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_writes_refresh_the_port_io_stamp() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let io = test_io(ScriptedWriter::new(vec![Ok(4)]), events);
+        let before = io.writer.last_write();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        io.writer
+            .request_before(
+                UsbWritePhase::Detect,
+                vec![1, 2, 3, 4],
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("scripted write completes");
+        assert!(io.writer.last_write() > before);
     }
 
     fn test_io(

@@ -1209,6 +1209,19 @@ async fn send_transfer_action(
         return Ok(());
     }
 
+    if let TransferAction::QueryProofCache(proof_data) = action {
+        return transport_tx
+            .send(TransportMessage::CacheRequest {
+                packet_hash: rns_protocol::resource::resource_proof_packet_hash(
+                    &link_id,
+                    &proof_data,
+                ),
+                destination_hash: link_id,
+            })
+            .await
+            .map_err(|_| RncpError::TransportUnavailable);
+    }
+
     let (context, body) = match action {
         TransferAction::SendAdvertisement(adv) => {
             let encrypted = link
@@ -1255,7 +1268,9 @@ async fn send_transfer_action(
             };
             (context, Bytes::from(encrypted))
         }
-        TransferAction::SendProof(_) => unreachable!("proof handled before data-packet match"),
+        TransferAction::SendProof(_) | TransferAction::QueryProofCache(_) => {
+            unreachable!("handled before data-packet match")
+        }
         TransferAction::None | TransferAction::Complete => return Ok(()),
         TransferAction::Failed(reason) => return Err(RncpError::ResourceFailed(reason)),
     };

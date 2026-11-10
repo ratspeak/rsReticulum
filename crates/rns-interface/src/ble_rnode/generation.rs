@@ -63,9 +63,10 @@ impl BleOperationStage {
             | Self::Discovery
             | Self::Subscribe
             | Self::NotificationAcquisition
-            | Self::Detect
             | Self::Capability
             | Self::Configure => Duration::from_secs(10),
+            // Python `ble_detect_timeout`.
+            Self::Detect => Duration::from_secs(5),
         }
     }
 }

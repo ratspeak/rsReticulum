@@ -3,12 +3,6 @@
 //! Port of `RNS/Utilities/rnid.py` from Reticulum 1.6.0: operation order,
 //! exit codes and the text printed on stdout follow the Python tool.
 
-mod b256;
-mod meta;
-mod pyfmt;
-mod pyre;
-mod rsg;
-
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -34,6 +28,8 @@ mod hw_commands;
 
 use rns_tools::RS_RETICULUM_VERSION;
 use rns_tools::format::pretty_size;
+use rns_tools::rsg::pyfmt::{self, py_fromhex, py_os_error};
+use rns_tools::rsg::{self, b256, meta};
 
 const DEFAULT_ASPECTS: &str = "rns.id";
 const NO_MESSAGE: &str = "\u{1}";
@@ -525,41 +521,6 @@ fn expanduser(path: &str) -> String {
 
 fn is_file(path: &str) -> bool {
     Path::new(path).is_file()
-}
-
-/// Python `str(OSError)` for a failed file operation.
-fn py_os_error(error: &std::io::Error, path: &str) -> String {
-    match error.raw_os_error() {
-        Some(code) => format!(
-            "[Errno {code}] {}: {}",
-            nix::errno::Errno::from_raw(code).desc(),
-            pyfmt::py_str_repr(path)
-        ),
-        None => error.to_string(),
-    }
-}
-
-/// `bytes.fromhex`.
-fn py_fromhex(text: &str) -> Result<Vec<u8>, String> {
-    let chars: Vec<char> = text.chars().collect();
-    let err =
-        |pos: usize| format!("non-hexadecimal number found in fromhex() arg at position {pos}");
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if matches!(chars[i], ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r') {
-            i += 1;
-            continue;
-        }
-        let hi = chars[i].to_digit(16).ok_or_else(|| err(i))?;
-        let lo = chars
-            .get(i + 1)
-            .and_then(|c| c.to_digit(16))
-            .ok_or_else(|| err(i + 1))?;
-        out.push((hi * 16 + lo) as u8);
-        i += 2;
-    }
-    Ok(out)
 }
 
 /// `base64.b32decode` (strict alphabet and padding).

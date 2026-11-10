@@ -1,6 +1,6 @@
-//! RNode over Android USB host access through JNI to `UsbManager`. The
-//! driver supports a single CDC-ACM function or CP2102-compatible USB UART
-//! (`10c4:ea60`), with bulk IN and OUT endpoints on the same data interface.
+//! RNode, Serial and KISS over Android USB host access through JNI to
+//! `UsbManager`. Supported adapters: a single CDC-ACM function, CP2102
+//! (`10c4:ea60`), and the FTDI and CH34x drivers of usbserial4a.
 //! Setup requires successful 8N1 configuration and matched DTR/RTS assertion,
 //! defaulting to 115200 baud; enumeration alone does not establish compatibility.
 
@@ -14,16 +14,17 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 
 use crate::android_usb_lifecycle::{
-    OwnedUsbIo, UsbApplicationQueue, UsbConnectionCleanup, UsbConnectionLifecycle,
+    OwnedUsbIo, PortIoAction, UsbApplicationQueue, UsbConnectionCleanup, UsbConnectionLifecycle,
     UsbDeviceCandidate, UsbDeviceResolutionError, UsbDeviceSelector, UsbInboundOutcome,
     UsbInboundState, UsbIoEvent, UsbLeaseTable, UsbRNodeCapabilityStartupError,
     UsbReadDrainOutcome, UsbReadResult, UsbReaderBackend, UsbShutdownReport, UsbTransferError,
-    UsbTxGate, UsbTxPumpExit, UsbWriterBackend, drain_usb_reader_tail, forward_usb_read_chunk,
-    resolve_usb_device, run_usb_rnode_capability_startup, run_usb_rnode_startup, run_usb_tx_pump,
-    spawn_owned_usb_io, usb_bulk_read_size,
+    UsbTxGate, UsbTxPumpExit, UsbWritePhase, UsbWriterBackend, drain_usb_reader_tail,
+    forward_usb_read_chunk, port_io_action, resolve_usb_device, run_usb_rnode_capability_startup,
+    run_usb_rnode_startup, run_usb_tx_pump, spawn_owned_usb_io, usb_bulk_read_size,
 };
 use crate::android_usb_setup::{
-    UsbEndpointDescriptor, UsbInterfaceDescriptor, configure_serial_port, select_serial_port,
+    UsbEndpointDescriptor, UsbInterfaceDescriptor, UsbSerialKind, UsbSerialLine,
+    configure_serial_port, select_serial_port, strip_ftdi_status, usb_read_timeout_ms,
 };
 #[cfg(test)]
 use crate::kiss;
@@ -42,7 +43,6 @@ pub const BAUD_RATE: u32 = 115_200;
 const USB_WRITE_QUEUE: usize = 64;
 const USB_READ_QUEUE: usize = 64;
 const USB_WRITE_TIMEOUT_MS: i32 = 1_000;
-const USB_READ_TIMEOUT_MS: i32 = 100;
 const USB_DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_millis(USB_WRITE_TIMEOUT_MS as u64);
 const USB_STARTUP_ACK_DEADLINE: Duration = Duration::from_secs(2);
 const USB_CAPABILITY_RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
@@ -250,10 +250,10 @@ pub struct AndroidUsbConfig {
     pub flow_control: bool,
     /// Short-term airtime cap, percent (0.0..=100.0). `None` sends no command
     /// and leaves the device's corresponding setting unchanged.
-    pub st_alock: Option<f32>,
+    pub st_alock: Option<f64>,
     /// Long-term airtime cap, percent (0.0..=100.0). `None` sends no command
     /// and leaves the device's corresponding setting unchanged.
-    pub lt_alock: Option<f32>,
+    pub lt_alock: Option<f64>,
     /// Station-ID beacon: seconds between IDs, sent only after data TX.
     pub id_interval: Option<u64>,
     pub id_callsign: Option<Vec<u8>>,
@@ -680,6 +680,9 @@ struct JniUsbReader {
     attached: Arc<AtomicBool>,
     idle_polls: u8,
     read_size: i32,
+    read_timeout_ms: i32,
+    /// FTDI prefixes each bulk IN packet of this size with two status bytes.
+    ftdi_packet_size: Option<usize>,
 }
 
 struct PendingAndroidUsbOpen {
@@ -958,14 +961,31 @@ impl UsbReaderBackend for JniUsbReader {
                         JValue::Object(endpoint.as_obj()),
                         JValue::Object(buffer.into()),
                         JValue::Int(read_size),
-                        JValue::Int(USB_READ_TIMEOUT_MS),
+                        JValue::Int(self.read_timeout_ms),
                     ],
                 )
                 .map_err(|error| jni_failure(env, "USB bulk read", error))?;
             let read = value
                 .i()
                 .map_err(|error| jni_failure(env, "USB bulk read result", error))?;
-            if read <= 0 {
+            if read > read_size {
+                return Err(format!(
+                    "USB bulk read returned invalid length {read} (capacity {read_size})"
+                ));
+            }
+            let data = if read > 0 {
+                let bytes = env
+                    .convert_byte_array(buffer)
+                    .map_err(|error| jni_failure(env, "USB read buffer conversion", error))?;
+                let bytes = &bytes[..read as usize];
+                match self.ftdi_packet_size {
+                    Some(packet) => strip_ftdi_status(bytes, packet),
+                    None => bytes.to_vec(),
+                }
+            } else {
+                Vec::new()
+            };
+            if data.is_empty() {
                 self.idle_polls = self.idle_polls.saturating_add(1);
                 if self.idle_polls >= 10 {
                     self.idle_polls = 0;
@@ -1009,15 +1029,7 @@ impl UsbReaderBackend for JniUsbReader {
                 return Ok(UsbReadResult::Idle);
             }
             self.idle_polls = 0;
-            if read > read_size {
-                return Err(format!(
-                    "USB bulk read returned invalid length {read} (capacity {read_size})"
-                ));
-            }
-            let bytes = env
-                .convert_byte_array(buffer)
-                .map_err(|error| jni_failure(env, "USB read buffer conversion", error))?;
-            Ok(UsbReadResult::Data(bytes[..read as usize].to_vec()))
+            Ok(UsbReadResult::Data(data))
         })
     }
 }
@@ -1155,7 +1167,7 @@ fn cleanup_failed_android_usb_open(owner: JniUsbConnectionOwner, setup_error: St
 
 fn open_usb_serial_attached(
     dev_name: &str,
-    baud_rate: u32,
+    line: &UsbSerialLine,
 ) -> Result<(JniUsbConnectionOwner, JniUsbWriter, JniUsbReader), String> {
     let result = with_env(|env| {
         let ctx = ensure_app_context(env)?;
@@ -1242,7 +1254,7 @@ fn open_usb_serial_attached(
             attached: attached.clone(),
         };
 
-        let setup = (|| -> Result<(GlobalRef, GlobalRef, i32), String> {
+        let setup = (|| -> Result<(GlobalRef, GlobalRef, i32, i32, Option<usize>), String> {
             let vendor_id = usb_int_property(env, device, "getVendorId")?;
             let product_id = usb_int_property(env, device, "getProductId")?;
             let iface_count = usb_int_property(env, device, "getInterfaceCount")?;
@@ -1324,7 +1336,7 @@ fn open_usb_serial_attached(
                 owner.claimed_interfaces.push(reference);
             }
 
-            configure_serial_port(&port, baud_rate, |request| {
+            configure_serial_port(&port, line, |request| {
                 let payload = env
                     .byte_array_from_slice(request.payload)
                     .map_err(|error| jni_failure(env, "USB setup payload", error))?;
@@ -1376,13 +1388,16 @@ fn open_usb_serial_attached(
                 input_endpoint,
                 output_endpoint,
                 usb_bulk_read_size(max_packet_size),
+                usb_read_timeout_ms(vendor_id, product_id),
+                (port.kind == UsbSerialKind::Ftdi).then_some(max_packet_size.max(3) as usize),
             ))
         })();
 
-        let (input_endpoint, output_endpoint, read_size) = match setup {
-            Ok(endpoints) => endpoints,
-            Err(error) => return Err(cleanup_failed_android_usb_open(owner, error)),
-        };
+        let (input_endpoint, output_endpoint, read_size, read_timeout_ms, ftdi_packet_size) =
+            match setup {
+                Ok(endpoints) => endpoints,
+                Err(error) => return Err(cleanup_failed_android_usb_open(owner, error)),
+            };
         let connection = match owner.connection.as_ref() {
             Some(connection) => connection.clone(),
             None => {
@@ -1409,6 +1424,8 @@ fn open_usb_serial_attached(
                 attached,
                 idle_polls: 0,
                 read_size,
+                read_timeout_ms,
+                ftdi_packet_size,
             },
         ))
     });
@@ -1433,7 +1450,8 @@ async fn open_usb_serial(
     let panic_device_name = dev_name.clone();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let _open_task = tokio::task::spawn_blocking(move || {
-        let result = open_usb_serial_attached(&dev_name, baud_rate).map(PendingAndroidUsbOpen::new);
+        let result = open_usb_serial_attached(&dev_name, &UsbSerialLine::eight_n_one(baud_rate))
+            .map(PendingAndroidUsbOpen::new);
         let _ = result_tx.send(result);
     });
     let pending = result_rx
@@ -1459,6 +1477,240 @@ async fn open_usb_serial(
         USB_DEFAULT_WRITE_TIMEOUT,
     );
     Ok((io, online))
+}
+
+#[cfg(feature = "serial")]
+/// The open USB session behind [`AndroidUsbSerialPort`] clones. The last clone
+/// releases the interfaces and closes the connection.
+struct AndroidUsbSerialSession {
+    reader: Mutex<Option<JniUsbReader>>,
+    writer: Mutex<Option<JniUsbWriter>>,
+    owner: Mutex<Option<JniUsbConnectionOwner>>,
+    pending: Mutex<Vec<u8>>,
+    name: String,
+}
+
+#[cfg(feature = "serial")]
+impl Drop for AndroidUsbSerialSession {
+    fn drop(&mut self) {
+        drop(
+            self.reader
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        drop(
+            self.writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        let owner = self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(owner) = owner
+            && let UsbConnectionCleanup::Unclosed { owner, .. } = owner.release_and_close()
+        {
+            owner.retain_quarantined();
+        }
+    }
+}
+
+#[cfg(feature = "serial")]
+/// A USB serial adapter opened through Android's `UsbManager`, exposed as a
+/// `serialport::SerialPort` so the Serial, KISS and AX.25 KISS drivers run
+/// over it unchanged (Python's Android interfaces use usbserial4a here).
+#[derive(Clone)]
+struct AndroidUsbSerialPort(Arc<AndroidUsbSerialSession>);
+
+#[cfg(feature = "serial")]
+impl std::io::Read for AndroidUsbSerialPort {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut pending = self
+            .0
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.is_empty() {
+            let mut reader = self
+                .0
+                .reader
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let reader = reader
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("USB serial reader released"))?;
+            match reader.read().map_err(std::io::Error::other)? {
+                UsbReadResult::Data(bytes) => *pending = bytes,
+                UsbReadResult::Idle => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "USB serial read timed out",
+                    ));
+                }
+            }
+        }
+        let n = buf.len().min(pending.len());
+        buf[..n].copy_from_slice(&pending[..n]);
+        pending.drain(..n);
+        Ok(n)
+    }
+}
+
+#[cfg(feature = "serial")]
+impl std::io::Write for AndroidUsbSerialPort {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut writer = self
+            .0
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let writer = writer
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("USB serial writer released"))?;
+        match writer.transfer(buf, USB_DEFAULT_WRITE_TIMEOUT) {
+            Ok(n) if n > 0 => Ok(n as usize),
+            Ok(n) => Err(std::io::Error::other(format!(
+                "USB bulk write returned {n}"
+            ))),
+            Err(error) => Err(std::io::Error::other(format!("{error:?}"))),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "serial")]
+impl serialport::SerialPort for AndroidUsbSerialPort {
+    fn name(&self) -> Option<String> {
+        Some(self.0.name.clone())
+    }
+    fn baud_rate(&self) -> serialport::Result<u32> {
+        Ok(0)
+    }
+    fn data_bits(&self) -> serialport::Result<serialport::DataBits> {
+        Ok(serialport::DataBits::Eight)
+    }
+    fn flow_control(&self) -> serialport::Result<serialport::FlowControl> {
+        Ok(serialport::FlowControl::None)
+    }
+    fn parity(&self) -> serialport::Result<serialport::Parity> {
+        Ok(serialport::Parity::None)
+    }
+    fn stop_bits(&self) -> serialport::Result<serialport::StopBits> {
+        Ok(serialport::StopBits::One)
+    }
+    fn timeout(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn set_baud_rate(&mut self, _: u32) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_data_bits(&mut self, _: serialport::DataBits) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_flow_control(&mut self, _: serialport::FlowControl) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_parity(&mut self, _: serialport::Parity) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_stop_bits(&mut self, _: serialport::StopBits) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_timeout(&mut self, _: Duration) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn write_request_to_send(&mut self, _: bool) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn write_data_terminal_ready(&mut self, _: bool) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+        Ok(true)
+    }
+    fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+        Ok(true)
+    }
+    fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+        Ok(false)
+    }
+    fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+        Ok(true)
+    }
+    fn bytes_to_read(&self) -> serialport::Result<u32> {
+        Ok(0)
+    }
+    fn bytes_to_write(&self) -> serialport::Result<u32> {
+        Ok(0)
+    }
+    fn clear(&self, _: serialport::ClearBuffer) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn try_clone(&self) -> serialport::Result<Box<dyn serialport::SerialPort>> {
+        Ok(Box::new(self.clone()))
+    }
+    fn set_break(&self) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn clear_break(&self) -> serialport::Result<()> {
+        Ok(())
+    }
+}
+
+/// Opener for Serial and KISS interfaces whose `port` names an Android USB
+/// device, as in Python's `Android/SerialInterface.py` and
+/// `Android/KISSInterface.py` (`usb.get_usb_device(self.port)`).
+#[cfg(feature = "serial")]
+pub(crate) fn usb_serial_opener(
+    port: &str,
+    baud_rate: u32,
+    data_bits: serialport::DataBits,
+    parity: serialport::Parity,
+    stop_bits: serialport::StopBits,
+) -> crate::serial_io::PortOpener {
+    use crate::android_usb_setup::UsbParity;
+    let device_name = port
+        .strip_prefix("androidusb://")
+        .unwrap_or(port)
+        .to_string();
+    let line = UsbSerialLine {
+        baud_rate,
+        data_bits: match data_bits {
+            serialport::DataBits::Five => 5,
+            serialport::DataBits::Six => 6,
+            serialport::DataBits::Seven => 7,
+            serialport::DataBits::Eight => 8,
+        },
+        parity: match parity {
+            serialport::Parity::Even => UsbParity::Even,
+            serialport::Parity::Odd => UsbParity::Odd,
+            serialport::Parity::None => UsbParity::None,
+        },
+        stop_bits: match stop_bits {
+            serialport::StopBits::Two => 2,
+            serialport::StopBits::One => 1,
+        },
+    };
+    Arc::new(move || {
+        reserve_android_usb_opening(&device_name).map_err(std::io::Error::other)?;
+        let (owner, writer, reader) =
+            open_usb_serial_attached(&device_name, &line).map_err(std::io::Error::other)?;
+        Ok(
+            Box::new(AndroidUsbSerialPort(Arc::new(AndroidUsbSerialSession {
+                reader: Mutex::new(Some(reader)),
+                writer: Mutex::new(Some(writer)),
+                owner: Mutex::new(Some(owner)),
+                pending: Mutex::new(Vec::new()),
+                name: device_name.clone(),
+            }))) as crate::serial_io::Port,
+        )
+    })
 }
 
 /// Explicitly quiesce and release an Android USB session that failed before
@@ -1791,6 +2043,9 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
             let mut drain_reader_tail = false;
             let mut terminal_reason = RNodeRuntimeReason::ConnectionLost;
             let mut configuration_rejected = None;
+            let mut port_unresponsive = false;
+            let mut last_read = std::time::Instant::now();
+            let mut port_io_check = tokio::time::interval(Duration::from_millis(250));
 
             loop {
                 tokio::select! {
@@ -1859,6 +2114,7 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
                                 break;
                             }
                             Some(UsbIoEvent::Read(bytes)) => {
+                                last_read = std::time::Instant::now();
                                 let forwarding = forward_usb_read_chunk(
                                     &mut inbound,
                                     &bytes,
@@ -1927,6 +2183,33 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
                                 }
                             }
                             None => break,
+                        }
+                    }
+                    _ = port_io_check.tick() => {
+                        let last_io = last_read.max(usb.writer.last_write());
+                        match port_io_action(last_io.elapsed()) {
+                            PortIoAction::None => {}
+                            PortIoAction::Detect => {
+                                let writer = usb.writer.clone();
+                                tokio::spawn(async move {
+                                    let _ = writer
+                                        .request_before(
+                                            UsbWritePhase::Detect,
+                                            rnode::build_detect_sequence(),
+                                            USB_DEFAULT_WRITE_TIMEOUT,
+                                        )
+                                        .await;
+                                });
+                            }
+                            PortIoAction::Unresponsive => {
+                                tracing::error!(
+                                    name = %read_name,
+                                    "Connected port became unresponsive, the interface is offline"
+                                );
+                                port_unresponsive = true;
+                                drain_reader_tail = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -2028,7 +2311,11 @@ pub async fn spawn_android_usb_rnode_interface_with_driver_and_options(
                 shutdown_status_tx.send_replace(AndroidUsbShutdownStatus::Complete(report));
                 return;
             }
-            publisher.connection_lost();
+            if port_unresponsive {
+                publisher.connection_failed();
+            } else {
+                publisher.connection_lost();
+            }
             snapshot_publisher = Some(publisher);
             last_report = Some(report);
             tracing::info!(name = %read_name, "Android USB RNode reconnecting");
@@ -2152,7 +2439,7 @@ mod tests {
         ));
 
         config = AndroidUsbConfig::new("validated", "device");
-        config.lt_alock = Some(f32::INFINITY);
+        config.lt_alock = Some(f64::INFINITY);
         assert!(matches!(
             config.validate(),
             Err(rnode::RNodeConfigValidationError::NonFinite {

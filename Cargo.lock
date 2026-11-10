@@ -1646,6 +1646,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rns-git"
+version = "1.4.0"
+dependencies = [
+ "base64",
+ "hex",
+ "rmpv",
+ "rns-identity",
+ "rns-tools",
+ "serde_json",
+]
+
+[[package]]
 name = "rns-identity"
 version = "1.4.0"
 dependencies = [

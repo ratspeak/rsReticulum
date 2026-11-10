@@ -102,9 +102,9 @@ pub struct SubInterfaceConfig {
     pub flow_control: bool,
     pub outgoing: bool,
     /// Short-term airtime cap, percent of duty cycle.
-    pub st_alock: Option<f32>,
+    pub st_alock: Option<f64>,
     /// Long-term airtime cap, percent of duty cycle.
-    pub lt_alock: Option<f32>,
+    pub lt_alock: Option<f64>,
 }
 
 impl SubInterfaceConfig {
@@ -227,16 +227,18 @@ pub fn build_subinterface_init(index: u8, config: &SubInterfaceConfig) -> Vec<u8
     kiss::frame_with_command_into(rnode::CMD_CR, &[config.coding_rate], &mut out);
     kiss::frame_with_command_into(rnode::CMD_TXPOWER, &[config.tx_power as u8], &mut out);
     if let Some(st) = config.st_alock {
-        let at = (st * 100.0) as u16;
-        let c1 = (at >> 8) as u8;
-        let c2 = (at & 0xFF) as u8;
-        kiss::frame_with_command_into(rnode::CMD_ST_ALOCK, &[c1, c2], &mut out);
+        kiss::frame_with_command_into(
+            rnode::CMD_ST_ALOCK,
+            &rnode::airtime_lock_word(st).to_be_bytes(),
+            &mut out,
+        );
     }
     if let Some(lt) = config.lt_alock {
-        let at = (lt * 100.0) as u16;
-        let c1 = (at >> 8) as u8;
-        let c2 = (at & 0xFF) as u8;
-        kiss::frame_with_command_into(rnode::CMD_LT_ALOCK, &[c1, c2], &mut out);
+        kiss::frame_with_command_into(
+            rnode::CMD_LT_ALOCK,
+            &rnode::airtime_lock_word(lt).to_be_bytes(),
+            &mut out,
+        );
     }
     kiss::frame_with_command_into(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_ON], &mut out);
     kiss::frame_with_command_into(

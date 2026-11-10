@@ -289,6 +289,11 @@ impl TransportActor {
         self.traffic.record_tx(0, request.raw.len() as u64);
         let packet_hash = rns_wire::hash::packet_hash(&request.raw, header.flags.header_type);
         self.packet_hashlist.insert(packet_hash);
+        if header.flags.packet_type == rns_wire::flags::PacketType::Proof
+            && header.context == rns_wire::context::PacketContext::ResourcePrf
+        {
+            self.cache_proof(packet_hash, request.raw.clone());
+        }
 
         if interface_id != LOCAL_LINK_INITIATOR_INTERFACE
             && interface_id != LOCAL_LINK_RESPONDER_INTERFACE

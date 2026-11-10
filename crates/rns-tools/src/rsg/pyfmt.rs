@@ -1,5 +1,6 @@
 //! Python `str()`/`repr()` rendering of msgpack values, as printed by
-//! `rnid -V <file>.rsm --meta` (`RNS/Utilities/rnid.py:697-723@1.6.0`).
+//! `rnid -V <file>.rsm --meta` (`RNS/Utilities/rnid.py:697-723@1.6.0`),
+//! and of the exceptions the rsg tools print.
 
 use rmpv::Value;
 
@@ -147,6 +148,41 @@ pub fn py_float(value: f64) -> String {
         }
         let esign = if exp < 0 { '-' } else { '+' };
         format!("{sign}{m}e{esign}{:02}", exp.abs())
+    }
+}
+
+/// `bytes.fromhex`.
+pub fn py_fromhex(text: &str) -> Result<Vec<u8>, String> {
+    let chars: Vec<char> = text.chars().collect();
+    let err =
+        |pos: usize| format!("non-hexadecimal number found in fromhex() arg at position {pos}");
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if matches!(chars[i], ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r') {
+            i += 1;
+            continue;
+        }
+        let hi = chars[i].to_digit(16).ok_or_else(|| err(i))?;
+        let lo = chars
+            .get(i + 1)
+            .and_then(|c| c.to_digit(16))
+            .ok_or_else(|| err(i + 1))?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Ok(out)
+}
+
+/// Python `str(OSError)` for a failed file operation.
+pub fn py_os_error(error: &std::io::Error, path: &str) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!(
+            "[Errno {code}] {}: {}",
+            nix::errno::Errno::from_raw(code).desc(),
+            py_str_repr(path)
+        ),
+        None => error.to_string(),
     }
 }
 

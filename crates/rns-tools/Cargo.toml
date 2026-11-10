@@ -67,3 +67,15 @@ path = "src/bin/rnodeconf-rs.rs"
 [[bin]]
 name = "rnsh-rs"
 path = "src/bin/rnsh-rs.rs"
+
+[[bin]]
+name = "rnir-rs"
+path = "src/bin/rnir-rs.rs"
+
+[[bin]]
+name = "rnpkg-rs"
+path = "src/bin/rnpkg-rs.rs"
+
+[[bin]]
+name = "rnx-rs"
+path = "src/bin/rnx-rs.rs"

@@ -310,22 +310,13 @@ impl TransportActor {
                 TransportQueryResponse::StringResult(name)
             }
             TransportQuery::GetPacketRssi { packet_hash } => TransportQueryResponse::FloatResult(
-                self.packet_metrics
-                    .get(&packet_hash)
-                    .and_then(|m| m.rssi)
-                    .map(|v| v as f64),
+                first_packet_metric(&self.packet_rssi_cache, &packet_hash),
             ),
             TransportQuery::GetPacketSnr { packet_hash } => TransportQueryResponse::FloatResult(
-                self.packet_metrics
-                    .get(&packet_hash)
-                    .and_then(|m| m.snr)
-                    .map(|v| v as f64),
+                first_packet_metric(&self.packet_snr_cache, &packet_hash),
             ),
             TransportQuery::GetPacketQ { packet_hash } => TransportQueryResponse::FloatResult(
-                self.packet_metrics
-                    .get(&packet_hash)
-                    .and_then(|m| m.q)
-                    .map(|v| v as f64),
+                first_packet_metric(&self.packet_q_cache, &packet_hash),
             ),
             TransportQuery::DropPath { dest } => {
                 // expire() forces immediate cull — plain `remove` would leave
@@ -614,6 +605,7 @@ impl TransportActor {
                     .map(|e| e.interface_id)
                     .or_else(|| self.local_destination_interface_id(&dest))
                     .and_then(|id| self.interfaces.get(&id))
+                    .filter(|iface| iface.packet_capacity.link_mtu_upgrade)
                     .map(|iface| i64::from(iface.mtu));
                 TransportQueryResponse::IntResult(mtu.unwrap_or(-1))
             }
@@ -627,18 +619,7 @@ impl TransportActor {
                 TransportQueryResponse::IntResult(id.unwrap_or(-1))
             }
             TransportQuery::FirstHopTimeout { dest } => {
-                let timeout = self
-                    .path_table
-                    .get_live(&dest)
-                    .and_then(|e| self.interfaces.get(&e.interface_id))
-                    .filter(|iface| iface.bitrate != 0)
-                    .map(|iface| {
-                        let per_byte_latency = 8.0 / iface.bitrate as f64;
-                        rns_wire::constants::MTU as f64 * per_byte_latency
-                            + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
-                    })
-                    .unwrap_or(rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT);
-                TransportQueryResponse::FloatResult(Some(timeout))
+                TransportQueryResponse::FloatResult(Some(self.first_hop_timeout(&dest)))
             }
             TransportQuery::ExtraLinkProofTimeout { interface_id } => {
                 let timeout = self
@@ -1065,6 +1046,43 @@ fn activation_epoch(now: f64, active: bool, activated: std::time::Instant) -> f6
     } else {
         0.0
     }
+}
+
+impl TransportActor {
+    /// Python `Transport.first_hop_timeout` (Transport.py:3539-3542).
+    pub(super) fn first_hop_timeout(&self, dest: &[u8; 16]) -> f64 {
+        self.path_table
+            .get_live(dest)
+            .and_then(|e| self.interfaces.get(&e.interface_id))
+            .filter(|iface| iface.bitrate != 0)
+            .map(|iface| {
+                let per_byte_latency = 8.0 / iface.bitrate as f64;
+                rns_wire::constants::MTU as f64 * per_byte_latency
+                    + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
+            })
+            .unwrap_or(rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT)
+    }
+
+    /// Python's receipt timeout for a non-Link destination:
+    /// `first_hop_timeout + TIMEOUT_PER_HOP * hops_to` (Packet.py:427-433).
+    pub(super) fn default_receipt_timeout(&self, dest: &[u8; 16]) -> std::time::Duration {
+        let hops = self
+            .path_table
+            .hops_to(dest)
+            .unwrap_or(crate::constants::PATHFINDER_M);
+        std::time::Duration::from_secs_f64(
+            self.first_hop_timeout(dest)
+                + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT * f64::from(hops),
+        )
+    }
+}
+
+/// Python returns the first matching cache entry (Reticulum.py:2085-2093).
+fn first_packet_metric(cache: &VecDeque<([u8; 32], f32)>, packet_hash: &[u8; 32]) -> Option<f64> {
+    cache
+        .iter()
+        .find(|(hash, _)| hash == packet_hash)
+        .map(|(_, value)| f64::from(*value))
 }
 
 #[cfg(test)]

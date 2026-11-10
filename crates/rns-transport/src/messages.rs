@@ -761,9 +761,9 @@ pub enum TransportMessage {
         id: AnnounceHandlerId,
         result_tx: Option<tokio::sync::oneshot::Sender<bool>>,
     },
-    /// Replay a matching packet from the local on-disk announce cache when
-    /// available. On a miss, a network CacheRequest is emitted only when transport
-    /// is enabled. This command has no success reply.
+    /// Python `Transport.cache_request`: replay a locally cached resource proof,
+    /// otherwise send a CACHE_REQUEST on the bound Link `destination_hash`.
+    /// This command has no success reply.
     CacheRequest {
         packet_hash: [u8; 32],
         destination_hash: [u8; 16],

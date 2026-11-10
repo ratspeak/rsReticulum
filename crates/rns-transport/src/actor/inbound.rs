@@ -2,15 +2,15 @@ use super::*;
 use crate::announce_validation::{CachedAnnounce, InvalidAnnounce, ValidatedAnnounce};
 use crate::now_f64;
 
-/// Where an inbound packet comes from. Python re-injects held and cached
-/// announces with `ifac_handled=True` (Interface.py:296, Transport.py:3119),
+/// Where an inbound packet comes from. Python re-injects held announces and
+/// cached packets with `ifac_handled=True` (Interface.py:296, Transport.py:3460),
 /// and its byte counters live in the interface drivers, so neither passes
 /// IFAC or counts as received traffic again.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InboundOrigin {
     Wire,
     HeldAnnounce,
-    CachedAnnounce,
+    CachedPacket,
 }
 
 /// A transit link proof's verdict; only a bad signature is a protocol
@@ -122,15 +122,22 @@ impl TransportActor {
         }
     }
 
-    pub(super) fn on_cached_announce(&mut self, packet: crate::messages::InboundPacket) {
-        if packet.raw.len() > 500
-            || !rns_wire::header::PacketHeader::unpack(&packet.raw).is_ok_and(|(header, _)| {
-                header.flags.packet_type == rns_wire::flags::PacketType::Announce
-            })
-        {
+    /// Python `Transport.inbound(cached.raw, cached.receiving_interface)`
+    /// for a locally cached packet; a sent packet has no receiving interface.
+    pub(super) fn replay_cached_packet(&mut self, raw: Bytes) {
+        if raw.len() > 500 {
             return;
         }
-        self.on_inbound_inner(packet, InboundOrigin::CachedAnnounce);
+        self.on_inbound_inner(
+            crate::messages::InboundPacket {
+                raw,
+                interface_id: 0,
+                rssi: None,
+                snr: None,
+                q: None,
+            },
+            InboundOrigin::CachedPacket,
+        );
     }
 
     fn on_inbound_inner(&mut self, packet: crate::messages::InboundPacket, origin: InboundOrigin) {
@@ -147,7 +154,7 @@ impl TransportActor {
         }
         // Upstream bounds the frame only after IFAC (Transport.py:2014,
         // HW_MTU + ifac_size, the default IFAC size without IFAC).
-        let clear_limit = if origin == InboundOrigin::CachedAnnounce {
+        let clear_limit = if origin == InboundOrigin::CachedPacket {
             500
         } else {
             let Some(entry) = self.interfaces.get(&packet.interface_id) else {
@@ -349,7 +356,6 @@ impl TransportActor {
             snr: packet.snr,
             q: packet.q,
         };
-        self.record_packet_metrics(pkt_hash, packet_metrics);
         self.record_interface_signal(packet.interface_id, packet_metrics);
 
         // On shared media (e.g. LoRa) we overhear our own forwards and link
@@ -377,7 +383,7 @@ impl TransportActor {
             }
         }
 
-        if origin != InboundOrigin::CachedAnnounce {
+        if origin != InboundOrigin::CachedPacket {
             self.count_rx_packet();
         }
 
@@ -399,6 +405,8 @@ impl TransportActor {
         if check_hashlist {
             self.packet_hashlist.insert(pkt_hash);
         }
+        // Python records PHY stats in `_inbound`, after the packet filter (Transport.py:2192-2209).
+        self.record_packet_metrics(pkt_hash, packet_metrics);
 
         parsed.hops = self.adjusted_inbound_hops(parsed.hops, packet.interface_id);
 
@@ -995,15 +1003,37 @@ impl TransportActor {
         }
         let app_data_for_handlers = announce_app_data;
 
+        // The desiring interface is unused: the response rebroadcasts once
+        // everywhere through the announce table (Transport.py:2626-2648).
         if is_from_local_client
             && header.context == rns_wire::context::PacketContext::PathResponse
-            && let Some(waiting_interface) = self
+            && self
                 .pending_local_path_requests
                 .remove(&header.destination_hash)
-            && let Some(response) =
-                self.path_response_from_cached_announce(raw, header.destination_hash, header.hops)
+                .is_some()
         {
-            self.send_to_interface(waiting_interface, &response);
+            let now = now_f64();
+            let rebroadcast_raw = self.transport_announce_from_raw(
+                raw,
+                header.destination_hash,
+                header.hops,
+                rns_wire::context::PacketContext::None,
+            );
+            self.announce_table.insert(
+                header.destination_hash,
+                crate::announce::AnnounceEntry {
+                    timestamp: now,
+                    retransmit_timeout: now,
+                    retries: PATHFINDER_R,
+                    received_from: header.transport_id.unwrap_or(header.destination_hash),
+                    hops: header.hops,
+                    packet_raw: rebroadcast_raw,
+                    local_rebroadcasts: 0,
+                    block_rebroadcast: false,
+                    attached_interface: None,
+                    source_interface: Some(interface_id),
+                },
+            );
         }
 
         self.send_announce_to_local_clients(
@@ -1166,8 +1196,14 @@ impl TransportActor {
             return;
         }
 
-        if header.context == rns_wire::context::PacketContext::CacheRequest {
-            self.handle_cache_request(raw, header, interface_id);
+        if header.context == rns_wire::context::PacketContext::CacheRequest
+            && self.handle_cache_request(
+                raw,
+                header,
+                interface_id,
+                self.is_transport_enabled || from_local_client || to_local_client,
+            )
+        {
             return;
         }
 

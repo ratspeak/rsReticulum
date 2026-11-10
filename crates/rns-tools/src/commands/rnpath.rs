@@ -197,32 +197,46 @@ pub(crate) async fn main() -> ExitCode {
         Ok(ctx) => ctx,
         Err(code) => return code,
     };
+    // rnpath.py:108-110
+    let registration = rns_tools::RpcRegistration::want(
+        ctx.endpoint.clone(),
+        ctx.rpc_key.clone(),
+        &[MGMT_APP, BLACKHOLE_APP],
+        LOCAL_RPC_TIMEOUT,
+    )
+    .await;
+    let code = dispatch_local(&args, &ctx, destination).await;
+    registration.release().await;
+    code
+}
+
+async fn dispatch_local(args: &Args, ctx: &ClientCtx, destination: Option<&str>) -> ExitCode {
     // Dispatch order of rnpath.py:132-490.
     if args.blackholed {
-        return show_blackholed(&ctx, destination).await;
+        return show_blackholed(ctx, destination).await;
     }
     if args.blackhole {
-        return do_blackhole(&ctx, destination, args.duration, args.reason.clone()).await;
+        return do_blackhole(ctx, destination, args.duration, args.reason.clone()).await;
     }
     if args.unblackhole {
-        return do_unblackhole(&ctx, destination).await;
+        return do_unblackhole(ctx, destination).await;
     }
     if args.table {
-        return show_path_table(&ctx, destination, args.max, args.json, args.usage).await;
+        return show_path_table(ctx, destination, args.max, args.json, args.usage).await;
     }
     if args.rates {
-        return show_rate_table(&ctx, destination, args.json).await;
+        return show_rate_table(ctx, destination, args.json).await;
     }
     if args.drop_announces {
-        return drop_announces(&ctx).await;
+        return drop_announces(ctx).await;
     }
     if args.drop {
-        return drop_path(&ctx, destination).await;
+        return drop_path(ctx, destination).await;
     }
     if args.drop_via {
-        return drop_all_via(&ctx, destination).await;
+        return drop_all_via(ctx, destination).await;
     }
-    query_path(&ctx, destination, args.timeout).await
+    query_path(ctx, destination, args.timeout).await
 }
 
 /// rnpath.py:249-255 and its copies: a 32-character hex destination.
@@ -1065,7 +1079,7 @@ fn now_epoch() -> f64 {
 
 /// Start the runtime used for `-R` and `-p`, as rnpath.py:108 does.
 async fn start_runtime(args: &Args) -> Result<ReticulumHandle, ExitCode> {
-    init(
+    let handle = init(
         args.config.as_deref(),
         None,
         ShutdownSignal::new(),
@@ -1075,7 +1089,11 @@ async fn start_runtime(args: &Args) -> Result<ReticulumHandle, ExitCode> {
     .map_err(|e| {
         eprintln!("rnpath-rs: failed to initialize Reticulum runtime: {e:?}");
         ExitCode::from(1)
-    })
+    })?;
+    // rnpath.py:108-110
+    handle.wants_destination_type(MGMT_APP).await;
+    handle.wants_destination_type(BLACKHOLE_APP).await;
+    Ok(handle)
 }
 
 async fn stop_runtime(handle: ReticulumHandle, code: ExitCode) -> ExitCode {

@@ -1,0 +1,20 @@
+usage: rngcs-rs [-h] -Y {sign,find-principals,check-novalidate,verify}
+                [-n NAMESPACE] [-f KEYFILE] [-I PRINCIPAL] [-s SIGFILE]
+                [-O SSH_OPTIONS]
+                [file]
+
+Git commit signer and validator
+
+positional arguments:
+  file                  File to sign (for signing)
+
+options:
+  -h, --help            show this help message and exit
+  -Y {sign,find-principals,check-novalidate,verify}
+                        Operation to perform
+  -n NAMESPACE          Namespace
+  -f KEYFILE            Key file (for signing) or allowed signers file (for
+                        verification)
+  -I PRINCIPAL          Principal identity (for verification)
+  -s SIGFILE            Signature file
+  -O SSH_OPTIONS        SSH options (for git compatibility, ignored)

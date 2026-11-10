@@ -1,0 +1,23 @@
+[package]
+name = "rns-git"
+description = "Git over Reticulum: rngit-rs and the rngcs-rs commit signer"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+autobins = false
+
+[dependencies]
+rns-tools = { path = "../rns-tools" }
+rns-identity = { workspace = true }
+rmpv = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[[bin]]
+name = "rngcs-rs"
+path = "src/bin/rngcs-rs.rs"

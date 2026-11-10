@@ -1,6 +1,9 @@
 use super::*;
 use crate::now_f64;
 
+/// Bound on the in-memory resource proof cache; Python keeps one file per proof.
+const PROOF_CACHE_MAX_ENTRIES: usize = 1024;
+
 /// Path-request lengths (Transport.py:3975-3980).
 pub(super) const PR_LEGACY_LENGTH: usize = 32;
 pub(super) const PR_LENGTH: usize = 48;
@@ -159,15 +162,13 @@ impl TransportActor {
                 .recent_announces
                 .get(&request.destination_hash)
                 .and_then(|announce| announce.public_key);
+            let receipt_timeout = self.default_receipt_timeout(&request.destination_hash);
             match self.receipt_table.entry(trunc_hash) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let full_hash =
                         rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
-                    let mut receipt = PacketReceipt::new(
-                        full_hash,
-                        trunc_hash,
-                        Some(std::time::Duration::from_secs(180)),
-                    );
+                    let mut receipt =
+                        PacketReceipt::new(full_hash, trunc_hash, Some(receipt_timeout));
                     receipt
                         .set_destination_identity(request.destination_hash, destination_public_key);
                     entry.insert(receipt);
@@ -502,80 +503,122 @@ impl TransportActor {
         Some(true)
     }
 
-    /// Payload is a 32-byte packet hash identifying a cached announce. Look
-    /// up the destination via `path_table.packet_hash`, fetch the stored raw
-    /// announce in `recent_announces`, and rebroadcast it so the requester
-    /// can resume an interrupted route.
+    /// Python's packet cache holds only the resource proofs this instance
+    /// sent; files expire after `PATH_TIMEOUT` (Reticulum.py:1438-1446).
+    pub(super) fn cache_proof(&mut self, packet_hash: [u8; 32], raw: Bytes) {
+        if self
+            .proof_cache
+            .insert(packet_hash, (raw, now_f64()))
+            .is_none()
+        {
+            self.proof_cache_order.push_back(packet_hash);
+        }
+        while self.proof_cache_order.len() > PROOF_CACHE_MAX_ENTRIES {
+            if let Some(oldest) = self.proof_cache_order.pop_front() {
+                self.proof_cache.remove(&oldest);
+            }
+        }
+    }
+
+    /// Python `Transport.get_cached_packet(packet_hash)` (Transport.py:3398-3437).
+    fn cached_proof(&self, packet_hash: &[u8; 32]) -> Option<Bytes> {
+        self.proof_cache
+            .get(packet_hash)
+            .filter(|(_, stored)| now_f64() - stored <= PATHFINDER_E as f64)
+            .map(|(raw, _)| raw.clone())
+    }
+
+    fn bound_link_role(&self, link_id: &[u8; 16]) -> Option<crate::messages::LinkEndpointRole> {
+        use crate::messages::LinkEndpointRole;
+        [LinkEndpointRole::Initiator, LinkEndpointRole::Responder]
+            .into_iter()
+            .find(|role| self.link_endpoints.contains_key(&(*link_id, *role)))
+    }
+
+    /// A CACHE_REQUEST for one of our established Links is answered by
+    /// re-sending the cached packet's data on that Link, and dropped on a
+    /// miss (Transport.py:2845-2855). Any other request replays a cache hit
+    /// through inbound when transport handling applies, and otherwise returns
+    /// false so normal processing continues (Transport.py:2271-2287, :3439-3452).
     pub(super) fn handle_cache_request(
         &mut self,
         raw: &[u8],
         header: &rns_wire::header::PacketHeader,
-        _interface_id: InterfaceId,
-    ) {
-        let payload_start = match self.data_payload_offset(raw, header) {
-            Some(offset) => offset,
-            None => {
-                trace!("cache request: packet too short for header");
-                return;
-            }
+        interface_id: InterfaceId,
+        transport_handling: bool,
+    ) -> bool {
+        let requested = self
+            .data_payload_offset(raw, header)
+            .and_then(|offset| <[u8; 32]>::try_from(&raw[offset..]).ok());
+        let link_id = header.destination_hash;
+        let local_link = (header.flags.destination_type == rns_wire::flags::DestinationType::Link)
+            .then(|| self.bound_link_role(&link_id))
+            .flatten();
+        let Some(role) = local_link else {
+            let Some(cached) = requested
+                .filter(|_| transport_handling)
+                .and_then(|hash| self.cached_proof(&hash))
+            else {
+                return false;
+            };
+            self.replay_cached_packet(cached);
+            return true;
         };
-        let payload = &raw[payload_start..];
-
-        if payload.len() != 32 {
-            trace!(
-                len = payload.len(),
-                "cache request: payload is not 32 bytes (expected packet hash), ignoring"
-            );
-            return;
+        if self.link_packet_on_unbound_interface(header, interface_id) {
+            return true;
         }
-
-        let mut requested_hash = [0u8; 32];
-        requested_hash.copy_from_slice(payload);
-
-        let dest_and_hops: Option<([u8; 16], u8)> = self
-            .path_table
-            .iter()
-            .find(|(_, entry)| entry.packet_hash == Some(requested_hash))
-            .map(|(dest, entry)| (*dest.as_bytes(), entry.hops));
-
-        let Some((dest, cached_hops)) = dest_and_hops else {
-            trace!(
-                hash = %hex::encode(requested_hash),
-                "cache request miss — no path entry with matching packet hash"
-            );
-            return;
+        let Some(cached) = requested.and_then(|hash| self.cached_proof(&hash)) else {
+            trace!(link_id = %hex::encode(link_id), "cache request miss");
+            return true;
         };
-
-        let Some(cached_raw) = self.cached_announce_raw(&requested_hash) else {
-            trace!(
-                dest = %hex::encode(dest),
-                "cache request: path entry found but no cached announce on disk"
-            );
-            return;
+        let Ok((cached_header, offset)) = rns_wire::header::PacketHeader::unpack(&cached) else {
+            return true;
         };
-
-        // Python 1.3.8 Transport.py:2164: a cached packet that fails to unpack
-        // (incl. hops >= PATHFINDER_M, Packet.py:247-248) is a miss — never
-        // replay the raw bytes.
-        if rns_wire::header::PacketHeader::unpack(&cached_raw)
-            .map_or(true, |(h, _)| h.hops >= PATHFINDER_M)
-        {
-            trace!(
-                dest = %hex::encode(dest),
-                "cache request: cached announce failed to parse, treating as miss"
-            );
-            return;
-        }
-
-        debug!(
-            dest = %hex::encode(dest),
-            hops = cached_hops,
-            hash = %hex::encode(requested_hash),
-            "cache request hit — replaying cached announce"
+        let mut answer = link_packet_header(
+            link_id,
+            cached_header.flags.packet_type,
+            cached_header.context,
+        )
+        .pack();
+        answer.extend_from_slice(&cached[offset..]);
+        debug!(link_id = %hex::encode(link_id), "cache request hit, re-sending cached packet");
+        self.send_link_endpoint(
+            link_id,
+            role,
+            crate::messages::OutboundRequest {
+                raw: Bytes::from(answer),
+                destination_hash: link_id,
+            },
         );
-        if self.is_transport_enabled {
-            self.broadcast_announce_on_interfaces(&cached_raw, None);
+        true
+    }
+
+    /// Python `Transport.cache_request`: replay a local hit, otherwise send
+    /// a CACHE_REQUEST to the destination (Transport.py:3455-3464).
+    pub(super) fn send_cache_request(&mut self, packet_hash: [u8; 32], destination_hash: [u8; 16]) {
+        if let Some(cached) = self.cached_proof(&packet_hash) {
+            self.replay_cached_packet(cached);
+            return;
         }
+        let Some(role) = self.bound_link_role(&destination_hash) else {
+            trace!(dest = %hex::encode(destination_hash), "cache request for an unbound Link");
+            return;
+        };
+        let mut raw = link_packet_header(
+            destination_hash,
+            rns_wire::flags::PacketType::Data,
+            rns_wire::context::PacketContext::CacheRequest,
+        )
+        .pack();
+        raw.extend_from_slice(&packet_hash);
+        self.send_link_endpoint(
+            destination_hash,
+            role,
+            crate::messages::OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash,
+            },
+        );
     }
 
     pub(super) fn data_payload_offset(
@@ -1276,6 +1319,27 @@ impl TransportActor {
             }
             self.state_dirty = true;
         }
+    }
+}
+
+/// The header Python's `RNS.Packet(link, ...)` packs (Packet.py:180-190).
+fn link_packet_header(
+    link_id: [u8; 16],
+    packet_type: rns_wire::flags::PacketType,
+    context: rns_wire::context::PacketContext,
+) -> rns_wire::header::PacketHeader {
+    rns_wire::header::PacketHeader {
+        flags: rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Link,
+            packet_type,
+        },
+        hops: 0,
+        transport_id: None,
+        destination_hash: link_id,
+        context,
     }
 }
 
