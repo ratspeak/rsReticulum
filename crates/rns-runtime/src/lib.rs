@@ -7,6 +7,7 @@ pub mod constants;
 mod deferred_request;
 pub mod destination_resolver;
 pub mod destination_runtime;
+pub mod destination_stamper;
 mod inbound_link_packet;
 pub mod interface_factory;
 mod interface_registry;

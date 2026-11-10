@@ -3351,6 +3351,7 @@ pub async fn init_with_policy(
     let _ = transport_tx.try_send(TransportMessage::SetStampPolicy {
         policy: rc.stamps.clone(),
     });
+    crate::destination_stamper::configure(rc.stamps.clone(), Some(paths.storage_dir.clone()));
 
     // Python defaults the local shared-instance RPC key to a hash of the
     // PERSISTENT transport identity (internal_identity(), Reticulum.py:352),
@@ -6860,6 +6861,20 @@ async fn run_discovery_publisher(
     let mut announcer = Some(announcer);
     let mut preparing: Option<tokio::task::JoinHandle<(Announcer, Vec<PreparedAnnounce>)>> = None;
     let mut deferred_commits: Vec<(PreparedAnnounce, f64)> = Vec::new();
+    let mut discovery_destination = match rns_identity::destination::Destination::new(
+        Some(announce_identity),
+        rns_identity::destination::Direction::In,
+        rns_identity::destination::DestType::Single,
+        rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
+    ) {
+        Ok(destination) => destination,
+        Err(error) => {
+            tracing::warn!(%error, "failed to build discovery destination");
+            return;
+        }
+    };
+    crate::destination_stamper::load_stored_stamp(&mut discovery_destination, announce_identity);
+    let mut discovery_stamps = crate::destination_stamper::DestinationStamps::<()>::new();
     let mut registered: HashMap<u64, Option<String>> = HashMap::new();
     let mut next_prepare = std::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -7005,11 +7020,34 @@ async fn run_discovery_publisher(
             if !online || now < publication.retry_at {
                 continue;
             }
-            let request = publication.prepared.request();
-            match build_announce_packet(
+            if let Some(outcome) = discovery_stamps.try_recv() {
+                discovery_stamps.complete(&mut discovery_destination, announce_identity, outcome);
+            }
+            // Wait for the destination stamp on later ticks without blocking the loop.
+            let stamp_ext = match discovery_stamps.admit(
+                &discovery_destination,
                 announce_identity,
-                rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
-                Some(&request.app_data),
+                false,
+                (),
+            ) {
+                crate::destination_stamper::Admission::Ready((), ext) => ext,
+                crate::destination_stamper::Admission::Queued
+                | crate::destination_stamper::Admission::Dropped(()) => continue,
+            };
+            let request = publication.prepared.request();
+            let wire_now = unix_now();
+            match rns_identity::destination::AnnounceTime::new(wire_now as u64, wire_now).and_then(
+                |time| {
+                    discovery_destination.announce_packet_with_ext_at(
+                        announce_identity,
+                        Some(&request.app_data),
+                        None,
+                        false,
+                        None,
+                        time,
+                        stamp_ext.as_ref(),
+                    )
+                },
             ) {
                 Ok(raw) => {
                     // A full admission lane is retried on the next bounded
@@ -7300,35 +7338,8 @@ async fn maybe_teardown_bootstrap_interfaces(handle: &ReticulumHandle) {
     }
 }
 
-fn build_announce_packet(
-    identity: &Identity,
-    app_name: &str,
-    app_data: Option<&[u8]>,
-) -> Result<Vec<u8>, String> {
-    let announce = rns_identity::announce::AnnounceData::create(identity, app_name, app_data, None)
-        .map_err(|e| e.to_string())?;
-    let dest_hash = rns_identity::destination::Destination::hash_from_name_and_identity(
-        app_name,
-        Some(&identity.hash),
-    );
-    let flags = rns_wire::flags::PacketFlags {
-        header_type: rns_wire::flags::HeaderType::Header1,
-        context_flag: false,
-        transport_type: rns_wire::flags::TransportType::Broadcast,
-        destination_type: rns_wire::flags::DestinationType::Single,
-        packet_type: rns_wire::flags::PacketType::Announce,
-    };
-    let header = rns_wire::header::PacketHeader {
-        flags,
-        hops: 0,
-        transport_id: None,
-        destination_hash: dest_hash,
-        context: rns_wire::context::PacketContext::None,
-    };
-    let mut raw = header.pack();
-    raw.extend_from_slice(&announce.pack());
-    Ok(raw)
-}
+/// Link-request cost of the blackhole list destination.
+pub const BLACKHOLE_LINK_COST: f64 = 5.25;
 
 async fn start_blackhole_publisher(handle: &ReticulumHandle) -> Result<[u8; 16], String> {
     let identity = handle.transport_identity.clone();
@@ -7370,17 +7381,21 @@ async fn start_blackhole_publisher(handle: &ReticulumHandle) -> Result<[u8; 16],
         }
     });
 
-    let announce_tx = handle.transport_tx.clone();
-    let announce_identity = identity.clone();
-    lm.set_announce_handler(move || {
-        send_announce_try(&announce_tx, &announce_identity, app_name, None);
-    });
-
+    // Transport.py:495@1.6.0.
+    if let Some(destination) = lm.destination_mut() {
+        destination.set_link_cost(BLACKHOLE_LINK_COST);
+    }
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let _ = command_tx.try_send(crate::link_manager::LinkManagerCommand::Announce);
+    let shutdown = handle.shutdown.clone();
     tokio::spawn(async move {
-        lm.run().await;
+        shutdown.wait().await;
+        drop(command_tx);
+    });
+    tokio::spawn(async move {
+        lm.run_with_commands(command_rx).await;
     });
 
-    send_announce_try(&handle.transport_tx, &identity, app_name, None);
     Ok(dest_hash)
 }
 
@@ -7481,29 +7496,6 @@ fn clone_identity(identity: &Identity) -> Option<Identity> {
     } else {
         None
     }
-}
-
-fn send_announce_try(
-    tx: &mpsc::Sender<TransportMessage>,
-    identity: &Identity,
-    app_name: &str,
-    app_data: Option<&[u8]>,
-) {
-    let raw = match build_announce_packet(identity, app_name, app_data) {
-        Ok(raw) => raw,
-        Err(e) => {
-            tracing::warn!(error = %e, app_name, "failed to build announce");
-            return;
-        }
-    };
-    let dest_hash = rns_identity::destination::Destination::hash_from_name_and_identity(
-        app_name,
-        Some(&identity.hash),
-    );
-    let _ = tx.try_send(TransportMessage::Outbound(OutboundRequest {
-        raw: Bytes::from(raw),
-        destination_hash: dest_hash,
-    }));
 }
 
 fn blocking_transport_query(

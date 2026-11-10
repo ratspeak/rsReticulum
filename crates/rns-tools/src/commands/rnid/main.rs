@@ -897,8 +897,23 @@ async fn announce_destination(identity: &Identity, aspects: &str, args: &Args) -
         return ExitCode::from(1);
     }
 
-    let raw = match destination.announce_packet(identity, None, None, false, None, now_epoch()) {
-        Ok(raw) => raw,
+    rns_runtime::destination_stamper::load_stored_stamp(&mut destination, identity);
+    let raw = match rns_runtime::destination_stamper::announce_packet(
+        &mut destination,
+        identity,
+        None,
+        None,
+        false,
+        None,
+    )
+    .await
+    {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            eprintln!("Could not generate a destination stamp, announce not sent");
+            shutdown.trigger();
+            return ExitCode::from(1);
+        }
         Err(e) => {
             eprintln!("An error occurred while attempting to send the announce: {e}");
             shutdown.trigger();

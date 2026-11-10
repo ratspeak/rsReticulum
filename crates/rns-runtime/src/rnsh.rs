@@ -212,15 +212,6 @@ async fn run_rnsh_listener_inner(
         link_mgr.register_channel_message_type(msg_type)?;
     }
 
-    let announce_tx = transport_tx.clone();
-    let announce_packet = build_announce_packet(&cfg.identity, RNSH_APP_NAME)?;
-    link_mgr.set_announce_handler(move || {
-        let _ = announce_tx.try_send(TransportMessage::Outbound(OutboundRequest {
-            raw: Bytes::from(announce_packet.clone()),
-            destination_hash,
-        }));
-    });
-
     let (command_tx, command_rx) = mpsc::channel::<LinkManagerCommand>(256);
     let (channel_tx, mut channel_rx) = mpsc::channel::<LinkChannelMessage>(256);
     let (established_tx, mut established_rx) = mpsc::channel::<[u8; 16]>(64);
@@ -236,7 +227,7 @@ async fn run_rnsh_listener_inner(
     });
 
     if cfg.announce_period.is_some() {
-        send_announce(&transport_tx, &cfg.identity, RNSH_APP_NAME).await?;
+        send_announce(&command_tx).await?;
     }
     let mut announce_interval = cfg
         .announce_period
@@ -315,7 +306,7 @@ async fn run_rnsh_listener_inner(
                     std::future::pending::<()>().await;
                 }
             } => {
-                send_announce(&transport_tx, &cfg.identity, RNSH_APP_NAME).await?;
+                send_announce(&command_tx).await?;
             }
             _ = async {
                 if let Some(shutdown) = shutdown.as_ref() {
@@ -1988,41 +1979,12 @@ fn build_data_packet(
     Bytes::from(raw)
 }
 
-async fn send_announce(
-    tx: &mpsc::Sender<TransportMessage>,
-    identity: &Identity,
-    app_name: &str,
-) -> Result<(), RnshError> {
-    let raw = build_announce_packet(identity, app_name)?;
-    let dest_hash = Destination::hash_from_name_and_identity(app_name, Some(&identity.hash));
-    tx.send(TransportMessage::Outbound(OutboundRequest {
-        raw: Bytes::from(raw),
-        destination_hash: dest_hash,
-    }))
-    .await
-    .map_err(|_| RnshError::TransportUnavailable)
-}
-
-fn build_announce_packet(identity: &Identity, app_name: &str) -> Result<Vec<u8>, RnshError> {
-    let announce = rns_identity::announce::AnnounceData::create(identity, app_name, None, None)
-        .map_err(|e| RnshError::LinkCrypto(format!("announce: {e}")))?;
-    let dest_hash = Destination::hash_from_name_and_identity(app_name, Some(&identity.hash));
-    let header = rns_wire::header::PacketHeader {
-        flags: rns_wire::flags::PacketFlags {
-            header_type: rns_wire::flags::HeaderType::Header1,
-            context_flag: false,
-            transport_type: rns_wire::flags::TransportType::Broadcast,
-            destination_type: rns_wire::flags::DestinationType::Single,
-            packet_type: rns_wire::flags::PacketType::Announce,
-        },
-        hops: 0,
-        transport_id: None,
-        destination_hash: dest_hash,
-        context: rns_wire::context::PacketContext::None,
-    };
-    let mut raw = header.pack();
-    raw.extend_from_slice(&announce.pack());
-    Ok(raw)
+// Each announce is fresh and carries the destination stamp when the policy stamps destinations.
+async fn send_announce(command_tx: &mpsc::Sender<LinkManagerCommand>) -> Result<(), RnshError> {
+    command_tx
+        .send(LinkManagerCommand::Announce)
+        .await
+        .map_err(|_| RnshError::TransportUnavailable)
 }
 
 fn remaining(deadline: Instant) -> Duration {

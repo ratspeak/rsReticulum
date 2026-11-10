@@ -12,7 +12,7 @@ use tokio::time::timeout;
 
 use rns_identity::destination::{DestType, Destination, Direction, ProofStrategy};
 use rns_identity::identity::Identity;
-use rns_transport::link_messages::DestinationEvent;
+use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
 use rns_transport::messages::{
     AnnounceRpcEntry, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
 };
@@ -89,45 +89,44 @@ pub async fn spawn_probe_responder(
     // Implicit proof is Python's default (`use_implicit_proof = Yes`).
     let implicit = true;
 
+    crate::destination_stamper::load_stored_stamp(&mut destination, &identity);
+
     tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
+        let mut stamps = crate::destination_stamper::DestinationStamps::<AnnounceRequest>::new();
+        loop {
+            let event = tokio::select! {
+                outcome = stamps.recv() => {
+                    let ready = stamps.complete(&mut destination, identity.as_ref(), outcome);
+                    for (request, ext) in ready {
+                        if !send_probe_announce(&transport_tx, &mut destination, &identity, dest_hash, request, ext).await {
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                event = event_rx.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
             let (raw, interface_id) = match event {
                 DestinationEvent::InboundPacket {
                     raw, interface_id, ..
                 } => (raw, interface_id),
                 DestinationEvent::AnnounceRequested(request) => {
-                    let raw = match destination.announce_packet(
-                        identity.as_ref(),
-                        None,
-                        None,
-                        request.path_response,
-                        request.tag.as_deref(),
-                        unix_now(),
-                    ) {
-                        Ok(raw) => raw,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                path_response = request.path_response,
-                                "probe responder: failed to build requested announce"
-                            );
-                            continue;
-                        }
-                    };
-                    let outbound = OutboundRequest {
-                        raw: Bytes::from(raw),
-                        destination_hash: dest_hash,
-                    };
-                    let message = if let Some(interface_id) = request.attached_interface {
-                        TransportMessage::OutboundAttached {
-                            request: outbound,
-                            interface_id,
-                        }
-                    } else {
-                        TransportMessage::Outbound(outbound)
-                    };
-                    if transport_tx.send(message).await.is_err() {
-                        tracing::debug!("probe responder: transport closed, exiting");
+                    let path_response = request.path_response;
+                    if let crate::destination_stamper::Admission::Ready(request, ext) =
+                        stamps.admit(&destination, identity.as_ref(), path_response, request)
+                        && !send_probe_announce(
+                            &transport_tx,
+                            &mut destination,
+                            &identity,
+                            dest_hash,
+                            request,
+                            ext,
+                        )
+                        .await
+                    {
                         break;
                     }
                     continue;
@@ -530,6 +529,56 @@ fn find_public_key(announces: &[AnnounceRpcEntry], dest_hash: &[u8; 16]) -> Opti
         .iter()
         .find(|a| &a.dest_hash == dest_hash)
         .and_then(|a| a.public_key)
+}
+
+/// Build and send one requested announce; false once the transport is closed.
+async fn send_probe_announce(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    destination: &mut Destination,
+    identity: &Identity,
+    dest_hash: [u8; 16],
+    request: AnnounceRequest,
+    stamp_ext: Option<rns_identity::announce::AnnounceStampExt>,
+) -> bool {
+    let now = unix_now();
+    let raw = match rns_identity::destination::AnnounceTime::new(now as u64, now).and_then(|time| {
+        destination.announce_packet_with_ext_at(
+            identity,
+            None,
+            None,
+            request.path_response,
+            request.tag.as_deref(),
+            time,
+            stamp_ext.as_ref(),
+        )
+    }) {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path_response = request.path_response,
+                "probe responder: failed to build requested announce"
+            );
+            return true;
+        }
+    };
+    let outbound = OutboundRequest {
+        raw: Bytes::from(raw),
+        destination_hash: dest_hash,
+    };
+    let message = if let Some(interface_id) = request.attached_interface {
+        TransportMessage::OutboundAttached {
+            request: outbound,
+            interface_id,
+        }
+    } else {
+        TransportMessage::Outbound(outbound)
+    };
+    if transport_tx.send(message).await.is_err() {
+        tracing::debug!("probe responder: transport closed, exiting");
+        return false;
+    }
+    true
 }
 
 fn unix_now() -> f64 {

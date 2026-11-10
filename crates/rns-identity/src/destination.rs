@@ -6,8 +6,10 @@ use std::fmt;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::announce::{AnnounceStampExt, DESTINATION_STAMP_MATERIAL_LENGTH};
 use crate::identity::{DecryptionResult, Identity};
 use crate::name_hash::name_hash;
+use crate::stamps::{LINK_COST_CAP, NETWORK_STAMP_SIZE, STAMP_COST_CAP};
 
 /// Callback invoked on incoming DATA: `fn(plaintext, raw_packet)`.
 /// [`Destination::receive`] supplies only the payload as its second argument;
@@ -129,6 +131,8 @@ pub enum DestinationError {
     IdentityMismatch,
     #[error("identity cannot sign")]
     SigningUnavailable,
+    #[error("announce link cost is not a finite number: {0}")]
+    InvalidLinkCost(f64),
 }
 
 /// Wire-shape controls for [`Destination::pack_packet`].
@@ -233,6 +237,12 @@ pub struct Destination {
     pub local_ratchet_pub: Option<[u8; 32]>,
 
     path_responses: HashMap<Vec<u8>, PathResponseCache>,
+
+    stamp: Option<[u8; NETWORK_STAMP_SIZE]>,
+    stamp_value: Option<f64>,
+    // Already clamped; `None` follows the current global destination value.
+    requested_value: Option<f64>,
+    link_cost: Option<f64>,
 }
 
 impl Destination {
@@ -347,6 +357,10 @@ impl Destination {
                     remote_ratchet_pub: None,
                     local_ratchet_pub: None,
                     path_responses: HashMap::new(),
+                    stamp: None,
+                    stamp_value: None,
+                    requested_value: None,
+                    link_cost: None,
                 })
             }
             DestType::Plain => {
@@ -380,6 +394,10 @@ impl Destination {
                     remote_ratchet_pub: None,
                     local_ratchet_pub: None,
                     path_responses: HashMap::new(),
+                    stamp: None,
+                    stamp_value: None,
+                    requested_value: None,
+                    link_cost: None,
                 })
             }
             DestType::Link => {
@@ -413,6 +431,10 @@ impl Destination {
                     remote_ratchet_pub: None,
                     local_ratchet_pub: None,
                     path_responses: HashMap::new(),
+                    stamp: None,
+                    stamp_value: None,
+                    requested_value: None,
+                    link_cost: None,
                 })
             }
         }
@@ -981,6 +1003,21 @@ impl Destination {
         tag: Option<&[u8]>,
         time: AnnounceTime,
     ) -> Result<(Vec<u8>, bool), DestinationError> {
+        self.create_announce_with_ext_at(identity, app_data, ratchet, tag, time, None)
+    }
+
+    /// As [`Self::create_announce_at`], appending the stamp extension to the
+    /// resolved app data before signing (Destination.py:347-361@1.6.0). Pass
+    /// [`Self::announce_stamp_ext`] when the stamp policy stamps destinations.
+    pub fn create_announce_with_ext_at(
+        &mut self,
+        identity: &Identity,
+        app_data: Option<&[u8]>,
+        ratchet: Option<&[u8; 32]>,
+        tag: Option<&[u8]>,
+        time: AnnounceTime,
+        stamp_ext: Option<&AnnounceStampExt>,
+    ) -> Result<(Vec<u8>, bool), DestinationError> {
         let time = AnnounceTime::new(time.wire, time.cache)?;
         if self.dest_type != DestType::Single {
             return Err(DestinationError::NotSingle);
@@ -998,9 +1035,17 @@ impl Destination {
             return Ok((cached.announce_data.clone(), cached.has_ratchet));
         }
 
-        let effective_app_data = app_data
+        let mut effective_app_data = app_data
             .map(|d| d.to_vec())
             .or_else(|| self.resolve_app_data());
+        if let Some(ext) = stamp_ext {
+            let ext = ext
+                .encode()
+                .map_err(|_| DestinationError::InvalidLinkCost(ext.lr_cost))?;
+            effective_app_data
+                .get_or_insert_with(Vec::new)
+                .extend_from_slice(&ext);
+        }
 
         let public_key = identity.get_public_key();
 
@@ -1086,10 +1131,86 @@ impl Destination {
         tag: Option<&[u8]>,
         time: AnnounceTime,
     ) -> Result<Vec<u8>, DestinationError> {
+        self.announce_packet_with_ext_at(
+            identity,
+            app_data,
+            ratchet,
+            path_response,
+            tag,
+            time,
+            None,
+        )
+    }
+
+    /// As [`Self::announce_packet_at`], carrying the stamp extension.
+    #[allow(clippy::too_many_arguments)]
+    pub fn announce_packet_with_ext_at(
+        &mut self,
+        identity: &Identity,
+        app_data: Option<&[u8]>,
+        ratchet: Option<&[u8; 32]>,
+        path_response: bool,
+        tag: Option<&[u8]>,
+        time: AnnounceTime,
+        stamp_ext: Option<&AnnounceStampExt>,
+    ) -> Result<Vec<u8>, DestinationError> {
         let (announce_data, has_ratchet) =
-            self.create_announce_at(identity, app_data, ratchet, tag, time)?;
+            self.create_announce_with_ext_at(identity, app_data, ratchet, tag, time, stamp_ext)?;
 
         Ok(self.pack_announce_packet(&announce_data, has_ratchet, path_response))
+    }
+
+    /// `Destination.stamp_material()`: hash, public key, name hash.
+    pub fn stamp_material(&self, public_key: &[u8; 64]) -> [u8; DESTINATION_STAMP_MATERIAL_LENGTH] {
+        crate::announce::destination_stamp_material(&self.hash, public_key, &self.name_hash)
+    }
+
+    /// Python `set_value`: stores `min(STAMP_COST_CAP, max(value, destination_value))`.
+    pub fn set_value(&mut self, value: f64, destination_value: f64) {
+        self.requested_value = Some(py_min(STAMP_COST_CAP, py_max(value, destination_value)));
+    }
+
+    /// Python `target_value`, re-clamped against the current global value.
+    pub fn target_value(&self, destination_value: f64) -> f64 {
+        let requested = self.requested_value.unwrap_or(destination_value);
+        py_min(STAMP_COST_CAP, py_max(requested, destination_value))
+    }
+
+    /// Python `set_link_cost`: `max(0, min(cost, LINK_COST_CAP))`; 0 means links are not stamped.
+    pub fn set_link_cost(&mut self, cost: f64) {
+        self.link_cost = Some(py_max(0.0, py_min(cost, LINK_COST_CAP)));
+    }
+
+    /// Python `get_link_cost`: the set cost or `lr_cost_default`, within `0..=STAMP_COST_CAP`.
+    pub fn link_cost(&self, lr_cost_default: f64) -> f64 {
+        let cost = self.link_cost.unwrap_or(lr_cost_default);
+        py_max(0.0, py_min(cost, STAMP_COST_CAP))
+    }
+
+    /// Install a destination stamp and its value, generated or loaded.
+    pub fn set_destination_stamp(&mut self, stamp: [u8; NETWORK_STAMP_SIZE], value: f64) {
+        self.stamp = Some(stamp);
+        self.stamp_value = Some(value);
+    }
+
+    pub fn destination_stamp(&self) -> Option<([u8; NETWORK_STAMP_SIZE], f64)> {
+        Some((self.stamp?, self.stamp_value?))
+    }
+
+    /// False where `Destination._await_stamp` would load or generate a new stamp.
+    pub fn destination_stamp_meets(&self, target_value: f64) -> bool {
+        let Some((_, value)) = self.destination_stamp() else {
+            return false;
+        };
+        crate::stamps::quantize_cost(target_value).is_ok_and(|target| value >= target)
+    }
+
+    /// The extension `_announce` appends: the held stamp and `get_link_cost()`.
+    pub fn announce_stamp_ext(&self, lr_cost_default: f64) -> Option<AnnounceStampExt> {
+        Some(AnnounceStampExt {
+            stamp: self.stamp?,
+            lr_cost: self.link_cost(lr_cost_default),
+        })
     }
 
     /// Return an exact cached path-response packet for `tag`, if it is still
@@ -1171,6 +1292,140 @@ impl Destination {
             return Err(DestinationError::IdentityMismatch);
         }
         Ok(())
+    }
+}
+
+// Python's min()/max() keep the first argument unless the second compares
+// strictly better, which fixes their NaN results.
+fn py_min(a: f64, b: f64) -> f64 {
+    if b < a { b } else { a }
+}
+
+fn py_max(a: f64, b: f64) -> f64 {
+    if b > a { b } else { a }
+}
+
+/// `Stamps.DESTINATION_STAMP_EXTENSION`.
+pub const DESTINATION_STAMP_EXTENSION: &str = ".dstamp";
+/// `Stamps.STAMP_FILE_VERSION`.
+pub const STAMP_FILE_VERSION: u64 = 1;
+const STAMP_FILE_MAX_LEN: usize = 1024;
+
+/// `<storage>/stamps/<hex hash>.dstamp` (Stamps.py:871-875@1.6.0).
+pub fn destination_stamp_path(
+    storage_dir: &std::path::Path,
+    destination_hash: &[u8; 16],
+) -> std::path::PathBuf {
+    storage_dir.join("stamps").join(format!(
+        "{}{DESTINATION_STAMP_EXTENSION}",
+        hex::encode(destination_hash)
+    ))
+}
+
+/// `store_destination_stamp`: msgpack `{v, stamp, value, generated}`, replaced atomically.
+pub fn store_destination_stamp(
+    storage_dir: &std::path::Path,
+    destination_hash: &[u8; 16],
+    stamp: &[u8; NETWORK_STAMP_SIZE],
+    value: f64,
+) -> std::io::Result<()> {
+    use rmpv::Value;
+    let generated = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let entry = Value::Map(vec![
+        (Value::from("v"), Value::from(STAMP_FILE_VERSION)),
+        (Value::from("stamp"), Value::Binary(stamp.to_vec())),
+        (Value::from("value"), Value::F64(value)),
+        (Value::from("generated"), Value::F64(generated)),
+    ]);
+    let mut data = Vec::new();
+    rmpv::encode::write_value(&mut data, &entry).map_err(std::io::Error::other)?;
+    let path = destination_stamp_path(storage_dir, destination_hash);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::persistence::atomic_write(&path, &data)
+}
+
+/// `load_destination_stamp`: the stored stamp and its recomputed value, or
+/// `None` when the file is missing, malformed or below `required_value`.
+pub fn load_destination_stamp(
+    storage_dir: &std::path::Path,
+    destination_hash: &[u8; 16],
+    material: &[u8],
+    required_value: f64,
+) -> Option<([u8; NETWORK_STAMP_SIZE], f64)> {
+    use rmpv::Value;
+    let path = destination_stamp_path(storage_dir, destination_hash);
+    let data = match crate::persistence::read_file_bounded(&path, STAMP_FILE_MAX_LEN) {
+        Ok(Some(data)) => data,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(dest = %hex::encode(destination_hash), %error,
+                "ignoring unreadable destination stamp file");
+            return None;
+        }
+    };
+    let entry = match rmpv::decode::read_value(&mut std::io::Cursor::new(&data)) {
+        Ok(Value::Map(entry)) => entry,
+        Ok(_) | Err(_) => {
+            tracing::warn!(dest = %hex::encode(destination_hash),
+                "ignoring unreadable destination stamp file");
+            return None;
+        }
+    };
+    let field = |name: &str| {
+        entry
+            .iter()
+            .find(|(key, _)| key.as_str() == Some(name))
+            .map(|(_, value)| value)
+    };
+    // Python compares with `!=`, so True and 1.0 also equal version 1.
+    let version_ok = match field("v") {
+        Some(Value::Integer(v)) => v.as_u64() == Some(STAMP_FILE_VERSION),
+        Some(Value::Boolean(v)) => *v,
+        Some(Value::F64(v)) => *v == STAMP_FILE_VERSION as f64,
+        Some(Value::F32(v)) => *v == STAMP_FILE_VERSION as f32,
+        _ => false,
+    };
+    if !version_ok {
+        return None;
+    }
+    let stamp: [u8; NETWORK_STAMP_SIZE] = match field("stamp") {
+        Some(Value::Binary(stamp)) => match stamp.as_slice().try_into() {
+            Ok(stamp) => stamp,
+            Err(_) => {
+                tracing::debug!(dest = %hex::encode(destination_hash),
+                    "stored destination stamp has invalid format, regenerating on next announce");
+                return None;
+            }
+        },
+        Some(_) => {
+            tracing::debug!(dest = %hex::encode(destination_hash),
+                "stored destination stamp has invalid format, regenerating on next announce");
+            return None;
+        }
+        None => {
+            tracing::warn!(dest = %hex::encode(destination_hash),
+                "ignoring unreadable destination stamp file");
+            return None;
+        }
+    };
+    let value = crate::stamps::stamp_value(material, &stamp);
+    match crate::stamps::stamp_valid(&stamp, required_value, material) {
+        Ok(true) => Some((stamp, value)),
+        Ok(false) => {
+            tracing::debug!(dest = %hex::encode(destination_hash), value, required_value,
+                "stored destination stamp is below the required value, regenerating on next announce");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(dest = %hex::encode(destination_hash), %error,
+                "ignoring unreadable destination stamp file");
+            None
+        }
     }
 }
 
@@ -1831,5 +2086,155 @@ mod tests {
             outbound.announce_packet(&identity, None, None, false, None, 1.0),
             Err(DestinationError::NotInbound)
         ));
+    }
+
+    fn stamp_test_dir(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rns-identity-dstamp-{label}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn low_stamp(material: &[u8], cost: f64) -> ([u8; NETWORK_STAMP_SIZE], f64) {
+        let (stamp, value) = crate::stamps::generate_stamp(
+            material,
+            cost,
+            0,
+            NETWORK_STAMP_SIZE,
+            &crate::stamps::StampControl::default(),
+        )
+        .unwrap()
+        .unwrap();
+        (stamp.try_into().unwrap(), value)
+    }
+
+    #[test]
+    fn stamped_announce_appends_signed_extension_after_app_data() {
+        let identity = Identity::new();
+        let mut dest =
+            Destination::new(Some(&identity), Direction::In, DestType::Single, "ext.test").unwrap();
+        let material = dest.stamp_material(&identity.get_public_key());
+        let (stamp, value) = low_stamp(&material, 4.0);
+        dest.set_destination_stamp(stamp, value);
+        dest.set_link_cost(10.75);
+        let ext = dest.announce_stamp_ext(12.5).unwrap();
+        let time = AnnounceTime::new(1_762_732_800, 1.0).unwrap();
+        for app_data in [Some(&b"app"[..]), None] {
+            let raw = dest
+                .announce_packet_with_ext_at(
+                    &identity,
+                    app_data,
+                    None,
+                    false,
+                    None,
+                    time,
+                    Some(&ext),
+                )
+                .unwrap();
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+            let parsed = crate::announce::AnnounceData::unpack(&raw[offset..], false).unwrap();
+            parsed.validate(&header.destination_hash).unwrap();
+            let carried = parsed.app_data.unwrap();
+            let prefix = app_data.unwrap_or_default();
+            assert_eq!(&carried[..prefix.len()], prefix);
+            assert_eq!(carried.len(), prefix.len() + 18);
+            let tail = &carried[prefix.len()..];
+            assert_eq!(&tail[..2], &[0xC1, 0x00]);
+            assert_eq!(&tail[2..16], &stamp);
+            // 10.75 is fixed point 0x0ac0, written fractional byte first.
+            assert_eq!(&tail[16..], &[0xC0, 0x0A]);
+            let check = parsed_check(&raw);
+            assert!(check.validated);
+        }
+    }
+
+    fn parsed_check(raw: &[u8]) -> crate::announce::AnnounceStampCheck {
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(raw).unwrap();
+        let parsed = crate::announce::AnnounceData::unpack(&raw[offset..], false).unwrap();
+        parsed.check_stamp(&header.destination_hash, 4.0)
+    }
+
+    #[test]
+    fn path_response_cache_keeps_the_extension() {
+        let identity = Identity::new();
+        let mut dest = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "ext.cache",
+        )
+        .unwrap();
+        let material = dest.stamp_material(&identity.get_public_key());
+        let (stamp, value) = low_stamp(&material, 2.0);
+        dest.set_destination_stamp(stamp, value);
+        let ext = dest.announce_stamp_ext(12.5).unwrap();
+        let time = AnnounceTime::new(100, 100.0).unwrap();
+        let first = dest
+            .announce_packet_with_ext_at(
+                &identity,
+                None,
+                None,
+                true,
+                Some(b"tag"),
+                time,
+                Some(&ext),
+            )
+            .unwrap();
+        assert_eq!(
+            dest.cached_path_response_packet(b"tag", 101.0).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(&first[first.len() - 18..first.len() - 16], &[0xC1, 0x00]);
+    }
+
+    #[test]
+    fn destination_stamp_file_round_trips_and_rejects_bad_entries() {
+        let dir = stamp_test_dir("roundtrip");
+        let identity = Identity::new();
+        let dest =
+            Destination::new(Some(&identity), Direction::In, DestType::Single, "ext.file").unwrap();
+        let material = dest.stamp_material(&identity.get_public_key());
+        assert!(load_destination_stamp(&dir, &dest.hash, &material, 1.0).is_none());
+        let (stamp, value) = low_stamp(&material, 6.0);
+        store_destination_stamp(&dir, &dest.hash, &stamp, value).unwrap();
+        let path = destination_stamp_path(&dir, &dest.hash);
+        assert!(path.ends_with(format!("stamps/{}.dstamp", hex::encode(dest.hash))));
+        assert_eq!(
+            load_destination_stamp(&dir, &dest.hash, &material, 6.0),
+            Some((stamp, value))
+        );
+        assert!(load_destination_stamp(&dir, &dest.hash, &material, value + 1.0).is_none());
+
+        let write = |entry: rmpv::Value| {
+            let mut data = Vec::new();
+            rmpv::encode::write_value(&mut data, &entry).unwrap();
+            std::fs::write(&path, data).unwrap();
+        };
+        use rmpv::Value;
+        write(Value::Map(vec![
+            (Value::from("v"), Value::from(2)),
+            (Value::from("stamp"), Value::Binary(stamp.to_vec())),
+        ]));
+        assert!(load_destination_stamp(&dir, &dest.hash, &material, 1.0).is_none());
+        write(Value::Map(vec![
+            (Value::from("v"), Value::from(1)),
+            (Value::from("stamp"), Value::Binary(stamp[..13].to_vec())),
+        ]));
+        assert!(load_destination_stamp(&dir, &dest.hash, &material, 1.0).is_none());
+        std::fs::write(&path, b"\xc1 not msgpack").unwrap();
+        assert!(load_destination_stamp(&dir, &dest.hash, &material, 1.0).is_none());
+        write(Value::Map(vec![
+            (Value::from("v"), Value::from(1)),
+            (Value::from("stamp"), Value::Binary(stamp.to_vec())),
+        ]));
+        assert_eq!(
+            load_destination_stamp(&dir, &dest.hash, &material, 6.0),
+            Some((stamp, value))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

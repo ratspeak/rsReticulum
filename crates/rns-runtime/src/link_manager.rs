@@ -383,6 +383,18 @@ pub enum LinkManagerCommand {
         accepts: bool,
         result_tx: Option<oneshot::Sender<Result<(), DestinationControlError>>>,
     },
+    /// Set the owned Destination's target stamp value (Python `set_value`).
+    /// Takes effect at the next announce.
+    SetStampValue {
+        value: f64,
+        result_tx: Option<oneshot::Sender<Result<(), DestinationControlError>>>,
+    },
+    /// Set the link-request cost the owned Destination announces (Python
+    /// `set_link_cost`); 0 means links are not stamped.
+    SetLinkCost {
+        cost: f64,
+        result_tx: Option<oneshot::Sender<Result<(), DestinationControlError>>>,
+    },
     /// Set or clear the owned Destination's default announce app data, used
     /// whenever an announce (including a path response) carries none.
     SetDefaultAppData {
@@ -675,6 +687,12 @@ struct ResourceTransferStart {
     allow_handshake: bool,
 }
 
+struct ParkedAnnounce {
+    request: AnnounceRequest,
+    app_data: Option<Vec<u8>>,
+    ratchet: Option<[u8; 32]>,
+}
+
 /// Owns responder Links for one destination. Configure admission policies and
 /// receivers before `run` or `run_with_commands`; callbacks execute on this
 /// manager task. Ordinary Resources default to `AcceptAll`, independently of
@@ -698,6 +716,8 @@ pub struct LinkManager {
     /// Links, so they must survive transient traffic bursts instead of being
     /// discarded by a best-effort `try_send`.
     pending_destination_announces: VecDeque<TransportMessage>,
+    /// Announces parked while the destination stamp is generated.
+    destination_stamps: crate::destination_stamper::DestinationStamps<ParkedAnnounce>,
     pending_link_control: VecDeque<TransportMessage>,
     pending_endpoint_sends: Vec<crate::link_endpoint::PendingLinkEndpointSend>,
     pending_endpoint_cleanups: Vec<PendingResponderEndpointCleanup>,
@@ -829,6 +849,7 @@ impl LinkManager {
             transport_tx,
             event_rx,
             pending_destination_announces: VecDeque::new(),
+            destination_stamps: crate::destination_stamper::DestinationStamps::new(),
             pending_link_control: VecDeque::new(),
             pending_endpoint_sends: Vec::new(),
             pending_endpoint_cleanups: Vec::new(),
@@ -899,7 +920,10 @@ impl LinkManager {
     ) -> Self {
         let dest = match Destination::new(Some(identity), Direction::In, DestType::Single, app_name)
         {
-            Ok(d) => Some(d),
+            Ok(mut d) => {
+                crate::destination_stamper::load_stored_stamp(&mut d, identity);
+                Some(d)
+            }
             Err(e) => {
                 tracing::error!(error = %e, app_name, "Destination::new() failed — link manager will not accept links");
                 None
@@ -924,6 +948,7 @@ impl LinkManager {
             transport_tx,
             event_rx,
             pending_destination_announces: VecDeque::new(),
+            destination_stamps: crate::destination_stamper::DestinationStamps::new(),
             pending_link_control: VecDeque::new(),
             pending_endpoint_sends: Vec::new(),
             pending_endpoint_cleanups: Vec::new(),
@@ -1037,7 +1062,11 @@ impl LinkManager {
     /// False can mean either no progress or a disconnected receiver; it is not
     /// a shutdown signal. Call `tick` periodically to advance protocol timers.
     pub fn try_step(&mut self) -> bool {
-        let endpoint_progress = self.poll_link_endpoints();
+        let mut endpoint_progress = self.poll_link_endpoints();
+        if let Some(outcome) = self.destination_stamps.try_recv() {
+            self.on_destination_stamp(outcome);
+            endpoint_progress = true;
+        }
         self.flush_pending_link_control();
         self.flush_pending_destination_announces();
         self.flush_pending_legacy_terminal_notifications();
@@ -1065,6 +1094,7 @@ impl LinkManager {
         }
         let inbound_deadline = self.inbound_packet_deadline();
         tokio::select! {
+            outcome = self.destination_stamps.recv() => { self.on_destination_stamp(outcome); true }
             _ = self.deferred_request_notify.notified() => { self.poll_deferred_requests(); true }
             _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); true }
             _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => { self.poll_inbound_packet_receipts(); true }
@@ -1132,6 +1162,7 @@ impl LinkManager {
             self.flush_pending_legacy_terminal_notifications();
             let inbound_deadline = self.inbound_packet_deadline();
             tokio::select! {
+                outcome = self.destination_stamps.recv() => { self.on_destination_stamp(outcome); }
                 _ = self.deferred_request_notify.notified() => { self.poll_deferred_requests(); }
             _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); }
                 _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => { self.poll_inbound_packet_receipts(); }
@@ -1198,6 +1229,7 @@ impl LinkManager {
                 (last_tick + std::time::Duration::from_secs(1)).min(self.inbound_packet_deadline())
             };
             tokio::select! {
+                outcome = self.destination_stamps.recv() => { self.on_destination_stamp(outcome); }
                 _ = self.deferred_request_notify.notified() => { self.poll_deferred_requests(); }
                 _ = self.inbound_packet_notify.notified() => {},
                 _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => {},
@@ -2069,6 +2101,29 @@ impl LinkManager {
                 }
                 true
             }
+            LinkManagerCommand::SetStampValue { value, result_tx } => {
+                let destination_value = crate::destination_stamper::policy().destination_value;
+                let result = self
+                    .destination
+                    .as_mut()
+                    .ok_or(DestinationControlError::DestinationUnavailable)
+                    .map(|destination| destination.set_value(value, destination_value));
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
+                }
+                true
+            }
+            LinkManagerCommand::SetLinkCost { cost, result_tx } => {
+                let result = self
+                    .destination
+                    .as_mut()
+                    .ok_or(DestinationControlError::DestinationUnavailable)
+                    .map(|destination| destination.set_link_cost(cost));
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
+                }
+                true
+            }
             LinkManagerCommand::SetDefaultAppData {
                 app_data,
                 result_tx,
@@ -2209,6 +2264,60 @@ impl LinkManager {
             );
             return Err(DestinationControlError::IdentityUnavailable);
         };
+        let destination = self
+            .destination
+            .as_ref()
+            .expect("destination presence checked above");
+        let parked = ParkedAnnounce {
+            app_data: app_data.map(<[u8]>::to_vec),
+            ratchet: ratchet.copied(),
+            request,
+        };
+        let path_response = parked.request.path_response;
+        match self
+            .destination_stamps
+            .admit(destination, identity, path_response, parked)
+        {
+            crate::destination_stamper::Admission::Ready(parked, ext) => {
+                self.emit_destination_announce(parked, ext)
+            }
+            crate::destination_stamper::Admission::Queued
+            | crate::destination_stamper::Admission::Dropped(_) => Ok(()),
+        }
+    }
+
+    fn on_destination_stamp(&mut self, outcome: crate::destination_stamper::StampOutcome) {
+        let (Some(destination), Some(identity)) =
+            (self.destination.as_mut(), self.identity.as_ref())
+        else {
+            return;
+        };
+        for (parked, ext) in self
+            .destination_stamps
+            .complete(destination, identity, outcome)
+        {
+            if let Err(error) = self.emit_destination_announce(parked, ext) {
+                tracing::warn!(%error, "failed to send announce after stamp generation");
+            }
+        }
+    }
+
+    fn emit_destination_announce(
+        &mut self,
+        parked: ParkedAnnounce,
+        stamp_ext: Option<rns_identity::announce::AnnounceStampExt>,
+    ) -> Result<(), DestinationControlError> {
+        let ParkedAnnounce {
+            request,
+            app_data,
+            ratchet,
+        } = parked;
+        let app_data = app_data.as_deref();
+        let ratchet = ratchet.as_ref();
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or(DestinationControlError::IdentityUnavailable)?;
 
         let managed_ratchet = match self.destination_ratchets.as_mut() {
             Some(ratchets) => {
@@ -2228,13 +2337,15 @@ impl LinkManager {
             destination.set_local_ratchet(current);
         }
         let announce_ratchet = managed_ratchet.as_ref().or(ratchet);
-        let raw = destination.announce_packet(
+        let now = unix_now();
+        let raw = destination.announce_packet_with_ext_at(
             identity,
             app_data,
             announce_ratchet,
             request.path_response,
             request.tag.as_deref(),
-            unix_now(),
+            rns_identity::destination::AnnounceTime::new(now as u64, now)?,
+            stamp_ext.as_ref(),
         )?;
 
         let outbound = OutboundRequest {

@@ -315,6 +315,74 @@ pub const ANNOUNCE_EXT_LENGTH: usize = 18;
 pub const ANNOUNCE_EXT_HEADER_LENGTH: usize = 2;
 pub const ANNOUNCE_EXT_MARKER: u8 = 0xC1;
 
+/// `Destination.get_ext_flags()` at 1.6.0.
+pub const ANNOUNCE_EXT_FLAGS: u8 = 0x00;
+/// Length of the destination stamp material: hash, public key, name hash.
+pub const DESTINATION_STAMP_MATERIAL_LENGTH: usize = 16 + PUBKEY_SIZE + NAME_HASH_SIZE;
+
+/// The stamp extension a destination appends to its announce app_data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnnounceStampExt {
+    pub stamp: [u8; crate::stamps::NETWORK_STAMP_SIZE],
+    /// The link-request cost to announce, already clamped by the destination.
+    pub lr_cost: f64,
+}
+
+impl AnnounceStampExt {
+    /// `0xC1 | flags | stamp | cost_bytes[1] | cost_bytes[0]` (Destination.py:351-352).
+    pub fn encode(&self) -> Result<[u8; ANNOUNCE_EXT_LENGTH], crate::stamps::StampError> {
+        let cost = crate::stamps::cost_to_bytes(self.lr_cost)?;
+        let mut ext = [0u8; ANNOUNCE_EXT_LENGTH];
+        ext[0] = ANNOUNCE_EXT_MARKER;
+        ext[1] = ANNOUNCE_EXT_FLAGS;
+        ext[ANNOUNCE_EXT_HEADER_LENGTH
+            ..ANNOUNCE_EXT_HEADER_LENGTH + crate::stamps::NETWORK_STAMP_SIZE]
+            .copy_from_slice(&self.stamp);
+        ext[ANNOUNCE_EXT_LENGTH - 2] = cost[1];
+        ext[ANNOUNCE_EXT_LENGTH - 1] = cost[0];
+        Ok(ext)
+    }
+}
+
+/// `Destination.stamp_material()`: public values only, so a host can stamp for a device.
+pub fn destination_stamp_material(
+    destination_hash: &[u8; 16],
+    public_key: &[u8; 64],
+    name_hash: &[u8; 10],
+) -> [u8; DESTINATION_STAMP_MATERIAL_LENGTH] {
+    let mut material = [0u8; DESTINATION_STAMP_MATERIAL_LENGTH];
+    material[..16].copy_from_slice(destination_hash);
+    material[16..16 + PUBKEY_SIZE].copy_from_slice(public_key);
+    material[16 + PUBKEY_SIZE..].copy_from_slice(name_hash);
+    material
+}
+
+/// Generate a destination stamp from public material alone, as
+/// `Destination._await_stamp` does (unexpanded workblock, 14-byte stamp).
+/// Returns the stamp and its value, or `None` when stopped by `ctl`.
+pub fn generate_destination_stamp(
+    destination_hash: &[u8; 16],
+    public_key: &[u8; 64],
+    name_hash: &[u8; 10],
+    target_value: f64,
+    ctl: &crate::stamps::StampControl,
+) -> Result<Option<([u8; crate::stamps::NETWORK_STAMP_SIZE], f64)>, crate::stamps::StampError> {
+    let material = destination_stamp_material(destination_hash, public_key, name_hash);
+    let generated = crate::stamps::generate_stamp(
+        &material,
+        target_value,
+        0,
+        crate::stamps::NETWORK_STAMP_SIZE,
+        ctl,
+    )?;
+    Ok(generated.map(|(stamp, value)| {
+        let stamp = stamp
+            .try_into()
+            .expect("generated with the network stamp size");
+        (stamp, value)
+    }))
+}
+
 /// A known-format stamp extension, borrowed from the announce app_data.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnnounceExt<'a> {
@@ -400,10 +468,8 @@ impl AnnounceData {
         };
         check.stamped = true;
         check.stamp = Some(*ext.stamp);
-        let mut material = [0u8; 16 + PUBKEY_SIZE + NAME_HASH_SIZE];
-        material[..16].copy_from_slice(destination_hash);
-        material[16..16 + PUBKEY_SIZE].copy_from_slice(&self.public_key);
-        material[16 + PUBKEY_SIZE..].copy_from_slice(&self.name_hash);
+        let material =
+            destination_stamp_material(destination_hash, &self.public_key, &self.name_hash);
         match crate::stamps::stamp_valid(ext.stamp, required_value, &material) {
             Ok(valid) => {
                 check.value = Some(crate::stamps::stamp_value(&material, ext.stamp));

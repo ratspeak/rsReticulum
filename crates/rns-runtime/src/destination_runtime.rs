@@ -47,6 +47,10 @@ pub struct DestinationRuntimeOptions {
     pub identity_gate: Option<IdentityGatePolicy>,
     /// User Channel message types registered before the manager starts.
     pub channel_message_types: Vec<u16>,
+    /// Target destination stamp value (Python `Destination.set_value`).
+    pub stamp_value: Option<f64>,
+    /// Announced link-request cost (Python `Destination.set_link_cost`).
+    pub link_cost: Option<f64>,
 }
 
 impl Default for DestinationRuntimeOptions {
@@ -60,6 +64,8 @@ impl Default for DestinationRuntimeOptions {
             resource_accept: None,
             identity_gate: None,
             channel_message_types: Vec::new(),
+            stamp_value: None,
+            link_cost: None,
         }
     }
 }
@@ -209,6 +215,38 @@ impl DestinationHandle {
         self.command_tx
             .send(LinkManagerCommand::SetAcceptsLinks {
                 accepts,
+                result_tx: Some(result_tx),
+            })
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)?;
+        result_rx
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)??;
+        Ok(())
+    }
+
+    /// Set the target destination stamp value, clamped as Python's `set_value`.
+    pub async fn set_stamp_value(&self, value: f64) -> Result<(), DestinationRuntimeError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkManagerCommand::SetStampValue {
+                value,
+                result_tx: Some(result_tx),
+            })
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)?;
+        result_rx
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)??;
+        Ok(())
+    }
+
+    /// Set the announced link-request cost, clamped as Python's `set_link_cost`.
+    pub async fn set_link_cost(&self, cost: f64) -> Result<(), DestinationRuntimeError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkManagerCommand::SetLinkCost {
+                cost,
                 result_tx: Some(result_tx),
             })
             .await
@@ -504,6 +542,15 @@ impl RegisteredDestination {
         owned_destination.set_accepts_links(options.accepts_links);
         if let Some(app_data) = options.default_app_data.clone() {
             owned_destination.set_default_app_data(DefaultAppData::Static(app_data));
+        }
+        if let Some(value) = options.stamp_value {
+            owned_destination.set_value(
+                value,
+                crate::destination_stamper::policy().destination_value,
+            );
+        }
+        if let Some(cost) = options.link_cost {
+            owned_destination.set_link_cost(cost);
         }
 
         transport_tx

@@ -755,6 +755,7 @@ fn spawn_listen_announcer(
                 return;
             }
         };
+        rns_runtime::destination_stamper::load_stored_stamp(&mut destination, &identity);
 
         loop {
             send_rncp_announce(&transport_tx, &mut destination, &identity, destination_hash).await;
@@ -772,12 +773,18 @@ async fn send_rncp_announce(
     identity: &Identity,
     destination_hash: [u8; 16],
 ) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let raw = match destination.announce_packet(identity, None, None, false, None, now) {
-        Ok(raw) => raw,
+    let raw = match rns_runtime::destination_stamper::announce_packet(
+        destination,
+        identity,
+        None,
+        None,
+        false,
+        None,
+    )
+    .await
+    {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return,
         Err(e) => {
             tracing::warn!(error = %e, "rncp-rs: could not build announce packet");
             return;
