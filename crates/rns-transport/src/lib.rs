@@ -19,6 +19,11 @@ pub fn now_f64() -> f64 {
         .as_secs_f64()
 }
 
+/// Events Python logs at `LOG_PATHING` (7): debug events on the `rns::pathing` target.
+macro_rules! pathing {
+    ($($arg:tt)*) => { tracing::debug!(target: "rns::pathing", $($arg)*) };
+}
+
 pub mod actor;
 pub mod announce;
 pub mod announce_validation;

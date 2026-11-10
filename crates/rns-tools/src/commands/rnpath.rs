@@ -143,11 +143,7 @@ pub(crate) async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let level = match args.verbose {
-        0 => tracing::Level::WARN,
-        1 => tracing::Level::INFO,
-        _ => tracing::Level::DEBUG,
-    };
+    let level = rns_tools::Utility::Rnpath.loglevel(None, args.verbose, 0, false);
     let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
     rns_tools::init_tracing(
         level,

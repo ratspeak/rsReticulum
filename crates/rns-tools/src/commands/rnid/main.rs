@@ -285,14 +285,7 @@ async fn run(args: Args) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let target_loglevel = 4 + args.verbose as i32 - args.quiet as i32;
-    let level = match target_loglevel {
-        i32::MIN..=1 => tracing::Level::ERROR,
-        2..=3 => tracing::Level::WARN,
-        4 => tracing::Level::INFO,
-        5 => tracing::Level::DEBUG,
-        _ => tracing::Level::TRACE,
-    };
+    let level = rns_tools::Utility::Rnid.loglevel(None, args.verbose, args.quiet, false);
     let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
     rns_tools::init_tracing(
         level,

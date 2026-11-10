@@ -680,8 +680,7 @@ pub(crate) async fn main() {
         return;
     }
 
-    let verbosity = (!args.service).then(|| args.verbose as i32 - args.quiet as i32);
-    let level = tracing_level(effective_loglevel(&config_dir, verbosity));
+    let level = effective_loglevel(&config_dir, args.verbose, args.quiet, args.service);
     let log_timestamps = rns_tools::config_log_timestamps(&config_dir);
 
     if args.service {
@@ -911,34 +910,23 @@ fn parse_string_literal(value: &str) -> Option<String> {
 }
 
 /// Python `Reticulum.__apply_config`: the configured level plus the `-v`/`-q`
-/// delta, clamped to 0..=8; without a `loglevel` key the level stays at 3.
-/// A missing file is read as the default config the runtime writes first.
-fn effective_loglevel(config_dir: &Path, verbosity: Option<i32>) -> i32 {
+/// delta. A missing file is read as the default config the runtime writes first.
+fn effective_loglevel(
+    config_dir: &Path,
+    verbose: u8,
+    quiet: u8,
+    service: bool,
+) -> rns_tools::LogLevel {
     let path = config_dir.join("config");
     let config = if path.exists() {
         rns_runtime::config::Config::from_file(&path).ok()
     } else {
         rns_runtime::config::Config::parse(rns_runtime::config::Config::default_config()).ok()
     };
-    match config
+    let configured = config
         .as_ref()
-        .and_then(|c| c.section("logging")?.get_int("loglevel"))
-    {
-        Some(level) => level
-            .saturating_add(verbosity.unwrap_or(0).into())
-            .clamp(0, 8) as i32,
-        None => 3,
-    }
-}
-
-fn tracing_level(verbosity: i32) -> tracing::Level {
-    match verbosity {
-        i32::MIN..=1 => tracing::Level::ERROR,
-        2 => tracing::Level::WARN,
-        3..=4 => tracing::Level::INFO,
-        5..=6 => tracing::Level::DEBUG,
-        7.. => tracing::Level::TRACE,
-    }
+        .and_then(|c| c.section("logging")?.get_int("loglevel"));
+    rns_tools::Utility::Rnsd.loglevel(configured, verbose, quiet, service)
 }
 
 fn rotate_log_if_needed(path: &Path) -> std::io::Result<()> {
@@ -1067,14 +1055,15 @@ mod tests {
 
     #[test]
     fn verbosity_is_added_to_configured_loglevel_and_clamped() {
+        use rns_tools::LogLevel;
         let dir = std::env::temp_dir().join(format!("rnsd-loglevel-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config"), "[logging]\nloglevel = 4\n").unwrap();
-        assert_eq!(effective_loglevel(&dir, Some(5)), 8);
-        assert_eq!(effective_loglevel(&dir, Some(-9)), 0);
-        assert_eq!(effective_loglevel(&dir, None), 4);
+        assert_eq!(effective_loglevel(&dir, 5, 0, false), LogLevel::Extreme);
+        assert_eq!(effective_loglevel(&dir, 0, 9, false), LogLevel::Critical);
+        assert_eq!(effective_loglevel(&dir, 3, 0, true), LogLevel::Info);
         fs::write(dir.join("config"), "[reticulum]\n").unwrap();
-        assert_eq!(effective_loglevel(&dir, Some(4)), 3);
+        assert_eq!(effective_loglevel(&dir, 4, 0, false), LogLevel::Notice);
         let _ = fs::remove_dir_all(&dir);
     }
 

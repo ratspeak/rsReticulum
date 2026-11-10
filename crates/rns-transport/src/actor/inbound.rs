@@ -734,7 +734,7 @@ impl TransportActor {
             false
         };
         if interface_rate_blocked {
-            debug!(
+            pathing!(
                 dest = hex::encode(header.destination_hash),
                 interface = interface_id,
                 "announce blocked by per-interface rate limit"
@@ -765,7 +765,7 @@ impl TransportActor {
             if header.hops > 0 && header.hops - 1 == existing_hops && existing_retries > 0 {
                 let existing_local_rebroadcasts = existing.local_rebroadcasts + 1;
                 if existing_local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
-                    debug!(
+                    trace!(
                         dest = hex::encode(header.destination_hash),
                         "announce dedup: local rebroadcast limit reached, removing from table"
                     );
@@ -779,7 +779,7 @@ impl TransportActor {
                 if let Some(ae) = self.announce_table.get(&header.destination_hash)
                     && now < ae.retransmit_timeout
                 {
-                    debug!(
+                    trace!(
                         dest = hex::encode(header.destination_hash),
                         "announce dedup: passed on by another node, cancelling rebroadcast"
                     );
@@ -913,7 +913,7 @@ impl TransportActor {
                 );
             }
 
-            debug!(
+            pathing!(
                 dest = hex::encode(header.destination_hash),
                 hops = header.hops,
                 next_hop = ?header.transport_id.map(hex::encode),

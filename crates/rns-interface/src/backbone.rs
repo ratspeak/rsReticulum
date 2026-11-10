@@ -753,7 +753,7 @@ fn spawn_backbone_server_on_listener(
                         match fast_flap_runtime.admit(peer.ip(), fast_flap_policy) {
                             FastFlapAdmission::Allowed(connection) => connection,
                             FastFlapAdmission::Rejected { flaps } => {
-                                tracing::warn!(
+                                tracing::debug!(target: "rns::pathing",
                                     remote_ip = %peer.ip(),
                                     flaps,
                                     "backbone: rejecting fast-flapping connection",
@@ -764,7 +764,7 @@ fn spawn_backbone_server_on_listener(
 
                     let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
                     let client_name = format!("{}/client_{}", config.name, client_id);
-                    tracing::info!(
+                    tracing::debug!(target: "rns::pathing",
                         name = %client_name,
                         peer = %peer,
                         "backbone: accepted connection",
@@ -801,7 +801,7 @@ fn spawn_backbone_server_on_listener(
                         )
                         .await;
                         fast_flap_connection.disconnected();
-                        tracing::info!(name = %cname, "backbone client disconnected");
+                        tracing::debug!(target: "rns::pathing", name = %cname, "backbone client disconnected");
                         // Proactive notify so broadcasts don't target dead tx.
                         let _ = dereg_tx
                             .send(TransportMessage::DeregisterInterface { id: client_id })

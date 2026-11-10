@@ -134,13 +134,7 @@ pub(crate) async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let verbosity = (args.verbose as i32) - (args.quiet as i32);
-    let level = match verbosity {
-        v if v <= -1 => tracing::Level::ERROR,
-        0 => tracing::Level::WARN,
-        1 => tracing::Level::INFO,
-        _ => tracing::Level::DEBUG,
-    };
+    let level = rns_tools::Utility::Rnstatus.loglevel(None, args.verbose, args.quiet, false);
     let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
     rns_tools::init_tracing(
         level,

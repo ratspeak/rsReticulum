@@ -286,12 +286,7 @@ async fn start_reticulum(
 }
 
 fn init_logging(verbose: u8, quiet: u8, config_dir: Option<&Path>) {
-    let level = match (verbose as i32) - (quiet as i32) {
-        n if n >= 2 => tracing::Level::DEBUG,
-        1 => tracing::Level::INFO,
-        0 => tracing::Level::WARN,
-        _ => tracing::Level::ERROR,
-    };
+    let level = rns_tools::Utility::Rnsh.loglevel(None, verbose, quiet, false);
     let resolved = resolve_config_dir(config_dir.and_then(|path| path.to_str()));
     rns_tools::init_tracing(
         level,

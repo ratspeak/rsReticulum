@@ -522,11 +522,11 @@ impl ReceiverState {
         match result {
             CacheLookup::Valid(_) => {
                 let hits = ReceiverMetrics::increment(&self.metrics.valid_cache_hits);
-                trace!(hits, "discovery: valid announce cache hit");
+                pathing!(hits, "discovery: valid announce cache hit");
             }
             CacheLookup::Invalid => {
                 let hits = ReceiverMetrics::increment(&self.metrics.invalid_cache_hits);
-                trace!(hits, "discovery: invalid announce cache hit");
+                pathing!(hits, "discovery: invalid announce cache hit");
             }
             CacheLookup::Miss => {}
         }

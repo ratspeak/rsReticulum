@@ -1,18 +1,6 @@
 use super::*;
 use crate::now_f64;
 
-/// Python 1.3.8 Transport.PR_LOGLEVEL (Transport.py:220/306): path-request
-/// chatter logs at DEBUG on transport nodes, EXTREME (trace) on leaf nodes.
-macro_rules! pr_log {
-    ($actor:expr, $($arg:tt)*) => {
-        if $actor.is_transport_enabled {
-            debug!($($arg)*);
-        } else {
-            trace!($($arg)*);
-        }
-    };
-}
-
 /// Path-request lengths (Transport.py:3975-3980).
 pub(super) const PR_LEGACY_LENGTH: usize = 32;
 pub(super) const PR_LENGTH: usize = 48;
@@ -614,8 +602,7 @@ impl TransportActor {
         let mut requested_dest = [0u8; 16];
         requested_dest.copy_from_slice(&data[..16]);
         if data.len() == 16 {
-            pr_log!(
-                self,
+            pathing!(
                 dest = %hex::encode(requested_dest),
                 "ignoring tagless path request"
             );
@@ -662,12 +649,15 @@ impl TransportActor {
                     )
             });
             if !stamp_ok {
-                trace!(
-                    dest = %hex::encode(requested_dest),
-                    stamped = ext.is_some(),
-                    lenient = ext.as_ref().is_some_and(|ext| ext[1] == 0xFF),
-                    "path request without a valid stamp"
-                );
+                if ext.is_some() {
+                    pathing!(
+                        dest = %hex::encode(requested_dest),
+                        lenient = ext.as_ref().is_some_and(|ext| ext[1] == 0xFF),
+                        "path request without a valid stamp"
+                    );
+                } else {
+                    trace!(dest = %hex::encode(requested_dest), "unstamped path request");
+                }
                 if self.stamp_policy.stamps_enforced {
                     return;
                 }
@@ -680,7 +670,7 @@ impl TransportActor {
         }
 
         if self.local_destinations.contains(&requested_dest) {
-            debug!(
+            pathing!(
                 dest = %hex::encode(requested_dest),
                 "answering path request — destination is local"
             );
@@ -728,14 +718,14 @@ impl TransportActor {
                 && path.interface_id == interface_id;
 
             if requestor_is_next_hop {
-                debug!(
+                pathing!(
                     dest = %hex::encode(requested_dest),
                     "not answering path request — requester is our next hop"
                 );
                 return;
             }
             if same_roaming_interface {
-                debug!(
+                pathing!(
                     dest = %hex::encode(requested_dest),
                     "not answering path request on roaming interface learned from same interface"
                 );
@@ -754,8 +744,7 @@ impl TransportActor {
                 else {
                     return;
                 };
-                pr_log!(
-                    self,
+                pathing!(
                     dest = %hex::encode(requested_dest),
                     hops,
                     "answering path request — path is known, queueing path response"
@@ -809,8 +798,7 @@ impl TransportActor {
             .is_some_and(|iface| iface.recursive_prs || mode_discovers_unknown_paths(iface.mode));
 
         if is_from_local_client {
-            pr_log!(
-                self,
+            pathing!(
                 dest = %hex::encode(requested_dest),
                 "forwarding path request from local shared client"
             );
@@ -827,7 +815,7 @@ impl TransportActor {
                 .get_mut(&interface_id)
                 .is_some_and(|iface| iface.ingress.should_ingress_limit_pr());
             if ingress_limited {
-                debug!(
+                pathing!(
                     dest = %hex::encode(requested_dest),
                     interface_id,
                     "not forwarding recursive path request — ingress PR burst active"
@@ -855,8 +843,7 @@ impl TransportActor {
                 );
             }
         } else if self.has_local_client_interfaces() {
-            pr_log!(
-                self,
+            pathing!(
                 dest = %hex::encode(requested_dest),
                 "forwarding path request to local shared clients"
             );
@@ -871,8 +858,7 @@ impl TransportActor {
                 );
             }
         } else {
-            pr_log!(
-                self,
+            pathing!(
                 dest = %hex::encode(requested_dest),
                 interface_id,
                 "ignoring unknown path request on non-discovery interface"
@@ -1183,13 +1169,13 @@ impl TransportActor {
                     if tunnel_timebase >= current_timebase {
                         should_add = true;
                     } else {
-                        debug!(
+                        pathing!(
                             dest = hex::encode(dest_hash),
                             "did not restore tunnel path: existing path is more recent"
                         );
                     }
                 } else {
-                    debug!(
+                    pathing!(
                         dest = hex::encode(dest_hash),
                         "did not restore tunnel path: newer path with fewer hops exists"
                     );
@@ -1197,7 +1183,7 @@ impl TransportActor {
             } else if now < tunnel_path.expires {
                 should_add = true;
             } else {
-                debug!(
+                pathing!(
                     dest = hex::encode(dest_hash),
                     "did not restore tunnel path: expired"
                 );
@@ -1216,7 +1202,7 @@ impl TransportActor {
                 self.path_table.insert(*dest_hash, entry);
                 self.state_dirty = true;
                 self.fire_path_waiters(dest_hash);
-                debug!(
+                pathing!(
                     dest = hex::encode(dest_hash),
                     hops = tunnel_path.hops,
                     "restored tunnel path"
@@ -1230,7 +1216,7 @@ impl TransportActor {
             if let Some(tunnel) = self.tunnel_table.get_mut(tunnel_id) {
                 for dest_hash in &deprecated_paths {
                     tunnel.tunnel_paths.remove(dest_hash);
-                    debug!(
+                    pathing!(
                         dest = hex::encode(dest_hash),
                         tunnel = hex::encode(&tunnel_id[..16]),
                         "removed deprecated path from tunnel"

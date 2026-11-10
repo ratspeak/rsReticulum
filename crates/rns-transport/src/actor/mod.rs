@@ -2013,7 +2013,7 @@ impl TransportActor {
         // Mode-independent gate: a non-local announce whose next-hop interface
         // doesn't exist is never rebroadcast (Transport.py:1216-1218).
         if !local && from_iface_mode.is_none() {
-            trace!(
+            pathing!(
                 dest = hex::encode(destination_hash),
                 interface = id,
                 "blocking announce broadcast: next hop interface doesn't exist"
@@ -2027,7 +2027,7 @@ impl TransportActor {
             && !entry.announces_from_internal
             && from_iface_mode == Some(Some(InterfaceMode::Internal))
         {
-            trace!(
+            pathing!(
                 dest = hex::encode(destination_hash),
                 interface = id,
                 "blocking announce broadcast: internal-mode next hop interface"

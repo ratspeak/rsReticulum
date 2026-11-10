@@ -211,12 +211,7 @@ pub(crate) async fn main() {
         process::exit(2);
     }
 
-    let level = match (args.verbose as i32) - (args.quiet as i32) {
-        n if n >= 2 => tracing::Level::DEBUG,
-        1 => tracing::Level::INFO,
-        0 => tracing::Level::WARN,
-        _ => tracing::Level::ERROR,
-    };
+    let level = rns_tools::Utility::Rncp.loglevel(None, args.verbose, args.quiet, false);
     let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
     rns_tools::init_tracing(
         level,

@@ -366,9 +366,10 @@ impl TransportActor {
             self.path_table.expire(&destination_hash);
         }
 
-        debug!(
+        pathing!(
             dest = hex::encode(destination_hash),
-            blocked_interface, "unvalidated link expired -- queued re-discovery"
+            blocked_interface,
+            "unvalidated link expired -- queued re-discovery"
         );
 
         Some(PendingDiscoveryPathRequest {
@@ -575,7 +576,7 @@ impl TransportActor {
                 .and_then(|iface| iface.ingress.try_release_held());
 
             if let Some(announce) = released {
-                debug!(
+                pathing!(
                     dest = hex::encode(announce.destination_hash),
                     interface = iface_id,
                     "releasing held announce"
@@ -666,7 +667,7 @@ impl TransportActor {
                 self.recent_announces.remove(hash);
             }
             self.state_dirty = true;
-            debug!(
+            pathing!(
                 removed = to_drop.len(),
                 remaining = self.recent_announces.len(),
                 before,
