@@ -258,8 +258,12 @@ mod tests {
         let (mut actor, handle, mut radio) = fixture();
         let link = dispatch(&mut actor);
         radio.try_recv().unwrap();
-        // A traffic touch is not a replacement announcement.
-        actor.path_table.get_live_mut(&[0xDD; 16]).unwrap().touch();
+        // Traffic use is not a replacement announcement.
+        actor
+            .path_table
+            .get_live_mut(&[0xDD; 16])
+            .unwrap()
+            .mark_used();
         let result = recover(&mut actor, &handle, [0xDD; 16], Some(link));
         assert!(result.path_dropped && !result.has_path && result.request_scheduled);
         assert!(actor.path_interface_suppressions.is_empty());

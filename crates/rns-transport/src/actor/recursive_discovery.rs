@@ -9,6 +9,9 @@ pub(super) struct DiscoveryOperation {
     pub(super) id: Arc<()>,
     pub(super) timeout: f64,
     requesters: Vec<Waiter>,
+    /// False while the entry only batches requesters behind an in-flight
+    /// request and no fan-out has started (Transport.py:2150-2156@1.6.0).
+    engaged: bool,
 }
 
 struct Waiter {
@@ -85,20 +88,28 @@ impl TransportActor {
             return Err(DiscoveryError::InterfaceUnavailable);
         }
         entry.ingress.received_path_request();
+        let search = path_search_modes(entry.recursive_prs, entry.mode);
         if entry.role != InterfaceRole::Normal
-            || !(entry.recursive_prs || mode_discovers_unknown_paths(entry.mode))
+            || search.is_none()
             || entry.ingress.should_ingress_limit_pr()
         {
             return Err(DiscoveryError::PolicyDenied);
         }
-        let admission = self.admit_discovery_requester(destination, requester, now)?;
+        let admission = self.admit_discovery_requester(destination, requester, now, true)?;
         if admission.started {
             let tag = rns_crypto::random::random_bytes(16);
             let mut unique_tag = [0u8; 32];
             unique_tag[..16].copy_from_slice(&destination);
             unique_tag[16..].copy_from_slice(&tag);
             self.discovery_pr_tags.insert(unique_tag);
-            self.forward_path_request(destination, Some(requester), Some(&tag), true);
+            self.forward_path_request_ext(
+                destination,
+                Some(requester),
+                Some(&tag),
+                None,
+                true,
+                search.flatten(),
+            );
         }
         Ok(admission)
     }
@@ -165,15 +176,30 @@ impl TransportActor {
         requester: InterfaceId,
         now: f64,
     ) -> bool {
-        self.admit_discovery_requester(destination, requester, now)
+        self.admit_discovery_requester(destination, requester, now, true)
             .is_ok_and(|admission| admission.started)
     }
 
+    /// Add a requester behind an in-flight path request without starting a
+    /// fan-out (Transport.py:2143-2156@1.6.0).
+    pub(super) fn batch_inflight_requester(
+        &mut self,
+        destination: [u8; 16],
+        requester: InterfaceId,
+        now: f64,
+    ) {
+        let _ = self.admit_discovery_requester(destination, requester, now, false);
+    }
+
+    /// `engage` starts a fan-out unless one is already engaged; an entry that
+    /// only batched requesters is engaged with a fresh deadline
+    /// (Transport.py:3888-3926@1.6.0).
     fn admit_discovery_requester(
         &mut self,
         destination: [u8; 16],
         requester: InterfaceId,
         now: f64,
+        engage: bool,
     ) -> Result<DiscoveryAdmission, DiscoveryError> {
         if !now.is_finite() {
             return Err(DiscoveryError::InvalidClock);
@@ -196,13 +222,19 @@ impl TransportActor {
             return Err(DiscoveryError::InterfaceUnavailable);
         }
         let channel = entry.tx.clone();
+        let engage_timeout = now + self.recursive_discovery_timeout(requester);
         if let Some(operation) = self.discovery_path_requests.get_mut(&destination) {
+            let start = engage && !operation.engaged;
+            if start {
+                operation.engaged = true;
+                operation.timeout = engage_timeout;
+            }
             if let Some(waiter) = operation.requesters.iter().find(|waiter| {
                 waiter.token.interface == requester && waiter.channel.same_channel(&channel)
             }) {
                 return Ok(DiscoveryAdmission {
                     requester: waiter.token.clone(),
-                    started: false,
+                    started: start,
                 });
             }
             if operation.requesters.len() >= MAX_DISCOVERY_REQUESTERS {
@@ -220,7 +252,7 @@ impl TransportActor {
             });
             return Ok(DiscoveryAdmission {
                 requester: token,
-                started: false,
+                started: start,
             });
         }
         if self.discovery_path_requests.len() >= MAX_DISCOVERY_DESTINATIONS {
@@ -229,7 +261,7 @@ impl TransportActor {
                 return Err(DiscoveryError::Capacity);
             }
         }
-        let timeout = now + self.recursive_discovery_timeout(requester);
+        let timeout = engage_timeout;
         if !timeout.is_finite() || timeout <= now {
             return Err(DiscoveryError::InvalidClock);
         }
@@ -249,11 +281,12 @@ impl TransportActor {
                     token: token.clone(),
                     channel,
                 }],
+                engaged: engage,
             },
         );
         Ok(DiscoveryAdmission {
             requester: token,
-            started: true,
+            started: engage,
         })
     }
 

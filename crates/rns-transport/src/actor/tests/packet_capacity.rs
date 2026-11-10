@@ -14,6 +14,7 @@ fn ingress(actor: &mut TransportActor, interface_id: InterfaceId, raw: Bytes) {
 fn capacity(clear: u32, wire: u32, upgrade: bool) -> InterfaceEntry {
     let (mut entry, _rx) = make_test_interface("capacity");
     entry.packet_capacity = InterfacePacketCapacity::new(clear, wire, upgrade);
+    entry.mtu = clear;
     entry
 }
 fn payload(mode: u8, mtu: u32) -> Vec<u8> {
@@ -23,7 +24,7 @@ fn payload(mode: u8, mtu: u32) -> Vec<u8> {
 }
 
 #[test]
-fn packet_capacity_attenuates_two_relays_without_changing_key_body() {
+fn packet_capacity_clamps_to_hardware_mtu_without_changing_key_body() {
     let input = capacity(10_000, 10_000, true);
     let mut middle = capacity(1500, 1500, true);
     middle.ifac_key = Some([1; 64].into());
@@ -32,12 +33,15 @@ fn packet_capacity_attenuates_two_relays_without_changing_key_body() {
     let original = payload(1, 4096);
     let (first, mode, ceiling) =
         crate::link_transit::attenuate_request(&original, 1, &input, 2, &middle).unwrap();
-    assert_eq!((mode, ceiling), (1, 1484));
+    assert_eq!((mode, ceiling), (1, 1500));
     assert_eq!(&first[..64], &original[..64]);
     let (second, _, ceiling) =
         crate::link_transit::attenuate_request(&first, 2, &middle, 3, &output).unwrap();
     assert_eq!(ceiling, 1000);
     assert_eq!(parse_request_signalling(&second).unwrap().mtu.get(), 1000);
+    let (back, _, ceiling) =
+        crate::link_transit::attenuate_request(&second, 3, &output, 1, &input).unwrap();
+    assert_eq!((back, ceiling), (second.clone(), 1000));
     let base = capacity(500, 508, false);
     let (legacy, _, ceiling) =
         crate::link_transit::attenuate_request(&second, 3, &output, 4, &base).unwrap();
@@ -50,23 +54,28 @@ fn packet_capacity_attenuates_two_relays_without_changing_key_body() {
 }
 
 #[test]
-fn packet_capacity_opaque_modes_only_transit_with_exact_supported_shape() {
+fn packet_capacity_opaque_modes_relay_unless_a_clamp_is_needed() {
     let high = capacity(1500, 1500, true);
+    let narrow = capacity(1200, 1200, true);
     let base = capacity(500, 508, false);
     for mode in [0, 2, 3, 4, 5, 6, 7] {
-        let exact = payload(mode, 500);
-        assert_eq!(
-            crate::link_transit::attenuate_request(&exact, 1, &high, 2, &base)
-                .unwrap()
-                .0,
-            exact
-        );
+        for exact in [payload(mode, 500), payload(mode, 1200), payload(mode, 0)] {
+            assert_eq!(
+                crate::link_transit::attenuate_request(&exact, 1, &high, 2, &narrow)
+                    .unwrap()
+                    .0,
+                exact
+            );
+        }
         assert!(
-            crate::link_transit::attenuate_request(&payload(mode, 501), 1, &high, 2, &base)
+            crate::link_transit::attenuate_request(&payload(mode, 1201), 1, &high, 2, &narrow)
                 .is_err()
         );
-        assert!(
-            crate::link_transit::attenuate_request(&payload(mode, 0), 1, &high, 2, &base).is_err()
+        assert_eq!(
+            crate::link_transit::attenuate_request(&payload(mode, 1201), 1, &high, 2, &base)
+                .unwrap()
+                .0,
+            vec![0x42; 64]
         );
     }
     for mtu in [1, 499] {
@@ -74,13 +83,6 @@ fn packet_capacity_opaque_modes_only_transit_with_exact_supported_shape() {
             crate::link_transit::attenuate_request(&payload(1, mtu), 1, &high, 2, &base).is_err()
         );
     }
-    let mut narrow = capacity(500, 508, false);
-    narrow.ifac_key = Some([1; 64].into());
-    narrow.ifac_size = 9;
-    assert_eq!(narrow.effective_clear_mtu().unwrap(), 499);
-    assert!(
-        crate::link_transit::attenuate_request(&payload(1, 500), 1, &high, 2, &narrow).is_err()
-    );
 }
 
 #[test]
@@ -438,49 +440,34 @@ fn packet_capacity_cancelled_request_attempt_cannot_emit_delayed_packet() {
 
 #[test]
 fn packet_capacity_refused_transit_request_can_retry_without_hash_poisoning() {
-    for queue_full in [false, true] {
-        let (mut actor, _) = TransportActor::new();
-        actor.is_transport_enabled = true;
-        let transport_id = [0x91; 16];
-        actor.transport_identity_hash = Some(transport_id);
-        let (first, _first_rx) = make_test_interface("ingress");
-        let (mut second, mut rx) = make_test_interface("egress");
-        second.packet_capacity =
-            InterfacePacketCapacity::new(if queue_full { 500 } else { 499 }, 564, false);
-        if queue_full {
-            while second.tx.try_send(Bytes::from_static(b"occupied")).is_ok() {}
-        }
-        actor.interfaces.insert(1, first);
-        actor.interfaces.insert(2, second);
-        let destination = [0x92; 16];
-        actor
-            .path_table
-            .insert(destination, PathEntry::new(None, 1, 2, InterfaceMode::Full));
-        let raw = make_header2_link_request_packet(transport_id, destination, 0, &[0x42; 64]);
-        let link_id = rns_wire::hash::link_id_from_raw(&raw, rns_wire::flags::HeaderType::Header2);
-        ingress(&mut actor, 1, raw.clone());
-        assert!(!actor.link_table.contains(&link_id));
-        if queue_full {
-            while let Ok(frame) = rx.try_recv() {
-                assert_eq!(&frame[..], b"occupied");
-            }
-        } else {
-            assert!(rx.try_recv().is_err());
-            actor.interfaces.get_mut(&2).unwrap().packet_capacity =
-                InterfacePacketCapacity::new(500, 564, false);
-        }
-        ingress(&mut actor, 1, raw.clone());
-        assert!(
-            rx.try_recv().is_ok(),
-            "retry refused after recovery queue_full={queue_full}"
-        );
-        assert!(actor.link_table.contains(&link_id));
-        let deadline = actor.link_table.get(&link_id).unwrap().proof_timeout;
-        ingress(&mut actor, 1, raw);
-        assert!(rx.try_recv().is_err());
-        assert_eq!(
-            actor.link_table.get(&link_id).unwrap().proof_timeout,
-            deadline
-        );
+    let (mut actor, _) = TransportActor::new();
+    actor.is_transport_enabled = true;
+    let transport_id = [0x91; 16];
+    actor.transport_identity_hash = Some(transport_id);
+    let (first, _first_rx) = make_test_interface("ingress");
+    let (second, mut rx) = make_test_interface("egress");
+    while second.tx.try_send(Bytes::from_static(b"occupied")).is_ok() {}
+    actor.interfaces.insert(1, first);
+    actor.interfaces.insert(2, second);
+    let destination = [0x92; 16];
+    actor
+        .path_table
+        .insert(destination, PathEntry::new(None, 1, 2, InterfaceMode::Full));
+    let raw = make_header2_link_request_packet(transport_id, destination, 0, &[0x42; 64]);
+    let link_id = rns_wire::hash::link_id_from_raw(&raw, rns_wire::flags::HeaderType::Header2);
+    ingress(&mut actor, 1, raw.clone());
+    assert!(!actor.link_table.contains(&link_id));
+    while let Ok(frame) = rx.try_recv() {
+        assert_eq!(&frame[..], b"occupied");
     }
+    ingress(&mut actor, 1, raw.clone());
+    assert!(rx.try_recv().is_ok(), "retry refused after queue recovery");
+    assert!(actor.link_table.contains(&link_id));
+    let deadline = actor.link_table.get(&link_id).unwrap().proof_timeout;
+    ingress(&mut actor, 1, raw);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        actor.link_table.get(&link_id).unwrap().proof_timeout,
+        deadline
+    );
 }

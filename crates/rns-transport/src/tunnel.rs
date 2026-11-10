@@ -22,6 +22,8 @@ pub struct TunnelPath {
     pub expires: f64,
     pub random_blobs: Vec<[u8; 10]>,
     pub packet_hash: Option<[u8; 32]>,
+    /// Last use of the path, carried into the path table on restore.
+    pub used: f64,
 }
 
 /// Tunnel records and cached interface-to-tunnel associations. Lookup does not

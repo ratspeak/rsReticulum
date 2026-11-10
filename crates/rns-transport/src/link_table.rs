@@ -18,9 +18,8 @@ pub struct LinkEntry {
     /// Local establishment bookkeeping flag. Transit proof processing updates
     /// `validated` separately, so this is not a universal Link-health check.
     pub established: bool,
-    /// Transport validation state. A pending transit Link may still forward
-    /// before its finite `proof_timeout`, subject to owner, packet-size, hop
-    /// and interface checks. This is separate from application authorization.
+    /// Transport validation state. Link packets for a pending transit Link
+    /// are dropped as protocol violations until its proof is relayed.
     pub validated: bool,
     pub proof_timeout: f64,
     /// Interface the initial link request arrived on.
@@ -115,9 +114,12 @@ impl LinkTable {
         self.entries.get_mut(link_id)
     }
 
+    /// Unvalidated entries stay until their proof deadline so rediscovery can
+    /// act on them (Transport.py:1036-1046).
     pub fn remove_interface(&mut self, interface_id: InterfaceId) {
         self.entries.retain(|_, entry| {
-            entry.interface_id != interface_id && entry.receiving_interface != interface_id
+            !entry.validated
+                || (entry.interface_id != interface_id && entry.receiving_interface != interface_id)
         });
     }
 
@@ -169,16 +171,18 @@ impl LinkTable {
         (before - self.entries.len(), unvalidated_expired)
     }
 
-    /// Drop entries whose interfaces have gone away. Run with the current
-    /// active-interface set during periodic maintenance.
+    /// Drop validated entries whose interfaces have gone away; unvalidated
+    /// ones expire through `cull_stale`. Run with the current active-interface
+    /// set during periodic maintenance.
     pub fn cull_dead_interfaces(
         &mut self,
         active_interfaces: &std::collections::HashSet<InterfaceId>,
     ) -> usize {
         let before = self.entries.len();
         self.entries.retain(|_, entry| {
-            active_interfaces.contains(&entry.interface_id)
-                && active_interfaces.contains(&entry.receiving_interface)
+            !entry.validated
+                || (active_interfaces.contains(&entry.interface_id)
+                    && active_interfaces.contains(&entry.receiving_interface))
         });
         before - self.entries.len()
     }

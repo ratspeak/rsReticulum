@@ -15,6 +15,7 @@ enum InboundOrigin {
 
 /// A transit link proof's verdict; only a bad signature is a protocol
 /// violation (Transport.py:2668).
+#[derive(PartialEq, Eq)]
 enum TransitProof {
     Valid,
     InvalidSignature,
@@ -325,10 +326,12 @@ impl TransportActor {
             let Some(ingress) = self.interfaces.get(&packet.interface_id) else {
                 return;
             };
-            if ingress
-                .packet_capacity
-                .link_ceiling(packet.interface_id, ingress.active_ifac_bytes())
-                .is_err()
+            // A relay has no capacity refusal (Transport.py:2331-2375).
+            if self.local_destinations.contains(&parsed.destination_hash)
+                && ingress
+                    .packet_capacity
+                    .link_ceiling(packet.interface_id, ingress.active_ifac_bytes())
+                    .is_err()
             {
                 return;
             }
@@ -885,6 +888,11 @@ impl TransportActor {
                 interface_id,
                 iface_mode,
             );
+            // Transport.py:2510,2726@1.6.0: a replacement keeps the path's use.
+            entry.used = self
+                .path_table
+                .get(&header.destination_hash)
+                .map_or(0.0, |existing| existing.used);
             if !random_blobs.contains(&announce_random_hash) {
                 if random_blobs.len() >= MAX_RANDOM_BLOBS {
                     random_blobs.pop_front();
@@ -918,6 +926,7 @@ impl TransportActor {
                     expires: entry.expires,
                     random_blobs: entry.random_blobs.iter().copied().collect(),
                     packet_hash: entry.packet_hash,
+                    used: entry.used,
                 };
                 self.path_table.insert(header.destination_hash, entry);
                 if let Some(tunnel) = self.tunnel_table.get_mut_by_interface(interface_id) {
@@ -933,6 +942,8 @@ impl TransportActor {
             }
             // Wake any callers waiting on a path for this destination.
             self.fire_path_waiters(&header.destination_hash);
+            // Transport.py:2751-2754@1.6.0.
+            self.inflight_path_requests.remove(&header.destination_hash);
 
             if self
                 .discovery_path_requests
@@ -1209,7 +1220,7 @@ impl TransportActor {
             );
             self.send_to_interface(target_interface, &forwarded);
             if let Some(path) = self.path_table.get_live_mut(&header.destination_hash) {
-                path.touch();
+                path.mark_used();
             }
             trace!(
                 dest = hex::encode(header.destination_hash),
@@ -1323,7 +1334,7 @@ impl TransportActor {
                 return;
             }
             if let Some(path) = self.path_table.get_live_mut(&header.destination_hash) {
-                path.touch();
+                path.mark_used();
             }
 
             // Cache the relay so the matching LRPROOF can be routed back to
@@ -1609,6 +1620,7 @@ impl TransportActor {
                 if !admitted || !signal_valid {
                     return;
                 }
+                self.rebalance_at_link_terminus(raw, header);
                 if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
                     let _ = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                         raw: raw.clone(),
@@ -1623,7 +1635,7 @@ impl TransportActor {
                 return;
             }
             if (self.is_transport_enabled || from_local_client || for_local_client_link)
-                && let Some(link_entry) = self.link_table.get(&header.destination_hash)
+                && let Some(mut link_entry) = self.link_table.get(&header.destination_hash).cloned()
             {
                 if !link_entry.validated
                     && (now_f64() >= link_entry.proof_timeout
@@ -1632,6 +1644,30 @@ impl TransportActor {
                     trace!("expired pending transit Link cannot accept a late proof");
                     return;
                 }
+                // Python re-balances the path from a validly signed proof that
+                // took a different number of hops (Transport.py:2886-2912).
+                if header.hops != link_entry.remaining_hops
+                    && _interface_id == link_entry.interface_id
+                    && !link_entry.validated
+                    && self.validate_transit_lrproof(raw, header, &link_entry)
+                        == TransitProof::Valid
+                {
+                    pathing!(
+                        dest = hex::encode(link_entry.destination_hash),
+                        from = link_entry.remaining_hops,
+                        to = header.hops,
+                        "re-balancing path from link request proof"
+                    );
+                    link_entry.remaining_hops = header.hops;
+                    if let Some(entry) = self.link_table.get_mut(&header.destination_hash) {
+                        entry.remaining_hops = header.hops;
+                    }
+                    if let Some(path) = self.path_table.get_mut(&link_entry.destination_hash) {
+                        path.hops = header.hops;
+                    }
+                    self.mark_path_responsive(&link_entry.destination_hash);
+                }
+                let link_entry = &link_entry;
                 let expected_hops = link_entry.remaining_hops;
                 let outbound_interface = link_entry.interface_id;
                 let target_interface = link_entry.receiving_interface;
@@ -1688,6 +1724,7 @@ impl TransportActor {
                     }
                     if !self.is_shared_instance {
                         self.use_destination(&destination_hash);
+                        self.mark_path_responsive(&destination_hash);
                     }
                     debug!(
                         link_id = hex::encode(header.destination_hash),
@@ -1828,18 +1865,6 @@ impl TransportActor {
         let Some(entry) = self.link_table.get(&header.destination_hash).cloned() else {
             return false;
         };
-        if !self.link_registration_is_current(&entry)
-            || raw.len() > entry.accepted_mtu_ceiling as usize
-        {
-            return true;
-        }
-
-        if !entry.validated
-            && (now_f64() >= entry.proof_timeout || !entry.proof_timeout.is_finite())
-        {
-            trace!("expired pending transit Link cannot forward traffic");
-            return true;
-        }
 
         let from_local_client = self.is_local_client_interface(interface_id);
         // Python 1.3.8 Transport.py:1548-1553 (the 1.3.7 eacff56f fix): links
@@ -1852,6 +1877,20 @@ impl TransportActor {
             || self.is_local_client_interface(entry.interface_id);
         if !self.is_transport_enabled && !shared_client_path {
             return false;
+        }
+        // Transport.py:2396-2402: nothing but the proof may cross before validation.
+        if !entry.validated {
+            debug!(
+                link_id = hex::encode(header.destination_hash),
+                interface_id, "link packet received before link validation"
+            );
+            self.protocol_violation(interface_id);
+            return true;
+        }
+        if !self.link_registration_is_current(&entry)
+            || raw.len() > entry.accepted_mtu_ceiling as usize
+        {
+            return true;
         }
 
         let target_interface = if entry.interface_id == entry.receiving_interface {
@@ -1899,7 +1938,7 @@ impl TransportActor {
                 outbound_interface = entry.interface_id,
                 "link packet arrived on interface outside link table path, not transporting"
             );
-            return false;
+            return true;
         };
 
         let mut forwarded = raw.to_vec();
@@ -1936,6 +1975,10 @@ impl TransportActor {
             entry.timestamp = now_f64();
         }
         self.send_to_interface(target_interface, &forwarded);
+        // Transport.py:2438-2440@1.6.0.
+        if let Some(path) = self.path_table.get_mut(&entry.destination_hash) {
+            path.mark_used();
+        }
         trace!(
             link_id = hex::encode(header.destination_hash),
             via_interface = target_interface,
@@ -2000,6 +2043,71 @@ impl TransportActor {
             return TransitProof::Refused;
         }
 
+        match self.lrproof_signature_valid(
+            proof_data,
+            &header.destination_hash,
+            &link_entry.destination_hash,
+        ) {
+            Some(true) => TransitProof::Valid,
+            Some(false) => {
+                warn!(
+                    link_id = hex::encode(header.destination_hash),
+                    destination = hex::encode(link_entry.destination_hash),
+                    "invalid link request proof signature, not transporting"
+                );
+                TransitProof::InvalidSignature
+            }
+            None => TransitProof::Refused,
+        }
+    }
+
+    /// Python's terminus re-balance (Transport.py:2954-2984): the first validly
+    /// signed proof for a pending local Link ends its pending state and, when
+    /// its hops differ from the path hops at request time, rewrites the path
+    /// hops and marks the path responsive.
+    fn rebalance_at_link_terminus(&mut self, raw: &[u8], header: &rns_wire::header::PacketHeader) {
+        let Some(&(destination_hash, expected_hops)) =
+            self.pending_local_link_hops.get(&header.destination_hash)
+        else {
+            return;
+        };
+        if self.lrproof_signature_valid(
+            &raw[header.size()..],
+            &header.destination_hash,
+            &destination_hash,
+        ) != Some(true)
+        {
+            return;
+        }
+        // A valid proof ends the pending state, so a replay cannot re-balance (Transport.py:2954).
+        self.pending_local_link_hops
+            .remove(&header.destination_hash);
+        if expected_hops == Some(header.hops) {
+            return;
+        }
+        pathing!(
+            dest = hex::encode(destination_hash),
+            from = ?expected_hops,
+            to = header.hops,
+            "re-balancing path at link terminus"
+        );
+        if let Some(path) = self.path_table.get_mut(&destination_hash) {
+            path.hops = header.hops;
+        }
+        self.mark_path_responsive(&destination_hash);
+    }
+
+    /// Verify an LRPROOF signature against the destination's announced key;
+    /// `None` when the length or identity is unusable.
+    fn lrproof_signature_valid(
+        &self,
+        proof_data: &[u8],
+        link_id: &[u8; 16],
+        destination_hash: &[u8; 16],
+    ) -> Option<bool> {
+        if proof_data.len() != 96 && proof_data.len() != 99 {
+            return None;
+        }
         let mut signature = [0u8; 64];
         signature.copy_from_slice(&proof_data[..64]);
         let responder_x25519_pub = &proof_data[64..96];
@@ -2011,15 +2119,15 @@ impl TransportActor {
 
         let Some(destination_public_key) = self
             .recent_announces
-            .get(&link_entry.destination_hash)
+            .get(destination_hash)
             .and_then(|announce| announce.public_key)
         else {
             warn!(
-                link_id = hex::encode(header.destination_hash),
-                destination = hex::encode(link_entry.destination_hash),
-                "link request proof has no known destination identity, not transporting"
+                link_id = hex::encode(link_id),
+                destination = hex::encode(destination_hash),
+                "link request proof has no known destination identity"
             );
-            return TransitProof::Refused;
+            return None;
         };
 
         let mut destination_ed25519 = [0u8; 32];
@@ -2029,30 +2137,21 @@ impl TransportActor {
                 Ok(key) => key,
                 Err(err) => {
                     warn!(
-                        link_id = hex::encode(header.destination_hash),
-                        destination = hex::encode(link_entry.destination_hash),
+                        link_id = hex::encode(link_id),
+                        destination = hex::encode(destination_hash),
                         error = %err,
-                        "link request proof destination identity is invalid, not transporting"
+                        "link request proof destination identity is invalid"
                     );
-                    return TransitProof::Refused;
+                    return None;
                 }
             };
 
         let mut signed_data = Vec::with_capacity(16 + 32 + 32 + signalling.len());
-        signed_data.extend_from_slice(&header.destination_hash);
+        signed_data.extend_from_slice(link_id);
         signed_data.extend_from_slice(responder_x25519_pub);
         signed_data.extend_from_slice(&destination_ed25519);
         signed_data.extend_from_slice(signalling);
 
-        if verify_key.verify(&signed_data, &signature).is_ok() {
-            TransitProof::Valid
-        } else {
-            warn!(
-                link_id = hex::encode(header.destination_hash),
-                destination = hex::encode(link_entry.destination_hash),
-                "invalid link request proof signature, not transporting"
-            );
-            TransitProof::InvalidSignature
-        }
+        Some(verify_key.verify(&signed_data, &signature).is_ok())
     }
 }

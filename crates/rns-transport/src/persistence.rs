@@ -45,6 +45,9 @@ pub struct PersistedPathEntry {
     /// Deserializing this byte vector does not validate its length or contents.
     #[serde(default)]
     pub packet_hash: Option<Vec<u8>>,
+    /// Last path use; absent in older snapshots, which load as used now.
+    #[serde(default)]
+    pub used: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +102,7 @@ pub fn save_path_table(
             interface_name,
             interface_hash,
             packet_hash: entry.packet_hash.map(|h| h.to_vec()),
+            used: Some(entry.used),
         });
     }
 
@@ -140,6 +144,8 @@ pub struct PythonDestinationEntry {
     pub random_blobs: Vec<[u8; 10]>,
     pub interface_hash: [u8; 32],
     pub packet_hash: [u8; 32],
+    /// Ninth field; `None` for a legacy eight-field row.
+    pub used: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +172,8 @@ pub struct PythonTunnelPath {
     pub random_blobs: Vec<[u8; 10]>,
     pub interface_hash: Option<[u8; 32]>,
     pub packet_hash: [u8; 32],
+    /// Ninth field; `None` for a legacy eight-field row.
+    pub used: Option<f64>,
 }
 
 /// Hash the exact UTF-8 interface name with full SHA-256. No normalization or
@@ -177,8 +185,7 @@ pub fn interface_hash_from_name(name: &str) -> [u8; 32] {
 /// Save the Python-compatible nine-field destination rows. Entries without a
 /// supplied interface name or cached announce hash are skipped; expired entries
 /// are retained. Rows carry every in-memory random blob, as Python does. The
-/// ninth field is Python's path `used` time; Rust does not track path use, so
-/// it writes the path timestamp, as a Python loader assumes for legacy rows.
+/// ninth field is the path's last use (Transport.py:4345-4357@1.6.0).
 pub fn save_python_destination_table(
     table: &PathTable,
     interface_names: &HashMap<u64, String>,
@@ -207,7 +214,7 @@ pub fn save_python_destination_table(
             Value::Array(random_blobs),
             Value::Binary(interface_hash_from_name(interface_name).to_vec()),
             Value::Binary(packet_hash.to_vec()),
-            Value::F64(entry.timestamp),
+            Value::F64(entry.used),
         ]));
     }
 
@@ -283,6 +290,7 @@ pub fn load_python_destination_table(
             random_blobs,
             interface_hash,
             packet_hash,
+            used: fields.get(8).map(|used| value_f64(used).unwrap_or(0.0)),
         });
     }
     Ok(out)
@@ -379,8 +387,8 @@ pub fn load_python_cached_announce(
 
 /// Save Python-compatible tunnel rows, retaining expired tunnels and paths.
 /// Nested paths without a cached announce hash are omitted; each saved path
-/// keeps at most the last 32 random blobs and, as its ninth field, the path
-/// timestamp in place of Python's `used` time. An unknown interface has no hash.
+/// keeps at most the last 32 random blobs and, as its ninth field, the path's
+/// last use (Transport.py:4419-4441@1.6.0). An unknown interface has no hash.
 pub fn save_python_tunnel_table(
     table: &crate::tunnel::TunnelTable,
     interface_names: &HashMap<u64, String>,
@@ -419,7 +427,7 @@ pub fn save_python_tunnel_table(
                 Value::Array(random_blobs),
                 interface_hash.clone(),
                 Value::Binary(packet_hash.to_vec()),
-                Value::F64(tunnel_path.timestamp),
+                Value::F64(tunnel_path.used),
             ]));
         }
 
@@ -506,6 +514,9 @@ pub fn load_python_tunnel_table(path: &Path) -> Result<Vec<PythonTunnelEntry>, P
                         random_blobs,
                         interface_hash,
                         packet_hash,
+                        used: path_fields
+                            .get(8)
+                            .map(|used| value_f64(used).unwrap_or(0.0)),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -1226,6 +1237,9 @@ pub struct PersistedTunnelPath {
     pub random_blobs: Vec<Vec<u8>>,
     #[serde(default)]
     pub packet_hash: Option<Vec<u8>>,
+    /// Last path use; absent in older snapshots, which load as used now.
+    #[serde(default)]
+    pub used: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1272,6 +1286,7 @@ pub fn save_tunnel_table(
                             .collect()
                     },
                     packet_hash: tp.packet_hash.map(|h| h.to_vec()),
+                    used: Some(tp.used),
                 })
                 .collect();
             PersistedTunnelEntry {
@@ -1626,6 +1641,7 @@ mod tests {
         entry.expires = 9876.5;
         entry.packet_hash = Some(packet_hash);
         entry.add_random_blob([0x44; 10]);
+        entry.used = 4321.5;
 
         let mut table = PathTable::new();
         table.insert(destination_hash, entry);
@@ -1652,6 +1668,26 @@ mod tests {
             interface_hash_from_name("Interface[Test]")
         );
         assert_eq!(loaded[0].packet_hash, packet_hash);
+        // Transport.py:4345-4357@1.6.0: the ninth field is the path's use.
+        assert_eq!(loaded[0].used, Some(4321.5));
+
+        // A legacy eight-field row has no use (Transport.py:557@1.6.0).
+        let mut legacy = Vec::new();
+        let rmpv::Value::Array(mut rows) = rmpv::decode::read_value(&mut std::io::Cursor::new(
+            std::fs::read(&destination_table_path).unwrap(),
+        ))
+        .unwrap() else {
+            panic!("rows");
+        };
+        if let rmpv::Value::Array(fields) = &mut rows[0] {
+            fields.truncate(8);
+        }
+        rmpv::encode::write_value(&mut legacy, &rmpv::Value::Array(rows)).unwrap();
+        std::fs::write(&destination_table_path, legacy).unwrap();
+        assert_eq!(
+            load_python_destination_table(&destination_table_path).unwrap()[0].used,
+            None
+        );
 
         let cache_dir = dir.join("cache").join("announces");
         write_python_cached_announce_if_absent(
@@ -1746,6 +1782,7 @@ mod tests {
         paths.insert(
             destination_hash,
             crate::tunnel::TunnelPath {
+                used: 0.0,
                 timestamp: 1234.5,
                 next_hop: Some(next_hop),
                 hops: 3,
@@ -1959,6 +1996,7 @@ mod tests {
     #[test]
     fn test_persisted_path_entry_roundtrip() {
         let entry = PersistedPathEntry {
+            used: None,
             destination_hash: vec![0xAA; 16],
             timestamp: 1234567890.0,
             next_hop: Some(vec![0xBB; 16]),

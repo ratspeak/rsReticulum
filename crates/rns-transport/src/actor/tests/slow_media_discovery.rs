@@ -413,7 +413,7 @@ fn disabling_transport_revokes_recursive_work_but_preserves_leaf_discovery() {
     assert!(!actor.has_pending_path_request_admission(remote));
     assert!(actor.has_pending_path_request_admission(local));
     assert_eq!(actor.pending_discovery_prs.len(), 1);
-    assert!(actor.link_table.get(&[0xEA; 16]).unwrap().validated);
+    assert!(actor.local_destinations.contains(&[0xEA; 16]));
     blocked_rx.try_recv().unwrap();
     let assert_requested = |raw: Bytes, expected: [u8; 16]| {
         let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();

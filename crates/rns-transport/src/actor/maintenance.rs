@@ -44,11 +44,9 @@ impl TransportActor {
         }
 
         if now - self.last_tables_cull >= TABLES_CULL_INTERVAL {
-            // Batched culls bound per-tick work; on large tables a single
-            // sweep would stall the actor and back up the inbound channel.
-            self.path_table.cull_expired_batch(100);
-            self.reverse_table.cull_expired_batch(100);
-            self.tunnel_table.cull_expired_batch(50);
+            self.cull_path_table(now);
+            self.reverse_table.cull_expired();
+            self.tunnel_table.cull_expired();
             self.cull_stale_tunnel_paths(now);
             self.cull_path_interface_suppressions(now);
             self.cull_local_link_route_attempts(now);
@@ -59,7 +57,6 @@ impl TransportActor {
             // Drop entries pointing to interfaces that have gone away —
             // those routes could never be used anyway.
             let active_interfaces: HashSet<InterfaceId> = self.interfaces.keys().copied().collect();
-            self.path_table.cull_dead_interfaces(&active_interfaces);
             self.reverse_table.cull_dead_interfaces(&active_interfaces);
             self.link_table.cull_dead_interfaces(&active_interfaces);
 
@@ -237,6 +234,8 @@ impl TransportActor {
         // Drop pending path-request markers after the upstream gate timeout.
         self.path_requests
             .retain(|_, last| now - *last < PATH_REQUEST_GATE_TIMEOUT);
+        self.inflight_path_requests
+            .retain(|_, since| now <= *since + PATH_REQUEST_GATE_TIMEOUT);
         self.cull_recursive_discovery(now);
         if self.discovery_pr_tags.len() > MAX_DISCOVERY_PR_TAGS {
             self.discovery_pr_tags_prev = std::mem::take(&mut self.discovery_pr_tags);
@@ -247,12 +246,48 @@ impl TransportActor {
         self.process_announce_queues(now);
     }
 
+    /// Transport.py:1118-1160@1.6.0. A leaf or shared-instance client lingers
+    /// never-used paths for 12 minutes, a transport node for 1.75 hours
+    /// (Transport.py:451-454@1.6.0).
+    fn cull_path_table(&mut self, now: f64) {
+        let linger = if !self.is_transport_enabled || self.shared_instance_client_mode {
+            UNUSED_PATH_LINGER_LEAF
+        } else {
+            UNUSED_PATH_LINGER
+        };
+        let check_unused = now > self.path_pool_last_checked + PATH_POOL_CHECK_INTERVAL;
+        let interfaces = &self.interfaces;
+        let (removed, unused) = self.path_table.cull(now, linger, check_unused, |id| {
+            interfaces.get(&id).map(|entry| entry.bitrate)
+        });
+        if let Some(unused) = unused {
+            self.path_pool_last_checked = now;
+            if unused > PATH_POOL_UNUSED_TARGET {
+                debug!(
+                    culled = unused - PATH_POOL_UNUSED_TARGET,
+                    "culled never-used paths to reach the pool size target"
+                );
+            }
+        }
+        if removed > 0 {
+            pathing!(removed, "removed stale paths");
+        }
+    }
+
     pub(super) fn queue_discovery_path_request(
         &mut self,
         destination_hash: [u8; 16],
         blocked_interface: Option<InterfaceId>,
         now: f64,
     ) -> bool {
+        // Transport.py:1420-1426@1.6.0: a destination is queued once.
+        if self
+            .pending_discovery_prs
+            .iter()
+            .any(|queued| queued.destination_hash == destination_hash)
+        {
+            return false;
+        }
         if self.pending_discovery_prs.len() >= MAX_QUEUED_DISCOVERY_PRS {
             trace!(
                 dest = hex::encode(destination_hash),
@@ -747,6 +782,7 @@ mod cleanup_tests {
         actor
             .pending_path_entries
             .push(crate::persistence::PersistedPathEntry {
+                used: None,
                 destination_hash: vec![0x04; 16],
                 timestamp: now,
                 next_hop: None,
@@ -790,6 +826,48 @@ mod cleanup_tests {
 
         actor.cleanup_known_destinations(now);
         assert!(actor.recent_announces.is_empty());
+    }
+
+    /// Transport.py:1420-1426@1.6.0: a destination already waiting in the
+    /// discovery queue is not queued again.
+    #[test]
+    fn discovery_queue_holds_a_destination_once() {
+        let (mut actor, _tx) = TransportActor::new();
+        assert!(actor.queue_discovery_path_request([0x31; 16], None, 1.0));
+        assert!(!actor.queue_discovery_path_request([0x31; 16], Some(2), 2.0));
+        assert!(actor.queue_discovery_path_request([0x32; 16], None, 3.0));
+        assert_eq!(actor.pending_discovery_prs.len(), 2);
+    }
+
+    /// Transport.py:1022-1029, 1249-1253@1.6.0: one cull pass removes every
+    /// reverse entry past REVERSE_TIMEOUT, with no batch cap.
+    #[test]
+    fn one_cull_removes_every_stale_reverse_entry() {
+        let start = now_f64();
+        let clock = crate::test_clock::Clock::at(start);
+        let (mut actor, _tx) = TransportActor::new();
+        let (iface_tx, _iface_rx) = tokio::sync::mpsc::channel(1);
+        actor.interfaces.insert(
+            1,
+            InterfaceEntry::new(
+                "a".into(),
+                InterfaceMode::Full,
+                crate::constants::InterfaceDirection::bidirectional(),
+                1_000_000,
+                500,
+                iface_tx,
+            ),
+        );
+        for i in 0..10_000u32 {
+            let mut hash = [0u8; 16];
+            hash[..4].copy_from_slice(&i.to_be_bytes());
+            actor.reverse_table.insert(hash, 1, 1);
+        }
+        clock.set(start + REVERSE_TIMEOUT as f64 + 1.0);
+        actor.reverse_table.insert([0xFF; 16], 1, 1);
+        actor.last_tables_cull = 0.0;
+        actor.on_tick();
+        assert_eq!(actor.reverse_table.len(), 1);
     }
 
     #[test]

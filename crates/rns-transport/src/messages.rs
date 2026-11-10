@@ -863,10 +863,10 @@ pub enum TransportMessage {
         timeout: Option<std::time::Duration>,
         proof_tx: mpsc::UnboundedSender<crate::link_messages::DestinationEvent>,
     },
-    /// Record local Link bookkeeping after ownership/capacity checks. Initiators
-    /// remain pending until `ActivateLink`; responder entries start validated.
-    /// This command trusts the caller to have performed the corresponding protocol
-    /// checks and does not itself prove a handshake.
+    /// Route a local Link's packets by `link_id` after ownership/capacity checks.
+    /// Local Links never enter the transit link table, so `next_hop`,
+    /// `remaining_hops` and `initiator` are not used for routing. This command
+    /// trusts the caller to have performed the protocol checks.
     RegisterLink {
         interface_owner: Option<InterfaceOwnerId>,
         link_id: [u8; 16],
@@ -876,8 +876,7 @@ pub enum TransportMessage {
         remaining_hops: u8,
         initiator: bool,
     },
-    /// Mark an existing Link entry validated and established. This command
-    /// performs no cryptographic handshake verification itself.
+    /// No-op kept for callers: local Links have no transit link-table state.
     ActivateLink {
         link_id: [u8; 16],
     },
@@ -1218,7 +1217,7 @@ pub struct PathTableRpcEntry {
     /// Destination stamp value: `None` for an unknown destination, 0 when
     /// known but unstamped (Reticulum.py:1884-1885).
     pub value: Option<f64>,
-    /// Last path use in Unix seconds; always 0, as path use is not recorded.
+    /// Last path use in Unix seconds; 0 when never used.
     pub used: f64,
     /// Announced link-request cost, if any.
     pub lr_cost: Option<f64>,

@@ -2,8 +2,8 @@ use crate::now_f64;
 use std::collections::{HashMap, VecDeque};
 
 use crate::constants::{
-    AP_PATH_TIME, DESTINATION_TIMEOUT, InterfaceMode, MAX_RANDOM_BLOBS, PERSIST_RANDOM_BLOBS,
-    PathState, ROAMING_PATH_TIME,
+    AP_PATH_TIME, DESTINATION_TIMEOUT, InterfaceMode, MAX_RANDOM_BLOBS, PATH_POOL_UNUSED_TARGET,
+    PATH_SLOW_BITRATE, PATH_SLOW_LINGER_FACTOR, PERSIST_RANDOM_BLOBS, PathState, ROAMING_PATH_TIME,
 };
 use crate::messages::InterfaceId;
 use rns_wire::types::DestHash;
@@ -12,7 +12,7 @@ use rns_wire::types::DestHash;
 /// record alone does not establish a live interface or reachable peer.
 #[derive(Debug, Clone)]
 pub struct PathEntry {
-    /// Learn or last-touch time (Unix seconds).
+    /// Learn time, or the last liveness proof (Unix seconds).
     pub timestamp: f64,
     /// Next-hop transport id; `None` for a directly-connected neighbour.
     pub next_hop: Option<[u8; 16]>,
@@ -27,6 +27,8 @@ pub struct PathEntry {
     /// Hash used to locate a cached announce packet. The record does not own
     /// its bytes, and a corresponding cache file may be unavailable.
     pub packet_hash: Option<[u8; 32]>,
+    /// Last use of this path (Unix seconds); 0 when never used.
+    pub used: f64,
 }
 
 impl PathEntry {
@@ -47,6 +49,7 @@ impl PathEntry {
             random_blobs: VecDeque::new(),
             interface_id,
             packet_hash: None,
+            used: 0.0,
         }
     }
 
@@ -65,19 +68,9 @@ impl PathEntry {
         now_f64() > self.expires
     }
 
-    /// Set the timestamp to now and preserve a positive prior lifetime
-    /// (`expires - timestamp`), or use the seven-day default otherwise.
-    /// This can renew an expired entry and performs no network liveness check;
-    /// the caller decides whether activity justifies renewal.
-    pub fn touch(&mut self) {
-        let now = now_f64();
-        let lifetime = if self.expires > self.timestamp {
-            self.expires - self.timestamp
-        } else {
-            path_expiry(InterfaceMode::Full) as f64
-        };
-        self.timestamp = now;
-        self.expires = now + lifetime;
+    /// Record traffic over this path without renewing its lifetime.
+    pub fn mark_used(&mut self) {
+        self.used = now_f64();
     }
 
     /// Return at most the last `PERSIST_RANDOM_BLOBS` entries, preserving their
@@ -216,6 +209,71 @@ impl PathTable {
         count
     }
 
+    /// Python `mark_path_responsive` (Transport.py:3632-3648@1.6.0): only a
+    /// cryptographic liveness proof renews a path. `mode` is the mode of the
+    /// interface the path was learned on. Returns whether a path existed.
+    pub fn mark_responsive(&mut self, dest_hash: &[u8; 16], mode: InterfaceMode) -> bool {
+        let Some(entry) = self.entries.get_mut(dest_hash) else {
+            return false;
+        };
+        let now = now_f64();
+        entry.timestamp = now;
+        entry.expires = now + path_expiry(mode) as f64;
+        entry.used = now;
+        self.states
+            .insert((*dest_hash).into(), PathState::Responsive);
+        true
+    }
+
+    /// Python's path-table cull (Transport.py:1118-1160@1.6.0): drop expired
+    /// paths, paths on a missing interface and never-used paths older than
+    /// `linger` (x10 on slow interfaces). With `check_unused`, never-used
+    /// paths beyond `PATH_POOL_UNUSED_TARGET` are dropped too, fast-interface
+    /// and earliest-expiring first. Returns the removed count and, with
+    /// `check_unused`, the never-used count before removal.
+    pub fn cull(
+        &mut self,
+        now: f64,
+        linger: f64,
+        check_unused: bool,
+        bitrate_of: impl Fn(InterfaceId) -> Option<u64>,
+    ) -> (usize, Option<usize>) {
+        let mut stale: Vec<DestHash> = Vec::new();
+        let mut unused: Vec<(u8, f64, DestHash)> = Vec::new();
+        for (hash, entry) in &self.entries {
+            let bitrate = bitrate_of(entry.interface_id);
+            let slow = bitrate.is_some_and(|b| b > 0 && b < PATH_SLOW_BITRATE);
+            if check_unused && entry.used == 0.0 {
+                unused.push((u8::from(slow), entry.expires, *hash));
+            }
+            let factor = if slow { PATH_SLOW_LINGER_FACTOR } else { 1.0 };
+            if now > entry.expires
+                || bitrate.is_none()
+                || (entry.used == 0.0 && now > entry.timestamp + linger * factor)
+            {
+                stale.push(*hash);
+            }
+        }
+        let unused_count = check_unused.then_some(unused.len());
+        if unused.len() > PATH_POOL_UNUSED_TARGET {
+            let cull_count = unused.len() - PATH_POOL_UNUSED_TARGET;
+            unused.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then(a.1.total_cmp(&b.1))
+                    .then(a.2.as_bytes().cmp(b.2.as_bytes()))
+            });
+            stale.extend(unused.into_iter().take(cull_count).map(|(_, _, hash)| hash));
+        }
+        let mut removed = 0;
+        for hash in &stale {
+            if self.entries.remove(hash.as_bytes()).is_some() {
+                removed += 1;
+            }
+            self.states.remove(hash.as_bytes());
+        }
+        (removed, unused_count)
+    }
+
     /// Drop paths whose interface id is no longer active.
     pub fn cull_dead_interfaces(
         &mut self,
@@ -297,17 +355,24 @@ mod tests {
     }
 
     #[test]
-    fn touch_extends_explicit_expiry_with_original_lifetime() {
-        let mut entry = PathEntry::new(None, 1, 1, InterfaceMode::Roaming);
-        let lifetime = entry.expires - entry.timestamp;
+    fn use_leaves_lifetime_and_liveness_proof_renews_it() {
+        let mut table = PathTable::new();
+        let hash = [0xA2; 16];
+        let mut entry = PathEntry::new(None, 1, 1, InterfaceMode::Full);
         entry.timestamp -= 10.0;
         entry.expires -= 10.0;
+        let (timestamp, expires) = (entry.timestamp, entry.expires);
+        entry.mark_used();
+        assert_eq!((entry.timestamp, entry.expires), (timestamp, expires));
+        assert!(entry.used > timestamp);
+        table.insert(hash, entry);
 
-        entry.touch();
-
-        let new_lifetime = entry.expires - entry.timestamp;
-        assert!((new_lifetime - lifetime).abs() < 0.001);
-        assert!(entry.expires > now_f64());
+        assert!(table.mark_responsive(&hash, InterfaceMode::Roaming));
+        let entry = table.get(&hash).unwrap();
+        assert_eq!(entry.expires - entry.timestamp, ROAMING_PATH_TIME as f64);
+        assert_eq!(entry.used, entry.timestamp);
+        assert_eq!(table.get_state(&hash), PathState::Responsive);
+        assert!(!table.mark_responsive(&[0xA3; 16], InterfaceMode::Full));
     }
 
     #[test]

@@ -27,8 +27,7 @@ impl TransportActor {
                             hops: entry.hops,
                             expires: entry.expires,
                             value: known.map(|k| k.stamp_value),
-                            // Path use is not recorded; 0 is upstream's never-used value.
-                            used: 0.0,
+                            used: entry.used,
                             lr_cost: known.and_then(|k| k.lr_cost),
                             interface: iface_name,
                             interface_id: entry.interface_id,

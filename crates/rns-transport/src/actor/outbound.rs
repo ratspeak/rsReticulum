@@ -271,12 +271,9 @@ impl TransportActor {
                         self.send_to_interface(target_interface, &request.raw)
                     };
 
-                    // Touch the path so an actively-used route isn't culled
-                    // for staleness while traffic is still flowing on it.
-                    if sent
-                        && let Some(path) = self.path_table.get_live_mut(&request.destination_hash)
-                    {
-                        path.touch();
+                    // Transport.py:1618@1.6.0: traffic marks use, never liveness.
+                    if let Some(path) = self.path_table.get_live_mut(&request.destination_hash) {
+                        path.mark_used();
                     }
                     sent
                 } else {
@@ -692,11 +689,31 @@ impl TransportActor {
         self.record_interface_event(interface_id, InterfaceEvent::ReceivedPathRequest, raw_len);
         self.count_transport_event(InterfaceEvent::ReceivedPathRequest);
 
+        // Transport.py:2136-2158@1.6.0: a request for a destination already
+        // in flight joins the waiting requesters instead of being processed.
+        if self.inflight_path_requests.contains_key(&requested_dest) {
+            // A leaf answers batched requesters only for its local clients;
+            // upstream would also emit PATH_RESPONSEs naming the leaf as relay.
+            if (self.is_transport_enabled || is_from_local_client)
+                && !self.processing_ingress_limited
+            {
+                pathing!(
+                    dest = %hex::encode(requested_dest),
+                    interface_id,
+                    "path request already in flight, batching to existing"
+                );
+                self.batch_inflight_requester(requested_dest, interface_id, now);
+            }
+            return;
+        }
+        self.inflight_path_requests.insert(requested_dest, now);
+
         if self.local_destinations.contains(&requested_dest) {
             pathing!(
                 dest = %hex::encode(requested_dest),
                 "answering path request — destination is local"
             );
+            self.inflight_path_requests.remove(&requested_dest);
             if let Some(tx) = self.destination_channels.get(&requested_dest)
                 && let Err(e) =
                     tx.try_send(crate::link_messages::DestinationEvent::AnnounceRequested(
@@ -740,6 +757,10 @@ impl TransportActor {
                 .is_some_and(|iface| iface.mode == InterfaceMode::Roaming)
                 && path.interface_id == interface_id;
 
+            if requestor_is_next_hop || same_roaming_interface {
+                // Transport.py:3962-3969@1.6.0: answered, even when declined.
+                self.inflight_path_requests.remove(&requested_dest);
+            }
             if requestor_is_next_hop {
                 pathing!(
                     dest = %hex::encode(requested_dest),
@@ -809,16 +830,18 @@ impl TransportActor {
                 if !self.shared_instance_client_mode {
                     self.use_destination(&requested_dest);
                 }
+                self.inflight_path_requests.remove(&requested_dest);
                 return;
             }
         }
 
         // Python 1.3.8 Transport.py:2946-2947: recursive_prs forces discovery
         // independent of interface mode (flag checked first).
-        let should_search_unknown = self
+        let search = self
             .interfaces
             .get(&interface_id)
-            .is_some_and(|iface| iface.recursive_prs || mode_discovers_unknown_paths(iface.mode));
+            .and_then(|iface| path_search_modes(iface.recursive_prs, iface.mode));
+        let should_search_unknown = search.is_some();
 
         if is_from_local_client {
             pathing!(
@@ -831,6 +854,7 @@ impl TransportActor {
                 tag_bytes,
                 ext.as_ref(),
                 false,
+                None,
             );
         } else if self.is_transport_enabled && should_search_unknown {
             let ingress_limited = self.processing_ingress_limited
@@ -864,6 +888,7 @@ impl TransportActor {
                     tag_bytes,
                     ext.as_ref(),
                     true,
+                    search.flatten(),
                 );
             }
         } else if self.has_local_client_interfaces() {
@@ -1054,6 +1079,7 @@ impl TransportActor {
                     Some(&job.tag),
                     Some(&ext),
                     job.recursive,
+                    None,
                 ),
         }
     }
@@ -1065,10 +1091,11 @@ impl TransportActor {
         tag: Option<&[u8]>,
         recursive: bool,
     ) {
-        self.forward_path_request_ext(destination_hash, except, tag, None, recursive);
+        self.forward_path_request_ext(destination_hash, except, tag, None, recursive, None);
     }
 
-    /// One request, stamped once, offered on every outbound interface but `except`.
+    /// One request, stamped once, offered on every outbound interface but
+    /// `except`, limited to `modes` when given (Transport.py:3936-3947@1.6.0).
     pub(super) fn forward_path_request_ext(
         &mut self,
         destination_hash: [u8; 16],
@@ -1076,7 +1103,23 @@ impl TransportActor {
         tag: Option<&[u8]>,
         ext: Option<&[u8; PR_EXT_PAYLOAD_LENGTH]>,
         recursive: bool,
+        modes: Option<&[InterfaceMode]>,
     ) {
+        if let Some(modes) = modes {
+            let ids: Vec<InterfaceId> = self
+                .prioritized_interface_ids()
+                .into_iter()
+                .filter(|id| {
+                    let entry = &self.interfaces[id];
+                    except != Some(*id) && entry.direction.outbound && modes.contains(&entry.mode)
+                })
+                .collect();
+            let tag = tag.map_or_else(|| rns_crypto::random::random_bytes(16), <[u8]>::to_vec);
+            for id in ids {
+                self.send_path_request_ext(destination_hash, id, Some(&tag), ext, recursive);
+            }
+            return;
+        }
         let Some((tag, ext)) = self.stamp_path_request_or_queue(
             destination_hash,
             tag,
@@ -1196,14 +1239,16 @@ impl TransportActor {
             }
 
             if should_add {
+                // Transport.py:3115-3127@1.6.0 keeps the saved timestamp and use.
                 let entry = crate::path_table::PathEntry {
-                    timestamp: now,
+                    timestamp: tunnel_path.timestamp,
                     next_hop: tunnel_path.next_hop,
                     hops: tunnel_path.hops,
                     expires: tunnel_path.expires,
                     random_blobs: tunnel_path.random_blobs.iter().copied().collect(),
                     interface_id,
                     packet_hash: tunnel_path.packet_hash,
+                    used: tunnel_path.used,
                 };
                 self.path_table.insert(*dest_hash, entry);
                 self.state_dirty = true;
@@ -1243,9 +1288,12 @@ mod cache_miss_tests {
 
     #[test]
     fn live_path_without_cached_announce_uses_normal_discovery_gates() {
-        for (mode, discovers) in [
-            (InterfaceMode::Gateway, true),
-            (InterfaceMode::Boundary, false),
+        // A Boundary requester searches only Boundary and Gateway interfaces
+        // (Transport.py:3781-3783@1.6.0), so the Full route gets no request.
+        for (mode, discovers, sent) in [
+            (InterfaceMode::Gateway, true, true),
+            (InterfaceMode::Boundary, true, false),
+            (InterfaceMode::Full, false, false),
         ] {
             let (mut actor, _actor_tx) = TransportActor::new();
             actor.is_transport_enabled = true;
@@ -1285,7 +1333,7 @@ mod cache_miss_tests {
             let mut request = requested.to_vec();
             request.extend_from_slice(&[0x55; 16]);
             actor.handle_inbound_path_request(&request, 1);
-            assert_eq!(egress_rx.try_recv().is_ok(), discovers);
+            assert_eq!(egress_rx.try_recv().is_ok(), sent);
             assert_eq!(
                 actor.discovery_path_requests.contains_key(&requested),
                 discovers

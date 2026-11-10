@@ -754,6 +754,8 @@ impl TransportActor {
                                 interface_name: cached.interface_reference.clone(),
                                 interface_hash: Some(pe.interface_hash.to_vec()),
                                 packet_hash: Some(pe.packet_hash.to_vec()),
+                                // Transport.py:557@1.6.0: a legacy row loads as used now.
+                                used: Some(pe.used.unwrap_or(now_ts)),
                             });
                         self.recent_announces
                             .entry(pe.destination_hash)
@@ -804,6 +806,8 @@ impl TransportActor {
                             legacy += 1;
                             continue;
                         }
+                        let mut pe = pe;
+                        pe.used.get_or_insert(now_ts);
                         self.pending_path_entries.push(pe);
                         pending += 1;
                     }
@@ -903,6 +907,8 @@ impl TransportActor {
                                     .map(|blob| blob.to_vec())
                                     .collect(),
                                 packet_hash: Some(tp.packet_hash.to_vec()),
+                                // Transport.py:617@1.6.0: a legacy row loads as used now.
+                                used: Some(tp.used.unwrap_or(now_ts)),
                             });
                             self.recent_announces
                                 .entry(tp.destination_hash)
@@ -1178,6 +1184,7 @@ impl TransportActor {
                         .packet_hash
                         .as_deref()
                         .and_then(|packet_hash| <[u8; 32]>::try_from(packet_hash).ok()),
+                    used: tp.used.unwrap_or_else(now_f64),
                 };
                 Some((dest, path))
             })
@@ -1250,6 +1257,7 @@ impl TransportActor {
                             None
                         }
                     }),
+                    used: pe.used.unwrap_or_else(now_f64),
                 };
                 if !self.path_table.has_path(&hash) {
                     self.path_table.insert(hash, entry);
@@ -1364,6 +1372,7 @@ mod announce_sweep_actor_tests {
         actor.path_table.insert(
             [0x11; 16],
             crate::path_table::PathEntry {
+                used: 0.0,
                 timestamp: crate::now_f64(),
                 next_hop: Some([0x22; 16]),
                 hops: 1,
@@ -1379,6 +1388,7 @@ mod announce_sweep_actor_tests {
             tunnel_paths: std::collections::HashMap::from([(
                 [0x12; 16],
                 crate::tunnel::TunnelPath {
+                    used: 0.0,
                     timestamp: crate::now_f64(),
                     next_hop: None,
                     hops: 2,
@@ -1395,6 +1405,7 @@ mod announce_sweep_actor_tests {
         actor
             .pending_path_entries
             .push(crate::persistence::PersistedPathEntry {
+                used: None,
                 destination_hash: vec![0x13; 16],
                 timestamp: crate::now_f64(),
                 next_hop: None,
@@ -1500,6 +1511,7 @@ mod async_save_tests {
         actor.path_table.insert(
             [0x11; 16],
             crate::path_table::PathEntry {
+                used: 0.0,
                 timestamp: crate::now_f64(),
                 next_hop: Some([0x22; 16]),
                 hops: 1,
@@ -1706,6 +1718,7 @@ mod async_save_tests {
             actor.path_table.insert(
                 [0x44; 16],
                 crate::path_table::PathEntry {
+                    used: 0.0,
                     timestamp: crate::now_f64(),
                     next_hop: Some([0x55; 16]),
                     hops: 2,

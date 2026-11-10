@@ -367,6 +367,7 @@ fn tunnels_without_an_interface_survive_a_reload() {
             .insert(
                 dest,
                 TunnelPath {
+                    used: 0.0,
                     timestamp: now,
                     next_hop: None,
                     hops: 1,
@@ -408,6 +409,7 @@ fn legacy_sidecar_tunnels_without_an_interface_survive_a_reload() {
             interface_id: 3,
             expires: now + 600.0,
             paths: vec![PersistedTunnelPath {
+                used: None,
                 destination_hash: vec![0x31; 16],
                 next_hop: None,
                 hops: 1,
@@ -445,6 +447,7 @@ fn pending_paths_are_culled_once_they_expire() {
     let mut actor = hub();
     for (dest, expires) in [([0x21; 16], start + 10.0), ([0x22; 16], start + 1000.0)] {
         actor.pending_path_entries.push(PersistedPathEntry {
+            used: None,
             destination_hash: dest.to_vec(),
             timestamp: start,
             next_hop: None,

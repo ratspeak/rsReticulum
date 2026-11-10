@@ -28,6 +28,7 @@ fn unknown_and_zero_bitrates_use_finite_timeout_defaults() {
     actor.path_table.insert(
         dest,
         crate::path_table::PathEntry {
+            used: 0.0,
             timestamp: crate::now_f64(),
             next_hop: None,
             hops: 1,

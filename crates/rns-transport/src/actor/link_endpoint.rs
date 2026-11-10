@@ -25,6 +25,14 @@ impl TransportActor {
             return LinkEndpointBindResult::InterfaceUnavailable;
         }
 
+        // Link.py:512-513@1.6.0: an initiator binds once the proof validated.
+        if binding.role == crate::messages::LinkEndpointRole::Initiator
+            && let Some(destination) = self
+                .pending_local_link_destinations
+                .remove(&binding.link_id)
+        {
+            self.mark_path_responsive(&destination);
+        }
         self.link_endpoints.insert(
             key,
             LinkEndpointEntry {

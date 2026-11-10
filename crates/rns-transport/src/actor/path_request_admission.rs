@@ -409,10 +409,10 @@ mod tests {
             let due = actor.pending_path_request_admissions[0].next_try;
             clock.set(due);
             let path = actor.path_table.get_mut(&dest).unwrap();
-            // Positive control: traffic updates both clocks without replacing
-            // the signed provenance or the forwarding choice.
-            path.touch();
-            assert!(path.timestamp > start);
+            // Positive control: traffic marks use without replacing the
+            // signed provenance or the forwarding choice.
+            path.mark_used();
+            assert!(path.used > start);
             match change {
                 0 => {}
                 1 => path.packet_hash = Some([0x42; 32]),

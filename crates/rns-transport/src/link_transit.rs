@@ -1,7 +1,7 @@
-//! Internal transit checks for Link-request signalling. Capacity attenuation
-//! changes only the unsigned request trailer, preserving the 64-byte request
-//! body and Link identity. Unsupported opaque-mode transformations are rejected;
-//! authenticated proof trailers are not rewritten.
+//! Internal transit checks for Link-request signalling. The MTU clamp changes
+//! only the unsigned request trailer, preserving the 64-byte request body and
+//! Link identity. A clamp of a non-default mode is rejected; authenticated
+//! proof trailers are not rewritten.
 use crate::{InterfaceCapacityError, messages::InterfaceEntry};
 use rns_wire::link_signalling::{
     DEFAULT_LINK_MODE, LinkSignallingError, SignallingData, parse_request_signalling,
@@ -25,38 +25,46 @@ pub enum LinkTransitError {
     StaleInterface,
 }
 
-/// Attenuate only the unsigned request trailer. The 64-byte request body is
-/// immutable. Proof trailers are authenticated and are never rewritten.
+/// Python's relay MTU clamp (Transport.py:2338-2361@1.6.0): strip the trailer
+/// when the egress cannot upgrade, clamp to `min(next-hop, previous-hop)`
+/// hardware MTU when either is below the offer, otherwise relay unchanged.
+/// IFAC is not subtracted. The 64-byte request body is never touched.
 pub(crate) fn attenuate_request(
     payload: &[u8],
-    ingress_id: crate::messages::InterfaceId,
+    _ingress_id: crate::messages::InterfaceId,
     ingress: &InterfaceEntry,
-    egress_id: crate::messages::InterfaceId,
+    _egress_id: crate::messages::InterfaceId,
     egress: &InterfaceEntry,
 ) -> Result<(Vec<u8>, u8, u32), LinkTransitError> {
     let signal = parse_request_signalling(payload)?;
     if !ingress.owner.is_current() || !egress.owner.is_current() {
         return Err(LinkTransitError::StaleInterface);
     }
-    let incoming = ingress
-        .packet_capacity
-        .link_ceiling(ingress_id, ingress.active_ifac_bytes())?;
-    let outgoing = egress
-        .packet_capacity
-        .link_ceiling(egress_id, egress.active_ifac_bytes())?;
-    let ceiling = signal.mtu.get().min(incoming).min(outgoing);
-    if signal.mode != DEFAULT_LINK_MODE {
-        // Opaque cipher semantics must retain the exact original trailer. Even
-        // zero normalization is a transformation we cannot make for that mode.
-        let raw = SignallingData::unpack(&payload[64..]).expect("modern opaque mode");
-        if raw.mtu != ceiling {
-            return Err(LinkTransitError::UnsupportedTransitModeTransform);
-        }
-        return Ok((payload.to_vec(), signal.mode, ceiling));
+    let base = rns_wire::link_signalling::BASE_LINK_MTU;
+    if !signal.signalling_present {
+        return Ok((payload.to_vec(), DEFAULT_LINK_MODE, base));
     }
+    let raw = SignallingData::unpack(&payload[64..]).expect("modern request");
+    if raw.mtu == 0 {
+        return Ok((payload.to_vec(), raw.mode, base));
+    }
+    if !egress.packet_capacity.link_mtu_upgrade {
+        return Ok((payload[..64].to_vec(), DEFAULT_LINK_MODE, base));
+    }
+    let (nh_mtu, ph_mtu) = (egress.mtu, ingress.mtu);
+    if nh_mtu >= raw.mtu && ph_mtu >= raw.mtu {
+        return Ok((payload.to_vec(), raw.mode, raw.mtu));
+    }
+    // Link.signalling_bytes raises for any mode but the enabled default.
+    if raw.mode != DEFAULT_LINK_MODE {
+        return Err(LinkTransitError::UnsupportedTransitModeTransform);
+    }
+    let clamped = nh_mtu.min(ph_mtu);
     let mut forwarded = payload[..64].to_vec();
-    if signal.signalling_present && egress.packet_capacity.link_mtu_upgrade {
-        forwarded.extend_from_slice(&SignallingData::try_new(signal.mode, ceiling)?.pack());
-    }
-    Ok((forwarded, signal.mode, ceiling))
+    forwarded.extend_from_slice(&SignallingData::new(raw.mode, clamped).pack());
+    Ok((
+        forwarded,
+        raw.mode,
+        clamped & rns_wire::link_signalling::MAX_SIGNALLED_LINK_MTU,
+    ))
 }

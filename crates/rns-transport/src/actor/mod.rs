@@ -154,6 +154,12 @@ pub struct TransportActor {
     local_link_routes: HashMap<[u8; 16], LocalLinkRoute>,
     // Only active caller-owned temporary destinations can allocate an attempt.
     pending_local_link_requests: HashMap<[u8; 16], HashMap<InterfaceId, crate::InterfaceOwnerId>>,
+    /// Destination and path hops of each pending local Link request, Python's
+    /// `link.expected_hops` (Link.py:307), until a proof re-balances it.
+    pending_local_link_hops: HashMap<[u8; 16], ([u8; 16], Option<u8>)>,
+    /// Destination of each sent local Link request until the Link is bound
+    /// (established) or abandoned; Python's `pending_links`.
+    pending_local_link_destinations: HashMap<[u8; 16], [u8; 16]>,
     /// Locally-owned established-Link endpoints. This is intentionally not
     /// the transit `link_table`: transit forwarding and local session
     /// ownership have different lifetimes and authority.
@@ -188,6 +194,12 @@ pub struct TransportActor {
     pub path_waiters: HashMap<[u8; 16], Vec<(tokio::sync::oneshot::Sender<bool>, f64)>>,
 
     last_tables_cull: f64,
+    /// Last never-used path pool check; starts at construction so the first
+    /// check waits one interval (Transport.py:516@1.6.0).
+    pub path_pool_last_checked: f64,
+    /// Destinations with a path request admitted and not yet answered
+    /// (Python `inflight_path_requests`), with the admission time.
+    pub inflight_path_requests: HashMap<[u8; 16], f64>,
     last_links_check: f64,
     last_receipts_check: f64,
     last_announces_check: f64,
@@ -510,6 +522,8 @@ impl TransportActor {
             destination_channels: HashMap::new(),
             local_link_routes: HashMap::new(),
             pending_local_link_requests: HashMap::new(),
+            pending_local_link_hops: HashMap::new(),
+            pending_local_link_destinations: HashMap::new(),
             link_endpoints: HashMap::new(),
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
@@ -523,6 +537,8 @@ impl TransportActor {
             path_states: HashMap::new(),
             path_waiters: HashMap::new(),
             last_tables_cull: 0.0,
+            path_pool_last_checked: now_f64(),
+            inflight_path_requests: HashMap::new(),
             last_links_check: 0.0,
             last_receipts_check: 0.0,
             last_announces_check: 0.0,
@@ -1306,8 +1322,8 @@ impl TransportActor {
                 link_id,
                 destination_hash,
                 interface_id,
-                next_hop,
-                remaining_hops,
+                next_hop: _,
+                remaining_hops: _,
                 initiator,
             } => {
                 if interface_id == LOCAL_LINK_RESPONDER_INTERFACE
@@ -1330,35 +1346,8 @@ impl TransportActor {
                 }) {
                     return;
                 }
-                // Initiators start pending (validated=false) until the proof
-                // arrives; non-initiators already hold a validated link.
-                let now = now_f64();
-                let entry = crate::link_table::LinkEntry {
-                    timestamp: now,
-                    next_hop,
-                    interface_id,
-                    remaining_hops,
-                    destination_hash,
-                    established: !initiator,
-                    validated: !initiator,
-                    proof_timeout: crate::link_table::pending_link_proof_deadline(
-                        now,
-                        remaining_hops,
-                    ),
-                    receiving_interface: interface_id,
-                    taken_hops: 0,
-                    interface_owner: self
-                        .interfaces
-                        .get(&interface_id)
-                        .map(|entry| entry.owner.clone()),
-                    receiving_owner: self
-                        .interfaces
-                        .get(&interface_id)
-                        .map(|entry| entry.owner.clone()),
-                    requested_mode: rns_wire::link_signalling::DEFAULT_LINK_MODE,
-                    accepted_mtu_ceiling: 500,
-                };
-                self.link_table.insert(link_id, entry);
+                // Local Links stay out of the transit link table, which Python
+                // reserves for relayed Links (Transport.py:3264-3273).
 
                 // Link-addressed packets (LRRTT, Resource, Keepalive, …) use
                 // link_id as their destination_hash, not the original
@@ -1373,16 +1362,8 @@ impl TransportActor {
                 debug!(link_id = hex::encode(link_id), initiator, "registered link");
             }
             TransportMessage::ActivateLink { link_id } => {
-                if let Some(entry) = self.link_table.get_mut(&link_id) {
-                    entry.validated = true;
-                    entry.established = true;
-                    debug!(link_id = hex::encode(link_id), "activated link");
-                } else {
-                    tracing::warn!(
-                        link_id = hex::encode(link_id),
-                        "attempted to activate link not in pending table"
-                    );
-                }
+                // Local Links are not in the transit link table.
+                debug!(link_id = hex::encode(link_id), "activated link");
             }
             TransportMessage::AwaitPath { dest, reply } => {
                 if self.path_table.has_path(&dest) {
@@ -1833,6 +1814,43 @@ impl TransportActor {
         }
     }
 
+    /// Transport.py:839-866@1.6.0: a Link that was never established expires
+    /// the path on a non-transport instance and, unless this is a
+    /// shared-instance client, queues a throttled rediscovery request.
+    fn rediscover_after_failed_link(&mut self, destination: [u8; 16]) {
+        if self.is_transport_enabled {
+            return;
+        }
+        if let Some(path) = self.path_table.get_mut(&destination) {
+            path.timestamp = 0.0;
+            path.expires = 0.0;
+            self.last_tables_cull = 0.0;
+        }
+        let now = now_f64();
+        let last_request = self.path_requests.get(&destination).copied().unwrap_or(0.0);
+        if !self.shared_instance_client_mode && now - last_request > PATH_REQUEST_MI {
+            pathing!(
+                dest = hex::encode(destination),
+                "rediscovering path since an attempted link was never established"
+            );
+            self.queue_discovery_path_request(destination, None, now);
+        }
+    }
+
+    /// Transport.py:3632-3648@1.6.0, with the lifetime of the interface the
+    /// path was learned on (:3616-3621).
+    pub(super) fn mark_path_responsive(&mut self, dest: &[u8; 16]) -> bool {
+        let Some(interface_id) = self.path_table.get(dest).map(|path| path.interface_id) else {
+            return false;
+        };
+        let mode = self
+            .interfaces
+            .get(&interface_id)
+            .map_or(InterfaceMode::Full, |entry| entry.mode);
+        self.state_dirty = true;
+        self.path_table.mark_responsive(dest, mode)
+    }
+
     fn suppress_path_interface(
         &mut self,
         dest: [u8; 16],
@@ -1872,7 +1890,11 @@ impl TransportActor {
     }
 
     fn deregister_destination(&mut self, hash: [u8; 16]) {
+        if let Some(destination) = self.pending_local_link_destinations.remove(&hash) {
+            self.rediscover_after_failed_link(destination);
+        }
         self.pending_local_link_requests.remove(&hash);
+        self.pending_local_link_hops.remove(&hash);
         self.local_destinations.remove(&hash);
         self.local_destination_keys.remove(&hash);
         self.destination_channels.remove(&hash);
@@ -1915,15 +1937,6 @@ impl TransportActor {
         if !entry.direction.outbound {
             return InterfaceSendOutcome::NotOutbound;
         }
-        if rns_wire::header::PacketHeader::unpack(raw).is_ok_and(|(header, _)| {
-            header.flags.packet_type == rns_wire::flags::PacketType::LinkRequest
-        }) && entry
-            .packet_capacity
-            .link_ceiling(id, entry.active_ifac_bytes())
-            .is_err()
-        {
-            return InterfaceSendOutcome::TooLarge;
-        }
         let request_owner =
             rns_wire::header::PacketHeader::unpack(raw)
                 .ok()
@@ -1932,11 +1945,13 @@ impl TransportActor {
                         return None;
                     }
                     let link_id = rns_wire::hash::link_id_from_raw(raw, header.flags.header_type);
-                    self.destination_channels
-                        .contains_key(&link_id)
-                        .then_some((link_id, offset))
+                    self.destination_channels.contains_key(&link_id).then_some((
+                        link_id,
+                        offset,
+                        header.destination_hash,
+                    ))
                 });
-        if let Some((link_id, offset)) = request_owner {
+        if let Some((link_id, offset, _)) = request_owner {
             let Ok(signal) = rns_wire::link_signalling::parse_request_signalling(&raw[offset..])
             else {
                 return InterfaceSendOutcome::TooLarge;
@@ -1985,12 +2000,18 @@ impl TransportActor {
                     self.record_interface_event(id, InterfaceEvent::SentAnnounce, raw.len());
                     self.count_transport_event(InterfaceEvent::SentAnnounce);
                 }
-                if let Some((link_id, _)) = request_owner {
+                if let Some((link_id, _, destination_hash)) = request_owner {
                     self.pending_local_link_requests
                         .entry(link_id)
                         .or_default()
                         .entry(id)
                         .or_insert(owner);
+                    let hops = self.path_table.hops_to(&destination_hash);
+                    self.pending_local_link_hops
+                        .entry(link_id)
+                        .or_insert((destination_hash, hops));
+                    self.pending_local_link_destinations
+                        .insert(link_id, destination_hash);
                 }
                 InterfaceSendOutcome::Sent
             }
@@ -2524,6 +2545,23 @@ fn rand_window() -> f64 {
     let mut rng = rand::thread_rng();
     let r: f64 = rng.r#gen();
     r * PATHFINDER_RW
+}
+
+/// Python `path_request` search decision (Transport.py:3774-3784@1.6.0):
+/// `None` means no search, `Some(None)` a search on every interface, and
+/// `Some(Some(modes))` a search limited to those interface modes.
+fn path_search_modes(
+    recursive_prs: bool,
+    mode: InterfaceMode,
+) -> Option<Option<&'static [InterfaceMode]>> {
+    if recursive_prs || mode_discovers_unknown_paths(mode) {
+        Some(None)
+    } else if mode == InterfaceMode::Boundary {
+        // Interface.py:56@1.6.0 BOUNDARY_SEARCH_MODES.
+        Some(Some(&[InterfaceMode::Boundary, InterfaceMode::Gateway]))
+    } else {
+        None
+    }
 }
 
 fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
@@ -3660,6 +3698,7 @@ mod tests {
         tunnel_paths.insert(
             dest,
             crate::tunnel::TunnelPath {
+                used: 0.0,
                 timestamp: now_f64(),
                 next_hop: None,
                 hops: 2,
@@ -7038,6 +7077,7 @@ mod tests {
         tunnel_paths.insert(
             dest_hash,
             crate::tunnel::TunnelPath {
+                used: 0.0,
                 timestamp: now_f64(),
                 next_hop: Some(next_hop),
                 hops: 4,
@@ -7078,6 +7118,7 @@ mod tests {
         tunnel_paths.insert(
             dest_hash,
             crate::tunnel::TunnelPath {
+                used: 0.0,
                 timestamp: now_f64(),
                 next_hop: Some([0x99; 16]),
                 hops: 4,
@@ -7120,6 +7161,7 @@ mod tests {
         tunnel_paths.insert(
             stale_dest,
             crate::tunnel::TunnelPath {
+                used: 0.0,
                 timestamp: now_f64() - TUNNEL_PATH_TIMEOUT as f64 - 1.0,
                 next_hop: None,
                 hops: 1,
@@ -7131,6 +7173,7 @@ mod tests {
         tunnel_paths.insert(
             fresh_dest,
             crate::tunnel::TunnelPath {
+                used: 0.0,
                 timestamp: now_f64(),
                 next_hop: None,
                 hops: 1,
@@ -7878,83 +7921,28 @@ mod tests {
     }
 
     #[test]
-    fn test_register_link_initiator() {
+    fn local_links_route_by_link_id_outside_the_transit_link_table() {
         let (mut actor, _tx) = TransportActor::new();
         let (interface, _wire) = make_test_interface("admitted interface");
         actor.interfaces.insert(1, interface);
+        let (delivery, _rx) = mpsc::channel(4);
+        actor.destination_channels.insert([0xBB; 16], delivery);
 
-        let link_id = [0xAA; 16];
-
-        actor.handle_message(TransportMessage::RegisterLink {
-            interface_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.id()),
-
-            link_id,
-            destination_hash: [0xBB; 16],
-            interface_id: 1,
-            next_hop: Some([0xCC; 16]),
-            remaining_hops: 3,
-            initiator: true,
-        });
-
-        let entry = actor.link_table.get(&link_id).unwrap();
-        assert!(!entry.validated);
-        assert!(!entry.established);
-        assert_eq!(
-            entry.proof_timeout,
-            crate::link_table::pending_link_proof_deadline(entry.timestamp, 3)
-        );
-    }
-
-    #[test]
-    fn test_register_link_responder() {
-        let (mut actor, _tx) = TransportActor::new();
-        let (interface, _wire) = make_test_interface("admitted interface");
-        actor.interfaces.insert(1, interface);
-
-        let link_id = [0xAA; 16];
-
-        actor.handle_message(TransportMessage::RegisterLink {
-            interface_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.id()),
-
-            link_id,
-            destination_hash: [0xBB; 16],
-            interface_id: 1,
-            next_hop: None,
-            remaining_hops: 0,
-            initiator: false,
-        });
-
-        let entry = actor.link_table.get(&link_id).unwrap();
-        assert!(entry.validated);
-        assert!(entry.established);
-    }
-
-    #[test]
-    fn test_activate_link() {
-        let (mut actor, _tx) = TransportActor::new();
-        let (interface, _wire) = make_test_interface("admitted interface");
-        actor.interfaces.insert(1, interface);
-
-        let link_id = [0xAA; 16];
-
-        // Register as initiator (pending)
-        actor.handle_message(TransportMessage::RegisterLink {
-            interface_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.id()),
-
-            link_id,
-            destination_hash: [0xBB; 16],
-            interface_id: 1,
-            next_hop: None,
-            remaining_hops: 0,
-            initiator: true,
-        });
-        assert!(!actor.link_table.get(&link_id).unwrap().validated);
-
-        // Activate
-        actor.handle_message(TransportMessage::ActivateLink { link_id });
-        let entry = actor.link_table.get(&link_id).unwrap();
-        assert!(entry.validated);
-        assert!(entry.established);
+        for (link_id, initiator) in [([0xAA; 16], true), ([0xAB; 16], false)] {
+            actor.handle_message(TransportMessage::RegisterLink {
+                interface_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.id()),
+                link_id,
+                destination_hash: [0xBB; 16],
+                interface_id: 1,
+                next_hop: None,
+                remaining_hops: 3,
+                initiator,
+            });
+            actor.handle_message(TransportMessage::ActivateLink { link_id });
+            assert!(actor.local_destinations.contains(&link_id));
+            assert!(actor.destination_channels.contains_key(&link_id));
+        }
+        assert!(actor.link_table.is_empty());
     }
 
     #[test]
@@ -9287,6 +9275,7 @@ mod tests {
         tunnel_paths.insert(
             dest_hash,
             crate::tunnel::TunnelPath {
+                used: 0.0,
                 timestamp: now_f64(),
                 next_hop: None,
                 hops: 2,
@@ -9467,6 +9456,7 @@ mod tests {
         table.insert(
             [0xBB; 16],
             crate::path_table::PathEntry {
+                used: 0.0,
                 timestamp: now - 86400.0,
                 next_hop: None,
                 hops: 1,
@@ -9603,6 +9593,7 @@ mod tests {
         actor
             .pending_path_entries
             .push(crate::persistence::PersistedPathEntry {
+                used: None,
                 destination_hash: vec![0xBB; 16],
                 timestamp: 1.0,
                 next_hop: None,
@@ -11308,7 +11299,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_path_request_only_forwards_from_discovery_modes() {
+    fn boundary_requester_searches_boundary_and_gateway_interfaces() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
 
@@ -11321,8 +11312,8 @@ mod tests {
 
         actor.handle_inbound_path_request(&make_path_request_payload([0x11; 16], None), 1);
         assert!(
-            gateway_rx.try_recv().is_err(),
-            "boundary interfaces should not trigger recursive unknown path discovery"
+            gateway_rx.try_recv().is_ok(),
+            "a boundary requester searches gateway interfaces (Transport.py:3781-3783@1.6.0)"
         );
 
         actor.handle_inbound_path_request(&make_path_request_payload([0x22; 16], None), 2);
@@ -11429,6 +11420,8 @@ mod tests {
             .get_mut(&requested)
             .expect("first forwarded request should create a waiting discovery entry")
             .timeout = 0.0;
+        // The in-flight registration outlives the discovery entry (45 s).
+        *actor.inflight_path_requests.get_mut(&requested).unwrap() -= 46.0;
         actor.on_tick();
         actor
             .interfaces
@@ -13213,6 +13206,7 @@ mod tests {
         actor
             .pending_path_entries
             .push(crate::persistence::PersistedPathEntry {
+                used: None,
                 destination_hash: vec![0x11; 16],
                 timestamp: 1.0,
                 next_hop: None,
