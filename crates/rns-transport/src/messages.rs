@@ -964,16 +964,18 @@ pub enum TransportQuery {
     /// Separate from unblackhole-by-hash so operators can flush auto-populated
     /// entries without losing their explicit blocks.
     ClearSystemBlackholes,
-    /// Build a MessagePack manifest from local entries whose identity public keys
-    /// are present in the announce cache. `publisher` is caller-supplied. This
-    /// operation neither signs the manifest nor freshly verifies cached identities.
+    /// Build the `/list` reply: the whole blackhole table, with `publisher` as
+    /// the source of local entries (Transport.py:4589-4596).
     BuildBlackholeManifest {
         publisher: [u8; 16],
     },
-    /// Decode and merge a MessagePack manifest. Caller must authenticate its source
-    /// and apply authorization policy first: this query does not verify a publisher
-    /// or bind inner source fields to a trusted peer. Returns operation count or error.
+    /// Merge a `/list` reply fetched from `publisher`, adding only identities
+    /// not yet present, and store the reply as the publisher's blackhole file
+    /// when anything was added (Discovery.py:920-946). The caller must have
+    /// authenticated the publisher. Returns the number added, or an error when
+    /// the reply is not a map.
     ApplyBlackholeManifest {
+        publisher: [u8; 16],
         payload: Vec<u8>,
     },
     /// Set a registered interface's shared online flag false if present. This does

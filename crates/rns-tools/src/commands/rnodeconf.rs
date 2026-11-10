@@ -1,31 +1,21 @@
 //! rnodeconf-rs - RNode configuration and firmware utility.
 //!
-//! Supports inspection, EEPROM backup, and saved TNC/normal startup configuration.
-//! Firmware installation, signing/trust enrollment, and Bluetooth, Wi-Fi,
-//! display and interference-avoidance mutations are disabled in this build.
+//! Device probe, info, configuration summary, EEPROM dump and backup, firmware
+//! hash readout and TNC/normal startup mode follow upstream `rnodeconf`.
+//! Firmware installation, EEPROM wipe and bootstrap, signing and trust
+//! enrollment, and Bluetooth, Wi-Fi, display and interference-avoidance
+//! mutations are disabled in this build.
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{CommandFactory, Parser};
-use rns_interface::{
-    rnode, rnode_admin,
-    rnode_capabilities::{
-        RNodeCapabilities, RNodeCapabilityParseError, RNodeKnownRadioCapabilities,
-        RNodeRadioAdmission, RNodeRadioCapabilities, RNodeRadioFamily, admit_rnode_radio_settings,
-        classify_rnode_radio_capabilities, parse_rnode_capabilities, rnode_product_name,
-    },
-    rnode_protocol::{
-        FREQUENCY_TOLERANCE_HZ, RNodeFirmwareVersion, RNodeProtocolEffect, RNodeProtocolState,
-        RNodeProtocolTarget, RNodeReadiness,
-    },
-};
+use rns_interface::rnode;
 use rns_tools::RS_RETICULUM_VERSION;
 
-// rnodeconf support is staged: safe inspection/config modules are compiled now,
-// while hardware-gated flashing/signing paths are wired in behind explicit CLI flows.
 #[allow(dead_code)]
 #[path = "rnodeconf/eeprom.rs"]
 mod eeprom;
@@ -46,922 +36,722 @@ mod session;
 #[path = "rnodeconf/trust.rs"]
 mod trust;
 
-use plan::{DevicePlan, MutationPlan};
-use session::{FrameSession, SerialFrameSession};
+use session::{RNode, py_float, py_round};
+
+/// Upstream `rnodeconf` program version, separate from the RNS version.
+const RNODECONF_VERSION: &str = "2.5.0";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "rnodeconf-rs",
-    about = "RNode Configuration and firmware utility",
-    disable_version_flag = true
+    about = "RNode Configuration and firmware utility. This program allows you to change various settings and startup modes of RNode. It can also install, flash and update the firmware on supported devices.",
+    disable_version_flag = true,
+    infer_long_args = true
 )]
 struct Args {
-    /// Read device identification, firmware version and EEPROM summary.
+    /// Show device info
     #[arg(short = 'i', long)]
     info: bool,
-    /// Unavailable: firmware installation is not implemented.
+    /// Automatic installation on various supported devices
     #[arg(short = 'a', long)]
     autoinstall: bool,
-    /// Unavailable: firmware updating is not implemented.
+    /// Update firmware to the latest version
     #[arg(short = 'u', long)]
     update: bool,
-    /// Unavailable: firmware updating is not implemented.
+    /// Update to specified firmware even if version matches or is older than installed version
     #[arg(short = 'U', long = "force-update")]
     force_update: bool,
-    /// Unavailable: firmware selection/planning is not implemented.
-    #[arg(long = "fw-version")]
+    /// Use a specific firmware version for update or autoinstall
+    #[arg(long = "fw-version", value_name = "version")]
     fw_version: Option<String>,
-    /// Unavailable: firmware download/planning is not implemented.
-    #[arg(long = "fw-url")]
+    /// Use an alternate firmware download URL
+    #[arg(long = "fw-url", value_name = "url")]
     fw_url: Option<String>,
-    /// Unavailable: firmware planning options are not implemented.
+    /// Don't check for firmware updates online
     #[arg(long)]
     nocheck: bool,
-    /// Unavailable: firmware extraction is not implemented.
+    /// Extract firmware from connected RNode for later use
     #[arg(short = 'e', long)]
     extract: bool,
-    /// Unavailable: flashing extracted firmware is not implemented.
+    /// Use the extracted firmware for autoinstallation or update
     #[arg(short = 'E', long = "use-extracted")]
     use_extracted: bool,
-    /// Remove and recreate the local update and extracted-cache directories, then exit.
+    /// Clear locally cached firmware files
     #[arg(short = 'C', long = "clear-cache")]
     clear_cache: bool,
-    /// Reserved flashing baud rate; non-default values are rejected and flashing is disabled.
-    #[arg(long = "baud-flash", default_value = "921600")]
+    /// Set specific baud rate when flashing device. Default is 921600
+    #[arg(
+        long = "baud-flash",
+        value_name = "baud_flash",
+        default_value = "921600"
+    )]
     baud_flash: String,
 
-    /// Delete the saved TNC startup configuration and check EEPROM readback.
+    /// Switch device to normal mode
     #[arg(short = 'N', long)]
     normal: bool,
-    /// Apply and save a complete RF tuple; requires --freq, --bw, --sf, --cr and --txp.
+    /// Switch device to TNC mode
     #[arg(short = 'T', long)]
     tnc: bool,
 
-    /// Unavailable: Bluetooth mutations are disabled.
+    /// Turn device bluetooth on
     #[arg(short = 'b', long = "bluetooth-on")]
     bluetooth_on: bool,
-    /// Unavailable: Bluetooth mutations are disabled.
+    /// Turn device bluetooth off
     #[arg(short = 'B', long = "bluetooth-off")]
     bluetooth_off: bool,
-    /// Unavailable: Bluetooth mutations are disabled.
+    /// Put device into bluetooth pairing mode
     #[arg(short = 'p', long = "bluetooth-pair")]
     bluetooth_pair: bool,
 
-    /// Unavailable: Wi-Fi mode mutations are disabled.
-    #[arg(short = 'w', long = "wifi")]
+    /// Set WiFi mode (OFF, AP or STATION)
+    #[arg(short = 'w', long = "wifi", value_name = "mode")]
     wifi: Option<String>,
-    /// Unavailable: Wi-Fi channel mutations are disabled.
-    #[arg(long)]
-    channel: Option<u8>,
-    /// Unavailable: Wi-Fi SSID mutations are disabled.
-    #[arg(long)]
+    /// Set WiFi channel
+    #[arg(long, value_name = "channel")]
+    channel: Option<String>,
+    /// Set WiFi SSID (NONE to delete)
+    #[arg(long, value_name = "ssid")]
     ssid: Option<String>,
-    /// Unavailable: Wi-Fi password mutations are disabled.
-    #[arg(long)]
+    /// Set WiFi PSK (NONE to delete)
+    #[arg(long, value_name = "psk")]
     psk: Option<String>,
-    /// Include password bytes in the configuration-sector hex dump; requires --config.
+    /// Display stored WiFi PSK
     #[arg(long = "show-psk")]
     show_psk: bool,
-    /// Unavailable: Wi-Fi IP address mutations are disabled.
-    #[arg(long)]
+    /// Set static WiFi IP address (NONE for DHCP)
+    #[arg(long, value_name = "ip")]
     ip: Option<String>,
-    /// Unavailable: Wi-Fi netmask mutations are disabled.
-    #[arg(long)]
+    /// Set static WiFi network mask (NONE for DHCP)
+    #[arg(long, value_name = "nm")]
     nm: Option<String>,
 
-    /// Unavailable: display mutations are disabled.
-    #[arg(short = 'D', long = "display")]
-    display: Option<i32>,
-    /// Unavailable: display-timeout mutations are disabled; this is not a command timeout.
-    #[arg(short = 't', long = "timeout")]
-    timeout: Option<i32>,
-    /// Unavailable: display-rotation mutations are disabled.
-    #[arg(short = 'R', long = "rotation")]
-    rotation: Option<i32>,
-    /// Unavailable: display-address mutations are disabled.
-    #[arg(long = "display-addr")]
+    /// Set display intensity (0-255)
+    #[arg(
+        short = 'D',
+        long = "display",
+        value_name = "i",
+        allow_negative_numbers = true
+    )]
+    display: Option<i64>,
+    /// Set display timeout in seconds, 0 to disable
+    #[arg(
+        short = 't',
+        long = "timeout",
+        value_name = "s",
+        allow_negative_numbers = true
+    )]
+    timeout: Option<i64>,
+    /// Set display rotation, valid values are 0 through 3
+    #[arg(
+        short = 'R',
+        long = "rotation",
+        value_name = "rotation",
+        allow_negative_numbers = true
+    )]
+    rotation: Option<i64>,
+    /// Set display address as hex byte (00 - FF)
+    #[arg(long = "display-addr", value_name = "byte")]
     display_addr: Option<String>,
-    /// Unavailable: display reconditioning is disabled.
+    /// Start display reconditioning
     #[arg(long = "recondition-display")]
     recondition_display: bool,
-    /// Unavailable: NeoPixel mutations are disabled.
-    #[arg(long = "np")]
-    neopixel: Option<i32>,
+    /// Set NeoPixel intensity (0-255)
+    #[arg(long = "np", value_name = "i", allow_negative_numbers = true)]
+    neopixel: Option<i64>,
 
-    /// RF centre frequency in hertz; requires the complete --tnc tuple.
-    #[arg(long = "freq")]
-    freq: Option<u32>,
-    /// RF bandwidth in hertz; requires the complete --tnc tuple.
-    #[arg(long = "bw")]
-    bandwidth: Option<u32>,
-    /// Requested TX power in dBm; requires the complete --tnc tuple.
-    #[arg(long = "txp")]
-    tx_power: Option<u8>,
-    /// LoRa spreading factor; requires the complete --tnc tuple.
-    #[arg(long = "sf")]
-    spreading_factor: Option<u8>,
-    /// LoRa coding-rate denominator (5 means 4/5); requires the complete --tnc tuple.
-    #[arg(long = "cr")]
-    coding_rate: Option<u8>,
+    /// Frequency in Hz for TNC mode
+    #[arg(long = "freq", value_name = "Hz", allow_negative_numbers = true)]
+    freq: Option<i64>,
+    /// Bandwidth in Hz for TNC mode
+    #[arg(long = "bw", value_name = "Hz", allow_negative_numbers = true)]
+    bandwidth: Option<i64>,
+    /// TX power in dBm for TNC mode
+    #[arg(long = "txp", value_name = "dBm", allow_negative_numbers = true)]
+    tx_power: Option<i64>,
+    /// Spreading factor for TNC mode (7 - 12)
+    #[arg(long = "sf", value_name = "factor", allow_negative_numbers = true)]
+    spreading_factor: Option<i64>,
+    /// Coding rate for TNC mode (5 - 8)
+    #[arg(long = "cr", value_name = "rate", allow_negative_numbers = true)]
+    coding_rate: Option<i64>,
 
-    /// Unavailable: interference-avoidance mutations are disabled.
+    /// Enable interference avoidance
     #[arg(short = 'x', long = "ia-enable")]
     ia_enable: bool,
-    /// Unavailable: interference-avoidance mutations are disabled.
+    /// Disable interference avoidance
     #[arg(short = 'X', long = "ia-disable")]
     ia_disable: bool,
 
-    /// Read the configuration sector as hex, with password bytes redacted by default.
+    /// Print device configuration
     #[arg(short = 'c', long = "config")]
     config: bool,
-    /// Read EEPROM and save a timestamped .eeprom file in the local rnodeconf data directory.
+
+    /// Backup EEPROM to file
     #[arg(long = "eeprom-backup")]
     eeprom_backup: bool,
-    /// Read EEPROM and print its raw hex bytes and summary.
+    /// Dump EEPROM to console
     #[arg(long = "eeprom-dump")]
     eeprom_dump: bool,
-    /// Unavailable: EEPROM wiping is disabled until provisioning is implemented.
+    /// Unlock and wipe EEPROM
     #[arg(long = "eeprom-wipe")]
     eeprom_wipe: bool,
 
-    /// Unavailable: signing-key management is not implemented.
+    /// Display public part of signing key
     #[arg(short = 'P', long = "public")]
     public: bool,
-    /// Unavailable: trusted-key enrollment is disabled.
-    #[arg(long = "trust-key")]
+    /// Public key to trust for device verification
+    #[arg(long = "trust-key", value_name = "hexbytes")]
     trust_key: Option<String>,
 
-    /// Print the utility version and exit.
+    /// Print program version and exit
     #[arg(long)]
     version: bool,
-    /// Unavailable: firmware flashing is not implemented.
+
+    /// Flash firmware and bootstrap EEPROM
     #[arg(short = 'f', long)]
     flash: bool,
-    /// Unavailable: ROM bootstrap is not implemented.
+    /// Bootstrap EEPROM without flashing firmware
     #[arg(short = 'r', long)]
     rom: bool,
-    /// Unavailable: signing-key management is not implemented.
+    /// Generate a new signing key and exit
     #[arg(short = 'k', long)]
     key: bool,
-    /// Unavailable: signing/provisioning is not implemented.
+    /// Display public part of signing key
     #[arg(short = 'S', long)]
     sign: bool,
-    /// Unavailable: writing device trust state is disabled.
-    #[arg(short = 'H', long = "firmware-hash")]
+    /// Set installed firmware hash
+    #[arg(short = 'H', long = "firmware-hash", value_name = "FIRMWARE_HASH")]
     firmware_hash: Option<String>,
-    /// Read the device-reported target firmware hash.
     #[arg(short = 'K', long = "get-target-firmware-hash", hide = true)]
     get_target_firmware_hash: bool,
-    /// Read the device-reported firmware hash.
     #[arg(short = 'L', long = "get-firmware-hash", hide = true)]
     get_firmware_hash: bool,
-    /// Unavailable: firmware platform selection is not implemented.
-    #[arg(long)]
+    /// Platform specification for device bootstrap
+    #[arg(long, value_name = "platform")]
     platform: Option<String>,
-    /// Unavailable: firmware product selection is not implemented.
-    #[arg(long)]
+    /// Product specification for device bootstrap
+    #[arg(long, value_name = "product")]
     product: Option<String>,
-    /// Unavailable: firmware model selection is not implemented.
-    #[arg(long)]
+    /// Model code for device bootstrap
+    #[arg(long, value_name = "model")]
     model: Option<String>,
-    /// Unavailable: firmware hardware-revision selection is not implemented.
-    #[arg(long)]
-    hwrev: Option<u8>,
+    /// Hardware revision for device bootstrap
+    #[arg(long, value_name = "revision", allow_negative_numbers = true)]
+    hwrev: Option<i64>,
 
-    /// Serial port where RNode is attached.
-    port: Option<PathBuf>,
+    /// serial port where RNode is attached
+    port: Option<String>,
 }
 
 pub(crate) fn main() -> ExitCode {
     let args = Args::parse();
     if args.version {
-        println!("rnodeconf-rs {RS_RETICULUM_VERSION}");
+        out(format!(
+            "rnodeconf-rs {RS_RETICULUM_VERSION} (rnodeconf {RNODECONF_VERSION})"
+        ));
         return ExitCode::SUCCESS;
-    }
-    if args.trust_key.is_some() {
-        eprintln!(
-            "rnodeconf-rs: --trust-key is not yet safely supported; validated DER key enrollment is required"
-        );
-        return ExitCode::from(2);
-    }
-    if args.key || args.sign || args.public {
-        eprintln!("rnodeconf-rs: signing key management is not fully implemented yet");
-        return ExitCode::from(2);
-    }
-    if args.flash || args.rom || args.autoinstall || args.update || args.force_update {
-        eprintln!("rnodeconf-rs: firmware flashing is not implemented yet");
-        return ExitCode::from(2);
-    }
-    if args.extract
-        || args.use_extracted
-        || args.fw_version.is_some()
-        || args.fw_url.is_some()
-        || args.nocheck
-        || args.platform.is_some()
-        || args.product.is_some()
-        || args.model.is_some()
-        || args.hwrev.is_some()
-        || args.baud_flash != "921600"
-    {
-        eprintln!(
-            "rnodeconf-rs: firmware planning/cache options are not implemented yet; flashing and update flows remain disabled"
-        );
-        return ExitCode::from(2);
-    }
-    if args.eeprom_wipe {
-        eprintln!(
-            "rnodeconf-rs: --eeprom-wipe is destructive and is disabled until the full provisioning flow is implemented"
-        );
-        return ExitCode::from(2);
-    }
-    if let Some(hash) = args.firmware_hash.as_deref() {
-        if let Err(e) = firmware::parse_sha256_hex(hash) {
-            eprintln!("rnodeconf-rs: {e}");
-            return ExitCode::from(2);
-        }
-        eprintln!(
-            "rnodeconf-rs: --firmware-hash writes device trust state and is disabled until signing/provisioning is implemented"
-        );
-        return ExitCode::from(2);
     }
     if args.clear_cache {
-        let paths = match rnodeconf_cache_paths() {
-            Ok(paths) => paths,
+        log("Clearing local firmware cache...");
+        match rnodeconf_cache_paths().and_then(|paths| clear_firmware_cache(&paths)) {
+            Ok(()) => log("Done"),
             Err(e) => {
                 eprintln!("rnodeconf-rs: {e}");
-                return ExitCode::from(2);
-            }
-        };
-        if let Err(e) = clear_firmware_cache(&paths) {
-            eprintln!("rnodeconf-rs: {e}");
-            return ExitCode::from(1);
-        }
-        println!("Firmware cache cleared.");
-        return ExitCode::SUCCESS;
-    }
-
-    let plan = match DevicePlan::build(&args) {
-        Ok(plan) => plan,
-        Err(e) => {
-            eprintln!("rnodeconf-rs: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    if plan.is_empty() {
-        let mut cmd = Args::command();
-        let _ = cmd.print_help();
-        println!();
-        return ExitCode::SUCCESS;
-    }
-
-    let cache_paths = if args.eeprom_backup {
-        match rnodeconf_cache_paths() {
-            Ok(paths) => Some(paths),
-            Err(e) => {
-                eprintln!("rnodeconf-rs: {e}");
-                return ExitCode::from(2);
-            }
-        }
-    } else {
-        None
-    };
-
-    let Some(port_path) = args.port.as_ref() else {
-        eprintln!("rnodeconf-rs: serial port is required for device operations");
-        return ExitCode::from(2);
-    };
-
-    let port = match rns_interface::serial::open_port(
-        serialport::new(port_path.to_string_lossy(), 115200).timeout(Duration::from_millis(250)),
-    ) {
-        Ok(port) => port,
-        Err(e) => {
-            eprintln!("rnodeconf-rs: could not open {}: {e}", port_path.display());
-            return ExitCode::from(1);
-        }
-    };
-
-    let mut session = SerialFrameSession::new(port);
-    if let Some(mutation) = plan.mutation {
-        match execute_mutation(&mut session, mutation) {
-            Ok(outcome) => println!(
-                "{} ({})",
-                outcome.summary(),
-                model_verification_summary(outcome.verification)
-            ),
-            Err(error) => {
-                eprintln!("rnodeconf-rs: {error}");
                 return ExitCode::from(1);
             }
         }
+        return ExitCode::SUCCESS;
+    }
+    if let Some(version) = args.fw_version.as_deref()
+        && version.trim().parse::<f64>().is_err()
+    {
+        log(format!(
+            "Selected version \"{version}\" does not appear to be a number."
+        ));
+        return ExitCode::SUCCESS;
+    }
+    if let Some(message) = plan::refusal_without_port(&args) {
+        eprintln!("rnodeconf-rs: {message}");
+        return ExitCode::from(2);
+    }
+    let Some(port_path) = args.port.clone() else {
+        out("");
+        let _ = Args::command().print_help();
+        out("");
+        out("");
+        return ExitCode::SUCCESS;
+    };
+    if let Some(message) = plan::refusal_with_port(&args) {
+        eprintln!("rnodeconf-rs: {message}");
+        return ExitCode::from(2);
     }
 
-    let responses = match execute_read_only(&mut session, &plan.read_only) {
-        Ok(responses) => responses,
-        Err(error) => {
-            eprintln!("rnodeconf-rs: {error}");
-            return ExitCode::from(1);
+    log(format!("Opening serial port {port_path}..."));
+    let port = match rns_interface::serial::open_port(
+        serialport::new(&port_path, 115200).timeout(Duration::from_millis(100)),
+    ) {
+        Ok(port) => port,
+        Err(e) => {
+            log("Could not open the specified serial port. The contained exception was:");
+            log(e.to_string());
+            return ExitCode::SUCCESS;
         }
     };
-    if let Err(e) = print_responses(&responses, &args, cache_paths.as_ref()) {
-        eprintln!("rnodeconf-rs: {e}");
-        return ExitCode::from(1);
-    }
-    ExitCode::SUCCESS
-}
-
-fn frame(command: u8, payload: &[u8]) -> rnode_admin::AdminFrame {
-    rnode_admin::AdminFrame {
-        command,
-        payload: payload.to_vec(),
-    }
-}
-
-const RESPONSE_TIMEOUT: Duration = Duration::from_millis(750);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum MutationError {
-    Failed(String),
-    PersistenceIndeterminate(String),
-}
-
-impl std::fmt::Display for MutationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Failed(message) => formatter.write_str(message),
-            Self::PersistenceIndeterminate(message) => write!(
-                formatter,
-                "persistence result is indeterminate because the device may have applied the command: {message}"
-            ),
+    let mut rnode = RNode::new(port, port_path);
+    match run_device(&mut rnode, &args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("rnodeconf-rs: {e}");
+            ExitCode::from(1)
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MutationKind {
-    Tnc,
-    Normal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MutationOutcome {
-    kind: MutationKind,
-    verification: RNodeRadioAdmission,
-}
-
-impl MutationOutcome {
-    const fn summary(self) -> &'static str {
-        match self.kind {
-            MutationKind::Tnc => "TNC startup configuration saved and read back successfully",
-            MutationKind::Normal => "Normal startup mode deleted and read back successfully",
-        }
+/// Upstream `main()` from the device probe on, for the operations this build
+/// supports. Errors are the cases where upstream raises an exception.
+fn run_device(rnode: &mut RNode, args: &Args) -> Result<ExitCode, String> {
+    if let Err(e) = rnode.device_probe() {
+        log("Serial port opened, but RNode did not respond. Is a valid firmware installed?");
+        out(e);
+        return Ok(graceful_exit(rnode, 0));
     }
-}
+    if rnode.detected == Some(true) && (rnode.platform.is_none() || rnode.mcu.is_none()) {
+        rnode.platform = Some(model::PLATFORM_AVR);
+        rnode.mcu = Some(model::MCU_1284P);
+    }
 
-fn model_verification_summary(admission: RNodeRadioAdmission) -> String {
-    // rnodeconf admissions derive from a locked, parsed identity, so the
-    // codes are always present; the unprovisioned arm is unreachable here.
-    let (Some(product), Some(model)) = (admission.product_code(), admission.model_code()) else {
-        return "generic RF validation only; no provisioned identity".to_string();
+    log("Reading EEPROM...");
+    rnode.download_eeprom()?;
+    let Some(eeprom) = rnode.eeprom.clone() else {
+        log("Could not download EEPROM from device. Is a valid firmware installed?");
+        return Ok(graceful_exit(rnode, 0));
     };
-    if admission.is_verified() {
-        format!("model-specific limits verified for product 0x{product:02x}, model 0x{model:02x}")
-    } else {
-        format!(
-            "generic RF validation only; model-specific limits unverified for product 0x{product:02x}, model 0x{model:02x}"
-        )
+    let device = match parse_eeprom(&eeprom, &rnode.name) {
+        ParsedEeprom::Device(device) => device,
+        ParsedEeprom::ChecksumMismatch => return Ok(graceful_exit(rnode, 0)),
+    };
+    // Upstream looks up the firmware file for every provisioned model and stops on an unknown one.
+    if let Some(device) = device.as_ref()
+        && model::model_info(device.model).is_none()
+    {
+        return Err(format!("unknown model code {}", device.model));
     }
-}
 
-#[derive(Debug, Clone, Copy)]
-struct MutationPreflight {
-    firmware: RNodeFirmwareVersion,
-    capabilities: RNodeCapabilities,
-}
-
-fn execute_mutation<S: FrameSession>(
-    session: &mut S,
-    mutation: MutationPlan,
-) -> Result<MutationOutcome, MutationError> {
-    let preflight = mutation_preflight(session)?;
-    match mutation {
-        MutationPlan::Tnc(settings) => execute_tnc(session, settings, preflight),
-        MutationPlan::Normal => execute_normal(session, preflight),
+    if args.config {
+        rnode.download_cfg_sector()?;
+        for line in
+            eeprom::device_configuration_lines(&eeprom, rnode.cfg_sector.as_deref(), args.show_psk)
+        {
+            out(line);
+        }
+        rnode.leave()?;
+        return Ok(graceful_exit(rnode, 0));
     }
-}
 
-fn mutation_preflight<S: FrameSession>(
-    session: &mut S,
-) -> Result<MutationPreflight, MutationError> {
-    let detect = send_and_expect(
-        session,
-        &frame(rnode::CMD_DETECT, &[rnode::DETECT_REQ]),
-        "RNode detection",
-        |payload| {
-            if payload == [rnode::DETECT_RESP] {
-                Ok(())
-            } else {
-                Err("detection response did not identify an RNode".to_string())
+    if args.eeprom_dump {
+        log("EEPROM contents:");
+        log(rns_tools::format::hex_rep(&eeprom));
+        return Ok(graceful_exit(rnode, 0));
+    }
+
+    if args.eeprom_backup {
+        match write_eeprom_backup(&eeprom) {
+            Ok(path) => log(format!("EEPROM backup written to: {path}")),
+            Err(_) => {
+                log("EEPROM was successfully downloaded from device,");
+                log("but file could not be written to disk.");
             }
-        },
-    )
-    .map_err(MutationError::Failed)?;
-    debug_assert_eq!(detect.command, rnode::CMD_DETECT);
-
-    let firmware_frame = send_and_expect(
-        session,
-        &frame(rnode::CMD_FW_VERSION, &[0]),
-        "firmware version",
-        |payload| exact_width(payload, 2, "firmware version"),
-    )
-    .map_err(MutationError::Failed)?;
-    let firmware = RNodeFirmwareVersion::new(firmware_frame.payload[0], firmware_frame.payload[1]);
-    if !firmware.is_supported() {
-        return Err(MutationError::Failed(format!(
-            "unsupported RNode firmware {}.{}; minimum is {}.{}",
-            firmware.major,
-            firmware.minor,
-            RNodeFirmwareVersion::MINIMUM_SUPPORTED.major,
-            RNodeFirmwareVersion::MINIMUM_SUPPORTED.minor
-        )));
-    }
-
-    let eeprom_frame = send_and_expect(
-        session,
-        &rnode_admin::eeprom_read_frame(),
-        "EEPROM identity",
-        |payload| {
-            eeprom::EepromImage::new(payload.to_vec())
-                .map(|_| ())
-                .map_err(|error| format!("malformed EEPROM response: {error}"))
-        },
-    )
-    .map_err(MutationError::Failed)?;
-    let capabilities = parse_rnode_capabilities(&eeprom_frame.payload)
-        .map_err(|error| MutationError::Failed(format!("invalid EEPROM identity: {error}")))?;
-
-    Ok(MutationPreflight {
-        firmware,
-        capabilities,
-    })
-}
-
-fn execute_tnc<S: FrameSession>(
-    session: &mut S,
-    settings: rnode::RNodeRadioSettings,
-    preflight: MutationPreflight,
-) -> Result<MutationOutcome, MutationError> {
-    let verification = admit_rnode_radio_settings(preflight.capabilities, settings)
-        .map_err(|error| MutationError::Failed(error.to_string()))?;
-    let target = RNodeProtocolTarget::new(
-        settings.frequency,
-        settings.bandwidth,
-        settings.spreading_factor,
-        settings.coding_rate,
-        settings.tx_power,
-    );
-    let mut reducer = RNodeProtocolState::new(target);
-    reducer.apply_frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]);
-    reducer.apply_frame(
-        rnode::CMD_FW_VERSION,
-        &[preflight.firmware.major, preflight.firmware.minor],
-    );
-
-    let radio_frames =
-        rnode_admin::decode_frames(&rnode::build_radio_configuration_sequence(&settings));
-    if radio_frames.len() != 7 {
-        return Err(MutationError::Failed(
-            "internal radio planner produced an unexpected command count".to_string(),
-        ));
-    }
-    for request in &radio_frames {
-        let response = send_and_expect(
-            session,
-            request,
-            radio_stage_name(request.command),
-            |payload| validate_radio_echo(request, payload),
-        )
-        .map_err(MutationError::Failed)?;
-        if matches!(
-            reducer.apply_frame(response.command, &response.payload),
-            RNodeProtocolEffect::Rejected(_)
-        ) {
-            return Err(MutationError::Failed(format!(
-                "malformed {} echo",
-                radio_stage_name(request.command)
-            )));
         }
-    }
-    if reducer.readiness() != RNodeReadiness::Ready {
-        return Err(MutationError::Failed(format!(
-            "radio reducer did not reach Ready: {:?}",
-            reducer.readiness()
-        )));
+        return Ok(graceful_exit(rnode, 0));
     }
 
-    let image = persist_then_read(session, rnode::CMD_CONF_SAVE)?;
-    let Some(saved) = image.radio_config() else {
-        return Err(MutationError::PersistenceIndeterminate(
-            "EEPROM readback did not contain the saved-configuration marker".to_string(),
-        ));
-    };
-    verify_saved_radio(&settings, &saved).map_err(MutationError::PersistenceIndeterminate)?;
-
-    Ok(MutationOutcome {
-        kind: MutationKind::Tnc,
-        verification,
-    })
-}
-
-fn execute_normal<S: FrameSession>(
-    session: &mut S,
-    preflight: MutationPreflight,
-) -> Result<MutationOutcome, MutationError> {
-    let verification = classify_rnode_radio_capabilities(preflight.capabilities);
-    let image = persist_then_read(session, rnode::CMD_CONF_DELETE)?;
-    if image.radio_config().is_some() {
-        return Err(MutationError::PersistenceIndeterminate(
-            "EEPROM readback still contains the saved-configuration marker".to_string(),
-        ));
+    if args.info {
+        let Some(device) = device.as_ref() else {
+            log("EEPROM is invalid, no further information available");
+            return Ok(graceful_exit(rnode, 0));
+        };
+        for line in device_info_lines(device, rnode)? {
+            log(line);
+        }
+        out("");
+        rnode.leave()?;
+        return Ok(graceful_exit(rnode, 0));
     }
-    Ok(MutationOutcome {
-        kind: MutationKind::Normal,
-        verification,
-    })
-}
 
-fn persist_then_read<S: FrameSession>(
-    session: &mut S,
-    persist_command: u8,
-) -> Result<eeprom::EepromImage, MutationError> {
-    session
-        .send(&frame(persist_command, &[0]))
-        .map_err(MutationError::PersistenceIndeterminate)?;
-    let readback = send_and_expect(
-        session,
-        &rnode_admin::eeprom_read_frame(),
-        "persisted EEPROM readback",
-        |payload| {
-            eeprom::EepromImage::new(payload.to_vec())
-                .map(|_| ())
-                .map_err(|error| format!("malformed EEPROM readback: {error}"))
-        },
-    )
-    .map_err(MutationError::PersistenceIndeterminate)?;
-    eeprom::EepromImage::new(readback.payload)
-        .map_err(|error| MutationError::PersistenceIndeterminate(error.to_string()))
-}
-
-fn verify_saved_radio(
-    expected: &rnode::RNodeRadioSettings,
-    saved: &eeprom::RadioConfig,
-) -> Result<(), String> {
-    if saved.frequency.abs_diff(expected.frequency) > FREQUENCY_TOLERANCE_HZ {
-        return Err(format!(
-            "saved frequency mismatch: requested {}, read back {}",
-            expected.frequency, saved.frequency
-        ));
-    }
-    for (name, observed, wanted) in [
+    for (wanted, label, hash) in [
         (
-            "bandwidth",
-            u64::from(saved.bandwidth),
-            u64::from(expected.bandwidth),
+            args.get_target_firmware_hash,
+            "target",
+            rnode.firmware_hash_target.clone(),
         ),
         (
-            "spreading factor",
-            u64::from(saved.spreading_factor),
-            u64::from(expected.spreading_factor),
-        ),
-        (
-            "coding rate",
-            u64::from(saved.coding_rate),
-            u64::from(expected.coding_rate),
-        ),
-        (
-            "TX power",
-            u64::from(saved.tx_power),
-            u64::from(expected.tx_power),
+            args.get_firmware_hash,
+            "actual",
+            rnode.firmware_hash.clone(),
         ),
     ] {
-        if observed != wanted {
-            return Err(format!(
-                "saved {name} mismatch: requested {wanted}, read back {observed}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn radio_stage_name(command: u8) -> &'static str {
-    match command {
-        rnode::CMD_FREQUENCY => "frequency",
-        rnode::CMD_BANDWIDTH => "bandwidth",
-        rnode::CMD_SF => "spreading factor",
-        rnode::CMD_CR => "coding rate",
-        rnode::CMD_TXPOWER => "TX power",
-        rnode::CMD_RADIO_STATE => "radio state",
-        _ => "radio configuration",
-    }
-}
-
-fn validate_radio_echo(request: &rnode_admin::AdminFrame, payload: &[u8]) -> Result<(), String> {
-    if payload.len() != request.payload.len() {
-        return Err(format!(
-            "malformed {} echo: expected {} bytes, got {}",
-            radio_stage_name(request.command),
-            request.payload.len(),
-            payload.len()
-        ));
-    }
-    if request.command == rnode::CMD_FREQUENCY {
-        let wanted =
-            u32::from_be_bytes(request.payload.as_slice().try_into().expect("width known"));
-        let observed = u32::from_be_bytes(payload.try_into().expect("width checked"));
-        if observed.abs_diff(wanted) <= FREQUENCY_TOLERANCE_HZ {
-            return Ok(());
-        }
-    } else if payload == request.payload {
-        return Ok(());
-    }
-    Err(format!(
-        "{} echo did not match the requested value",
-        radio_stage_name(request.command)
-    ))
-}
-
-fn send_and_expect<S, F>(
-    session: &mut S,
-    request: &rnode_admin::AdminFrame,
-    stage: &str,
-    validate: F,
-) -> Result<rnode_admin::AdminFrame, String>
-where
-    S: FrameSession,
-    F: Fn(&[u8]) -> Result<(), String>,
-{
-    session.send(request)?;
-    let deadline = Instant::now() + RESPONSE_TIMEOUT;
-    loop {
-        let Some(response) = session.receive_until(deadline)? else {
-            return Err(format!("timed out waiting for {stage} response"));
-        };
-        if response.command == rnode::CMD_ERROR {
-            return Err(format!(
-                "device reported CMD_ERROR while waiting for {stage}"
-            ));
-        }
-        if response.command != request.command {
+        if !wanted {
             continue;
         }
-        validate(&response.payload)?;
-        return Ok(response);
+        if device.is_none() {
+            log("This device has not been provisioned yet, cannot get firmware hash");
+            return Ok(ExitCode::from(77));
+        }
+        let hash =
+            hash.ok_or_else(|| format!("the device did not report its {label} firmware hash"))?;
+        log(format!(
+            "The {label} firmware hash is: {}",
+            hex::encode(hash)
+        ));
     }
-}
 
-fn exact_width(payload: &[u8], expected: usize, name: &str) -> Result<(), String> {
-    if payload.len() == expected {
-        Ok(())
+    if device.is_some() {
+        if args.normal {
+            rnode.set_normal_mode()?;
+            log("Device set to normal (host-controlled) operating mode");
+            return Ok(graceful_exit(rnode, 0));
+        }
+        if args.tnc {
+            set_tnc_mode(rnode, args)?;
+            return Ok(graceful_exit(rnode, 0));
+        }
     } else {
-        Err(format!(
-            "malformed {name} response: expected {expected} bytes, got {}",
-            payload.len()
-        ))
+        log("This device contains a valid firmware, but EEPROM is invalid.");
+        log("Probably the device has not been initialised, or the EEPROM has been erased.");
+        log("Please correctly initialise the device and try again!");
     }
+    Ok(graceful_exit(rnode, 0))
 }
 
-fn execute_read_only<S: FrameSession>(
-    session: &mut S,
-    requests: &[rnode_admin::AdminFrame],
-) -> Result<Vec<rnode_admin::AdminFrame>, String> {
-    let mut responses = Vec::with_capacity(requests.len());
-    for request in requests {
-        responses.push(send_and_expect(
-            session,
-            request,
-            "read-only command",
-            |payload| validate_read_only_reply(request, payload),
-        )?);
+/// Upstream `graceful_exit`: only Windows tells the device the host left.
+fn graceful_exit(rnode: &mut RNode, code: u8) -> ExitCode {
+    if cfg!(windows) {
+        let _ = rnode.leave();
     }
-    Ok(responses)
+    ExitCode::from(code)
 }
 
-fn validate_read_only_reply(
-    request: &rnode_admin::AdminFrame,
-    payload: &[u8],
-) -> Result<(), String> {
-    match request.command {
-        rnode::CMD_DETECT if payload != [rnode::DETECT_RESP] => {
-            Err("detection response did not identify an RNode".to_string())
-        }
-        rnode::CMD_FW_VERSION => exact_width(payload, 2, "firmware version"),
-        rnode::CMD_PLATFORM | rnode::CMD_MCU | rnode::CMD_BOARD => {
-            exact_width(payload, 1, "hardware identity")
-        }
-        rnode::CMD_DEV_HASH => exact_width(payload, 32, "device hash"),
-        rnode::CMD_HASHES => {
-            exact_width(payload, 33, "firmware hash")?;
-            if payload.first() == request.payload.first() {
-                Ok(())
-            } else {
-                Err("firmware hash response selector did not match request".to_string())
-            }
-        }
-        rnode::CMD_CFG_READ if !payload.is_empty() && payload.len() < eeprom::ADDR_CONF_NM + 4 => {
-            Err(format!(
-                "configuration sector response is too short: {} bytes",
-                payload.len()
-            ))
-        }
-        rnode::CMD_ROM_READ => eeprom::EepromImage::new(payload.to_vec())
-            .map(|_| ())
-            .map_err(|error| format!("malformed EEPROM response: {error}")),
-        _ => Ok(()),
+fn set_tnc_mode(rnode: &mut RNode, args: &Args) -> Result<(), String> {
+    let given = |value: Option<i64>| value.filter(|value| *value != 0);
+    if [
+        args.freq,
+        args.bandwidth,
+        args.tx_power,
+        args.spreading_factor,
+        args.coding_rate,
+    ]
+    .iter()
+    .any(|value| given(*value).is_none())
+    {
+        log("Please input startup configuration:");
     }
+    out("");
+    let frequency = given(args.freq).map_or_else(|| prompt("Frequency in Hz:\t"), Ok)?;
+    let bandwidth = given(args.bandwidth).map_or_else(|| prompt("Bandwidth in Hz:\t"), Ok)?;
+    let tx_power = args
+        .tx_power
+        .filter(|txp| (0..=17).contains(txp))
+        .map_or_else(|| prompt("TX Power in dBm:\t"), Ok)?;
+    let spreading_factor =
+        given(args.spreading_factor).map_or_else(|| prompt("Spreading factor:\t"), Ok)?;
+    let coding_rate = given(args.coding_rate).map_or_else(|| prompt("Coding rate:\t\t"), Ok)?;
+    out("");
+
+    // initRadio: frequency and bandwidth are escaped, the one-byte setters are not.
+    rnode.send(rnode::CMD_FREQUENCY, &radio_word(frequency)?)?;
+    rnode.send(rnode::CMD_BANDWIDTH, &radio_word(bandwidth)?)?;
+    rnode.send_raw_byte(rnode::CMD_TXPOWER, radio_byte(tx_power)?)?;
+    rnode.send_raw_byte(rnode::CMD_SF, radio_byte(spreading_factor)?)?;
+    rnode.send_raw_byte(rnode::CMD_CR, radio_byte(coding_rate)?)?;
+    rnode.send_raw_byte(rnode::CMD_RADIO_STATE, rnode::RADIO_STATE_ON)?;
+    rnode.pump(Duration::from_millis(500))?;
+    rnode.set_tnc_mode()?;
+    log("Device set to TNC operating mode");
+    rnode.pump(Duration::from_secs(1))
 }
 
-fn print_responses(
-    frames: &[rnode_admin::AdminFrame],
-    args: &Args,
-    cache_paths: Option<&firmware::CachePaths>,
-) -> Result<(), String> {
-    for frame in frames {
-        match frame.command {
-            rnode::CMD_BT_PIN => {
-                if let Some(pin) = rnode_admin::parse_bt_pin(frame) {
-                    println!("Bluetooth pairing PIN: {pin:06}");
-                }
-            }
-            rnode::CMD_FW_VERSION if frame.payload.len() >= 2 => {
-                println!(
-                    "Firmware version: {}.{}",
-                    frame.payload[0], frame.payload[1]
-                );
-            }
-            rnode::CMD_PLATFORM => println!("Platform: {}", hex::encode(&frame.payload)),
-            rnode::CMD_MCU => println!("MCU: {}", hex::encode(&frame.payload)),
-            rnode::CMD_BOARD => println!("Board: {}", hex::encode(&frame.payload)),
-            rnode::CMD_DEV_HASH => println!("Device hash: {}", hex::encode(&frame.payload)),
-            rnode::CMD_HASHES if frame.payload.len() == 33 => {
-                let label = match frame.payload[0] {
-                    1 => "Target firmware hash",
-                    2 => "Firmware hash",
-                    _ => "Unknown firmware hash",
-                };
-                println!("{label}: {}", hex::encode(&frame.payload[1..]));
-            }
-            rnode::CMD_CFG_READ => {
-                println!(
-                    "Config sector: {}",
-                    format_config_sector(&frame.payload, args.show_psk)
-                );
-            }
-            rnode::CMD_ROM_READ => {
-                if args.eeprom_dump {
-                    println!("EEPROM contents: {}", hex::encode(&frame.payload));
-                }
-                match eeprom::EepromImage::new(frame.payload.clone()) {
-                    Ok(image) => {
-                        for line in eeprom_summary_lines(&image) {
-                            println!("{line}");
-                        }
-                    }
-                    Err(e) => println!("EEPROM: {e}"),
-                }
-                if args.eeprom_backup {
-                    let Some(paths) = cache_paths else {
-                        return Err("EEPROM backup requested without cache paths".to_string());
-                    };
-                    let path = write_eeprom_backup(paths, &frame.payload)?;
-                    println!("EEPROM backup written to: {}", path.display());
-                }
-            }
-            _ => println!("0x{:02x}: {}", frame.command, hex::encode(&frame.payload)),
-        }
-    }
-    Ok(())
+/// Upstream packs `value >> 24` unmasked, so it must fit in four bytes.
+fn radio_word(value: i64) -> Result<[u8; 4], String> {
+    u32::try_from(value)
+        .map(u32::to_be_bytes)
+        .map_err(|_| "bytes must be in range(0, 256)".to_string())
 }
 
-fn format_config_sector(payload: &[u8], show_psk: bool) -> String {
-    if show_psk || payload.len() <= eeprom::ADDR_CONF_PSK {
-        return hex::encode(payload);
+fn radio_byte(value: i64) -> Result<u8, String> {
+    u8::try_from(value).map_err(|_| "bytes must be in range(0, 256)".to_string())
+}
+
+fn prompt(label: &str) -> Result<i64, String> {
+    let mut stdout = std::io::stdout().lock();
+    let _ = write!(stdout, "{label}");
+    let _ = stdout.flush();
+    drop(stdout);
+    let mut line = String::new();
+    let read = std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    if read == 0 {
+        return Err("EOF when reading a line".to_string());
     }
-    let redaction_end = eeprom::ADDR_CONF_IP.min(payload.len());
+    line.trim().replace('_', "").parse().map_err(|_| {
+        format!(
+            "invalid literal for int() with base 10: '{}'",
+            line.trim_end()
+        )
+    })
+}
+
+struct Device {
+    product: u8,
+    model: u8,
+    hw_rev: u8,
+    serialno: [u8; 4],
+    made: u32,
+    min_freq: u64,
+    max_freq: u64,
+    max_output: u8,
+    signature: trust::SignatureCheck,
+    configured: Option<eeprom::RadioConfig>,
+}
+
+enum ParsedEeprom {
+    /// `None` is upstream's `provisioned = False`.
+    Device(Option<Device>),
+    ChecksumMismatch,
+}
+
+/// Upstream `RNode.parse_eeprom`, including its log output.
+fn parse_eeprom(bytes: &[u8], port_name: &str) -> ParsedEeprom {
+    if bytes.len() <= eeprom::ADDR_CONF_OK {
+        log("Invalid EEPROM data, could not parse device EEPROM.");
+        log("The contained exception was: index out of range");
+        return ParsedEeprom::Device(None);
+    }
+    if bytes[eeprom::ADDR_INFO_LOCK] != eeprom::INFO_LOCK_BYTE {
+        return ParsedEeprom::Device(None);
+    }
+    let model_code = bytes[eeprom::ADDR_MODEL];
+    let (min_freq, max_freq, max_output) = match model::model_info(model_code) {
+        Some(info) => (info.min_freq, info.max_freq, info.max_output),
+        None => {
+            log("Error: Model band and output power capabilities are unknown!");
+            log(format!("The contained exception was: {model_code}"));
+            (0, 0, 0)
+        }
+    };
+    let checksum = &bytes[eeprom::ADDR_CHKSUM..eeprom::ADDR_CHKSUM + 16];
+    if checksum != eeprom::md5_digest(&bytes[..eeprom::ADDR_CHKSUM]) {
+        log("EEPROM checksum mismatch");
+        return ParsedEeprom::ChecksumMismatch;
+    }
+    log("EEPROM checksum correct");
+    let root = rnodeconf_root().ok();
+    let signature = trust::validate_device_signature(
+        &bytes[eeprom::ADDR_SIGNATURE..eeprom::ADDR_SIGNATURE + 128],
+        checksum,
+        root.as_deref(),
+    );
+    if signature.valid {
+        log("Device signature validated");
+    } else {
+        log("Device signature validation failed");
+        for line in UNVERIFIED_DEVICE_WARNING {
+            out(*line);
+        }
+        out(format!("              rnodeconf {port_name} --autoinstall"));
+        out("");
+    }
+    let image = eeprom::EepromImage::new(bytes.to_vec()).expect("length checked");
+    let identity = image.identity();
+    ParsedEeprom::Device(Some(Device {
+        product: identity.product,
+        model: model_code,
+        hw_rev: identity.hw_rev,
+        serialno: identity.serial.to_be_bytes(),
+        made: identity.made,
+        min_freq,
+        max_freq,
+        max_output,
+        signature,
+        configured: image.radio_config(),
+    }))
+}
+
+const UNVERIFIED_DEVICE_WARNING: &[&str] = &[
+    "     ",
+    "     WARNING! This device is NOT verifiable and should NOT be trusted.",
+    "     Someone could have added privacy-breaking or malicious code to it.",
+    "     ",
+    "     Please verify the signing key is present on this machine.",
+    "     Autogenerated keys will not match another machine's signature.",
+    "     ",
+    "     Proceed at your own risk and responsibility! If you created this",
+    "     device yourself, please read the documentation on how to sign your",
+    "     device to avoid this warning.",
+    "     ",
+    "     Always use a firmware downloaded as binaries or compiled from source",
+    "     from one of the following locations:",
+    "     ",
+    "        https://github.com/markqvist/rnode_firmware",
+    "        https://github.com/liberatedsystems/RNode_Firmware_CE",
+    "     ",
+    "     You can reflash and bootstrap this device to a verifiable state",
+    "     by using this utility. It is recommended to do so NOW!",
+    "     ",
+    "     To initialise this device to a verifiable state, please run:",
+    "     ",
+];
+
+/// Upstream `--info` block, one entry per `RNS.log` call.
+fn device_info_lines(device: &Device, rnode: &RNode) -> Result<Vec<String>, String> {
+    let product = model::product_name(device.product)
+        .ok_or_else(|| format!("KeyError: {}", device.product))?;
+    let info =
+        model::model_info(device.model).ok_or_else(|| format!("KeyError: {}", device.model))?;
+    let signature = if !device.signature.valid {
+        "Unverified".to_string()
+    } else if device.signature.locally_signed {
+        "Validated - Local signature".to_string()
+    } else {
+        format!(
+            "Genuine board, vendor is {}",
+            device.signature.vendor.as_deref().unwrap_or_default()
+        )
+    };
+    let board = rnode
+        .board
+        .map(|board| format!(":{board:02x}"))
+        .unwrap_or_default();
+    let mut lines = vec![
+        String::new(),
+        "Device info:".to_string(),
+        format!(
+            "\tProduct            : {product} {} ({:02x}:{:02x}{board})",
+            info.band, device.product, device.model
+        ),
+        format!("\tDevice signature   : {signature}"),
+        format!(
+            "\tFirmware version   : {}",
+            rnode.version().unwrap_or_default()
+        ),
+        format!("\tHardware revision  : {}", device.hw_rev),
+        format!(
+            "\tSerial number      : {}",
+            rns_tools::format::hex_rep(&device.serialno)
+        ),
+        format!("\tModem chip         : {}", info.modem),
+        format!(
+            "\tFrequency range    : {} MHz - {} MHz",
+            py_float(device.min_freq as f64 / 1e6),
+            py_float(device.max_freq as f64 / 1e6)
+        ),
+        format!("\tMax TX power       : {} dBm", device.max_output),
+        format!(
+            "\tManufactured       : {}",
+            format_local_time(i64::from(device.made), "-", " ", ":")
+        ),
+    ];
+    if let Some(conf) = device.configured.as_ref() {
+        let sf = f64::from(conf.spreading_factor);
+        let bandwidth_khz = f64::from(conf.bandwidth) / 1000.0;
+        if conf.coding_rate == 0 || conf.bandwidth == 0 {
+            return Err("the stored TNC configuration has no valid bitrate".to_string());
+        }
+        let bitrate =
+            sf * ((4.0 / f64::from(conf.coding_rate)) / (2f64.powf(sf) / bandwidth_khz)) * 1000.0;
+        let txp_mw = py_round(10f64.powf(f64::from(conf.tx_power) / 10.0), 3);
+        lines.extend([
+            String::new(),
+            "\tDevice mode        : TNC".to_string(),
+            format!(
+                "\t  Frequency        : {} MHz",
+                py_float(f64::from(conf.frequency) / 1_000_000.0)
+            ),
+            format!("\t  Bandwidth        : {} KHz", py_float(bandwidth_khz)),
+            format!(
+                "\t  TX power         : {} dBm ({} mW)",
+                conf.tx_power,
+                py_float(txp_mw)
+            ),
+            format!("\t  Spreading factor : {}", conf.spreading_factor),
+            format!("\t  Coding rate      : {}", conf.coding_rate),
+            format!(
+                "\t  On-air bitrate   : {} kbps",
+                py_float(py_round(bitrate / 1000.0, 2))
+            ),
+        ]);
+    } else {
+        lines.push("\tDevice mode        : Normal (host-controlled)".to_string());
+    }
+    Ok(lines)
+}
+
+/// Print a line, ignoring a closed stdout as upstream's logger does.
+fn out(line: impl AsRef<str>) {
+    let _ = writeln!(std::io::stdout().lock(), "{}", line.as_ref());
+}
+
+/// `RNS.log` with rnodeconf's compact `[%H:%M:%S]` format.
+fn log(message: impl AsRef<str>) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    let [_, _, _, hour, minute, second] = local_time(now);
+    out(format!(
+        "[{hour:02}:{minute:02}:{second:02}] {}",
+        message.as_ref()
+    ));
+}
+
+fn format_local_time(secs: i64, date_sep: &str, mid: &str, time_sep: &str) -> String {
+    let [year, month, day, hour, minute, second] = local_time(secs);
     format!(
-        "{}<psk-redacted>{}",
-        hex::encode(&payload[..eeprom::ADDR_CONF_PSK]),
-        hex::encode(&payload[redaction_end..])
+        "{year:04}{date_sep}{month:02}{date_sep}{day:02}{mid}{hour:02}{time_sep}{minute:02}{time_sep}{second:02}"
     )
 }
 
-fn eeprom_summary_lines(image: &eeprom::EepromImage) -> Vec<String> {
-    let identity = image.identity();
-    let capabilities = match parse_rnode_capabilities(image.bytes()) {
-        Ok(capabilities) => capabilities,
-        Err(RNodeCapabilityParseError::InfoNotLocked) => {
-            return vec!["EEPROM: not provisioned or info lock missing".to_string()];
-        }
-        Err(error) => {
-            let mut lines = private_eeprom_identity_lines(&identity, false);
-            lines.push(format!("  Radio capabilities: unavailable ({error})"));
-            append_startup_config_lines(image, &mut lines);
-            return lines;
-        }
-    };
-
-    let mut lines = private_eeprom_identity_lines(&identity, true);
-    append_capability_lines(capabilities, &mut lines);
-    append_startup_config_lines(image, &mut lines);
-    lines
-}
-
-fn private_eeprom_identity_lines(
-    identity: &eeprom::IdentityInfo,
-    identity_validated: bool,
-) -> Vec<String> {
-    let checksum_status = if identity_validated {
-        "valid"
-    } else {
-        "invalid"
-    };
-    let product = if identity_validated {
-        format!("  Product code: 0x{:02x}", identity.product)
-    } else {
-        format!("  Product code: 0x{:02x} (unvalidated)", identity.product)
-    };
-    let model = if identity_validated {
-        format!("  Model: 0x{:02x}", identity.model)
-    } else {
-        format!("  Model code: 0x{:02x} (unvalidated)", identity.model)
-    };
-
-    vec![
-        "EEPROM: provisioned".to_string(),
-        product,
-        model,
-        format!("  Hardware revision: {}", identity.hw_rev),
-        format!("  Serial: {}", hex::encode(identity.serial.to_be_bytes())),
-        format!("  Manufactured: {}", identity.made),
-        format!("  Identity checksum: {checksum_status}"),
+/// Local calendar time, as Python's `time.localtime`.
+#[cfg(unix)]
+fn local_time(secs: i64) -> [i64; 6] {
+    let time = secs as nix::libc::time_t;
+    let mut tm = std::mem::MaybeUninit::<nix::libc::tm>::zeroed();
+    // SAFETY: both pointers are valid for the call; localtime_r is reentrant.
+    let result = unsafe { nix::libc::localtime_r(&time, tm.as_mut_ptr()) };
+    if result.is_null() {
+        return utc_time(secs);
+    }
+    // SAFETY: localtime_r filled `tm` when it returned non-null.
+    let tm = unsafe { tm.assume_init() };
+    [
+        i64::from(tm.tm_year) + 1900,
+        i64::from(tm.tm_mon) + 1,
+        i64::from(tm.tm_mday),
+        i64::from(tm.tm_hour),
+        i64::from(tm.tm_min),
+        i64::from(tm.tm_sec),
     ]
 }
 
-fn append_capability_lines(capabilities: RNodeCapabilities, lines: &mut Vec<String>) {
-    let product = rnode_product_name(capabilities.product_code()).unwrap_or("Unknown product");
-    lines[1] = format!(
-        "  Product: {product} (0x{:02x})",
-        capabilities.product_code()
-    );
-    lines[2] = format!("  Model: 0x{:02x}", capabilities.model_code());
-
-    match capabilities.radio() {
-        RNodeRadioCapabilities::Known(radio) => append_known_radio_lines(radio, lines),
-        _ => {
-            lines.push("  Radio capabilities: unavailable for this model".to_string());
-        }
-    }
+#[cfg(not(unix))]
+fn local_time(secs: i64) -> [i64; 6] {
+    utc_time(secs)
 }
 
-fn append_known_radio_lines(radio: RNodeKnownRadioCapabilities, lines: &mut Vec<String>) {
-    lines.extend([
-        format!("  Radio family: {}", radio_family_name(radio.family())),
-        format!(
-            "  Frequency range: {} - {} Hz",
-            radio.min_frequency_hz(),
-            radio.max_frequency_hz()
-        ),
-        format!("  Maximum TX power: {} dBm", radio.max_tx_power_dbm()),
-    ]);
-}
-
-fn radio_family_name(family: RNodeRadioFamily) -> &'static str {
-    match family {
-        RNodeRadioFamily::Sx1262 => "SX1262",
-        RNodeRadioFamily::Sx1268 => "SX1268",
-        RNodeRadioFamily::Sx1276 => "SX1276",
-        RNodeRadioFamily::Sx1278 => "SX1278",
-        RNodeRadioFamily::Sx1280 => "SX1280",
-        RNodeRadioFamily::Sx1262AndSx1280 => "SX1262 + SX1280",
-        _ => "Unrecognized",
-    }
-}
-
-fn append_startup_config_lines(image: &eeprom::EepromImage, lines: &mut Vec<String>) {
-    if let Some(radio) = image.radio_config() {
-        let bitrate =
-            rnode::calculate_bitrate(radio.spreading_factor, radio.coding_rate, radio.bandwidth);
-        lines.extend([
-            "  Startup mode: TNC".to_string(),
-            format!("    Frequency: {} Hz", radio.frequency),
-            format!("    Bandwidth: {} Hz", radio.bandwidth),
-            format!("    TX power: {} dBm", radio.tx_power),
-            format!("    Spreading factor: {}", radio.spreading_factor),
-            format!("    Coding rate: {}", radio.coding_rate),
-            format!("    On-air bitrate: {bitrate} bps"),
-        ]);
-    } else {
-        lines.push("  Startup mode: Normal (host-controlled)".to_string());
-    }
+fn utc_time(secs: i64) -> [i64; 6] {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    [year, month, day, rem / 3600, rem % 3600 / 60, rem % 60]
 }
 
 fn rnodeconf_cache_paths() -> Result<firmware::CachePaths, String> {
@@ -982,565 +772,32 @@ fn rnodeconf_root() -> Result<PathBuf, String> {
     }
 }
 
+/// Upstream removes only the downloaded firmware; extracted firmware stays.
 fn clear_firmware_cache(paths: &firmware::CachePaths) -> Result<(), String> {
-    for dir in [&paths.update, &paths.extracted] {
-        match fs::remove_dir_all(dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("could not clear {}: {e}", dir.display())),
-        }
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("could not recreate {}: {e}", dir.display()))?;
+    match fs::remove_dir_all(&paths.update) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not clear {}: {e}", paths.update.display())),
     }
-    Ok(())
 }
 
-fn write_eeprom_backup(paths: &firmware::CachePaths, bytes: &[u8]) -> Result<PathBuf, String> {
-    fs::create_dir_all(&paths.eeprom)
-        .map_err(|e| format!("could not create {}: {e}", paths.eeprom.display()))?;
-    let timestamp = SystemTime::now()
+/// Upstream joins `ROM_DIR` and the timestamp without a separator.
+fn eeprom_backup_path(root: &Path, now: i64) -> String {
+    format!(
+        "{}{}.eeprom",
+        root.join("eeprom").display(),
+        format_local_time(now, "-", "_", "-")
+    )
+}
+
+fn write_eeprom_backup(bytes: &[u8]) -> Result<String, String> {
+    let root = rnodeconf_root()?;
+    fs::create_dir_all(root.join("eeprom")).map_err(|e| e.to_string())?;
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("system clock before Unix epoch: {e}"))?
-        .as_secs();
-    let path = paths.eeprom.join(format!("{timestamp}.eeprom"));
-    fs::write(&path, bytes).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+        .map_err(|e| e.to_string())?
+        .as_secs() as i64;
+    let path = eeprom_backup_path(&root, now);
+    fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(path)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-
-    use super::*;
-
-    type Reply = Result<Option<rnode_admin::AdminFrame>, String>;
-
-    #[derive(Default)]
-    struct ScriptedSession {
-        sent: Vec<rnode_admin::AdminFrame>,
-        replies: VecDeque<Reply>,
-        fail_send_at: Option<(usize, &'static str)>,
-    }
-
-    impl ScriptedSession {
-        fn from_frames(frames: Vec<rnode_admin::AdminFrame>) -> Self {
-            Self {
-                replies: frames.into_iter().map(|frame| Ok(Some(frame))).collect(),
-                ..Self::default()
-            }
-        }
-
-        fn from_replies(replies: Vec<Reply>) -> Self {
-            Self {
-                replies: replies.into(),
-                ..Self::default()
-            }
-        }
-
-        fn commands(&self) -> Vec<u8> {
-            self.sent.iter().map(|frame| frame.command).collect()
-        }
-    }
-
-    impl FrameSession for ScriptedSession {
-        fn send(&mut self, frame: &rnode_admin::AdminFrame) -> Result<(), String> {
-            if let Some((index, message)) = self.fail_send_at
-                && self.sent.len() == index
-            {
-                return Err(message.to_string());
-            }
-            self.sent.push(frame.clone());
-            Ok(())
-        }
-
-        fn receive_until(
-            &mut self,
-            _deadline: Instant,
-        ) -> Result<Option<rnode_admin::AdminFrame>, String> {
-            self.replies.pop_front().unwrap_or(Ok(None))
-        }
-    }
-
-    fn settings(frequency: u32) -> rnode::RNodeRadioSettings {
-        rnode::RNodeRadioSettings::new(frequency, 125_000, 7, 5, 14)
-    }
-
-    fn radio_config(settings: rnode::RNodeRadioSettings) -> eeprom::RadioConfig {
-        eeprom::RadioConfig {
-            spreading_factor: settings.spreading_factor,
-            coding_rate: settings.coding_rate,
-            tx_power: settings.tx_power,
-            bandwidth: settings.bandwidth,
-            frequency: settings.frequency,
-        }
-    }
-
-    fn provisioned_eeprom(model_code: u8, saved: Option<&eeprom::RadioConfig>) -> Vec<u8> {
-        let identity = eeprom::IdentityInfo {
-            product: model::PRODUCT_RNODE,
-            model: model_code,
-            hw_rev: 2,
-            serial: 0x0102_0304,
-            made: 0x6553_F100,
-        };
-        let mut bytes = vec![0xFF; eeprom::EEPROM_SIZE];
-        let mut writes = eeprom::identity_write_frames(&identity);
-        if let Some(saved) = saved {
-            writes.extend(eeprom::radio_config_write_frames(saved));
-        }
-        for write in writes {
-            assert_eq!(write.command, rnode::CMD_ROM_WRITE);
-            bytes[usize::from(write.payload[0])] = write.payload[1];
-        }
-        bytes
-    }
-
-    fn preflight_frames(model_code: u8) -> Vec<rnode_admin::AdminFrame> {
-        vec![
-            frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]),
-            frame(rnode::CMD_FW_VERSION, &[1, 74]),
-            frame(rnode::CMD_ROM_READ, &provisioned_eeprom(model_code, None)),
-        ]
-    }
-
-    fn radio_echoes(settings: rnode::RNodeRadioSettings) -> Vec<rnode_admin::AdminFrame> {
-        rnode_admin::decode_frames(&rnode::build_radio_configuration_sequence(&settings))
-    }
-
-    fn successful_tnc_frames(
-        model_code: u8,
-        settings: rnode::RNodeRadioSettings,
-        saved: eeprom::RadioConfig,
-    ) -> Vec<rnode_admin::AdminFrame> {
-        let mut frames = preflight_frames(model_code);
-        frames.extend(radio_echoes(settings));
-        frames.push(frame(
-            rnode::CMD_ROM_READ,
-            &provisioned_eeprom(model_code, Some(&saved)),
-        ));
-        frames
-    }
-
-    fn assert_no_save(session: &ScriptedSession) {
-        assert!(
-            session
-                .sent
-                .iter()
-                .all(|frame| frame.command != rnode::CMD_CONF_SAVE),
-            "CONF_SAVE must not follow a failed stage: {:?}",
-            session.sent
-        );
-    }
-
-    #[test]
-    fn tnc_uses_canonical_order_and_readback_without_fabricated_save_echo() {
-        let settings = settings(433_000_000);
-        let mut session = ScriptedSession::from_frames(successful_tnc_frames(
-            0xB4,
-            settings,
-            radio_config(settings),
-        ));
-
-        let outcome = execute_mutation(&mut session, MutationPlan::Tnc(settings)).unwrap();
-
-        assert_eq!(outcome.kind, MutationKind::Tnc);
-        assert!(matches!(
-            outcome.verification,
-            RNodeRadioAdmission::Verified {
-                model_code: 0xB4,
-                ..
-            }
-        ));
-        assert_eq!(
-            model_verification_summary(outcome.verification),
-            "model-specific limits verified for product 0x03, model 0xb4"
-        );
-        assert_eq!(
-            session.commands(),
-            vec![
-                rnode::CMD_DETECT,
-                rnode::CMD_FW_VERSION,
-                rnode::CMD_ROM_READ,
-                rnode::CMD_RADIO_STATE,
-                rnode::CMD_FREQUENCY,
-                rnode::CMD_BANDWIDTH,
-                rnode::CMD_SF,
-                rnode::CMD_CR,
-                rnode::CMD_TXPOWER,
-                rnode::CMD_RADIO_STATE,
-                rnode::CMD_CONF_SAVE,
-                rnode::CMD_ROM_READ,
-            ]
-        );
-        assert_eq!(
-            session
-                .sent
-                .iter()
-                .filter(|frame| frame.command == rnode::CMD_CONF_SAVE)
-                .count(),
-            1
-        );
-        assert!(
-            session.replies.is_empty(),
-            "success script contains no fabricated CONF_SAVE reply"
-        );
-    }
-
-    #[test]
-    fn pre_save_transport_and_protocol_failures_never_send_save() {
-        let settings = settings(433_000_000);
-        let base: Vec<Reply> = preflight_frames(0xB4)
-            .into_iter()
-            .map(|frame| Ok(Some(frame)))
-            .collect();
-        let cases: Vec<(&str, Vec<Reply>, Option<&'static str>)> = vec![
-            ("write", base.clone(), Some("serial write failed: injected")),
-            ("flush", base.clone(), Some("serial flush failed: injected")),
-            (
-                "read",
-                base.iter()
-                    .cloned()
-                    .chain([Err("serial read failed: injected".to_string())])
-                    .collect(),
-                None,
-            ),
-            (
-                "timeout",
-                base.iter().cloned().chain([Ok(None)]).collect(),
-                None,
-            ),
-            (
-                "malformed",
-                base.iter()
-                    .cloned()
-                    .chain([Ok(Some(frame(rnode::CMD_RADIO_STATE, &[])))])
-                    .collect(),
-                None,
-            ),
-            (
-                "mismatch",
-                base.iter()
-                    .cloned()
-                    .chain([Ok(Some(frame(
-                        rnode::CMD_RADIO_STATE,
-                        &[rnode::RADIO_STATE_ON],
-                    )))])
-                    .collect(),
-                None,
-            ),
-            (
-                "raw CMD_ERROR",
-                base.iter()
-                    .cloned()
-                    .chain([Ok(Some(frame(rnode::CMD_ERROR, &[0xFE, 0xED])))])
-                    .collect(),
-                None,
-            ),
-        ];
-
-        for (name, replies, send_error) in cases {
-            let mut session = ScriptedSession::from_replies(replies);
-            if let Some(message) = send_error {
-                session.fail_send_at = Some((3, message));
-            }
-            let error =
-                execute_mutation(&mut session, MutationPlan::Tnc(settings)).expect_err(name);
-            assert!(
-                matches!(error, MutationError::Failed(_)),
-                "{name}: {error:?}"
-            );
-            assert_no_save(&session);
-        }
-    }
-
-    #[test]
-    fn detection_firmware_and_identity_failures_never_reach_radio_or_save() {
-        let settings = settings(433_000_000);
-        let invalid_eeprom = vec![0; eeprom::EEPROM_SIZE];
-        let cases = vec![
-            vec![frame(rnode::CMD_DETECT, &[0])],
-            vec![
-                frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]),
-                frame(rnode::CMD_FW_VERSION, &[1, 51]),
-            ],
-            vec![
-                frame(rnode::CMD_DETECT, &[rnode::DETECT_RESP]),
-                frame(rnode::CMD_FW_VERSION, &[1, 74]),
-                frame(rnode::CMD_ROM_READ, &invalid_eeprom),
-            ],
-        ];
-
-        for frames in cases {
-            let mut session = ScriptedSession::from_frames(frames);
-            assert!(matches!(
-                execute_mutation(&mut session, MutationPlan::Tnc(settings)),
-                Err(MutationError::Failed(_))
-            ));
-            assert_no_save(&session);
-            assert!(
-                session
-                    .sent
-                    .iter()
-                    .all(|request| request.command != rnode::CMD_FREQUENCY)
-            );
-        }
-    }
-
-    #[test]
-    fn every_radio_stage_mismatch_stops_before_later_stages_and_save() {
-        let settings = settings(433_000_000);
-        let echoes = radio_echoes(settings);
-        for failed_index in 0..echoes.len() {
-            let mut frames = preflight_frames(0xB4);
-            frames.extend(echoes[..failed_index].iter().cloned());
-            let mut wrong = echoes[failed_index].clone();
-            if matches!(wrong.command, rnode::CMD_FREQUENCY | rnode::CMD_BANDWIDTH) {
-                let value = u32::from_be_bytes(wrong.payload.as_slice().try_into().unwrap());
-                let delta = if wrong.command == rnode::CMD_FREQUENCY {
-                    FREQUENCY_TOLERANCE_HZ + 1
-                } else {
-                    1
-                };
-                wrong.payload = (value + delta).to_be_bytes().to_vec();
-            } else {
-                wrong.payload[0] ^= 1;
-            }
-            frames.push(wrong);
-            let mut session = ScriptedSession::from_frames(frames);
-
-            assert!(matches!(
-                execute_mutation(&mut session, MutationPlan::Tnc(settings)),
-                Err(MutationError::Failed(_))
-            ));
-            assert_no_save(&session);
-            assert_eq!(session.sent.len(), 3 + failed_index + 1);
-        }
-    }
-
-    #[test]
-    fn frequency_tolerance_is_accepted_for_echo_and_persisted_readback() {
-        let settings = settings(433_000_000);
-        let mut saved = radio_config(settings);
-        saved.frequency += FREQUENCY_TOLERANCE_HZ;
-        let mut frames = successful_tnc_frames(0xB4, settings, saved);
-        frames[4].payload = (settings.frequency + FREQUENCY_TOLERANCE_HZ)
-            .to_be_bytes()
-            .to_vec();
-        let mut session = ScriptedSession::from_frames(frames);
-
-        assert!(execute_mutation(&mut session, MutationPlan::Tnc(settings)).is_ok());
-    }
-
-    #[test]
-    fn every_post_save_verification_failure_is_indeterminate() {
-        let settings = settings(433_000_000);
-        let mut prefix: Vec<Reply> = preflight_frames(0xB4)
-            .into_iter()
-            .chain(radio_echoes(settings))
-            .map(|frame| Ok(Some(frame)))
-            .collect();
-        let mut mismatch = radio_config(settings);
-        mismatch.bandwidth += 1;
-        let cases: Vec<(&str, Reply)> = vec![
-            (
-                "marker absent",
-                Ok(Some(frame(
-                    rnode::CMD_ROM_READ,
-                    &provisioned_eeprom(0xB4, None),
-                ))),
-            ),
-            (
-                "value mismatch",
-                Ok(Some(frame(
-                    rnode::CMD_ROM_READ,
-                    &provisioned_eeprom(0xB4, Some(&mismatch)),
-                ))),
-            ),
-            ("timeout", Ok(None)),
-            ("read", Err("serial read failed: injected".to_string())),
-            ("device error", Ok(Some(frame(rnode::CMD_ERROR, &[0x7F])))),
-            (
-                "malformed readback",
-                Ok(Some(frame(rnode::CMD_ROM_READ, &[0; 8]))),
-            ),
-        ];
-
-        for (name, final_reply) in cases {
-            let mut replies = prefix.clone();
-            replies.push(final_reply);
-            let mut session = ScriptedSession::from_replies(replies);
-            let error =
-                execute_mutation(&mut session, MutationPlan::Tnc(settings)).expect_err(name);
-            assert!(
-                matches!(error, MutationError::PersistenceIndeterminate(_)),
-                "{name}: {error:?}"
-            );
-            assert!(
-                session
-                    .sent
-                    .iter()
-                    .any(|request| request.command == rnode::CMD_CONF_SAVE)
-            );
-        }
-        prefix.clear();
-    }
-
-    #[test]
-    fn normal_delete_requires_readback_marker_to_be_absent() {
-        let mut frames = preflight_frames(0xB4);
-        frames.push(frame(rnode::CMD_ROM_READ, &provisioned_eeprom(0xB4, None)));
-        let mut success = ScriptedSession::from_frames(frames);
-        let outcome = execute_mutation(&mut success, MutationPlan::Normal).unwrap();
-        assert_eq!(outcome.kind, MutationKind::Normal);
-        assert_eq!(
-            &success.commands()[3..],
-            &[rnode::CMD_CONF_DELETE, rnode::CMD_ROM_READ]
-        );
-
-        let settings = settings(433_000_000);
-        let mut frames = preflight_frames(0xB4);
-        frames.push(frame(
-            rnode::CMD_ROM_READ,
-            &provisioned_eeprom(0xB4, Some(&radio_config(settings))),
-        ));
-        let mut failure = ScriptedSession::from_frames(frames);
-        assert!(matches!(
-            execute_mutation(&mut failure, MutationPlan::Normal),
-            Err(MutationError::PersistenceIndeterminate(_))
-        ));
-    }
-
-    #[test]
-    fn model_gate_enforces_known_limits_and_labels_quarantine_honestly() {
-        let unsupported = settings(868_000_000);
-        let mut known = ScriptedSession::from_frames(preflight_frames(0xB4));
-        let error = execute_mutation(&mut known, MutationPlan::Tnc(unsupported)).unwrap_err();
-        assert_eq!(
-            error,
-            MutationError::Failed(
-                "frequency 868000000 Hz is outside verified model range 420000000..=520000000 Hz"
-                    .to_string()
-            )
-        );
-        assert_no_save(&known);
-        assert!(
-            known
-                .sent
-                .iter()
-                .all(|request| request.command != rnode::CMD_FREQUENCY)
-        );
-
-        let excessive_power = rnode::RNodeRadioSettings::new(433_000_000, 125_000, 7, 5, 18);
-        let mut known = ScriptedSession::from_frames(preflight_frames(0xB4));
-        let error = execute_mutation(&mut known, MutationPlan::Tnc(excessive_power)).unwrap_err();
-        assert_eq!(
-            error,
-            MutationError::Failed(
-                "TX power 18 dBm exceeds verified model maximum 17 dBm".to_string()
-            )
-        );
-        assert_no_save(&known);
-        assert!(
-            known
-                .sent
-                .iter()
-                .all(|request| request.command != rnode::CMD_FREQUENCY)
-        );
-
-        let mut quarantined = ScriptedSession::from_frames(successful_tnc_frames(
-            0xA6,
-            unsupported,
-            radio_config(unsupported),
-        ));
-        let outcome = execute_mutation(&mut quarantined, MutationPlan::Tnc(unsupported)).unwrap();
-        assert!(matches!(
-            outcome.verification,
-            RNodeRadioAdmission::Unverified {
-                model_code: 0xA6,
-                ..
-            }
-        ));
-        assert_eq!(
-            model_verification_summary(outcome.verification),
-            "generic RF validation only; model-specific limits unverified for product 0x03, model 0xa6"
-        );
-    }
-
-    #[test]
-    fn unrelated_telemetry_cannot_satisfy_an_expected_reply() {
-        let request = frame(rnode::CMD_CFG_READ, &[0]);
-        let config = vec![0; eeprom::ADDR_CONF_NM + 4];
-        let mut session = ScriptedSession::from_frames(vec![
-            frame(rnode::CMD_READY, &[1]),
-            frame(rnode::CMD_CFG_READ, &config),
-        ]);
-        let responses = execute_read_only(&mut session, std::slice::from_ref(&request)).unwrap();
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0].command, rnode::CMD_CFG_READ);
-        assert_eq!(session.sent, vec![request.clone()]);
-
-        let mut only_telemetry =
-            ScriptedSession::from_replies(vec![Ok(Some(frame(rnode::CMD_READY, &[1]))), Ok(None)]);
-        assert!(
-            execute_read_only(&mut only_telemetry, &[request])
-                .unwrap_err()
-                .contains("timed out")
-        );
-    }
-
-    #[test]
-    fn read_only_hash_shape_and_selector_are_strict() {
-        let request = frame(rnode::CMD_HASHES, &[1]);
-        let mut payload = vec![1];
-        payload.extend([0xA5; 32]);
-        let mut session = ScriptedSession::from_frames(vec![frame(rnode::CMD_HASHES, &payload)]);
-        assert!(execute_read_only(&mut session, std::slice::from_ref(&request)).is_ok());
-
-        payload[0] = 2;
-        let mut wrong_selector =
-            ScriptedSession::from_frames(vec![frame(rnode::CMD_HASHES, &payload)]);
-        assert!(
-            execute_read_only(&mut wrong_selector, &[request])
-                .unwrap_err()
-                .contains("selector")
-        );
-    }
-
-    #[test]
-    fn config_accepts_documented_empty_sector_and_rejects_partial_sector() {
-        let request = frame(rnode::CMD_CFG_READ, &[0]);
-        let mut empty = ScriptedSession::from_frames(vec![frame(rnode::CMD_CFG_READ, &[])]);
-        assert!(execute_read_only(&mut empty, std::slice::from_ref(&request)).is_ok());
-
-        let mut partial = ScriptedSession::from_frames(vec![frame(rnode::CMD_CFG_READ, &[0; 8])]);
-        assert!(execute_read_only(&mut partial, &[request]).is_err());
-    }
-
-    #[test]
-    fn config_psk_redaction_covers_the_full_33_byte_slot() {
-        let mut config = vec![0; eeprom::ADDR_CONF_NM + 4];
-        config[eeprom::ADDR_CONF_PSK..eeprom::ADDR_CONF_IP].fill(0xAB);
-        config[eeprom::ADDR_CONF_IP - 1] = 0xCD;
-
-        let redacted = format_config_sector(&config, false);
-        assert!(redacted.contains("<psk-redacted>"));
-        assert!(!redacted.contains("abab"));
-        assert!(!redacted.contains("cd"));
-        let visible = format_config_sector(&config, true);
-        assert!(visible.contains("abab"));
-        assert!(visible.contains("cd"));
-    }
-
-    #[test]
-    fn eeprom_summary_retains_validated_capability_and_startup_information() {
-        let settings = settings(433_000_000);
-        let image =
-            eeprom::EepromImage::new(provisioned_eeprom(0xB4, Some(&radio_config(settings))))
-                .unwrap();
-        let lines = eeprom_summary_lines(&image);
-
-        assert!(lines.iter().any(|line| line == "  Model: 0xb4"));
-        assert!(lines.iter().any(|line| line == "  Radio family: SX1278"));
-        assert!(lines.iter().any(|line| line.contains("Startup mode: TNC")));
-    }
 }

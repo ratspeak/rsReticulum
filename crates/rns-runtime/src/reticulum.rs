@@ -4347,9 +4347,14 @@ pub async fn init_with_policy(
         .into());
     }
 
+    let mut management_announces = Vec::new();
+    let mut blackhole_announce = None;
     if instance_mode != InstanceMode::Client && rc.publish_blackhole {
         match start_blackhole_publisher(&handle).await {
-            Ok(dest) => tracing::info!(dest = %hex::encode(dest), "blackhole publisher started"),
+            Ok((dest, announce)) => {
+                blackhole_announce = Some(announce);
+                tracing::info!(dest = %hex::encode(dest), "blackhole publisher started")
+            }
             Err(e) => tracing::warn!("failed to start blackhole publisher: {}", e),
         }
     }
@@ -4434,7 +4439,8 @@ pub async fn init_with_policy(
         )
         .await
         {
-            Ok(dest) => {
+            Ok((dest, announce)) => {
+                management_announces.push(announce);
                 tracing::info!(
                     dest = %hex::encode(dest),
                     transport_identity = %hex::encode(handle.transport_identity.hash),
@@ -4447,8 +4453,15 @@ pub async fn init_with_policy(
         }
     }
 
-    // `respond_to_probes = Yes` registers `rnstransport.probe` (PROVE_ALL).
-    if instance_mode != InstanceMode::Client && rc.respond_to_probes {
+    management_announces.extend(blackhole_announce);
+    if instance_mode != InstanceMode::Client
+        && let Some(network_identity) = handle.network_identity.as_ref()
+    {
+        management_announces.extend(start_network_destinations(&transport_tx, network_identity));
+    }
+
+    // Transport.py:534,645-650@1.6.0: only a transport instance has a probe destination.
+    if instance_mode != InstanceMode::Client && rc.enable_transport && rc.respond_to_probes {
         let probe_path = paths.storage_dir.join("probe_identity");
         let probe_identity = match rns_identity::identity::Identity::from_file(&probe_path) {
             Ok(id) => id,
@@ -4461,14 +4474,15 @@ pub async fn init_with_policy(
                 id
             }
         };
-        match crate::probe::spawn_probe_responder(
+        match crate::probe::spawn_announced_probe_responder(
             transport_tx.clone(),
             probe_identity,
             crate::probe::default_probe_app_name(),
         )
         .await
         {
-            Ok(dest) => {
+            Ok((dest, announce)) => {
+                management_announces.push(announce);
                 if let Some(transport_stats) = &transport_stats {
                     transport_stats.set_probe_responder(dest);
                 }
@@ -4478,6 +4492,13 @@ pub async fn init_with_policy(
                 tracing::warn!("failed to start probe responder: {}", e);
             }
         }
+    }
+
+    if !management_announces.is_empty() {
+        tokio::spawn(run_management_announcer(
+            management_announces,
+            shutdown.clone(),
+        ));
     }
 
     let _ = INSTANCE.set(handle.clone());
@@ -7724,7 +7745,9 @@ async fn maybe_teardown_bootstrap_interfaces(handle: &ReticulumHandle) {
 /// Link-request cost of the blackhole list destination.
 pub const BLACKHOLE_LINK_COST: f64 = 5.25;
 
-async fn start_blackhole_publisher(handle: &ReticulumHandle) -> Result<[u8; 16], String> {
+async fn start_blackhole_publisher(
+    handle: &ReticulumHandle,
+) -> Result<([u8; 16], ManagementAnnounce), String> {
     let identity = handle.transport_identity.clone();
     let signing_key = identity
         .get_signing_key()
@@ -7734,8 +7757,8 @@ async fn start_blackhole_publisher(handle: &ReticulumHandle) -> Result<[u8; 16],
         app_name,
         Some(&identity.hash),
     );
-    let event_rx =
-        crate::link_manager::register_destination(&handle.transport_tx, dest_hash, app_name);
+    let (event_rx, announce) =
+        register_management_destination(&handle.transport_tx, dest_hash, app_name);
     let mut lm = LinkManager::with_destination(
         handle.transport_tx.clone(),
         event_rx,
@@ -7769,7 +7792,6 @@ async fn start_blackhole_publisher(handle: &ReticulumHandle) -> Result<[u8; 16],
         destination.set_link_cost(BLACKHOLE_LINK_COST);
     }
     let (command_tx, command_rx) = mpsc::channel(8);
-    let _ = command_tx.try_send(crate::link_manager::LinkManagerCommand::Announce);
     let shutdown = handle.shutdown.clone();
     tokio::spawn(async move {
         shutdown.wait().await;
@@ -7779,7 +7801,114 @@ async fn start_blackhole_publisher(handle: &ReticulumHandle) -> Result<[u8; 16],
         lm.run_with_commands(command_rx).await;
     });
 
-    Ok(dest_hash)
+    Ok((dest_hash, announce))
+}
+
+/// Interval between management announces (Transport.py:359@1.6.0).
+const MGMT_ANNOUNCE_INTERVAL: Duration =
+    Duration::from_secs(rns_transport::constants::MGMT_ANNOUNCE_INTERVAL as u64);
+/// Delay before the first management announce (Transport.py:522-523@1.6.0).
+const MGMT_ANNOUNCE_FIRST_DELAY: Duration = Duration::from_secs(15);
+
+/// Asks one of the transport's management destinations to announce itself.
+#[derive(Clone)]
+pub(crate) struct ManagementAnnounce {
+    // Weak, so the destination's event channel still closes with transport.
+    delivery_tx: mpsc::WeakSender<rns_transport::link_messages::DestinationEvent>,
+    app_name: String,
+}
+
+impl ManagementAnnounce {
+    pub(crate) fn new(
+        delivery_tx: &mpsc::Sender<rns_transport::link_messages::DestinationEvent>,
+        app_name: &str,
+    ) -> Self {
+        Self {
+            delivery_tx: delivery_tx.downgrade(),
+            app_name: app_name.to_string(),
+        }
+    }
+
+    fn announce(&self) {
+        let Some(delivery_tx) = self.delivery_tx.upgrade() else {
+            return;
+        };
+        let request = rns_transport::link_messages::AnnounceRequest::normal(self.app_name.clone());
+        if let Err(e) = delivery_tx
+            .try_send(rns_transport::link_messages::DestinationEvent::AnnounceRequested(request))
+        {
+            tracing::warn!(app_name = %self.app_name, error = %e, "management announce not sent");
+        }
+    }
+}
+
+/// Register a management destination with transport, keeping a handle that
+/// can ask it to announce.
+pub(crate) fn register_management_destination(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    dest_hash: [u8; 16],
+    app_name: &str,
+) -> (
+    mpsc::Receiver<rns_transport::link_messages::DestinationEvent>,
+    ManagementAnnounce,
+) {
+    let (tx, rx) = mpsc::channel(256);
+    if let Err(e) = transport_tx.try_send(TransportMessage::RegisterDestination {
+        hash: dest_hash,
+        app_name: app_name.to_string(),
+        delivery_tx: Some(tx.clone()),
+    }) {
+        tracing::warn!(dest = hex::encode(dest_hash), err = %e,
+            "failed to register management destination with transport");
+    }
+    (rx, ManagementAnnounce::new(&tx, app_name))
+}
+
+/// The `rnstransport.network.instance.<hash>` and `rnstransport.network`
+/// destinations on the network identity (Transport.py:501-507@1.6.0).
+fn start_network_destinations(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    network_identity: &Identity,
+) -> Vec<ManagementAnnounce> {
+    let instance_name = format!(
+        "rnstransport.network.instance.{}",
+        hex::encode(network_identity.hash)
+    );
+    let mut announces = Vec::new();
+    for app_name in [instance_name.as_str(), "rnstransport.network"] {
+        let dest_hash = rns_identity::destination::Destination::hash_from_name_and_identity(
+            app_name,
+            Some(&network_identity.hash),
+        );
+        let (event_rx, announce) =
+            register_management_destination(transport_tx, dest_hash, app_name);
+        let lm = LinkManager::with_destination(
+            transport_tx.clone(),
+            event_rx,
+            network_identity,
+            app_name,
+            network_identity.get_signing_key(),
+        );
+        tokio::spawn(lm.run());
+        announces.push(announce);
+    }
+    announces
+}
+
+/// Announce every management destination 15 s after start and then every
+/// two hours (Transport.py:1359-1368@1.6.0).
+async fn run_management_announcer(destinations: Vec<ManagementAnnounce>, shutdown: ShutdownSignal) {
+    let mut wait = MGMT_ANNOUNCE_FIRST_DELAY;
+    loop {
+        tokio::select! {
+            _ = shutdown.wait() => return,
+            _ = tokio::time::sleep(wait) => {}
+        }
+        for destination in &destinations {
+            destination.announce();
+        }
+        wait = MGMT_ANNOUNCE_INTERVAL;
+    }
 }
 
 async fn start_blackhole_subscriber(handle: ReticulumHandle) {
@@ -7824,6 +7953,28 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
             let now = unix_now();
             for source in state.due_sources(&sources, now) {
                 let source_hash = source.into_bytes();
+                let destination_hash =
+                    rns_identity::destination::Destination::hash_from_name_and_identity(
+                        rns_transport::discovery::BLACKHOLE_ASPECT_FILTER,
+                        Some(&source_hash),
+                    );
+                // Discovery.py:964-971: without a path, retry on the next job
+                // run; once a path exists the source waits a full interval.
+                if handle
+                    .await_path(
+                        destination_hash,
+                        Duration::from_secs_f64(rns_transport::constants::PATH_REQUEST_TIMEOUT),
+                    )
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(
+                        source = %hex::encode(source_hash),
+                        "no path for blackhole list update, retrying later"
+                    );
+                    continue;
+                }
+                state.mark_updated(source, unix_now());
                 match client
                     .query(
                         source_hash,
@@ -7837,22 +7988,24 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
                 {
                     Ok(payload) => {
                         match handle
-                            .query_transport(TransportQuery::ApplyBlackholeManifest { payload })
+                            .query_transport(TransportQuery::ApplyBlackholeManifest {
+                                publisher: source_hash,
+                                payload,
+                            })
                             .await
                         {
-                            Some(TransportQueryResponse::IntResult(applied)) => {
-                                state.mark_updated(source, unix_now());
+                            Some(TransportQueryResponse::IntResult(added)) => {
                                 tracing::debug!(
                                     source = %hex::encode(source_hash),
-                                    applied,
-                                    "blackhole manifest applied"
+                                    added,
+                                    "blackhole list update completed"
                                 );
                             }
                             Some(TransportQueryResponse::Error(e)) => {
-                                tracing::warn!(
+                                tracing::debug!(
                                     source = %hex::encode(source_hash),
                                     error = %e,
-                                    "blackhole manifest rejected"
+                                    "blackhole list reply is not a list"
                                 );
                             }
                             _ => {}
@@ -7862,7 +8015,7 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
                         tracing::debug!(
                             source = %hex::encode(source_hash),
                             error = %e,
-                            "blackhole manifest pull failed"
+                            "blackhole list update failed"
                         );
                     }
                 }

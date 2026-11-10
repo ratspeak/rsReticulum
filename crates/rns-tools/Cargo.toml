@@ -34,6 +34,7 @@ serde_json = { workspace = true }
 nix = { workspace = true }
 bytes = { workspace = true }
 sha2 = { workspace = true }
+rsa = "0.9"
 
 [[bin]]
 name = "rnsd-rs"

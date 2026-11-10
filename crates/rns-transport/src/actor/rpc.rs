@@ -358,11 +358,7 @@ impl TransportActor {
                 reason_label,
             } => {
                 // Transport.py:4487-4497: an existing entry is left untouched.
-                if self
-                    .blackhole_table
-                    .iter()
-                    .any(|known| known.into_bytes() == hash)
-                {
+                if self.blackhole_table.contains(&hash) {
                     return TransportQueryResponse::OptBoolResult(None);
                 }
                 self.blackhole_table
@@ -387,6 +383,7 @@ impl TransportActor {
                         }
                     })
                     .collect();
+                self.persist_local_blackhole();
                 for dest in dropped {
                     self.path_table.remove(&dest);
                 }
@@ -397,6 +394,7 @@ impl TransportActor {
             TransportQuery::UnblackholeIdentity { hash } => {
                 let removed = self.blackhole_table.remove(&hash);
                 if removed {
+                    self.persist_local_blackhole();
                     self.state_dirty = true;
                     self.publish_blackhole_snapshot();
                 }
@@ -408,43 +406,31 @@ impl TransportActor {
             TransportQuery::ClearSystemBlackholes => {
                 let cleared = self.blackhole_table.clear_system_entries();
                 if cleared > 0 {
+                    self.persist_local_blackhole();
                     self.state_dirty = true;
                     self.publish_blackhole_snapshot();
                 }
                 TransportQueryResponse::IntResult(cleared as i64)
             }
             TransportQuery::BuildBlackholeManifest { publisher } => {
-                // Quarantine unverifiable entries from publication. Pre-fix
-                // garbage (LXMF-dest-as-identity bytes) and identities whose
-                // announce has been pruned both fail this check; we refuse to
-                // republish either.
-                let verified_ids: std::collections::HashSet<[u8; 16]> = self
-                    .recent_announces
-                    .values()
-                    .filter_map(|e| e.public_key.map(|pk| rns_crypto::sha::truncated_hash(&pk)))
-                    .collect();
-                match crate::discovery::build_local_manifest(
-                    &self.blackhole_table,
-                    publisher.into(),
-                    Some(&verified_ids),
-                ) {
+                match crate::discovery::build_manifest(&self.blackhole_table, publisher.into()) {
                     Ok(payload) => TransportQueryResponse::Data(payload),
                     Err(e) => TransportQueryResponse::Error(e.to_string()),
                 }
             }
-            TransportQuery::ApplyBlackholeManifest { payload } => {
-                match crate::discovery::decode_manifest(&payload) {
+            TransportQuery::ApplyBlackholeManifest { publisher, payload } => {
+                match crate::discovery::decode_published_manifest(&payload, publisher.into()) {
                     Ok(manifest) => {
-                        let applied = crate::discovery::apply_manifest(
+                        let added = crate::discovery::apply_manifest(
                             &mut self.blackhole_table,
                             &manifest,
                             now_f64(),
                         );
-                        if applied > 0 {
-                            self.state_dirty = true;
+                        if added > 0 {
+                            self.persist_blackhole_source(publisher, &payload);
                             self.publish_blackhole_snapshot();
                         }
-                        TransportQueryResponse::IntResult(applied as i64)
+                        TransportQueryResponse::IntResult(added as i64)
                     }
                     Err(e) => TransportQueryResponse::Error(e.to_string()),
                 }

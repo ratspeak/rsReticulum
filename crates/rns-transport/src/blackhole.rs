@@ -62,6 +62,16 @@ impl BlackholeEntry {
             .as_deref()
             .unwrap_or_else(|| self.reason.as_str())
     }
+
+    /// Reason as stored and published: the label, nil for an unlabelled
+    /// manual entry (upstream `reason=None`), else the system reason.
+    pub fn wire_reason(&self) -> Option<&str> {
+        match (&self.reason_label, self.reason) {
+            (Some(label), _) => Some(label),
+            (None, BlackholeReason::Manual) => None,
+            (None, reason) => Some(reason.as_str()),
+        }
+    }
 }
 
 /// In-memory identity block entries. Each insertion replaces any entry for
@@ -155,6 +165,11 @@ impl BlackholeTable {
     /// Used when rehydrating the table from persistence.
     pub fn insert_entry(&mut self, identity_hash: impl Into<IdentityHash>, entry: BlackholeEntry) {
         self.entries.insert(identity_hash.into(), entry);
+    }
+
+    /// Whether any entry, expired or not, exists for the identity.
+    pub fn contains(&self, identity_hash: &[u8; 16]) -> bool {
+        self.entries.contains_key(identity_hash)
     }
 
     /// Check whether an entry has no expiry or its elapsed wall-clock time is

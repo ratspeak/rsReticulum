@@ -24,7 +24,8 @@ pub mod storage;
 
 pub use announcer::{AnnounceRequest, Announcer, DiscoveryInterfaceConfig, SkipReason};
 pub use blackhole_manifest::{
-    BlackholeManifestEntry, ManifestError, apply_manifest, build_local_manifest, decode_manifest,
+    BlackholeManifestEntry, ManifestError, apply_manifest, build_manifest, decode_manifest,
+    decode_published_manifest,
 };
 pub use blackhole_subscriber::{
     INITIAL_WAIT as BLACKHOLE_INITIAL_WAIT, JOB_INTERVAL as BLACKHOLE_JOB_INTERVAL,

@@ -68,6 +68,17 @@ pub async fn spawn_probe_responder(
     identity: Identity,
     app_name: &str,
 ) -> Result<[u8; 16], ProbeError> {
+    spawn_announced_probe_responder(transport_tx, identity, app_name)
+        .await
+        .map(|(dest_hash, _)| dest_hash)
+}
+
+/// As [`spawn_probe_responder`], with a handle for the management announce job.
+pub(crate) async fn spawn_announced_probe_responder(
+    transport_tx: mpsc::Sender<TransportMessage>,
+    identity: Identity,
+    app_name: &str,
+) -> Result<([u8; 16], crate::reticulum::ManagementAnnounce), ProbeError> {
     let mut dest = Destination::new(Some(&identity), Direction::In, DestType::Single, app_name)
         .map_err(|e| ProbeError::Internal(format!("destination: {e}")))?;
     dest.set_proof_strategy(ProofStrategy::ProveAll);
@@ -79,10 +90,12 @@ pub async fn spawn_probe_responder(
         .send(TransportMessage::RegisterDestination {
             hash: dest_hash,
             app_name: app_name.to_string(),
-            delivery_tx: Some(event_tx),
+            delivery_tx: Some(event_tx.clone()),
         })
         .await
         .map_err(|_| ProbeError::TransportClosed)?;
+    let announce = crate::reticulum::ManagementAnnounce::new(&event_tx, app_name);
+    drop(event_tx);
 
     let identity = Arc::new(identity);
     let mut destination = dest;
@@ -209,7 +222,7 @@ pub async fn spawn_probe_responder(
         "probe responder registered"
     );
 
-    Ok(dest_hash)
+    Ok((dest_hash, announce))
 }
 
 /// Filters DeliveryProof fan-out down to this probe's `msg_id`.

@@ -786,7 +786,8 @@ async fn process_rpc_request(
         }
         RpcRequest::DropAnnounceQueues => {
             match authoritative_query!(TransportQuery::DropAnnounceQueues, "announce queue drop") {
-                TransportQueryResponse::Ok => RpcResponse::Ok,
+                // Transport.drop_announce_queues returns None (Transport.py:4214-4224).
+                TransportQueryResponse::Ok => RpcResponse::OptBoolResult(None),
                 _ => unexpected_transport_response("announce queue drop"),
             }
         }
@@ -831,7 +832,8 @@ async fn process_rpc_request(
             reason,
         } => {
             let Some(hash) = hash_to_array(&identity_hash) else {
-                return invalid_request_hash("identity");
+                // Reticulum.py:2192,2203: a wrong-length hash answers False.
+                return RpcResponse::BoolResult(false);
             };
             // `until` (absolute unix ts) → relative TTL; past timestamps
             // clamp to ~0 so the entry expires on the next maintenance tick.
@@ -861,7 +863,8 @@ async fn process_rpc_request(
         }
         RpcRequest::UnblackholeIdentity { identity_hash } => {
             let Some(hash) = hash_to_array(&identity_hash) else {
-                return invalid_request_hash("identity");
+                // Reticulum.py:2192,2203: a wrong-length hash answers False.
+                return RpcResponse::BoolResult(false);
             };
             match authoritative_query!(
                 TransportQuery::UnblackholeIdentity { hash },

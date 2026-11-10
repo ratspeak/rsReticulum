@@ -22,12 +22,11 @@
 //! - **apply**: skip deadlines at or before `now`, then use `created = now`
 //!   and `ttl = max(0, until - now)`. Decoding alone does not apply expiry.
 //!
-//! # Publication filter
+//! # Publication
 //!
-//! [`build_local_manifest`] includes only entries with `source == None`.
-//! This marker is a caller-controlled provenance convention, not cryptographic
-//! evidence. Applying a manifest preserves its claimed inner source fields;
-//! callers must authorize the publisher and any delegated-source policy.
+//! [`build_manifest`] publishes the whole table, as upstream does. Applying a
+//! manifest preserves its claimed inner source fields; callers must
+//! authorize the publisher.
 
 use std::collections::BTreeMap;
 
@@ -69,31 +68,21 @@ pub enum ManifestError {
     Encode(String),
 }
 
-/// Build a manifest from entries marked local (`source == None`), writing
-/// `our_identity_hash` into every source field. Remote-marked entries are
-/// excluded, but expired entries are not filtered here.
-///
-/// `verified_ids`, when supplied, restricts output to hashes in that set.
-/// The helper trusts the set; it does not verify identities itself. `None`
-/// disables this additional filter. The returned body is not signed here.
-pub fn build_local_manifest(
+/// Encode the whole table as upstream's `/list` reply
+/// (`Transport.blackhole_list_handler`): every entry, local or learned, with
+/// its source (`local_identity_hash` for local entries), absolute `until` and
+/// reason, nil when none was given. Expired entries not yet culled are
+/// included, as upstream's are.
+pub fn build_manifest(
     table: &BlackholeTable,
-    our_identity_hash: IdentityHash,
-    verified_ids: Option<&std::collections::HashSet<[u8; 16]>>,
+    local_identity_hash: IdentityHash,
 ) -> Result<Vec<u8>, ManifestError> {
     let mut map: Vec<(Value, Value)> = Vec::new();
 
     for (hash, entry) in table.iter_entries() {
-        if entry.source.is_some() {
-            continue;
-        }
-        if let Some(set) = verified_ids
-            && !set.contains(hash.as_bytes())
-        {
-            continue;
-        }
         let until = entry.ttl.map(|ttl| entry.created + ttl);
-        let wire_entry = encode_entry_map(until, entry.reason_str(), our_identity_hash);
+        let source = entry.source.unwrap_or(local_identity_hash);
+        let wire_entry = encode_entry_map(until, entry.wire_reason(), source);
         map.push((Value::Binary(hash.as_bytes().to_vec()), wire_entry));
     }
 
@@ -103,7 +92,7 @@ pub fn build_local_manifest(
     Ok(buf)
 }
 
-fn encode_entry_map(until: Option<f64>, reason: &str, source: IdentityHash) -> Value {
+fn encode_entry_map(until: Option<f64>, reason: Option<&str>, source: IdentityHash) -> Value {
     let until_v = match until {
         Some(t) => Value::F64(t),
         None => Value::Nil,
@@ -116,7 +105,9 @@ fn encode_entry_map(until: Option<f64>, reason: &str, source: IdentityHash) -> V
         (Value::String("until".into()), until_v),
         (
             Value::String("reason".into()),
-            Value::String(reason.to_string().into()),
+            reason
+                .map(|r| Value::String(r.into()))
+                .unwrap_or(Value::Nil),
         ),
     ])
 }
@@ -211,40 +202,81 @@ fn decode_entry_map(v: Value) -> Result<BlackholeManifestEntry, ManifestError> {
     })
 }
 
-/// Merge entries into `table`, trusting their inner source fields. There is
-/// no publisher parameter or authentication check: the caller must authorize
-/// the manifest before applying it and supply finite time values.
+/// Decode a `/list` reply from `publisher` the way upstream's updater takes
+/// it (`Discovery.py:920-933`): any map is accepted and each entry is taken
+/// as given. Keys that are not 16-byte hashes are skipped, since they can
+/// never match an identity. A missing or malformed field reads as nil, and an
+/// entry that is not a map is a permanent entry without a reason; a missing
+/// source is the publisher.
+pub fn decode_published_manifest(
+    bytes: &[u8],
+    publisher: IdentityHash,
+) -> Result<Vec<([u8; 16], BlackholeManifestEntry)>, ManifestError> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let root =
+        rmpv::decode::read_value(&mut cursor).map_err(|e| ManifestError::Decode(e.to_string()))?;
+    let Value::Map(map) = root else {
+        return Err(ManifestError::NotAMap);
+    };
+
+    let mut sorted: BTreeMap<[u8; 16], BlackholeManifestEntry> = BTreeMap::new();
+    for (k, v) in map {
+        let Value::Binary(key) = k else {
+            continue;
+        };
+        let Ok(key) = <[u8; 16]>::try_from(key.as_slice()) else {
+            continue;
+        };
+        let mut entry = BlackholeManifestEntry {
+            until: None,
+            reason: String::new(),
+            source: publisher,
+        };
+        if let Value::Map(fields) = v {
+            for (field, value) in fields {
+                match (field.as_str(), value) {
+                    (Some("source"), Value::Binary(b)) => {
+                        if let Ok(source) = <[u8; 16]>::try_from(b.as_slice()) {
+                            entry.source = source.into();
+                        }
+                    }
+                    (Some("until"), Value::F64(t)) => entry.until = Some(t),
+                    (Some("until"), Value::F32(t)) => entry.until = Some(t as f64),
+                    (Some("until"), Value::Integer(i)) => entry.until = i.as_f64(),
+                    (Some("reason"), Value::String(r)) => {
+                        entry.reason = r.into_str().unwrap_or_default()
+                    }
+                    _ => {}
+                }
+            }
+        }
+        sorted.insert(key, entry);
+    }
+
+    Ok(sorted.into_iter().collect())
+}
+
+/// Merge entries into `table` as upstream's updater does: an identity that
+/// already has an entry, local or learned, expired or not, keeps it; only
+/// absent identities are added, with their claimed source and reason (an
+/// empty reason is nil). Already-expired entries are added too, as upstream
+/// adds them, and fall to the next expiry cull. Entries absent from the
+/// manifest are not removed.
 ///
-/// Entries with `until <= now` are skipped. Any existing entry marked local
-/// (`source == None`) wins, even if it is expired but not yet culled. Otherwise
-/// the incoming entry replaces the identity's record, retaining its reason
-/// label and claimed source and converting the deadline to a remaining TTL.
-/// Entries absent from the manifest are not removed.
-///
-/// Returns the number of insert/update operations, which can exceed the number
-/// of unique identities if the supplied slice repeats them.
+/// Returns the number of identities added.
 pub fn apply_manifest(
     table: &mut BlackholeTable,
     manifest: &[([u8; 16], BlackholeManifestEntry)],
     now: f64,
 ) -> usize {
-    let mut applied = 0usize;
+    let mut added = 0usize;
     for (id_hash, entry) in manifest {
-        if let Some(until) = entry.until
-            && until <= now
-        {
-            continue;
-        }
-        if let Some(existing) = table
-            .iter_entries()
-            .find(|(h, _)| h.as_bytes() == id_hash)
-            .map(|(_, e)| e.clone())
-            && existing.source.is_none()
-        {
+        if table.contains(id_hash) {
             continue;
         }
 
-        let ttl = entry.until.map(|u| (u - now).max(0.0));
+        // A past `until` gives a negative lifetime, so the entry is inert until culled.
+        let ttl = entry.until.map(|u| u - now);
         let reason = BlackholeReason::parse(&entry.reason);
         table.insert_entry(
             *id_hash,
@@ -252,13 +284,13 @@ pub fn apply_manifest(
                 created: now,
                 ttl,
                 reason,
-                reason_label: Some(entry.reason.clone()),
+                reason_label: (!entry.reason.is_empty()).then(|| entry.reason.clone()),
                 source: Some(entry.source),
             },
         );
-        applied += 1;
+        added += 1;
     }
-    applied
+    added
 }
 
 #[cfg(test)]
@@ -276,13 +308,13 @@ mod tests {
     #[test]
     fn empty_table_produces_empty_map() {
         let table = BlackholeTable::new();
-        let bytes = build_local_manifest(&table, our_id(), None).unwrap();
+        let bytes = build_manifest(&table, our_id()).unwrap();
         let decoded = decode_manifest(&bytes).unwrap();
         assert!(decoded.is_empty());
     }
 
     #[test]
-    fn local_entries_are_published_remote_entries_are_filtered() {
+    fn manifest_publishes_local_and_learned_entries() {
         let mut table = BlackholeTable::new();
         table.add([0xAA; 16], None);
         table.add_from_source(
@@ -293,14 +325,18 @@ mod tests {
             1000.0,
         );
 
-        let bytes = build_local_manifest(&table, our_id(), None).unwrap();
-        let manifest = decode_manifest(&bytes).unwrap();
+        let bytes = build_manifest(&table, our_id()).unwrap();
+        let manifest = decode_published_manifest(&bytes, peer_id()).unwrap();
 
-        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest.len(), 2);
         assert_eq!(manifest[0].0, [0xAA; 16]);
         assert_eq!(manifest[0].1.source, our_id());
         assert_eq!(manifest[0].1.until, None);
-        assert_eq!(manifest[0].1.reason, "manual");
+        assert_eq!(manifest[0].1.reason, "");
+        assert_eq!(manifest[1].0, [0xBB; 16]);
+        assert_eq!(manifest[1].1.source, peer_id());
+        assert_eq!(manifest[1].1.until, Some(4600.0));
+        assert_eq!(manifest[1].1.reason, "rate_limit");
     }
 
     #[test]
@@ -309,7 +345,7 @@ mod tests {
         let now_at_add = now_seconds();
         table.add_with_reason([0xCC; 16], Some(600.0), BlackholeReason::Malformed);
 
-        let bytes = build_local_manifest(&table, our_id(), None).unwrap();
+        let bytes = build_manifest(&table, our_id()).unwrap();
         let manifest = decode_manifest(&bytes).unwrap();
 
         assert_eq!(manifest.len(), 1);
@@ -343,24 +379,6 @@ mod tests {
         assert_eq!(entry.reason, BlackholeReason::Malformed);
         assert_eq!(entry.created, now);
         assert!((entry.ttl.unwrap() - 500.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn apply_manifest_skips_expired_entries() {
-        let mut table = BlackholeTable::new();
-        let now = 10_000.0;
-        let manifest = vec![(
-            [0xEE; 16],
-            BlackholeManifestEntry {
-                until: Some(now - 10.0),
-                reason: "malformed".into(),
-                source: peer_id(),
-            },
-        )];
-
-        let applied = apply_manifest(&mut table, &manifest, now);
-        assert_eq!(applied, 0);
-        assert!(table.is_empty());
     }
 
     #[test]
@@ -406,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_manifest_overwrites_existing_remote_entry_from_same_source() {
+    fn apply_manifest_keeps_existing_remote_entry() {
         let mut table = BlackholeTable::new();
         let now = 10_000.0;
         table.add_from_source(
@@ -422,22 +440,22 @@ mod tests {
             BlackholeManifestEntry {
                 until: Some(now + 3600.0),
                 reason: "rate_limit".into(),
-                source: peer_id(),
+                source: our_id(),
             },
         )];
 
         let applied = apply_manifest(&mut table, &manifest, now);
-        assert_eq!(applied, 1);
+        assert_eq!(applied, 0);
         let entry = table.iter_entries().next().unwrap().1.clone();
-        assert_eq!(entry.reason, BlackholeReason::RateLimit);
-        assert!((entry.ttl.unwrap() - 3600.0).abs() < 0.01);
+        assert_eq!(entry.reason, BlackholeReason::Malformed);
+        assert_eq!(entry.source, Some(peer_id()));
     }
 
     #[test]
     fn decode_rejects_bad_key_length() {
         let root = Value::Map(vec![(
             Value::Binary(vec![0; 8]),
-            encode_entry_map(None, "manual", peer_id()),
+            encode_entry_map(None, Some("manual"), peer_id()),
         )]);
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &root).unwrap();

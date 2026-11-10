@@ -111,7 +111,7 @@ fn write_responder_config(tmp: &TempDir, shared_port: u16, control_port: u16, li
          shared_instance_port = {shared_port}\n\
          instance_control_port = {control_port}\n\
          rpc_key = 5151515151515151515151515151515151515151515151515151515151515151\n\
-         enable_transport = No\n\
+         enable_transport = Yes\n\
          respond_to_probes = Yes\n\
          \n\
          [logging]\n\

@@ -1806,6 +1806,7 @@ dependencies = [
  "rns-runtime",
  "rns-transport",
  "rns-wire",
+ "rsa",
  "serde",
  "serde_json",
  "serialport",

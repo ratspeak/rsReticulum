@@ -156,9 +156,10 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
         );
     }
 
+    // Publisher files are written only when fetched (Discovery.py:938-943).
     if let Some(local_identity_hash) = snapshot.transport_identity_hash {
         let blackhole_dir = dir.join("blackhole");
-        if let Err(e) = crate::persistence::save_python_blackhole_files(
+        if let Err(e) = crate::persistence::save_local_blackhole_file(
             &snapshot.blackhole_table,
             local_identity_hash,
             &blackhole_dir,
@@ -1050,6 +1051,50 @@ impl TransportActor {
                 }
                 debug!(count, "loaded announce cache entries from disk");
             }
+        }
+    }
+
+    /// Write `blackhole/local` now, as upstream does on every local change
+    /// (Transport.py:4489-4491, 4512-4514).
+    pub(super) fn persist_local_blackhole(&mut self) {
+        if self.shared_instance_client_mode {
+            return;
+        }
+        let (Some(dir), Some(local_identity_hash)) =
+            (self.storage_dir.as_ref(), self.transport_identity_hash)
+        else {
+            return;
+        };
+        let _guard = self
+            .routing_save_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = crate::persistence::save_local_blackhole_file(
+            &self.blackhole_table,
+            local_identity_hash,
+            &dir.join("blackhole"),
+        ) {
+            warn!("failed to persist local blackhole list: {}", e);
+        }
+    }
+
+    /// Store a publisher's fetched `/list` reply as its blackhole file.
+    pub(super) fn persist_blackhole_source(&mut self, publisher: [u8; 16], payload: &[u8]) {
+        if self.shared_instance_client_mode {
+            return;
+        }
+        let Some(dir) = self.storage_dir.as_ref() else {
+            return;
+        };
+        if let Err(e) = crate::persistence::save_blackhole_source_file(
+            publisher,
+            payload,
+            &dir.join("blackhole"),
+        ) {
+            warn!(
+                publisher = hex::encode(publisher),
+                "failed to persist blackhole list: {}", e
+            );
         }
     }
 

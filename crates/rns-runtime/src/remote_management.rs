@@ -33,25 +33,29 @@ pub async fn start_remote_management(
     identity: &Identity,
     allowed_identities: Vec<[u8; 16]>,
 ) -> Result<[u8; 16], String> {
-    start_remote_management_with_stats(transport_tx, identity, allowed_identities, None, None).await
+    start_remote_management_with_stats(transport_tx, identity, allowed_identities, None, None)
+        .await
+        .map(|(dest_hash, _)| dest_hash)
 }
 
 /// As [`start_remote_management`], with the runtime's IFAC records and
-/// transport instance, so status replies carry every field of Python's.
+/// transport instance, so status replies carry every field of Python's, and a
+/// handle for the management announce job.
 pub(crate) async fn start_remote_management_with_stats(
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: &Identity,
     allowed_identities: Vec<[u8; 16]>,
     ifac: Option<InterfaceIfacStats>,
     transport: Option<TransportStatsSource>,
-) -> Result<[u8; 16], String> {
+) -> Result<([u8; 16], crate::reticulum::ManagementAnnounce), String> {
     let signing_key = identity
         .get_signing_key()
         .ok_or_else(|| "No signing key available for remote management".to_string())?;
 
     let app_name = "rnstransport.remote.management";
     let dest_hash = Destination::hash_from_name_and_identity(app_name, Some(&identity.hash));
-    let event_rx = crate::link_manager::register_destination(&transport_tx, dest_hash, app_name);
+    let (event_rx, announce) =
+        crate::reticulum::register_management_destination(&transport_tx, dest_hash, app_name);
     let mut lm = crate::link_manager::LinkManager::with_destination(
         transport_tx.clone(),
         event_rx,
@@ -119,7 +123,7 @@ pub(crate) async fn start_remote_management_with_stats(
         "remote management destination registered"
     );
 
-    Ok(dest_hash)
+    Ok((dest_hash, announce))
 }
 
 fn peer_allowed(allowed: &[[u8; 16]], peer: &[u8; 16]) -> bool {

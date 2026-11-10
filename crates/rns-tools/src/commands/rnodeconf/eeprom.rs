@@ -115,6 +115,132 @@ impl EepromImage {
     }
 }
 
+/// Upstream `rnodeconf --config` summary (`main()`, args.config branch).
+/// Returns the decode error lines and the block, each line as printed.
+pub fn device_configuration_lines(
+    eeprom: &[u8],
+    cfg_sector: Option<&[u8]>,
+    show_psk: bool,
+) -> Vec<String> {
+    let byte = |address: usize| eeprom.get(address).copied().unwrap_or(0xFF);
+    let bt = byte(ADDR_CONF_BT);
+    let dint = byte(ADDR_CONF_DINT);
+    let dadr = byte(ADDR_CONF_DADR);
+    let dblk = byte(ADDR_CONF_DBLK);
+    let drot = byte(ADDR_CONF_DROT);
+    let pset = byte(ADDR_CONF_PSET);
+    let pint = byte(ADDR_CONF_PINT);
+    let bset = byte(ADDR_CONF_BSET);
+    let dia = byte(ADDR_CONF_DIA);
+    let wifi = byte(ADDR_CONF_WIFI);
+    let mut wchn = byte(ADDR_CONF_WCHN);
+    let mut lines = Vec::new();
+    let (mut ssid, mut psk, mut ip, mut nm) = (None, None, None, None);
+
+    if !(1..=14).contains(&wchn) {
+        wchn = 1;
+    }
+    if let Some(cfg) = cfg_sector.filter(|cfg| !cfg.is_empty()) {
+        let cfg_byte = |address: usize| cfg.get(address).copied().unwrap_or(0x00);
+        let string_at = |start: usize| -> Vec<u8> {
+            (0..32)
+                .map(|offset| cfg_byte(start + offset))
+                .take_while(|&b| b != 0x00 && b != 0xFF)
+                .collect()
+        };
+        let quad_at = |start: usize| -> Option<String> {
+            let quad: Vec<u8> = (0..4).map(|offset| cfg_byte(start + offset)).collect();
+            (quad != [255; 4] && quad != [0; 4])
+                .then(|| format!("{}.{}.{}.{}", quad[0], quad[1], quad[2], quad[3]))
+        };
+        match String::from_utf8(string_at(ADDR_CONF_SSID)) {
+            Ok(value) => ssid = Some(value),
+            Err(_) => lines.push("Error: Could not decode WiFi SSID read from device".to_string()),
+        }
+        let psk_bytes = string_at(ADDR_CONF_PSK);
+        ip = quad_at(ADDR_CONF_IP);
+        nm = quad_at(ADDR_CONF_NM);
+        if wifi == 0x02 {
+            ip = Some("10.0.0.1".to_string());
+            nm = Some("255.255.255.0".to_string());
+        }
+        match String::from_utf8(psk_bytes) {
+            Ok(value) if !show_psk && !value.is_empty() => {
+                psk = Some("*".repeat(value.chars().count()))
+            }
+            Ok(value) => psk = Some(value),
+            Err(_) => lines.push("Error: Could not decode WiFi PSK read from device".to_string()),
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Device configuration:".to_string());
+    lines.push(format!(
+        "  Bluetooth              : {}",
+        if bt == 0x73 { "Enabled" } else { "Disabled" }
+    ));
+    lines.push(format!(
+        "  WiFi                   : {}",
+        match wifi {
+            0x01 => "Enabled (Station)",
+            0x02 => "Enabled (AP)",
+            _ => "Disabled",
+        }
+    ));
+    if wifi == 0x01 || wifi == 0x02 {
+        lines.push(format!("    Channel              : {wchn}"));
+        lines.push(format!(
+            "    SSID                 : {}",
+            non_empty(&ssid).unwrap_or("Not set")
+        ));
+        lines.push(format!(
+            "    PSK                  : {}",
+            non_empty(&psk).unwrap_or("Not set")
+        ));
+        lines.push(format!(
+            "    IP Address           : {}",
+            non_empty(&ip).unwrap_or("DHCP")
+        ));
+        if let (Some(_), Some(nm)) = (non_empty(&ip), non_empty(&nm)) {
+            lines.push(format!("    Network Mask         : {nm}"));
+        }
+    }
+    lines.push(format!(
+        "  Interference avoidance : {}",
+        if dia == 0x00 { "Enabled" } else { "Disabled" }
+    ));
+    lines.push(format!("  Display brightness     : {dint}"));
+    if dadr == 0xFF {
+        lines.push("  Display address        : Default".to_string());
+    } else {
+        lines.push(format!("  Display address        : {dadr:02x}"));
+    }
+    if bset == 0x73 && dblk != 0x00 {
+        lines.push(format!("  Display blanking       : {dblk}s"));
+    } else {
+        lines.push("  Display blanking       : Disabled".to_string());
+    }
+    let rotation = match drot {
+        0x00 => "Landscape".to_string(),
+        0x01 => "Portrait".to_string(),
+        0x02 => "Landscape 180".to_string(),
+        0x03 => "Portrait 180".to_string(),
+        0xFF => "Default".to_string(),
+        // Upstream raises on these values; show the stored byte instead.
+        other => other.to_string(),
+    };
+    lines.push(format!("  Display rotation       : {rotation}"));
+    if pset == 0x73 {
+        lines.push(format!("  Neopixel Intensity     : {pint}"));
+    }
+    lines.push(String::new());
+    lines
+}
+
+fn non_empty(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|v| !v.is_empty())
+}
+
 pub fn identity_checksum(info: &IdentityInfo) -> [u8; 16] {
     md5_digest(&identity_checksum_input(info))
 }
@@ -176,7 +302,7 @@ fn read_be_u32(bytes: &[u8], start: usize) -> u32 {
     )
 }
 
-fn md5_digest(input: &[u8]) -> [u8; 16] {
+pub fn md5_digest(input: &[u8]) -> [u8; 16] {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,

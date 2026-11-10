@@ -734,15 +734,18 @@ impl PersistedBlackholeTable {
     pub const SUPPORTED_VERSIONS: &'static [u32] = &[1, 2];
 }
 
-/// Save all entries as a version-2 Rust blackhole snapshot, including expired
-/// entries. Publisher/source identity is not stored in this format; use
-/// [`save_python_blackhole_files`] when source grouping must be preserved.
+/// Save local entries as a version-2 Rust blackhole snapshot, including
+/// expired ones. This format stores no source, so learned entries are left
+/// to their publishers' files, which reload attributes to the publisher.
 pub fn save_blackhole_table(
     table: &crate::blackhole::BlackholeTable,
     path: &Path,
 ) -> Result<(), PersistenceError> {
     let mut entries = Vec::new();
     for (hash, entry) in table.iter_entries() {
+        if entry.source.is_some() {
+            continue;
+        }
         entries.push(PersistedBlackholeEntry {
             identity_hash: hash.to_vec(),
             created: entry.created,
@@ -808,7 +811,7 @@ pub fn save_python_blackhole_files(
             .map(|source| source.into_bytes())
             .unwrap_or(local_identity_hash);
         let until = entry.ttl.map(|ttl| entry.created + ttl);
-        let value = blackhole_entry_value(source, until, entry.reason_str());
+        let value = blackhole_entry_value(source, until, entry.wire_reason());
         let key = Value::Binary(identity_hash.to_vec());
         if source == local_identity_hash {
             local_entries.push((key, value));
@@ -827,11 +830,49 @@ pub fn save_python_blackhole_files(
     Ok(())
 }
 
+/// Write `blackhole_dir/local` with the local entries, as upstream
+/// `Transport.persist_blackhole` does (Transport.py:4598-4616).
+pub fn save_local_blackhole_file(
+    table: &crate::blackhole::BlackholeTable,
+    local_identity_hash: [u8; 16],
+    blackhole_dir: &Path,
+) -> Result<(), PersistenceError> {
+    std::fs::create_dir_all(blackhole_dir).map_err(PersistenceError::Io)?;
+    let local_entries = table
+        .iter_entries()
+        .filter(|(_, entry)| {
+            entry
+                .source
+                .is_none_or(|source| source.into_bytes() == local_identity_hash)
+        })
+        .map(|(identity_hash, entry)| {
+            let until = entry.ttl.map(|ttl| entry.created + ttl);
+            (
+                Value::Binary(identity_hash.to_vec()),
+                blackhole_entry_value(local_identity_hash, until, entry.wire_reason()),
+            )
+        })
+        .collect();
+    write_value_file(&blackhole_dir.join("local"), &Value::Map(local_entries))
+}
+
+/// Store a publisher's fetched `/list` reply as `blackhole_dir/<publisher>`,
+/// unchanged, as upstream's updater does (Discovery.py:938-943).
+pub fn save_blackhole_source_file(
+    publisher: [u8; 16],
+    payload: &[u8],
+    blackhole_dir: &Path,
+) -> Result<(), PersistenceError> {
+    std::fs::create_dir_all(blackhole_dir).map_err(PersistenceError::Io)?;
+    atomic_write_bytes(&blackhole_dir.join(hex::encode(publisher)), payload)
+}
+
 /// Load local blackholes and enabled remote-source files from a directory.
 ///
 /// A missing directory gives an empty result; other directory-open errors fail.
-/// Unreadable files, non-map records and invalid identity keys are skipped.
-/// A map with a valid 16-byte identity can still omit `until`: missing, Nil or
+/// Unreadable files and invalid identity keys are skipped; a non-map record is
+/// a permanent entry without a reason, as upstream reloads it. A map with a
+/// valid 16-byte identity can still omit `until`: missing, Nil or
 /// nonnumeric values become a permanent entry (`ttl=None`). A missing or
 /// nonstring reason becomes Manual; string reasons are also retained as labels.
 /// Source identity comes from the filename (or `local_identity_hash` for
@@ -894,8 +935,10 @@ pub fn load_python_blackhole_dir(
             let Some(identity_hash) = value_bin_array::<16>(&identity_value) else {
                 continue;
             };
-            let Value::Map(entry_map) = entry_value else {
-                continue;
+            // Transport.py:4550-4552: a non-map entry reloads as permanent.
+            let entry_map = match entry_value {
+                Value::Map(entry_map) => entry_map,
+                _ => Vec::new(),
             };
             let until = map_get(&entry_map, "until").and_then(value_f64);
             if until.is_some_and(|until| now >= until) {
@@ -931,7 +974,7 @@ pub fn load_python_blackhole_dir(
     Ok(entries)
 }
 
-fn blackhole_entry_value(source: [u8; 16], until: Option<f64>, reason: &str) -> Value {
+fn blackhole_entry_value(source: [u8; 16], until: Option<f64>, reason: Option<&str>) -> Value {
     Value::Map(vec![
         (
             Value::String("source".into()),
@@ -941,7 +984,12 @@ fn blackhole_entry_value(source: [u8; 16], until: Option<f64>, reason: &str) -> 
             Value::String("until".into()),
             until.map(Value::F64).unwrap_or(Value::Nil),
         ),
-        (Value::String("reason".into()), Value::String(reason.into())),
+        (
+            Value::String("reason".into()),
+            reason
+                .map(|r| Value::String(r.into()))
+                .unwrap_or(Value::Nil),
+        ),
     ])
 }
 
@@ -2016,7 +2064,7 @@ mod tests {
             blackhole_entry_value(
                 remote_source,
                 None,
-                crate::blackhole::BlackholeReason::ProtocolViolation.as_str(),
+                Some(crate::blackhole::BlackholeReason::ProtocolViolation.as_str()),
             ),
         )]);
         write_value_file(&dir.join(hex::encode(remote_source)), &conflicting_remote).unwrap();

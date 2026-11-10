@@ -8240,9 +8240,7 @@ mod tests {
         ));
 
         // ClearSystemBlackholes drops Malformed/RateLimit/ProtocolViolation but
-        // leaves Manual entries intact. We use a real identity for the Manual
-        // entry so it survives the manifest publication filter (Stage 3) which
-        // refuses to republish identities not backed by a known announce.
+        // leaves Manual entries intact.
         let manual_identity = rns_identity::identity::Identity::new();
         let manual_public_key = manual_identity.get_public_key();
         actor.recent_announces.insert(
@@ -8297,12 +8295,14 @@ mod tests {
         assert_eq!(decoded[0].1.source.as_bytes(), &[0x99; 16]);
 
         let (mut subscriber, _tx) = TransportActor::new();
-        let applied = match subscriber
-            .handle_query(crate::messages::TransportQuery::ApplyBlackholeManifest { payload })
-        {
-            crate::messages::TransportQueryResponse::IntResult(n) => n,
-            other => panic!("expected IntResult, got {other:?}"),
-        };
+        let applied =
+            match subscriber.handle_query(crate::messages::TransportQuery::ApplyBlackholeManifest {
+                publisher: [0x99; 16],
+                payload,
+            }) {
+                crate::messages::TransportQueryResponse::IntResult(n) => n,
+                other => panic!("expected IntResult, got {other:?}"),
+            };
         assert_eq!(applied, 1);
         assert!(
             subscriber
@@ -13062,21 +13062,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_publication_skips_unverified_entries() {
+    fn manifest_publishes_entries_without_an_announce() {
         let (mut actor, _tx) = TransportActor::new();
         let verified = rns_identity::identity::Identity::new();
-        let unverified_id = [0xFE; 16]; // no matching announce
+        let unannounced = [0xFE; 16];
         insert_announce_for(&mut actor, [0xA1; 16], &verified);
-        actor.blackhole_table.add_with_reason(
-            verified.hash,
-            None,
-            crate::blackhole::BlackholeReason::Manual,
-        );
-        actor.blackhole_table.add_with_reason(
-            unverified_id,
-            None,
-            crate::blackhole::BlackholeReason::Manual,
-        );
+        actor.blackhole_table.add(verified.hash, None);
+        actor.blackhole_table.add(unannounced, None);
 
         let payload =
             match actor.handle_query(crate::messages::TransportQuery::BuildBlackholeManifest {
@@ -13085,13 +13077,9 @@ mod tests {
                 crate::messages::TransportQueryResponse::Data(p) => p,
                 other => panic!("expected Data manifest, got {other:?}"),
             };
-        let decoded = crate::discovery::decode_manifest(&payload).unwrap();
-        assert_eq!(
-            decoded.len(),
-            1,
-            "only the verified entry should be published"
-        );
-        assert_eq!(decoded[0].0, verified.hash);
+        let decoded =
+            crate::discovery::decode_published_manifest(&payload, [0x99; 16].into()).unwrap();
+        assert_eq!(decoded.len(), 2);
     }
 
     #[test]
