@@ -18,12 +18,18 @@ impl TransportActor {
                             .get(&entry.interface_id)
                             .map(|e| e.name.clone())
                             .unwrap_or_else(|| format!("interface_{}", entry.interface_id));
+                        let hash = hash.into_bytes();
+                        let known = self.recent_announces.get(&hash);
                         PathTableRpcEntry {
-                            hash: hash.into_bytes(),
+                            hash,
                             timestamp: entry.timestamp,
-                            via: entry.next_hop,
+                            via: Some(entry.next_hop.unwrap_or(hash)),
                             hops: entry.hops,
                             expires: entry.expires,
+                            value: known.map(|k| k.stamp_value),
+                            // Path use is not recorded; 0 is upstream's never-used value.
+                            used: 0.0,
+                            lr_cost: known.and_then(|k| k.lr_cost),
                             interface: iface_name,
                             interface_id: entry.interface_id,
                             interface_mode: self
@@ -226,7 +232,7 @@ impl TransportActor {
                 let next_hop = self
                     .path_table
                     .get_live(&dest)
-                    .and_then(|e| e.next_hop)
+                    .map(|e| e.next_hop.unwrap_or(dest))
                     .or_else(|| {
                         self.local_destinations
                             .contains(&dest)
@@ -267,9 +273,11 @@ impl TransportActor {
             TransportQuery::DropPath { dest } => {
                 // expire() forces immediate cull — plain `remove` would leave
                 // observers racing against the next maintenance tick.
-                self.path_table.expire(&dest);
-                self.state_dirty = true;
-                TransportQueryResponse::Ok
+                let existed = self.path_table.expire(&dest);
+                if existed {
+                    self.state_dirty = true;
+                }
+                TransportQueryResponse::BoolResult(existed)
             }
             TransportQuery::SuppressPathInterface {
                 dest,
@@ -349,6 +357,14 @@ impl TransportActor {
                 reason,
                 reason_label,
             } => {
+                // Transport.py:4487-4497: an existing entry is left untouched.
+                if self
+                    .blackhole_table
+                    .iter()
+                    .any(|known| known.into_bytes() == hash)
+                {
+                    return TransportQueryResponse::OptBoolResult(None);
+                }
                 self.blackhole_table
                     .add_with_reason_label(hash, ttl, reason, reason_label);
                 // Mirror Python `Transport.remove_blackholed_paths`: walk the
@@ -376,7 +392,7 @@ impl TransportActor {
                 }
                 self.state_dirty = true;
                 self.publish_blackhole_snapshot();
-                TransportQueryResponse::Ok
+                TransportQueryResponse::OptBoolResult(Some(true))
             }
             TransportQuery::UnblackholeIdentity { hash } => {
                 let removed = self.blackhole_table.remove(&hash);
@@ -384,7 +400,7 @@ impl TransportActor {
                     self.state_dirty = true;
                     self.publish_blackhole_snapshot();
                 }
-                TransportQueryResponse::BoolResult(removed)
+                TransportQueryResponse::OptBoolResult(removed.then_some(true))
             }
             TransportQuery::IsBlackholed { hash } => {
                 TransportQueryResponse::BoolResult(self.blackhole_table.is_blackholed(&hash))

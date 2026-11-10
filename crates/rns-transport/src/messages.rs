@@ -1069,6 +1069,8 @@ pub enum TransportQueryResponse {
     StringResult(Option<String>),
     HashResult(Option<[u8; 16]>),
     BoolResult(bool),
+    /// Upstream's True/False/None mutation results (blackhole, unblackhole).
+    OptBoolResult(Option<bool>),
     PathStateResult(crate::constants::PathState),
     BlackholeList(Vec<BlackholeRpcEntry>),
     /// Subset of dest hashes supplied to `FilterBlackholedDests` whose
@@ -1086,9 +1088,18 @@ pub enum TransportQueryResponse {
 pub struct PathTableRpcEntry {
     pub hash: [u8; 16],
     pub timestamp: f64,
+    /// Next hop; for a direct path this is the destination hash itself, as
+    /// upstream stores it (Transport.py:2480).
     pub via: Option<[u8; 16]>,
     pub hops: u8,
     pub expires: f64,
+    /// Destination stamp value: `None` for an unknown destination, 0 when
+    /// known but unstamped (Reticulum.py:1884-1885).
+    pub value: Option<f64>,
+    /// Last path use in Unix seconds; always 0, as path use is not recorded.
+    pub used: f64,
+    /// Announced link-request cost, if any.
+    pub lr_cost: Option<f64>,
     pub interface: String,
     pub interface_id: InterfaceId,
     pub interface_mode: InterfaceMode,

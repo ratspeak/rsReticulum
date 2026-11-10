@@ -184,6 +184,9 @@ fn handle_path(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec<u
                         via: e.via.map(|v| v.to_vec()),
                         hops: e.hops,
                         expires: e.expires,
+                        value: e.value,
+                        used: e.used,
+                        lr_cost: e.lr_cost,
                         interface: e.interface,
                     });
                 }
@@ -439,6 +442,9 @@ mod tests {
                                 via: Some([0x22; 16]),
                                 hops: 2,
                                 expires: 1_700_100_000.0,
+                                value: None,
+                                used: 0.0,
+                                lr_cost: None,
                                 interface: "MockIf".to_string(),
                                 interface_id: 1,
                                 interface_mode: rns_transport::constants::InterfaceMode::Full,

@@ -179,6 +179,8 @@ pub enum RpcResponse {
     FloatResult(Option<f64>),
     IntResult(i64),
     BoolResult(bool),
+    /// True, False or None, as upstream's blackhole mutations answer.
+    OptBoolResult(Option<bool>),
     BlackholeList(Vec<BlackholeEntry>),
     Ok,
     Error(String),
@@ -191,6 +193,15 @@ pub struct PathTableEntry {
     pub via: Option<Vec<u8>>,
     pub hops: u8,
     pub expires: f64,
+    /// Destination stamp value: `None` when the destination is unknown, 0 when
+    /// known but unstamped (Reticulum.py:1884-1885).
+    #[serde(default)]
+    pub value: Option<f64>,
+    /// Last use in Unix seconds; 0 when never used.
+    #[serde(default)]
+    pub used: f64,
+    #[serde(default)]
+    pub lr_cost: Option<f64>,
     pub interface: String,
 }
 
@@ -749,6 +760,12 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                         ),
                         ("hops", PyValue::Int(i128::from(e.hops))),
                         ("expires", PyValue::Float(e.expires)),
+                        ("value", e.value.map(py_number).unwrap_or(PyValue::None)),
+                        ("used", py_number(e.used)),
+                        (
+                            "lr_cost",
+                            e.lr_cost.map(PyValue::Float).unwrap_or(PyValue::None),
+                        ),
                         ("interface", PyValue::String(e.interface.clone())),
                     ])
                 })
@@ -783,6 +800,7 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
         RpcResponse::FloatResult(v) => v.map(PyValue::Float).unwrap_or(PyValue::None),
         RpcResponse::IntResult(v) => PyValue::Int(i128::from(*v)),
         RpcResponse::BoolResult(v) => PyValue::Bool(*v),
+        RpcResponse::OptBoolResult(v) => v.map(PyValue::Bool).unwrap_or(PyValue::None),
         RpcResponse::BlackholeList(entries) => PyValue::Dict(
             entries
                 .iter()
@@ -1084,10 +1102,19 @@ fn py_value_to_response_for_request(
         RpcRequest::GetBlackholedIdentities => {
             Ok(RpcResponse::BlackholeList(parse_blackhole_list(value)?))
         }
-        RpcRequest::DropPath { .. }
-        | RpcRequest::DropAnnounceQueues
-        | RpcRequest::BlackholeIdentity { .. }
-        | RpcRequest::UnblackholeIdentity { .. } => Ok(RpcResponse::Ok),
+        RpcRequest::DropPath { .. } => Ok(RpcResponse::BoolResult(match value {
+            PyValue::Bool(v) => *v,
+            PyValue::None => false,
+            _ => py_required_int(value)? != 0,
+        })),
+        RpcRequest::BlackholeIdentity { .. } | RpcRequest::UnblackholeIdentity { .. } => {
+            Ok(RpcResponse::OptBoolResult(match value {
+                PyValue::Bool(v) => Some(*v),
+                PyValue::None => None,
+                _ => Some(py_required_int(value)? != 0),
+            }))
+        }
+        RpcRequest::DropAnnounceQueues => Ok(RpcResponse::Ok),
         RpcRequest::GetLowestInterfaceBitrate => match value {
             PyValue::None => Ok(RpcResponse::StringResult(None)),
             _ => Ok(RpcResponse::IntResult(py_required_int(value)?)),
@@ -1171,6 +1198,9 @@ fn parse_path_table(value: &PyValue) -> Result<Vec<PathTableEntry>, RpcError> {
                 },
                 hops: dict_get(m, "hops").and_then(py_u8).unwrap_or(0),
                 expires: dict_get(m, "expires").and_then(py_f64).unwrap_or(0.0),
+                value: dict_get(m, "value").and_then(py_f64),
+                used: dict_get(m, "used").and_then(py_f64).unwrap_or(0.0),
+                lr_cost: dict_get(m, "lr_cost").and_then(py_f64),
                 interface: dict_get(m, "interface")
                     .and_then(py_string)
                     .unwrap_or_default(),
@@ -1399,6 +1429,15 @@ fn py_bool(value: &PyValue) -> Option<bool> {
     match value {
         PyValue::Bool(v) => Some(*v),
         _ => None,
+    }
+}
+
+/// Upstream stores the never-used marker and an unstamped value as the int 0.
+fn py_number(value: f64) -> PyValue {
+    if value == 0.0 {
+        PyValue::Int(0)
+    } else {
+        PyValue::Float(value)
     }
 }
 
@@ -2292,6 +2331,9 @@ mod tests {
             via: Some(vec![0xBB; 16]),
             hops: 3,
             expires: 1234567890.0 + 604800.0,
+            value: None,
+            used: 0.0,
+            lr_cost: None,
             interface: "TCPInterface[test]".to_string(),
         };
         let resp = RpcResponse::PathTable(vec![entry]);
@@ -2862,7 +2904,10 @@ mod tests {
     const FX_REQ_BLACKHOLE_IDENTITY_NONE: &str = "83b2626c61636b686f6c655f6964656e74697479c41042424242424242424242424242424242a5756e74696cc0a6726561736f6ec0";
     const FX_REQ_DESTINATION_DATA_USED: &str = "82b064657374696e6174696f6e5f64617461a475736564b064657374696e6174696f6e5f68617368c410cccccccccccccccccccccccccccccccc";
     const FX_REQ_IDENTITY_DATA_RETAIN: &str = "82ad6964656e746974795f64617461a672657461696ead6964656e746974795f68617368c410dddddddddddddddddddddddddddddddd";
-    const FX_RESP_PATH_TABLE: &str = "9186a468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a9696e74657266616365b2544350496e746572666163655b746573745d";
+    // Path-table replies: RNS 1.6.0 umsgpack over the dict get_path_table builds
+    // (Reticulum.py:1887-1891), unknown and stamped destinations.
+    const FX_RESP_PATH_TABLE: &str = "9189a468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a576616c7565c0a47573656400a76c725f636f7374c0a9696e74657266616365b2544350496e746572666163655b746573745d";
+    const FX_RESP_PATH_TABLE_STAMPED: &str = "9189a468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a576616c7565cb4018500000000000a475736564cb41d26580cfe00000a76c725f636f7374cb400a000000000000a9696e74657266616365b2544350496e746572666163655b746573745d";
     const FX_RESP_BLACKHOLE_DICT: &str = "81c4104242424242424242424242424242424283a6736f75726365c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5756e74696ccb4093480000000000a6726561736f6ea6706172697479";
     const FX_INT_EDGES: &str = "dc0014007fcc80ccffcd0100cdffffce00010000ceffffffffcf0000000100000000cfffffffffffffffffffe0d0dfd080d1ff7fd18000d2ffff7fffd280000000d3ffffffff7fffffffd38000000000000000";
     const FX_STR_EDGES: &str = "93a0bf61616161616161616161616161616161616161616161616161616161616161d9206161616161616161616161616161616161616161616161616161616161616161";
@@ -2950,13 +2995,16 @@ mod tests {
     }
 
     #[test]
-    fn path_table_response_is_byte_exact_with_python_138_umsgpack() {
+    fn path_table_response_is_byte_exact_with_python_umsgpack() {
         let resp = RpcResponse::PathTable(vec![PathTableEntry {
             hash: vec![0xAA; 16],
             timestamp: 1234567890.0,
             via: Some(vec![0xBB; 16]),
             hops: 3,
             expires: 1235172690.0,
+            value: None,
+            used: 0.0,
+            lr_cost: None,
             interface: "TCPInterface[test]".to_string(),
         }]);
         assert_eq!(
@@ -2973,9 +3021,90 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].hops, 3);
                 assert_eq!(entries[0].interface, "TCPInterface[test]");
+                assert_eq!(entries[0].value, None);
+                assert_eq!(entries[0].lr_cost, None);
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn stamped_path_table_response_carries_value_used_and_lr_cost() {
+        let entry = PathTableEntry {
+            hash: vec![0xAA; 16],
+            timestamp: 1234567890.0,
+            via: Some(vec![0xBB; 16]),
+            hops: 3,
+            expires: 1235172690.0,
+            value: Some(6.078125),
+            used: 1234567999.5,
+            lr_cost: Some(3.25),
+            interface: "TCPInterface[test]".to_string(),
+        };
+        let resp = RpcResponse::PathTable(vec![entry]);
+        assert_eq!(
+            hex::encode(encode_response(&resp).unwrap()),
+            FX_RESP_PATH_TABLE_STAMPED
+        );
+        match decode_response_for_request(
+            &hex::decode(FX_RESP_PATH_TABLE_STAMPED).unwrap(),
+            &RpcRequest::GetPathTable { max_hops: None },
+        )
+        .unwrap()
+        {
+            RpcResponse::PathTable(entries) => {
+                assert_eq!(entries[0].value, Some(6.078125));
+                assert_eq!(entries[0].used, 1234567999.5);
+                assert_eq!(entries[0].lr_cost, Some(3.25));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutation_replies_keep_upstream_true_false_none() {
+        let decode = |hex_reply: &str, request: RpcRequest| {
+            decode_response_for_request(&hex::decode(hex_reply).unwrap(), &request).unwrap()
+        };
+        let drop = || RpcRequest::DropPath {
+            destination_hash: vec![0; 16],
+        };
+        let blackhole = || RpcRequest::BlackholeIdentity {
+            identity_hash: vec![0; 16],
+            until: None,
+            reason: None,
+        };
+        let unblackhole = || RpcRequest::UnblackholeIdentity {
+            identity_hash: vec![0; 16],
+        };
+        assert!(matches!(
+            decode("c3", drop()),
+            RpcResponse::BoolResult(true)
+        ));
+        assert!(matches!(
+            decode("c2", drop()),
+            RpcResponse::BoolResult(false)
+        ));
+        assert!(matches!(
+            decode("c3", blackhole()),
+            RpcResponse::OptBoolResult(Some(true))
+        ));
+        assert!(matches!(
+            decode("c0", blackhole()),
+            RpcResponse::OptBoolResult(None)
+        ));
+        assert!(matches!(
+            decode("c0", unblackhole()),
+            RpcResponse::OptBoolResult(None)
+        ));
+        assert_eq!(
+            hex::encode(encode_response(&RpcResponse::OptBoolResult(None)).unwrap()),
+            "c0"
+        );
+        assert_eq!(
+            hex::encode(encode_response(&RpcResponse::BoolResult(false)).unwrap()),
+            "c2"
+        );
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub async fn resolve_destination_on_transport(
         )
         .await?
         {
-            TransportQueryResponse::Ok => {}
+            TransportQueryResponse::BoolResult(_) => {}
             _ => return Err(DestinationResolveError::UnexpectedResponse("path drop")),
         }
     }
@@ -318,7 +318,9 @@ mod tests {
                 panic!("expected path drop");
             };
             assert!(matches!(query, TransportQuery::DropPath { dest } if dest == destination_hash));
-            response_tx.send(TransportQueryResponse::Ok).unwrap();
+            response_tx
+                .send(TransportQueryResponse::BoolResult(true))
+                .unwrap();
             assert!(matches!(
                 transport_rx.recv().await.unwrap(),
                 TransportMessage::RequestPath { destination_hash: dest } if dest == destination_hash

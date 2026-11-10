@@ -8164,26 +8164,29 @@ mod tests {
             reason: crate::blackhole::BlackholeReason::Manual,
             reason_label: None,
         });
-        assert!(matches!(resp, crate::messages::TransportQueryResponse::Ok));
+        assert!(matches!(
+            resp,
+            crate::messages::TransportQueryResponse::OptBoolResult(Some(true))
+        ));
         assert!(actor.blackhole_table.is_blackholed(&[0xAA; 16]));
 
-        // Remove via RPC — returns BoolResult(true) when something was removed.
+        // Remove via RPC: True when something was removed.
         let resp = actor.handle_query(crate::messages::TransportQuery::UnblackholeIdentity {
             hash: [0xAA; 16],
         });
         assert!(matches!(
             resp,
-            crate::messages::TransportQueryResponse::BoolResult(true)
+            crate::messages::TransportQueryResponse::OptBoolResult(Some(true))
         ));
         assert!(!actor.blackhole_table.is_blackholed(&[0xAA; 16]));
 
-        // Removing a non-existent hash returns BoolResult(false).
+        // Removing an absent hash answers None, as upstream does.
         let resp = actor.handle_query(crate::messages::TransportQuery::UnblackholeIdentity {
             hash: [0xAA; 16],
         });
         assert!(matches!(
             resp,
-            crate::messages::TransportQueryResponse::BoolResult(false)
+            crate::messages::TransportQueryResponse::OptBoolResult(None)
         ));
 
         // IsBlackholed query
@@ -12983,7 +12986,10 @@ mod tests {
             reason: crate::blackhole::BlackholeReason::Manual,
             reason_label: None,
         });
-        assert!(matches!(resp, crate::messages::TransportQueryResponse::Ok));
+        assert!(matches!(
+            resp,
+            crate::messages::TransportQueryResponse::OptBoolResult(Some(true))
+        ));
 
         // Both destinations belonging to `identity` are scrubbed; `other` survives.
         assert!(!actor.path_table.has_path(&dest_a));

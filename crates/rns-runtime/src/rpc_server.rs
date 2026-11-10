@@ -703,6 +703,9 @@ async fn process_rpc_request(
                             via: e.via.map(|v| v.to_vec()),
                             hops: e.hops,
                             expires: e.expires,
+                            value: e.value,
+                            used: e.used,
+                            lr_cost: e.lr_cost,
                             interface: e.interface,
                         })
                         .collect();
@@ -803,7 +806,7 @@ async fn process_rpc_request(
                 return invalid_request_hash("destination");
             };
             match authoritative_query!(TransportQuery::DropPath { dest }, "path drop") {
-                TransportQueryResponse::Ok => RpcResponse::Ok,
+                TransportQueryResponse::BoolResult(existed) => RpcResponse::BoolResult(existed),
                 _ => unexpected_transport_response("path drop"),
             }
         }
@@ -891,7 +894,7 @@ async fn process_rpc_request(
                 },
                 "identity blackhole"
             ) {
-                TransportQueryResponse::Ok => RpcResponse::Ok,
+                TransportQueryResponse::OptBoolResult(result) => RpcResponse::OptBoolResult(result),
                 _ => unexpected_transport_response("identity blackhole"),
             }
         }
@@ -903,10 +906,7 @@ async fn process_rpc_request(
                 TransportQuery::UnblackholeIdentity { hash },
                 "identity unblackhole"
             ) {
-                // Python's mutation response is success-shaped even when the
-                // identity was not present; the typed actor result proves the
-                // mutation was authoritatively processed.
-                TransportQueryResponse::BoolResult(_) => RpcResponse::Ok,
+                TransportQueryResponse::OptBoolResult(result) => RpcResponse::OptBoolResult(result),
                 _ => unexpected_transport_response("identity unblackhole"),
             }
         }
