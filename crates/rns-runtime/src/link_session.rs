@@ -21,9 +21,9 @@ use rns_protocol::channel::{
 };
 use rns_protocol::channel_message::{ChannelMessageError, MessageBase};
 use rns_protocol::resource::{
-    CancelType, HASHMAP_IS_EXHAUSTED, InboundTransfer, MAPHASH_LEN, MAX_SEGMENTS,
-    MultiSegmentInbound, OutboundTransfer, RANDOM_HASH_SIZE, TransferAction, get_map_hash,
-    parse_hashmap_update,
+    CancelType, DEFAULT_INBOUND_REASSEMBLY_LIMIT, HASHMAP_IS_EXHAUSTED, InboundTransfer,
+    MAPHASH_LEN, MultiSegmentInbound, OutboundTransfer, RANDOM_HASH_SIZE, TransferAction,
+    get_map_hash, parse_hashmap_update,
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::{DestinationEvent, PacketMetrics};
@@ -43,7 +43,6 @@ const EVENT_BUFFER: usize = 256;
 const MAX_PENDING_REQUESTS: usize = 64;
 const MAX_QUEUED_RESOURCES: usize = 8;
 const MAX_PENDING_RESOURCE_OFFERS: usize = 8;
-const RESOURCE_OFFER_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCE_REJECTION_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
@@ -71,6 +70,10 @@ pub struct LinkSessionConfig {
     /// Where file responses are spooled by default, as Reticulum.resourcepath;
     /// the system temp dir when unset.
     pub resource_dir: Option<PathBuf>,
+    /// Largest advertised total size of an inbound Resource the session
+    /// reassembles in memory; `None` accepts any size. Spooled responses are
+    /// not bounded by it. See [`DEFAULT_INBOUND_REASSEMBLY_LIMIT`].
+    pub inbound_reassembly_limit: Option<usize>,
 }
 
 impl LinkSessionConfig {
@@ -89,6 +92,7 @@ impl LinkSessionConfig {
             track_phy_stats: false,
             proof_strategy: ProofStrategy::ProveNone,
             resource_dir: None,
+            inbound_reassembly_limit: Some(DEFAULT_INBOUND_REASSEMBLY_LIMIT),
         }
     }
 }
@@ -303,8 +307,9 @@ pub struct LinkSessionReceivedResource {
 
 /// An inbound Resource advertisement awaiting an application decision.
 ///
-/// The actor keeps up to eight undecided offers. Its periodic timer rejects
-/// undecided offers after 30 seconds; an occupied actor can delay that check.
+/// The actor keeps up to eight undecided offers. Its periodic timer rejects an
+/// undecided offer once a Python sender would have stopped re-advertising a
+/// request Resource; an occupied actor can delay that check.
 /// Dropping an offer leaves this expiry in force and does not accept data.
 /// Acceptance covers the logical transfer and valid follow-up segments.
 /// Response Resources for pending requests are accepted internally, without an
@@ -766,6 +771,8 @@ struct SessionInboundLogical {
     segment_gap_since: Option<Instant>,
     /// Longest wait for the next segment's advertisement.
     segment_gap_timeout: Option<Duration>,
+    /// Largest total of payload bytes accepted for this transfer.
+    size_bound: usize,
 }
 
 struct InboundResourceLifecycle {
@@ -816,6 +823,7 @@ struct SessionResources {
     inbound_logicals: HashMap<[u8; 32], SessionInboundLogical>,
     rejected_inbound: HashMap<[u8; 32], Instant>,
     resource_dir: Option<PathBuf>,
+    inbound_reassembly_limit: Option<usize>,
 }
 
 struct SessionActorState {
@@ -1325,7 +1333,13 @@ impl LinkSession {
             phy_stats_rx,
         };
         tokio::spawn(run_session_actor(
-            (link, channel, config.proof_strategy, config.resource_dir),
+            (
+                link,
+                channel,
+                config.proof_strategy,
+                config.resource_dir,
+                config.inbound_reassembly_limit,
+            ),
             attached_interface,
             interface_owner,
             delivery_rx,
@@ -1414,7 +1428,13 @@ pub async fn lookup_destination(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_session_actor(
-    link_and_channel: (Link, LinkChannel, ProofStrategy, Option<PathBuf>),
+    link_and_channel: (
+        Link,
+        LinkChannel,
+        ProofStrategy,
+        Option<PathBuf>,
+        Option<usize>,
+    ),
     attached_interface: InterfaceId,
     interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
     mut delivery_rx: mpsc::Receiver<DestinationEvent>,
@@ -1432,7 +1452,8 @@ async fn run_session_actor(
         resource_offer_tx,
         phy_stats_tx,
     } = channels;
-    let (mut link, channel, proof_strategy, resource_dir) = link_and_channel;
+    let (mut link, channel, proof_strategy, resource_dir, inbound_reassembly_limit) =
+        link_and_channel;
     let link_id = link.link_id;
     let mut state = SessionActorState {
         packets: HashSet::new(),
@@ -1442,6 +1463,7 @@ async fn run_session_actor(
         proof_strategy,
         resources: SessionResources {
             resource_dir,
+            inbound_reassembly_limit,
             ..SessionResources::default()
         },
     };
@@ -2073,6 +2095,7 @@ async fn begin_outbound_resource(
     if !matches!(link.state, LinkState::Active | LinkState::Stale) {
         return Err(LinkSessionResourceError::LinkNotActive);
     }
+    outbound.transfer.advertisement_mdu = link.mdu;
     let action = outbound.transfer.tick();
     if !matches!(action, TransferAction::SendAdvertisement(_)) {
         return Err(LinkSessionResourceError::Failed(
@@ -2533,7 +2556,6 @@ fn validate_inbound_advertisement(
     advertisement: &ResourceAdvertisement,
 ) -> Result<(), LinkSessionResourceError> {
     if advertisement.total_segments == 0
-        || advertisement.total_segments > MAX_SEGMENTS
         || advertisement.segment_index == 0
         || advertisement.segment_index > advertisement.total_segments
     {
@@ -2621,6 +2643,13 @@ async fn accept_inbound_offer(
     let coordinator = (advertisement.total_segments > 1).then(|| {
         MultiSegmentInbound::new(advertisement.total_segments, advertisement.original_hash)
     });
+    let in_memory_limit = match lifecycle.spool {
+        Some(_) => None,
+        None => resources.inbound_reassembly_limit,
+    };
+    let size_bound = advertisement
+        .data_size
+        .min(in_memory_limit.unwrap_or(usize::MAX));
     resources.inbound_logicals.insert(
         resource_id,
         SessionInboundLogical {
@@ -2640,6 +2669,7 @@ async fn accept_inbound_offer(
             max_bytes: lifecycle.max_bytes,
             segment_gap_since: None,
             segment_gap_timeout: lifecycle.segment_gap_timeout,
+            size_bound,
         },
     );
     resources.inbound.insert(
@@ -3016,6 +3046,35 @@ async fn process_inbound_resource_advertisement(
             None => (None, None),
         };
         let spool_path = spool.as_ref().map(|spool| spool.path.clone());
+        if spool.is_none()
+            && let Some(max) = resources.inbound_reassembly_limit
+            && advertisement.data_size > max
+        {
+            let size = advertisement.data_size as u64;
+            let transport_failed = matches!(
+                send_resource_action(
+                    transport_tx,
+                    attached_interface,
+                    link,
+                    TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+                )
+                .await,
+                Err(LinkSessionResourceError::TransportUnavailable)
+            );
+            tracing::debug!(
+                size,
+                max,
+                "rejected response above the inbound reassembly limit"
+            );
+            fail_session_request(
+                link,
+                pending_requests,
+                sinks.event_tx,
+                request_id,
+                LinkSessionError::ResponseRejected { size, max },
+            );
+            return transport_failed;
+        }
         let max_bytes = pending.max_response_size;
         let segment_gap_timeout = Some(pending.timeout);
 
@@ -3062,6 +3121,9 @@ async fn process_inbound_resource_advertisement(
     if advertisement.segment_index != 1
         || has_pending_logical
         || resources.pending_inbound.len() >= MAX_PENDING_RESOURCE_OFFERS
+        || resources
+            .inbound_reassembly_limit
+            .is_some_and(|limit| advertisement.data_size > limit)
     {
         return matches!(
             send_resource_action(
@@ -3212,6 +3274,37 @@ async fn complete_inbound_segment(
         }
     };
     let metadata = inbound.transfer.resource.metadata.clone();
+    let metadata_size = metadata.as_ref().map_or(0, |metadata| 3 + metadata.len());
+    let overflow = resources
+        .inbound_logicals
+        .get(&resource_id)
+        .and_then(|logical| {
+            let received = logical
+                .received_bytes
+                .saturating_add(data.len())
+                .saturating_add(metadata_size);
+            (received > logical.size_bound).then(|| match logical.max_bytes {
+                Some(max) if received > max => LinkSessionResourceError::TooLarge {
+                    size: received as u64,
+                    max,
+                },
+                _ => LinkSessionResourceError::Failed("received more data than advertised".into()),
+            })
+        });
+    if let Some(error) = overflow {
+        let transport_failed = matches!(
+            send_resource_action(
+                transport_tx,
+                attached_interface,
+                link,
+                TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+            )
+            .await,
+            Err(LinkSessionResourceError::TransportUnavailable)
+        );
+        fail_inbound_logical(link, resources, event_tx, resource_id, error);
+        return transport_failed;
+    }
     if let Err(error) = send_resource_action(
         transport_tx,
         attached_interface,
@@ -3236,7 +3329,6 @@ async fn complete_inbound_segment(
     let mut coordinator_error = None;
     if let Some(logical) = resources.inbound_logicals.get_mut(&resource_id) {
         logical.current_segment = None;
-        let metadata_size = metadata.as_ref().map_or(0, |metadata| 3 + metadata.len());
         logical.received_bytes = logical
             .received_bytes
             .saturating_add(data.len())
@@ -3507,6 +3599,15 @@ fn handle_inbound_resource_cancel(
     );
 }
 
+/// Advertisement lifetime of a Python request Resource: its timeout is the
+/// request timeout, retried `MAX_ADV_RETRIES` times after the first attempt.
+fn resource_offer_timeout(link: &Link) -> Duration {
+    let attempt = link.rtt_secs() * rns_link::constants::TRAFFIC_TIMEOUT_FACTOR
+        + rns_link::constants::RESPONSE_MAX_GRACE_TIME * 1.125
+        + rns_protocol::resource::PROCESSING_GRACE;
+    Duration::from_secs_f64(attempt * (rns_protocol::resource::MAX_ADV_RETRIES + 1) as f64)
+}
+
 async fn poll_inbound_resources(
     transport_tx: &mpsc::Sender<TransportMessage>,
     attached_interface: InterfaceId,
@@ -3518,11 +3619,12 @@ async fn poll_inbound_resources(
         .rejected_inbound
         .retain(|_, rejected_at| rejected_at.elapsed() < RESOURCE_REJECTION_TTL);
 
+    let offer_timeout = resource_offer_timeout(link);
     let expired_offers: Vec<[u8; 32]> = resources
         .pending_inbound
         .iter()
         .filter_map(|(segment_hash, pending)| {
-            (pending.offered_at.elapsed() >= RESOURCE_OFFER_TIMEOUT).then_some(*segment_hash)
+            (pending.offered_at.elapsed() >= offer_timeout).then_some(*segment_hash)
         })
         .collect();
     for segment_hash in expired_offers {
@@ -4835,7 +4937,7 @@ mod tests {
             segment_hash,
             PendingInboundResourceOffer {
                 advertisement,
-                offered_at: Instant::now() - RESOURCE_OFFER_TIMEOUT,
+                offered_at: Instant::now() - resource_offer_timeout(&initiator),
             },
         );
         let (transport_tx, mut transport_rx) = test_transport_channel(1);
@@ -4858,6 +4960,163 @@ mod tests {
             responder.decrypt(&rejection.raw[offset..]).unwrap(),
             segment_hash
         );
+    }
+
+    /// An ordinary inbound Resource of `data` advertising `advertised` bytes,
+    /// offered to a session with the given reassembly limit and accepted when
+    /// offered. Returns the control packet contexts sent and the conclusion.
+    async fn drive_session_inbound(
+        data: Vec<u8>,
+        advertised: usize,
+        limit: Option<usize>,
+    ) -> (
+        Vec<rns_wire::context::PacketContext>,
+        Option<Result<LinkSessionReceivedResource, LinkSessionResourceError>>,
+    ) {
+        let destination_hash = [0xAE; 16];
+        let server_signing = Ed25519PrivateKey::generate();
+        let server_public = server_signing.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &server_signing, destination_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &server_public, &server_public.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+
+        let mut sender = OutboundTransfer::new_encrypted(
+            data,
+            false,
+            Duration::from_secs_f64(responder.rtt_secs().max(0.001)),
+            responder.session_keys().unwrap(),
+        )
+        .unwrap();
+        sender.resource.advertisement_data_size = advertised;
+        let TransferAction::SendAdvertisement(advertisement) = sender.tick() else {
+            panic!("expected an advertisement");
+        };
+        let segment_hash = sender.resource.resource_hash;
+
+        let mut resources = SessionResources {
+            inbound_reassembly_limit: limit,
+            ..Default::default()
+        };
+        let mut pending_requests = HashMap::new();
+        let (transport_tx, mut transport_rx) = test_transport_channel(16);
+        let (command_tx, _command_rx) = mpsc::channel::<LinkSessionCommand>(8);
+        let (event_tx, _event_rx) = mpsc::channel::<LinkSessionEvent>(16);
+        let (offer_tx, mut offer_rx) = mpsc::channel::<LinkSessionResourceOffer>(1);
+        process_inbound_resource_advertisement(
+            &transport_tx,
+            1,
+            &mut initiator,
+            &mut resources,
+            &mut pending_requests,
+            InboundResourceSinks {
+                event_tx: &event_tx,
+                command_tx: &command_tx,
+                offer_tx: &offer_tx,
+            },
+            &responder.encrypt(&advertisement).unwrap(),
+        )
+        .await;
+
+        let mut conclusion = None;
+        if offer_rx.try_recv().is_ok() {
+            let (progress_tx, _progress_rx) = watch::channel(0.0);
+            let (conclusion_tx, mut conclusion_rx) = oneshot::channel();
+            accept_inbound_offer(
+                &transport_tx,
+                1,
+                &mut initiator,
+                &mut resources,
+                &event_tx,
+                segment_hash,
+                InboundResourceLifecycle {
+                    progress_tx,
+                    conclusion_tx,
+                    spool: None,
+                    max_bytes: None,
+                    segment_gap_timeout: None,
+                },
+            )
+            .await
+            .unwrap();
+            for part in sender.resource.parts.clone() {
+                handle_inbound_resource_part(
+                    &transport_tx,
+                    1,
+                    &mut initiator,
+                    &mut resources,
+                    &event_tx,
+                    &part,
+                )
+                .await;
+            }
+            conclusion = conclusion_rx.try_recv().ok();
+        }
+        drop(transport_tx);
+        let mut contexts = Vec::new();
+        while let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_millis(200), transport_rx.recv()).await
+        {
+            match message {
+                TransportMessage::BindLinkEndpoint {
+                    lifecycle_tx,
+                    result_tx,
+                    ..
+                } => {
+                    let _ = result_tx.send(rns_transport::messages::LinkEndpointBindResult::Bound);
+                    std::mem::forget(lifecycle_tx);
+                }
+                TransportMessage::SendLinkEndpoint {
+                    request, result_tx, ..
+                }
+                | TransportMessage::SendLinkEndpointAndUnbind {
+                    request, result_tx, ..
+                } => {
+                    let _ = result_tx.send(rns_transport::messages::LinkEndpointSendResult::Sent);
+                    contexts.push(
+                        rns_wire::header::PacketHeader::unpack(&request.raw)
+                            .unwrap()
+                            .0
+                            .context,
+                    );
+                }
+                _ => {}
+            }
+        }
+        (contexts, conclusion)
+    }
+
+    #[tokio::test]
+    async fn inbound_resource_above_session_reassembly_limit_is_refused() {
+        let data = vec![0x5C; 4000];
+        let (contexts, conclusion) =
+            drive_session_inbound(data.clone(), data.len(), Some(data.len() - 1)).await;
+        assert_eq!(
+            contexts,
+            vec![rns_wire::context::PacketContext::ResourceRcl]
+        );
+        assert!(conclusion.is_none(), "a refused Resource is never offered");
+
+        let (_, conclusion) = drive_session_inbound(data.clone(), data.len(), None).await;
+        assert_eq!(conclusion.unwrap().unwrap().data, data);
+    }
+
+    #[tokio::test]
+    async fn inbound_resource_sending_more_than_advertised_is_cut_off() {
+        let data = vec![0x5D; 4000];
+        let (contexts, conclusion) = drive_session_inbound(data, 3999, None).await;
+        assert!(matches!(
+            conclusion,
+            Some(Err(LinkSessionResourceError::Failed(_)))
+        ));
+        assert_eq!(
+            contexts.last(),
+            Some(&rns_wire::context::PacketContext::ResourceRcl)
+        );
+        assert!(!contexts.contains(&rns_wire::context::PacketContext::ResourcePrf));
     }
 
     #[tokio::test]
@@ -5283,6 +5542,7 @@ mod tests {
                 track_phy_stats: false,
                 proof_strategy: ProofStrategy::ProveNone,
                 resource_dir: None,
+                inbound_reassembly_limit: None,
             },
         )
         .await
@@ -5489,7 +5749,7 @@ mod tests {
         registration.endpoint_bound();
 
         tokio::spawn(run_session_actor(
-            (initiator, channel, ProofStrategy::ProveNone, None),
+            (initiator, channel, ProofStrategy::ProveNone, None, None),
             7,
             None,
             delivery_rx,
@@ -5606,6 +5866,7 @@ mod tests {
                 track_phy_stats: false,
                 proof_strategy: ProofStrategy::ProveNone,
                 resource_dir: None,
+                inbound_reassembly_limit: None,
             },
         ));
         let link_id = match rx.recv().await.unwrap() {
@@ -5656,6 +5917,7 @@ mod tests {
                 track_phy_stats: false,
                 proof_strategy: ProofStrategy::ProveNone,
                 resource_dir: None,
+                inbound_reassembly_limit: None,
             },
         ));
 
@@ -5700,6 +5962,7 @@ mod tests {
                 track_phy_stats: false,
                 proof_strategy: ProofStrategy::ProveNone,
                 resource_dir: None,
+                inbound_reassembly_limit: None,
             },
         ));
 
@@ -5808,6 +6071,7 @@ mod tests {
                 track_phy_stats: false,
                 proof_strategy: ProofStrategy::ProveNone,
                 resource_dir: None,
+                inbound_reassembly_limit: None,
             },
         ));
         let delivery_tx = match transport_rx.recv().await.unwrap() {
@@ -5902,6 +6166,7 @@ mod tests {
                 track_phy_stats: true,
                 proof_strategy: ProofStrategy::ProveAll,
                 resource_dir: None,
+                inbound_reassembly_limit: None,
             },
         ));
 

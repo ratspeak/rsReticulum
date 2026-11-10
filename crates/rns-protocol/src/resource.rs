@@ -64,6 +64,8 @@ pub const EIFR_COLD_START_BYTES: usize = 600;
 pub const WATCHDOG_MAX_SLEEP: f64 = 1.0;
 pub const HASHMAP_IS_NOT_EXHAUSTED: u8 = 0x00;
 pub const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
+/// Request flag for an advertisement sent without its initial hashmap.
+pub const HASHMAP_IS_EMPTY: u8 = 0xFE;
 
 /// Link-resource encryption hook applied before chunking payload data.
 pub type ResourceEncryptor<'a> = dyn Fn(&[u8]) -> Vec<u8> + 'a;
@@ -74,7 +76,7 @@ pub type ResourceDecryptor<'a> = dyn Fn(&[u8]) -> Result<Vec<u8>, ResourceError>
 ///
 /// Wire layout (bit 0 = LSB):
 ///   0: encrypted, 1: compressed, 2: split,
-///   3: is_request, 4: is_response, 5: has_metadata.
+///   3: is_request, 4: is_response, 5: has_metadata, 6: app_flag.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResourceFlags {
     pub encrypted: bool,
@@ -83,6 +85,7 @@ pub struct ResourceFlags {
     pub is_request: bool,
     pub is_response: bool,
     pub has_metadata: bool,
+    pub app_flag: bool,
 }
 
 impl ResourceFlags {
@@ -106,6 +109,9 @@ impl ResourceFlags {
         if self.has_metadata {
             f |= 0x20;
         }
+        if self.app_flag {
+            f |= 0x40;
+        }
         f
     }
 
@@ -117,6 +123,7 @@ impl ResourceFlags {
             is_request: b & 0x08 != 0,
             is_response: b & 0x10 != 0,
             has_metadata: b & 0x20 != 0,
+            app_flag: b & 0x40 != 0,
         }
     }
 }
@@ -445,6 +452,7 @@ impl OutboundResource {
             is_request: false,
             is_response: false,
             has_metadata,
+            app_flag: false,
         };
 
         Ok(Self {
@@ -830,13 +838,19 @@ pub enum ResourceError {
     DuplicateSegment,
 }
 
-/// Upper bound on input payload size across all segments (128 MiB - 1).
-/// The segment-count limit and first-segment metadata budget also apply.
+/// Local storage bound (128 MiB - 1) used by applications that buffer a whole
+/// Resource. The Resource protocol itself has no total size limit.
 pub const MAX_RESOURCE_SIZE: usize = 134_217_727;
 
-/// Max segments per split resource. Caps the ADV's `l` field so a peer
-/// can't force allocation of `u32::MAX` slot vectors. Runtime callers must
-/// validate `total_segments <= MAX_SEGMENTS` before constructing a coordinator.
+/// Default bound on the advertised total size of an inbound Resource that is
+/// reassembled in memory (128 MiB - 1). Local difference from upstream, which
+/// assembles every inbound Resource to storage and has no such bound
+/// (Resource.py:202-207, 714-754@1.6.0). Streaming inbound reassembly to the
+/// consumer would remove the need for it.
+pub const DEFAULT_INBOUND_REASSEMBLY_LIMIT: usize = MAX_RESOURCE_SIZE;
+
+/// Former split-resource segment cap. The Resource protocol has no segment
+/// limit and this crate no longer enforces one; kept for API compatibility.
 pub const MAX_SEGMENTS: usize = 128;
 
 /// Sender-side coordinator for a resource split across multiple segments.
@@ -864,6 +878,7 @@ pub struct LazyMultiSegmentOutbound {
     metadata_wire_size: usize,
     request_id: Option<Vec<u8>>,
     is_response: bool,
+    app_flag: bool,
     next_offset: usize,
     next_segment_index: usize,
     pub original_hash: [u8; 32],
@@ -990,19 +1005,12 @@ impl LazyMultiSegmentOutbound {
         request_id: Option<Vec<u8>>,
         is_response: bool,
     ) -> Result<Self, ResourceError> {
-        if data.len() > MAX_RESOURCE_SIZE {
-            return Err(ResourceError::TooLarge);
-        }
-
         let data_size = data.len();
         let metadata_wire_size = metadata.as_ref().map(|value| 3 + value.len()).unwrap_or(0);
         if metadata_wire_size > MAX_EFFICIENT_SIZE {
             return Err(ResourceError::MetadataTooLarge);
         }
         let total_segments = required_segment_count(data_size, metadata_wire_size);
-        if total_segments > MAX_SEGMENTS {
-            return Err(ResourceError::TooLarge);
-        }
 
         crate::resource_control::preflight_outbound(
             data_size,
@@ -1029,12 +1037,19 @@ impl LazyMultiSegmentOutbound {
             metadata_wire_size,
             request_id,
             is_response,
+            app_flag: false,
             next_offset: 0,
             next_segment_index: 1,
             original_hash,
             total_segments,
             data_size,
         })
+    }
+
+    /// Set the application flag carried by every segment.
+    pub fn with_app_flag(mut self, app_flag: bool) -> Self {
+        self.app_flag = app_flag;
+        self
     }
 
     /// Number of segments that have not yet been materialised.
@@ -1081,6 +1096,7 @@ impl LazyMultiSegmentOutbound {
         )?;
         resource.flags.split = true;
         resource.flags.is_response = self.is_response;
+        resource.flags.app_flag = self.app_flag;
         // Later segments advertise the metadata flag without carrying metadata.
         resource.flags.has_metadata |= self.metadata_wire_size > 0;
         resource.segment_index = segment_index;
@@ -1114,29 +1130,44 @@ pub struct MultiSegmentInbound {
     /// can attach metadata to the first segment; the owner must carry it here
     /// after assembling that segment.
     pub metadata: Option<Vec<u8>>,
+    /// Largest total of segment payloads accepted; `None` accepts any total.
+    pub size_bound: Option<usize>,
 }
 
 impl MultiSegmentInbound {
-    /// Allocate slots and retain the sender's `original_hash`. Before calling,
-    /// validate a nonzero count no greater than `MAX_SEGMENTS` and the transfer
-    /// limits. This constructor does not check them and allocates directly from
-    /// `total_segments`.
+    /// Retain the sender's `original_hash` and segment count. Slots are
+    /// allocated only as segments arrive, so the wire count costs no memory.
     pub fn new(total_segments: usize, original_hash: [u8; 32]) -> Self {
         Self {
             original_hash,
             total_segments,
-            segments: (0..total_segments).map(|_| None).collect(),
-            assembled_segments: (0..total_segments).map(|_| None).collect(),
+            segments: Vec::new(),
+            assembled_segments: Vec::new(),
             data_size: 0,
             metadata: None,
+            size_bound: None,
         }
+    }
+
+    /// Refuse segment payloads once their total would exceed `bound`, such as
+    /// the advertised data size or a local reassembly limit.
+    pub fn with_size_bound(mut self, bound: usize) -> Self {
+        self.size_bound = Some(bound);
+        self
+    }
+
+    fn slot<T>(slots: &mut Vec<Option<T>>, idx: usize) -> &mut Option<T> {
+        if slots.len() <= idx {
+            slots.resize_with(idx + 1, || None);
+        }
+        &mut slots[idx]
     }
 
     /// Attach an inbound resource. `segment_index` is 1-based (as it appears
     /// on the wire) and silently ignored when out of range.
     pub fn set_segment(&mut self, segment_index: usize, resource: InboundResource) {
         if segment_index >= 1 && segment_index <= self.total_segments {
-            self.segments[segment_index - 1] = Some(resource);
+            *Self::slot(&mut self.segments, segment_index - 1) = Some(resource);
         }
     }
 
@@ -1151,9 +1182,9 @@ impl MultiSegmentInbound {
             return Err(ResourceError::InvalidAdvertisement);
         }
         let idx = segment_index - 1;
-        if let Some(ref mut resource) = self.segments[idx] {
+        if let Some(Some(resource)) = self.segments.get_mut(idx) {
             let data = resource.assemble(decrypt_fn)?;
-            self.assembled_segments[idx] = Some(data);
+            *Self::slot(&mut self.assembled_segments, idx) = Some(data);
             Ok(())
         } else {
             Err(ResourceError::Incomplete)
@@ -1162,7 +1193,8 @@ impl MultiSegmentInbound {
 
     /// Runtime ingest of an assembled segment at 1-based `segment_index`.
     /// Errors: `InvalidAdvertisement` for out-of-range index;
-    /// `DuplicateSegment` on overwrite (slot already accepted).
+    /// `DuplicateSegment` on overwrite (slot already accepted); `TooLarge`
+    /// when the payload total would exceed the size bound.
     pub fn set_segment_data(
         &mut self,
         segment_index: usize,
@@ -1171,12 +1203,16 @@ impl MultiSegmentInbound {
         if segment_index < 1 || segment_index > self.total_segments {
             return Err(ResourceError::InvalidAdvertisement);
         }
-        let idx = segment_index - 1;
-        if self.assembled_segments[idx].is_some() {
+        let data_size = self.data_size.saturating_add(data.len());
+        if self.size_bound.is_some_and(|bound| data_size > bound) {
+            return Err(ResourceError::TooLarge);
+        }
+        let slot = Self::slot(&mut self.assembled_segments, segment_index - 1);
+        if slot.is_some() {
             return Err(ResourceError::DuplicateSegment);
         }
-        self.data_size = self.data_size.saturating_add(data.len());
-        self.assembled_segments[idx] = Some(data);
+        self.data_size = data_size;
+        *slot = Some(data);
         Ok(())
     }
 
@@ -1188,7 +1224,7 @@ impl MultiSegmentInbound {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.assembled_segments.iter().all(|s| s.is_some())
+        self.assembled_count() == self.total_segments
     }
 
     /// Concatenate every assembled segment into the original payload.
@@ -1448,6 +1484,8 @@ pub struct OutboundTransfer {
     /// Advertisement wait per attempt before PROCESSING_GRACE; `None` uses
     /// `rtt * TRAFFIC_TIMEOUT_FACTOR`, as Resource does without a timeout.
     pub advertisement_timeout: Option<Duration>,
+    /// Link MDU the advertisement must fit; past it the hashmap is deferred.
+    pub advertisement_mdu: usize,
 }
 
 impl OutboundTransfer {
@@ -1477,6 +1515,12 @@ impl OutboundTransfer {
         Ok(Self::from_resource(resource, rtt))
     }
 
+    /// Set the application flag (advertisement bit 6) on this transfer.
+    pub fn with_app_flag(mut self, app_flag: bool) -> Self {
+        self.resource.flags.app_flag = app_flag;
+        self
+    }
+
     /// Build a transfer from a pre-constructed resource (e.g. one with
     /// metadata attached via [`OutboundResource::with_options`]).
     pub fn from_prebuilt(resource: OutboundResource, rtt: Duration) -> Self {
@@ -1504,6 +1548,7 @@ impl OutboundTransfer {
             last_progress: Instant::now(),
             last_request_parts: 0,
             advertisement_timeout: None,
+            advertisement_mdu: rns_wire::constants::LINK_MDU,
         }
     }
 
@@ -1785,13 +1830,14 @@ impl OutboundTransfer {
         }
         if !matches!(
             request_data[0],
-            HASHMAP_IS_NOT_EXHAUSTED | HASHMAP_IS_EXHAUSTED
+            HASHMAP_IS_NOT_EXHAUSTED | HASHMAP_IS_EXHAUSTED | HASHMAP_IS_EMPTY
         ) {
             return Vec::new();
         }
 
-        let wants_more_hashmap = request_data[0] == HASHMAP_IS_EXHAUSTED;
-        let pad = if wants_more_hashmap {
+        let hashmap_is_empty = request_data[0] == HASHMAP_IS_EMPTY;
+        let wants_more_hashmap = hashmap_is_empty || request_data[0] == HASHMAP_IS_EXHAUSTED;
+        let pad = if request_data[0] == HASHMAP_IS_EXHAUSTED {
             1 + MAPHASH_LEN
         } else {
             1
@@ -1845,9 +1891,11 @@ impl OutboundTransfer {
             let mut last_map_hash = [0u8; MAPHASH_LEN];
             last_map_hash.copy_from_slice(&request_data[1..1 + MAPHASH_LEN]);
 
-            // Locate the part following the receiver's last received hash.
+            // Locate the part following the receiver's last received hash. An
+            // empty-hashmap request searches nothing and answers segment 0.
             let mut part_index = search_start;
-            for i in search_start..search_end {
+            let hashmap_search_end = if hashmap_is_empty { 0 } else { search_end };
+            for i in search_start..hashmap_search_end {
                 part_index = i + 1;
                 if i < self.resource.map_hashes.len()
                     && self.resource.map_hashes[i] == last_map_hash
@@ -1869,7 +1917,10 @@ impl OutboundTransfer {
 
             // Python cancels if an exhausted request cursor is not aligned to
             // a hashmap segment boundary.
-            if hashmap_max_len > 0 && !part_index.is_multiple_of(hashmap_max_len) {
+            if !hashmap_is_empty
+                && hashmap_max_len > 0
+                && !part_index.is_multiple_of(hashmap_max_len)
+            {
                 self.resource.state = ResourceState::Failed;
                 actions.push(TransferAction::SendCancel(
                     CancelType::Icl,
@@ -2011,6 +2062,7 @@ impl OutboundTransfer {
             }
         }
         adv.request_id = self.resource.request_id.clone();
+        adv.defer_hashmap_if_over(self.advertisement_mdu)?;
 
         crate::resource_control::check_advertisement(&adv, mtu)?;
         Ok(adv.pack())
@@ -2257,8 +2309,16 @@ impl InboundTransfer {
         let search_size = self.resource.window.window;
         let search_end = (search_start + search_size).min(self.resource.total_parts);
 
+        // The advertisement carried no hashmap, so no part can be named yet.
+        if self.resource.map_hashes.is_empty() {
+            hashmap_exhausted = HASHMAP_IS_EMPTY;
+        }
+
         let mut count = 0;
         for pn in search_start..search_end {
+            if hashmap_exhausted == HASHMAP_IS_EMPTY {
+                break;
+            }
             if self.resource.parts[pn].is_none() {
                 if pn < self.resource.map_hashes.len() {
                     requested_hashes.extend_from_slice(&self.resource.map_hashes[pn]);
@@ -2286,6 +2346,9 @@ impl InboundTransfer {
                     request_data.extend_from_slice(&self.resource.map_hashes[last_idx]);
                 }
             }
+            self.waiting_for_hmu = true;
+        }
+        if hashmap_exhausted == HASHMAP_IS_EMPTY {
             self.waiting_for_hmu = true;
         }
 
@@ -2570,6 +2633,7 @@ mod tests {
             is_request: true,
             is_response: false,
             has_metadata: true,
+            app_flag: true,
         };
         let byte = flags.to_byte();
         let flags2 = ResourceFlags::from_byte(byte);
@@ -2579,6 +2643,8 @@ mod tests {
         assert_eq!(flags.is_request, flags2.is_request);
         assert_eq!(flags.is_response, flags2.is_response);
         assert_eq!(flags.has_metadata, flags2.has_metadata);
+        assert_eq!(flags.app_flag, flags2.app_flag);
+        assert_eq!(byte, 0x6b);
     }
 
     #[test]
@@ -3997,9 +4063,11 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_segment_outbound_too_large() {
-        let data = vec![0; MAX_RESOURCE_SIZE + 1];
-        assert!(MultiSegmentOutbound::new(data, false).is_err());
+    fn test_split_plan_has_no_segment_limit() {
+        let data = vec![0; MAX_EFFICIENT_SIZE * MAX_SEGMENTS + 1];
+        let plan = LazyMultiSegmentOutbound::new(data, false).unwrap();
+        assert_eq!(plan.total_segments, MAX_SEGMENTS + 1);
+        assert_eq!(plan.remaining_segments(), MAX_SEGMENTS + 1);
     }
 
     #[test]

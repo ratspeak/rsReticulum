@@ -246,6 +246,18 @@ impl ResourceAdvertisement {
         Ok(counter.0)
     }
 
+    /// Send the advertisement without its hashmap when the packed form exceeds
+    /// `mdu`; the receiver then asks for segment 0 with `HASHMAP_IS_EMPTY`.
+    pub fn defer_hashmap_if_over(
+        &mut self,
+        mdu: usize,
+    ) -> Result<(), crate::resource::ResourceError> {
+        if self.encoded_len()? > mdu {
+            self.hashmap.clear();
+        }
+        Ok(())
+    }
+
     /// Split `hashmap` into four-byte entries, dropping any incomplete trailing
     /// entry. Validate divisibility first when rejecting malformed input.
     pub fn get_map_hashes(&self) -> Vec<[u8; MAPHASH_LEN]> {

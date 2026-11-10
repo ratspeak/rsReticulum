@@ -51,6 +51,10 @@ pub struct DestinationRuntimeOptions {
     pub stamp_value: Option<f64>,
     /// Announced link-request cost (Python `Destination.set_link_cost`).
     pub link_cost: Option<f64>,
+    /// Largest advertised total size of an inbound Resource, which the
+    /// destination reassembles in memory; `None` accepts any size. See
+    /// [`rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT`].
+    pub inbound_reassembly_limit: Option<usize>,
 }
 
 impl Default for DestinationRuntimeOptions {
@@ -66,6 +70,9 @@ impl Default for DestinationRuntimeOptions {
             channel_message_types: Vec::new(),
             stamp_value: None,
             link_cost: None,
+            inbound_reassembly_limit: Some(
+                rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT,
+            ),
         }
     }
 }
@@ -529,6 +536,7 @@ impl RegisteredDestination {
             manager.enable_persistent_ratchets(ratchet_options.path, ratchet_options.enforce)?;
         }
         manager.set_resource_strategy(options.resource_strategy);
+        manager.set_inbound_reassembly_limit(options.inbound_reassembly_limit);
         manager.set_use_implicit_proof(true);
         if let Some(policy) = options.resource_accept.clone() {
             manager.set_resource_accept_handler(move |link_id, adv| (policy.0)(link_id, adv));
@@ -809,6 +817,7 @@ mod tests {
                     track_phy_stats: false,
                     proof_strategy: rns_identity::destination::ProofStrategy::ProveNone,
                     resource_dir: None,
+                    inbound_reassembly_limit: None,
                 },
             ),
         )

@@ -407,11 +407,18 @@ async fn wait_for_response(
                                 continue;
                             }
                             // Segments are appended as they complete, so only the next one fits.
-                            if adv.total_segments > rns_protocol::resource::MAX_SEGMENTS
-                                || adv.segment_index != completed_segments + 1
+                            if adv.segment_index != completed_segments + 1
                                 || adv.segment_index > adv.total_segments
                             {
                                 continue;
+                            }
+                            if adv.data_size
+                                > rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT
+                            {
+                                return Err(LinkClientError::UnexpectedResponse(format!(
+                                    "response of {} bytes exceeds the in-memory limit",
+                                    adv.data_size
+                                )));
                             }
 
                             let mut random_hash = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
@@ -545,6 +552,13 @@ async fn wait_for_response(
                                 inbound_resources.remove(&rh);
                                 let (segment_index, total_segments, file_response) =
                                     segments.remove(&rh).unwrap_or((1, 1, false));
+                                if split_response.len() + assembled.len()
+                                    > rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT
+                                {
+                                    return Err(LinkClientError::UnexpectedResponse(
+                                        "response exceeds the in-memory limit".into(),
+                                    ));
+                                }
                                 split_response.extend_from_slice(&assembled);
                                 completed_segments = segment_index;
                                 if segment_index < total_segments {

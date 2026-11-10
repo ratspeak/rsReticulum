@@ -39,8 +39,8 @@ use rns_link::link::{
 use rns_protocol::channel::{ChannelError, HandlerId, LinkChannel, MessageCallback};
 use rns_protocol::channel_message::{MessageBase, SMT_STREAM_DATA, SYSTEM_MESSAGE_TYPE_MIN};
 use rns_protocol::resource::{
-    InboundTransfer, MAX_EFFICIENT_SIZE, MAX_SEGMENTS, MultiSegmentInbound, MultiSegmentOutbound,
-    OutboundTransfer, TransferAction,
+    DEFAULT_INBOUND_REASSEMBLY_LIMIT, InboundTransfer, MAX_EFFICIENT_SIZE, MultiSegmentInbound,
+    MultiSegmentOutbound, OutboundTransfer, TransferAction,
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_endpoint_dispatch::{
@@ -97,6 +97,17 @@ enum NextSegment {
     Done,
     Failed(String),
 }
+
+/// An outbound Resource admitted while another one holds the link, as a
+/// Python Resource waits in `QUEUED` until the link is ready for it.
+struct QueuedOutboundResource {
+    resource_id: [u8; 32],
+    first: OutboundTransfer,
+    rest: Option<OutboundSplitQueue>,
+}
+
+/// Bound on outbound Resources waiting for a link, matching the lxmd bridge.
+const MAX_QUEUED_OUTBOUND_RESOURCES: usize = 256;
 
 impl OutboundSplitQueue {
     /// What to do once the current segment is proved.
@@ -899,11 +910,15 @@ pub struct LinkManager {
     request_handler: Option<RequestHandler>,
     /// Destination.max_request_size: larger requests are ignored or rejected.
     max_request_size: Option<usize>,
+    /// Largest advertised total size of an inbound Resource this manager
+    /// reassembles in memory; `None` accepts any size.
+    inbound_reassembly_limit: Option<usize>,
     deferred_request_notify: Arc<tokio::sync::Notify>,
     pending_deferred_requests: Vec<PendingDeferredRequest>,
     deferred_resource_leases: Vec<DeferredResourceLease>,
     /// File response segments being prepared on the blocking pool.
     segment_jobs: Vec<SegmentJob>,
+    queued_outbound_resources: HashMap<[u8; 16], VecDeque<QueuedOutboundResource>>,
     /// Wins over `request_handler` when set; can schedule a resource transfer.
     request_handler_ex: Option<RequestHandlerEx>,
     /// Python-compatible Destination handlers keyed by truncated path hash.
@@ -1029,10 +1044,12 @@ impl LinkManager {
             destination_ratchets: std::sync::RwLock::new(None),
             request_handler: None,
             max_request_size: None,
+            inbound_reassembly_limit: Some(DEFAULT_INBOUND_REASSEMBLY_LIMIT),
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
             pending_deferred_requests: Vec::new(),
             deferred_resource_leases: Vec::new(),
             segment_jobs: Vec::new(),
+            queued_outbound_resources: HashMap::new(),
             request_handler_ex: None,
             destination_request_handlers: HashMap::new(),
             pending_inbound_request_resources: HashSet::new(),
@@ -1130,10 +1147,12 @@ impl LinkManager {
             destination_ratchets: std::sync::RwLock::new(None),
             request_handler: None,
             max_request_size: None,
+            inbound_reassembly_limit: Some(DEFAULT_INBOUND_REASSEMBLY_LIMIT),
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
             pending_deferred_requests: Vec::new(),
             deferred_resource_leases: Vec::new(),
             segment_jobs: Vec::new(),
+            queued_outbound_resources: HashMap::new(),
             request_handler_ex: None,
             destination_request_handlers: HashMap::new(),
             pending_inbound_request_resources: HashSet::new(),
@@ -1310,6 +1329,7 @@ impl LinkManager {
     /// Manual event loops should call this regularly (the built-in loops target
     /// one second); a blocked callback delays timer work.
     pub fn tick(&mut self) {
+        self.activate_queued_outbound_resources();
         self.poll_link_endpoints();
         self.flush_pending_link_control();
         self.flush_pending_destination_announces();
@@ -1350,6 +1370,7 @@ impl LinkManager {
         let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
         loop {
+            self.activate_queued_outbound_resources();
             self.poll_link_endpoints();
             self.flush_pending_link_control();
             self.flush_pending_destination_announces();
@@ -1388,6 +1409,7 @@ impl LinkManager {
         let mut last_tick = std::time::Instant::now();
         let mut events_closed = false;
         'run: loop {
+            self.activate_queued_outbound_resources();
             self.poll_link_endpoints();
             self.flush_pending_link_control();
             self.flush_pending_destination_announces();
@@ -3660,12 +3682,22 @@ impl LinkManager {
                             let is_response = adv.flags.is_response && adv.request_id.is_some();
                             let ordinary_resource = !is_request && !is_response;
 
+                            // A responder has no pending requests, so a response
+                            // Resource never matches one and is ignored silently.
+                            if is_response && !is_request {
+                                tracing::debug!(
+                                    link_id = hex::encode(link_id),
+                                    resource = hex::encode(&adv.resource_hash[..8]),
+                                    "ignoring response Resource with no pending request"
+                                );
+                                break 'adv;
+                            }
+
                             // Structural and logical continuity checks run before
                             // application admission. Once an application accepts a
                             // first segment, every later removal is paired with one
                             // terminal accounting event.
                             if adv.total_segments == 0
-                                || adv.total_segments > MAX_SEGMENTS
                                 || adv.segment_index == 0
                                 || adv.segment_index > adv.total_segments
                             {
@@ -3682,8 +3714,8 @@ impl LinkManager {
                                     resource_id,
                                     adv.resource_hash,
                                     format!(
-                                        "segment metadata is out of range ({}/{}, max {})",
-                                        adv.segment_index, adv.total_segments, MAX_SEGMENTS
+                                        "segment metadata is out of range ({}/{})",
+                                        adv.segment_index, adv.total_segments
                                     ),
                                 );
                                 break 'adv;
@@ -3864,6 +3896,41 @@ impl LinkManager {
                                         "ignoring inbound Resource advertisement by policy"
                                     );
                                 }
+                                break 'adv;
+                            }
+
+                            if self
+                                .inbound_reassembly_limit
+                                .is_some_and(|limit| adv.data_size > limit)
+                            {
+                                let cancel_sent = Self::send_resource_action(
+                                    &self.transport_tx,
+                                    &mut self.pending_link_control,
+                                    &mut self.pending_endpoint_sends,
+                                    active,
+                                    &link_id,
+                                    TransferAction::SendCancel(
+                                        rns_protocol::resource::CancelType::Rcl,
+                                        adv.resource_hash,
+                                    ),
+                                );
+                                Self::conclude_inbound_failure(
+                                    active,
+                                    &mut self.active_inbound_lifecycles,
+                                    &mut self.pending_inbound_request_resources,
+                                    &self.resource_event_tx,
+                                    &self.accounting_event_tx,
+                                    link_id,
+                                    resource_id,
+                                    LinkResourceConclusion::Rejected,
+                                );
+                                tracing::debug!(
+                                    link_id = hex::encode(link_id),
+                                    resource = hex::encode(&adv.resource_hash[..8]),
+                                    size = adv.data_size,
+                                    cancel_sent,
+                                    "rejected Resource above the inbound reassembly limit"
+                                );
                                 break 'adv;
                             }
 
@@ -4163,6 +4230,53 @@ impl LinkManager {
                             let resource_id = Self::inbound_resource_identity(active, &rh).0;
                             match completion {
                                 Some(Ok((assembled_data, proof))) => {
+                                    let received_before = active
+                                        .segment_routing
+                                        .get(&rh)
+                                        .and_then(|route| {
+                                            active.inbound_split_resources.get(&route.original_hash)
+                                        })
+                                        .map_or(0, |coordinator| coordinator.data_size);
+                                    let size_bound = self
+                                        .active_inbound_lifecycles
+                                        .get(&(link_id, resource_id))
+                                        .map_or(usize::MAX, |lifecycle| lifecycle.data_size)
+                                        .min(self.inbound_reassembly_limit.unwrap_or(usize::MAX));
+                                    let overflow = received_before
+                                        .saturating_add(assembled_data.len())
+                                        > size_bound;
+                                    if overflow {
+                                        let cancel_sent = Self::send_resource_action(
+                                            &self.transport_tx,
+                                            &mut self.pending_link_control,
+                                            &mut self.pending_endpoint_sends,
+                                            active,
+                                            &link_id,
+                                            TransferAction::SendCancel(
+                                                rns_protocol::resource::CancelType::Rcl,
+                                                rh,
+                                            ),
+                                        );
+                                        Self::conclude_inbound_failure(
+                                            active,
+                                            &mut self.active_inbound_lifecycles,
+                                            &mut self.pending_inbound_request_resources,
+                                            &self.resource_event_tx,
+                                            &self.accounting_event_tx,
+                                            link_id,
+                                            resource_id,
+                                            LinkResourceConclusion::Failed(
+                                                "received more data than advertised".into(),
+                                            ),
+                                        );
+                                        tracing::warn!(
+                                            link_id = hex::encode(link_id),
+                                            resource = hex::encode(&resource_id[..8]),
+                                            cancel_sent,
+                                            "split Resource exceeded its size bound"
+                                        );
+                                        break 'resource_part;
+                                    }
                                     // PROOF+RESOURCE_PRF = plaintext, PacketType::Proof
                                     // (Packet.py:195-197). Each split segment still needs its
                                     // own proof or the sender retries.
@@ -5174,12 +5288,15 @@ impl LinkManager {
         }
         let inbound_resource_ids =
             Self::active_inbound_logical_ids(&self.active_inbound_lifecycles, link_id);
-        let outbound_resource_ids: HashSet<[u8; 32]> = active
+        let mut outbound_resource_ids: HashSet<[u8; 32]> = active
             .outbound_resources
             .values()
             .map(Self::outbound_resource_identity)
             .map(|identity| identity.0)
             .collect();
+        if let Some(queue) = self.queued_outbound_resources.remove(&link_id) {
+            outbound_resource_ids.extend(queue.into_iter().map(|queued| queued.resource_id));
+        }
 
         if send_teardown && ownership.is_some() {
             if let Some(teardown_data) = active.link.teardown(reason) {
@@ -6382,33 +6499,17 @@ impl LinkManager {
         let resource_key = first.logical_hash;
         let total_segments = first.total_segments;
         let data_size = first.data_size;
-        if Self::start_outbound_transfer(
-            &self.transport_tx,
-            &mut self.pending_link_control,
-            &mut self.pending_endpoint_sends,
-            active,
-            &link_id,
-            first.transfer,
-        )
-        .is_none()
+        let rest = (!source.is_exhausted()).then(|| {
+            OutboundSplitQueue::Source(Box::new(StreamedSegments {
+                source: Some(source),
+                ..StreamedSegments::default()
+            }))
+        });
+        if self
+            .admit_outbound_resource(&link_id, resource_key, first.transfer, rest)
+            .is_none()
         {
             return warn("could not retain the Resource advertisement");
-        }
-        if !source.is_exhausted() {
-            let mut streamed = StreamedSegments::default();
-            match Self::spawn_next_segment(&self.deferred_request_notify, &active.link, source) {
-                Some(output) => self.segment_jobs.push(SegmentJob {
-                    link_id,
-                    kind: SegmentJobKind::Next {
-                        resource_id: resource_key,
-                    },
-                    output,
-                }),
-                None => streamed.failed = Some("link keys are unavailable".into()),
-            }
-            active
-                .outbound_split_queues
-                .insert(resource_key, OutboundSplitQueue::Source(Box::new(streamed)));
         }
         Self::emit_resource_event(
             &self.resource_event_tx,
@@ -6518,16 +6619,24 @@ impl LinkManager {
     fn poll_deferred_requests(&mut self) -> bool {
         let segments_progressed = self.poll_segment_jobs();
         self.deferred_resource_leases.retain(|pending| {
-            self.active_links
+            self.queued_outbound_resources
                 .get(&pending.link_id)
-                .is_some_and(|active| {
-                    active
-                        .outbound_split_queues
-                        .contains_key(&pending.resource_id)
-                        || active.outbound_resources.values().any(|transfer| {
-                            Self::outbound_resource_identity(transfer).0 == pending.resource_id
-                        })
+                .is_some_and(|queue| {
+                    queue
+                        .iter()
+                        .any(|queued| queued.resource_id == pending.resource_id)
                 })
+                || self
+                    .active_links
+                    .get(&pending.link_id)
+                    .is_some_and(|active| {
+                        active
+                            .outbound_split_queues
+                            .contains_key(&pending.resource_id)
+                            || active.outbound_resources.values().any(|transfer| {
+                                Self::outbound_resource_identity(transfer).0 == pending.resource_id
+                            })
+                    })
         });
         let mut progressed = false;
         let mut waiting = Vec::new();
@@ -6726,6 +6835,14 @@ impl LinkManager {
     /// any size.
     pub fn set_max_request_size(&mut self, limit: Option<usize>) {
         self.max_request_size = limit;
+    }
+
+    /// Bound the advertised total size of inbound Resources, which this
+    /// manager reassembles in memory. Larger advertisements are refused with a
+    /// cancel before admission. Defaults to
+    /// [`DEFAULT_INBOUND_REASSEMBLY_LIMIT`]; `None` accepts any size.
+    pub fn set_inbound_reassembly_limit(&mut self, limit: Option<usize>) {
+        self.inbound_reassembly_limit = limit;
     }
 
     /// Remove the request handler registered for `path`.
@@ -7441,7 +7558,27 @@ impl LinkManager {
                                 .then_some(*segment_hash)
                         });
                 let Some(segment_hash) = segment_hash else {
-                    return false;
+                    let Some(queue) = self.queued_outbound_resources.get_mut(link_id) else {
+                        return false;
+                    };
+                    let Some(position) = queue
+                        .iter()
+                        .position(|queued| queued.resource_id == *resource_id)
+                    else {
+                        return false;
+                    };
+                    queue.remove(position);
+                    Self::emit_resource_event(
+                        &self.resource_event_tx,
+                        &self.accounting_event_tx,
+                        LinkResourceEvent::Concluded {
+                            link_id: *link_id,
+                            resource_id: *resource_id,
+                            direction,
+                            conclusion: LinkResourceConclusion::Cancelled,
+                        },
+                    );
+                    return true;
                 };
                 let logical_id = active
                     .outbound_resources
@@ -7803,19 +7940,8 @@ impl LinkManager {
             .map(|resource| OutboundTransfer::from_prebuilt(resource, rtt))
             .collect();
         let first = transfers.pop_front()?;
-        Self::start_outbound_transfer(
-            &self.transport_tx,
-            &mut self.pending_link_control,
-            &mut self.pending_endpoint_sends,
-            active,
-            link_id,
-            first,
-        )?;
-        if !transfers.is_empty() {
-            active
-                .outbound_split_queues
-                .insert(resource_key, OutboundSplitQueue::Prebuilt(transfers));
-        }
+        let rest = (!transfers.is_empty()).then_some(OutboundSplitQueue::Prebuilt(transfers));
+        self.admit_outbound_resource(link_id, resource_key, first, rest)?;
         Self::emit_resource_event(
             &self.resource_event_tx,
             &self.accounting_event_tx,
@@ -7831,6 +7957,149 @@ impl LinkManager {
         Some(resource_key)
     }
 
+    fn outbound_busy(active: &ActiveLink) -> bool {
+        !active.outbound_resources.is_empty() || !active.outbound_split_queues.is_empty()
+    }
+
+    /// Advertise now if the link carries no outgoing Resource, else queue it.
+    fn admit_outbound_resource(
+        &mut self,
+        link_id: &[u8; 16],
+        resource_id: [u8; 32],
+        first: OutboundTransfer,
+        rest: Option<OutboundSplitQueue>,
+    ) -> Option<()> {
+        let active = self.active_links.get_mut(link_id)?;
+        let queued = self
+            .queued_outbound_resources
+            .get(link_id)
+            .is_some_and(|queue| !queue.is_empty());
+        if Self::outbound_busy(active) || queued {
+            let queue = self.queued_outbound_resources.entry(*link_id).or_default();
+            if queue.len() >= MAX_QUEUED_OUTBOUND_RESOURCES {
+                tracing::warn!(
+                    link_id = hex::encode(link_id),
+                    "outbound Resource queue is full"
+                );
+                return None;
+            }
+            queue.push_back(QueuedOutboundResource {
+                resource_id,
+                first,
+                rest,
+            });
+            return Some(());
+        }
+        Self::start_outbound_transfer(
+            &self.transport_tx,
+            &mut self.pending_link_control,
+            &mut self.pending_endpoint_sends,
+            active,
+            link_id,
+            first,
+        )?;
+        if let Some(rest) = rest {
+            Self::install_split_queue(
+                &mut self.segment_jobs,
+                &self.deferred_request_notify,
+                active,
+                *link_id,
+                resource_id,
+                rest,
+            );
+        }
+        Some(())
+    }
+
+    /// Hold a split Resource's remaining segments; a streamed source starts
+    /// preparing its next segment only once the Resource is advertised.
+    fn install_split_queue(
+        segment_jobs: &mut Vec<SegmentJob>,
+        notify: &Arc<tokio::sync::Notify>,
+        active: &mut ActiveLink,
+        link_id: [u8; 16],
+        resource_id: [u8; 32],
+        mut rest: OutboundSplitQueue,
+    ) {
+        if let OutboundSplitQueue::Source(streamed) = &mut rest
+            && streamed.ready.is_none()
+            && let Some(source) = streamed.source.take()
+        {
+            match Self::spawn_next_segment(notify, &active.link, source) {
+                Some(output) => segment_jobs.push(SegmentJob {
+                    link_id,
+                    kind: SegmentJobKind::Next { resource_id },
+                    output,
+                }),
+                None => streamed.failed = Some("link keys are unavailable".into()),
+            }
+        }
+        active.outbound_split_queues.insert(resource_id, rest);
+    }
+
+    fn activate_queued_outbound_resources(&mut self) {
+        if self.queued_outbound_resources.is_empty() {
+            return;
+        }
+        let link_ids: Vec<[u8; 16]> = self.queued_outbound_resources.keys().copied().collect();
+        for link_id in link_ids {
+            let Some(active) = self.active_links.get_mut(&link_id) else {
+                self.queued_outbound_resources.remove(&link_id);
+                continue;
+            };
+            while !Self::outbound_busy(active) {
+                let Some(next) = self
+                    .queued_outbound_resources
+                    .get_mut(&link_id)
+                    .and_then(VecDeque::pop_front)
+                else {
+                    break;
+                };
+                if Self::start_outbound_transfer(
+                    &self.transport_tx,
+                    &mut self.pending_link_control,
+                    &mut self.pending_endpoint_sends,
+                    active,
+                    &link_id,
+                    next.first,
+                )
+                .is_some()
+                {
+                    if let Some(rest) = next.rest {
+                        Self::install_split_queue(
+                            &mut self.segment_jobs,
+                            &self.deferred_request_notify,
+                            active,
+                            link_id,
+                            next.resource_id,
+                            rest,
+                        );
+                    }
+                } else {
+                    Self::emit_resource_event(
+                        &self.resource_event_tx,
+                        &self.accounting_event_tx,
+                        LinkResourceEvent::Concluded {
+                            link_id,
+                            resource_id: next.resource_id,
+                            direction: LinkResourceDirection::Outbound,
+                            conclusion: LinkResourceConclusion::Failed(
+                                "could not advertise queued Resource".into(),
+                            ),
+                        },
+                    );
+                }
+            }
+            if self
+                .queued_outbound_resources
+                .get(&link_id)
+                .is_some_and(VecDeque::is_empty)
+            {
+                self.queued_outbound_resources.remove(&link_id);
+            }
+        }
+    }
+
     fn start_outbound_transfer(
         transport_tx: &mpsc::Sender<TransportMessage>,
         pending_link_control: &mut VecDeque<TransportMessage>,
@@ -7839,6 +8108,7 @@ impl LinkManager {
         link_id: &[u8; 16],
         mut transfer: OutboundTransfer,
     ) -> Option<[u8; 32]> {
+        transfer.advertisement_mdu = active.link.mdu;
         let action = transfer.tick();
         let adv_data = match action {
             TransferAction::SendAdvertisement(adv) => adv,
@@ -9364,7 +9634,11 @@ mod tests {
         assert_eq!(active.link.state, LinkState::Active);
         assert!(!active.outbound_resources.contains_key(&failed));
         assert!(!active.outbound_split_queues.contains_key(&failed));
-        assert!(active.outbound_resources.contains_key(&sibling));
+        assert!(
+            manager.queued_outbound_resources[&id]
+                .iter()
+                .any(|queued| queued.resource_id == sibling)
+        );
         assert!(
             matches!(receipts.try_recv().unwrap(), LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Concluded {resource_id, conclusion:LinkResourceConclusion::Failed(_), ..}) if resource_id == failed)
         );
@@ -9375,6 +9649,13 @@ mod tests {
             next_transport_message(&mut outgoing).is_err(),
             "oversized advertisement must never be emitted"
         );
+        manager.activate_queued_outbound_resources();
+        assert!(
+            manager.active_links[&id]
+                .outbound_resources
+                .contains_key(&sibling)
+        );
+        assert!(next_transport_message(&mut outgoing).is_ok());
     }
 
     #[test]
@@ -13569,6 +13850,8 @@ mod tests {
             segment.segment_index = i + 1;
             segment.total_segments = total_segments;
             segment.original_hash = Some(original_hash);
+            // Every segment advertises the whole transfer's size, as upstream does.
+            segment.advertisement_data_size = payload.len();
 
             let mut transfer = OutboundTransfer::from_prebuilt(segment, rtt);
             let action = transfer.tick();
@@ -13703,6 +13986,159 @@ mod tests {
         );
     }
 
+    /// Drive a two-segment split Resource whose advertisements claim
+    /// `advertised` bytes into a manager with the given reassembly limit and
+    /// return the accounting events and the context of every control packet.
+    fn drive_split_with_advertised_size(
+        advertised: usize,
+        limit: Option<usize>,
+    ) -> (
+        Vec<LinkManagerAccountingEvent>,
+        Vec<rns_wire::context::PacketContext>,
+    ) {
+        use rns_protocol::resource::OutboundResource;
+
+        let (sender_link, receiver_link) = handshaken_link_pair();
+        let link_id = receiver_link.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(4096);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xBB; 16], None);
+        lm.set_inbound_reassembly_limit(limit);
+        let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
+        lm.set_accounting_event_channel(accounting_tx);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                interface_owner: None,
+                endpoint_authority: None,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let encrypt_fn = |d: &[u8]| sender_link.encrypt(d).expect("link encrypt");
+        let mut contexts = Vec::new();
+        for index in 1..=2 {
+            let chunk = vec![index as u8; 8 * 1024];
+            let mut segment =
+                OutboundResource::with_options(chunk, false, None, None, Some(&encrypt_fn))
+                    .expect("build segment");
+            segment.flags.split = true;
+            segment.segment_index = index;
+            segment.total_segments = 2;
+            segment.original_hash = Some([0x5B; 32]);
+            segment.advertisement_data_size = advertised;
+            let mut transfer =
+                OutboundTransfer::from_prebuilt(segment, std::time::Duration::from_millis(50));
+            let TransferAction::SendAdvertisement(adv) = transfer.tick() else {
+                panic!("expected an advertisement");
+            };
+            lm.handle_inbound_packet(&resource_advertisement_packet(&sender_link, &adv), 1);
+            let segment_hash = transfer.resource.resource_hash;
+            let total_parts = transfer.resource.parts.len();
+            if let Some(inbound) = lm
+                .active_links
+                .get_mut(&link_id)
+                .and_then(|active| active.inbound_resources.get_mut(&segment_hash))
+            {
+                inbound.resource.window.window = total_parts;
+                inbound.outstanding_parts = total_parts;
+                for part in &transfer.resource.parts {
+                    lm.handle_inbound_packet(&resource_data_packet(&sender_link, part), 1);
+                }
+            }
+            while let Ok(message) = next_transport_message(&mut transport_rx) {
+                let raw = match message {
+                    TransportMessage::Outbound(request)
+                    | TransportMessage::OutboundAttached { request, .. } => request.raw,
+                    _ => continue,
+                };
+                contexts.push(
+                    rns_wire::header::PacketHeader::unpack(&raw)
+                        .unwrap()
+                        .0
+                        .context,
+                );
+            }
+        }
+        let mut events = Vec::new();
+        while let Ok(event) = accounting_rx.try_recv() {
+            events.push(event);
+        }
+        (events, contexts)
+    }
+
+    fn inbound_conclusion(
+        events: &[LinkManagerAccountingEvent],
+    ) -> Option<&LinkResourceConclusion> {
+        events.iter().find_map(|event| match event {
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Concluded {
+                conclusion,
+                ..
+            }) => Some(conclusion),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn inbound_split_resource_above_reassembly_limit_is_refused() {
+        let size = 16 * 1024;
+        let (events, contexts) = drive_split_with_advertised_size(size, Some(size - 1));
+        assert_eq!(
+            contexts.first(),
+            Some(&rns_wire::context::PacketContext::ResourceRcl),
+            "the first advertisement is refused with a cancel"
+        );
+        assert!(
+            !contexts.contains(&rns_wire::context::PacketContext::ResourceReq),
+            "no part of a refused Resource is requested"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LinkManagerAccountingEvent::ResourceCompletion(_)))
+        );
+
+        let (events, _) = drive_split_with_advertised_size(size, Some(size));
+        assert!(matches!(
+            inbound_conclusion(&events),
+            Some(LinkResourceConclusion::Complete)
+        ));
+        let (events, _) = drive_split_with_advertised_size(size, None);
+        assert!(matches!(
+            inbound_conclusion(&events),
+            Some(LinkResourceConclusion::Complete)
+        ));
+    }
+
+    #[test]
+    fn inbound_split_resource_sending_more_than_advertised_is_cut_off() {
+        let (events, contexts) = drive_split_with_advertised_size(8 * 1024 + 1, None);
+        assert!(matches!(
+            inbound_conclusion(&events),
+            Some(LinkResourceConclusion::Failed(_))
+        ));
+        assert_eq!(
+            contexts.last(),
+            Some(&rns_wire::context::PacketContext::ResourceRcl),
+            "the overflowing segment is cancelled, not proved"
+        );
+        assert_eq!(
+            contexts
+                .iter()
+                .filter(|context| **context == rns_wire::context::PacketContext::ResourcePrf)
+                .count(),
+            1,
+            "only the segment within the advertised size is proved"
+        );
+    }
+
     #[test]
     fn one_segment_split_uses_original_hash_for_completion_and_terminal() {
         let (sender_link, receiver_link) = handshaken_link_pair();
@@ -13791,11 +14227,11 @@ mod tests {
         assert!(manager.active_inbound_lifecycles.is_empty());
     }
 
-    /// MAX_SEGMENTS cap: oversized `total_segments` is rejected without
-    /// allocating a coordinator (would OOM `Vec` otherwise).
+    /// Any `total_segments` is admitted, as upstream has no segment limit, and
+    /// the coordinator allocates nothing per advertised segment.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_split_resource_rejects_oversized_total_segments() {
-        use rns_protocol::resource::{MAX_SEGMENTS, ResourceFlags};
+    async fn test_split_resource_admits_large_total_segments_without_allocation() {
+        use rns_protocol::resource::ResourceFlags;
         use rns_protocol::resource_adv::ResourceAdvertisement;
 
         let (sender_link, receiver_link) = handshaken_link_pair();
@@ -13827,7 +14263,7 @@ mod tests {
             },
         );
 
-        let evil_total = MAX_SEGMENTS + 1;
+        let large_total = 1_000_000;
         let mut adv = ResourceAdvertisement::with_metadata_size(
             64,
             32,
@@ -13844,7 +14280,7 @@ mod tests {
         );
         adv.original_hash = [0x99; 32];
         adv.segment_index = 1;
-        adv.total_segments = evil_total;
+        adv.total_segments = large_total;
 
         let adv_bytes = adv.pack();
         let encrypted = sender_link.encrypt(&adv_bytes).expect("encrypt");
@@ -13865,28 +14301,36 @@ mod tests {
         raw.extend_from_slice(&encrypted);
         lm.handle_inbound_packet(&raw, 1);
 
+        {
+            let active = lm.active_links.get(&link_id).expect("link still present");
+            let coordinator = active
+                .inbound_split_resources
+                .get(&[0x99; 32])
+                .expect("large split resource admitted");
+            assert_eq!(coordinator.total_segments, large_total);
+            assert!(coordinator.segments.capacity() == 0);
+            assert!(coordinator.assembled_segments.capacity() == 0);
+            assert_eq!(active.inbound_resources.len(), 1);
+        }
+        assert_eq!(decision_calls.load(Ordering::SeqCst), 1);
+
+        adv.resource_hash = [0x43; 32];
+        adv.original_hash = [0x98; 32];
         adv.total_segments = 1;
         adv.segment_index = 0;
         adv.flags.split = false;
         lm.handle_inbound_packet(&resource_advertisement_packet(&sender_link, &adv.pack()), 1);
 
         let active = lm.active_links.get(&link_id).expect("link still present");
-        assert!(
-            active.inbound_split_resources.is_empty(),
-            "no coordinator must be allocated for an over-cap total_segments"
-        );
-        assert!(
-            active.segment_routing.is_empty(),
-            "no routing must be inserted for a rejected ADV"
-        );
-        assert!(
-            active.inbound_resources.is_empty(),
-            "no per-segment transfer must be opened for a rejected ADV"
+        assert_eq!(
+            active.inbound_resources.len(),
+            1,
+            "segment index 0 must not open a transfer"
         );
         assert_eq!(
             decision_calls.load(Ordering::SeqCst),
-            0,
-            "structurally invalid split Resources must not reserve application state"
+            1,
+            "structurally invalid Resources must not reserve application state"
         );
     }
 

@@ -1186,6 +1186,10 @@ pub struct LinkConnectOptions {
     pub identify: bool,
     /// Retain RSSI, SNR and quality measurements reported by interfaces.
     pub track_phy_stats: bool,
+    /// Largest advertised total size of an inbound Resource the session
+    /// reassembles in memory; `None` accepts any size. See
+    /// [`rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT`].
+    pub inbound_reassembly_limit: Option<usize>,
 }
 
 impl Default for LinkConnectOptions {
@@ -1196,6 +1200,9 @@ impl Default for LinkConnectOptions {
             client_label: "rns-runtime.link".to_string(),
             identify: false,
             track_phy_stats: false,
+            inbound_reassembly_limit: Some(
+                rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT,
+            ),
         }
     }
 }
@@ -1570,6 +1577,7 @@ impl ReticulumHandle {
             track_phy_stats: options.track_phy_stats,
             proof_strategy: rns_identity::destination::ProofStrategy::ProveNone,
             resource_dir: Some(StoragePaths::from_config_dir(&self.config_dir).resource_dir),
+            inbound_reassembly_limit: options.inbound_reassembly_limit,
         })
     }
 
@@ -13194,6 +13202,7 @@ loglevel = 7
             client_label: "example.client".to_string(),
             identify: true,
             track_phy_stats: true,
+            inbound_reassembly_limit: Some(7),
         };
         let config = handle
             .resolve_link_session_config(destination_hash, &options)
@@ -13206,6 +13215,7 @@ loglevel = 7
         assert_eq!(config.client_label, "example.client");
         assert!(config.track_phy_stats);
         assert!(config.identify);
+        assert_eq!(config.inbound_reassembly_limit, Some(7));
         responder.await.unwrap();
     }
 

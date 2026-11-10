@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use rns_link::key_derivation::LinkKeys;
 use rns_protocol::resource::{
-    MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MAX_SEGMENTS, OutboundResource, OutboundTransfer,
-    ResourceError,
+    MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, OutboundResource, OutboundTransfer, ResourceError,
 };
 use sha2::{Digest, Sha256};
 
@@ -68,7 +67,7 @@ impl From<bool> for AutoCompress {
 pub enum ResourceSourceError {
     #[error("resource source I/O failed: {0}")]
     Io(#[from] io::Error),
-    #[error("resource source exceeds the supported {MAX_RESOURCE_SIZE}-byte limit")]
+    #[error("resource source size does not fit in memory addresses on this platform")]
     TooLarge,
     #[error("resource metadata leaves no valid bounded segment plan")]
     TooManySegments,
@@ -219,11 +218,8 @@ impl PreparedResourceSource {
                 source.seek(SeekFrom::End(0))?
             }
         };
-        if data_size > MAX_RESOURCE_SIZE as u64 {
-            return Err(ResourceSourceError::TooLarge);
-        }
+        let data_size = usize::try_from(data_size).map_err(|_| ResourceSourceError::TooLarge)?;
         source.seek(SeekFrom::Start(0))?;
-        let data_size = data_size as usize;
         match auto_compress {
             Some(policy) => options.auto_compress = policy.applies_to(data_size),
             None => options.auto_compress &= AutoCompress::On.applies_to(data_size),
@@ -262,9 +258,6 @@ impl PreparedResourceSource {
         let first_len = data_size.min(first_payload_size);
         let remaining = data_size.saturating_sub(first_len);
         let total_segments = 1 + remaining.div_ceil(MAX_EFFICIENT_SIZE);
-        if total_segments > MAX_SEGMENTS {
-            return Err(ResourceSourceError::TooManySegments);
-        }
 
         let random_hash: [u8; 4] = rns_crypto::random::random_bytes(4)
             .try_into()

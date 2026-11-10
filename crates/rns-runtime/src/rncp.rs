@@ -443,6 +443,8 @@ pub async fn spawn_rncp_listener(
     let (identified_tx, mut identified_rx) = mpsc::channel::<([u8; 16], [u8; 16])>(64);
     link_mgr.set_link_identified_channel(identified_tx);
     link_mgr.set_resource_strategy(ResourceStrategy::AcceptApp);
+    // Received files are handed to storage, as upstream rncp moves its file.
+    link_mgr.set_inbound_reassembly_limit(None);
     let link_identities = link_mgr.link_identities_handle();
     let push_allowed = Arc::clone(&allowed_set);
     link_mgr.set_resource_accept_handler(move |link_id, _adv| {
@@ -1074,6 +1076,7 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
         progress_span,
     } = request;
 
+    transfer.advertisement_mdu = link.mdu;
     let total = transfer.resource.parts.len();
     if let Some(ref tx) = progress_tx {
         let _ = tx.try_send(if total == 0 {
@@ -1451,9 +1454,7 @@ pub struct RncpFetchRequest<'a> {
 /// proof is sent before this local write. Filename collision handling follows
 /// [`RncpListenerConfig`].
 pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchOutcome, RncpError> {
-    use rns_protocol::resource::{
-        InboundTransfer, MAX_SEGMENTS, MultiSegmentInbound, TransferAction,
-    };
+    use rns_protocol::resource::{InboundTransfer, MultiSegmentInbound, TransferAction};
 
     let RncpFetchRequest {
         transport_tx,
@@ -1633,21 +1634,23 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                         continue;
                     };
                     if adv.total_segments > 1 {
-                        if adv.total_segments > MAX_SEGMENTS
-                            || adv.segment_index == 0
-                            || adv.segment_index > adv.total_segments
-                        {
+                        if adv.segment_index == 0 || adv.segment_index > adv.total_segments {
                             break Err(RncpError::ResourceFailed(
                                 "invalid split-resource advertisement".into(),
                             ));
                         }
                         let coord = split_resources.entry(adv.original_hash).or_insert_with(|| {
                             MultiSegmentInbound::new(adv.total_segments, adv.original_hash)
+                                .with_size_bound(adv.data_size)
                         });
                         if coord.total_segments != adv.total_segments {
                             break Err(RncpError::ResourceFailed(
                                 "split-resource total_segments changed".into(),
                             ));
+                        }
+                        // Upstream advertises segments in order; anything else is stale.
+                        if adv.segment_index != coord.assembled_count() + 1 {
+                            continue;
                         }
                         segment_routes
                             .insert(adv.resource_hash, (adv.original_hash, adv.segment_index));

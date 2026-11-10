@@ -1,8 +1,8 @@
 //! Checked admission for fixed-stride Resource control frames.
 //! A decoder profile is not a promise that the transport can carry a control.
 use crate::resource::{
-    MAPHASH_LEN, MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MAX_SEGMENTS, RANDOM_HASH_SIZE,
-    ResourceError, ResourceFlags, SDU, WINDOW_MAX,
+    MAPHASH_LEN, MAX_EFFICIENT_SIZE, RANDOM_HASH_SIZE, ResourceError, ResourceFlags, SDU,
+    WINDOW_MAX,
 };
 use crate::resource_adv::ResourceAdvertisement;
 use rns_wire::context::PacketContext;
@@ -99,9 +99,6 @@ pub(crate) fn preflight_outbound_with_sdu(
     if part_sdu == 0 {
         return Err(ResourceError::InvalidAdvertisement);
     }
-    if data_len > MAX_RESOURCE_SIZE {
-        return Err(ResourceError::TooLarge);
-    }
     let metadata_wire = metadata_len
         .map(|n| n.checked_add(3).ok_or(ResourceError::MetadataTooLarge))
         .transpose()?
@@ -116,9 +113,6 @@ pub(crate) fn preflight_outbound_with_sdu(
     let total_segments = 1usize
         .checked_add(data_len.saturating_sub(first).div_ceil(MAX_EFFICIENT_SIZE))
         .ok_or(ResourceError::TooLarge)?;
-    if total_segments > MAX_SEGMENTS {
-        return Err(ResourceError::TooLarge);
-    }
     // Request ID storage is bounded by the packet before copying into the small
     // temporary advertisement. No attacker-sized allocation precedes admission.
     if let Some(id) = request_id {
@@ -154,6 +148,7 @@ pub(crate) fn preflight_outbound_with_sdu(
             is_request: request_id.is_some() && !is_response,
             is_response,
             has_metadata: metadata_len.is_some(),
+            app_flag: false,
         },
         &hashes[..parts.min(HASHMAP_STRIDE)],
         rns_wire::constants::LINK_MDU,
@@ -161,6 +156,7 @@ pub(crate) fn preflight_outbound_with_sdu(
     advertisement.segment_index = total_segments;
     advertisement.total_segments = total_segments;
     advertisement.request_id = request_id.map(<[u8]>::to_vec);
+    advertisement.defer_hashmap_if_over(rns_wire::constants::LINK_MDU)?;
     check_advertisement(&advertisement, mtu)?;
     // HMU uses the production MessagePack encoder and largest possible segment
     // index for this admitted source. At most 296 hashmap octets are materialized.
@@ -230,6 +226,7 @@ mod tests {
                 is_request: request_id.is_some(),
                 is_response: false,
                 has_metadata: false,
+                app_flag: false,
             },
             &[[3; 4]; 74],
             rns_wire::constants::LINK_MDU,
