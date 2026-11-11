@@ -1661,7 +1661,8 @@ impl Link {
                 if send_keepalive {
                     self.keepalive.mark_keepalive_sent_at(now);
                 }
-                if self.keepalive.is_stale_at(now) {
+                // Link.py's initiator only reaches STALE on a pass that also sends a keepalive.
+                if self.keepalive.is_stale_at(now) && (send_keepalive || !self.is_initiator) {
                     self.state = LinkState::Stale;
                     self.stale_since = Some(now);
                     tracing::debug!(link_id = ?self.link_id, "link state -> Stale");
@@ -3689,6 +3690,43 @@ mod tests {
             ));
             assert_eq!(responder.state, LinkState::Closed);
             assert_eq!(responder.teardown_reason, Some(CloseReason::Timeout));
+        }
+    }
+
+    /// Link.py's initiator goes STALE only on a watchdog pass that also sends a
+    /// keepalive (Link.py:836-843), whatever the phase of a 1 s tick.
+    #[test]
+    fn initiator_sends_a_keepalive_on_the_tick_it_goes_stale() {
+        for phase_ms in [0u64, 300, 600, 900] {
+            let (mut initiator, _, _) = make_active_link();
+            initiator
+                .keepalive
+                .update_from_rtt(Duration::from_millis(10));
+            let base = Instant::now();
+            initiator.keepalive.activated_at = Some(base);
+            initiator.keepalive.last_inbound = base;
+            initiator.keepalive.last_outbound = None;
+            initiator.keepalive.last_keepalive_sent = None;
+            initiator.keepalive.last_proof = None;
+            let mut sent = 0;
+            for n in 0..30u64 {
+                let now = base + Duration::from_millis(phase_ms + n * 1000);
+                // No reply ever arrives.
+                let action = initiator.tick_at(now);
+                if matches!(action, LinkAction::SendKeepalive) {
+                    sent += 1;
+                }
+                if initiator.state == LinkState::Stale {
+                    assert_eq!(
+                        action,
+                        LinkAction::TransitionedToStale,
+                        "phase {phase_ms} ms: STALE at tick {n} without a keepalive"
+                    );
+                    assert_eq!(sent, 1, "phase {phase_ms} ms");
+                    break;
+                }
+            }
+            assert_eq!(initiator.state, LinkState::Stale, "phase {phase_ms} ms");
         }
     }
 

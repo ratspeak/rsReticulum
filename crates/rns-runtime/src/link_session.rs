@@ -5810,7 +5810,7 @@ mod tests {
         // application packet models a peer heartbeat arriving during the
         // recoverable stale grace period.
         initiator.keepalive.stale_time = Duration::ZERO;
-        initiator.keepalive.keepalive_interval = Duration::from_secs(60);
+        initiator.keepalive.keepalive_interval = Duration::ZERO;
 
         let link_id = initiator.link_id;
         let mdu = initiator.mdu;
@@ -5862,6 +5862,11 @@ mod tests {
                 .await
                 .unwrap(),
             Some(LinkSessionEvent::Stale)
+        );
+        let keepalive = next_initiator_endpoint(&mut transport_rx).await;
+        assert_eq!(
+            keepalive.raw.last(),
+            Some(&rns_link::constants::KEEPALIVE_REQUEST)
         );
 
         let inbound_ciphertext = responder.encrypt(b"ping").unwrap();
