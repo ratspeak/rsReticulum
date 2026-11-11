@@ -26,6 +26,10 @@ pub const STALE_GRACE: f64 = 5.0;
 
 pub const KEEPALIVE_MAX: f64 = 360.0;
 pub const KEEPALIVE_MIN: f64 = 5.0;
+/// Fraction of the interval an initiator waits past it before a keepalive,
+/// so the responder's full-interval reply check passes. Not in upstream,
+/// whose watchdog oversleeps by a few milliseconds to the same effect.
+pub const KEEPALIVE_SEND_MARGIN: f64 = 0.05;
 pub const KEEPALIVE_DEFAULT: f64 = 360.0;
 
 /// Stale threshold as a multiple of keepalive interval.

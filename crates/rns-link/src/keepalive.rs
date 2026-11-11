@@ -83,7 +83,11 @@ impl KeepaliveState {
     }
 
     pub(crate) fn should_send_keepalive_at(&self, now: Instant) -> bool {
-        let interval = self.keepalive_interval;
+        // Upstream's responder answers only when a full interval has passed
+        // since its own last packet (Link.py:1219@1.6.0), which is its reply
+        // to the previous keepalive: a request sent exactly on the interval
+        // arrives a moment early by the responder's clock and gets no reply.
+        let interval = self.keepalive_interval.mul_f64(1.0 + KEEPALIVE_SEND_MARGIN);
         let inbound_elapsed = now.saturating_duration_since(self.peer_evidence());
         let outbound_elapsed = self
             .last_outbound
@@ -251,7 +255,8 @@ mod tests {
         state.last_keepalive_sent = Some(now - Duration::from_secs(4));
 
         assert!(!state.should_send_keepalive_at(now));
-        assert!(state.should_send_keepalive_at(now + Duration::from_secs(1)));
+        assert!(!state.should_send_keepalive_at(now + Duration::from_secs(1)));
+        assert!(state.should_send_keepalive_at(now + Duration::from_secs(2)));
     }
 
     #[test]
@@ -292,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_fires_at_the_exact_interval() {
+    fn keepalive_waits_a_margin_past_the_interval() {
         let now = Instant::now();
         let mut state = KeepaliveState::new(true);
         state.update_from_rtt(Duration::from_millis(500));
@@ -302,8 +307,18 @@ mod tests {
         state.last_outbound = Some(now);
         state.last_keepalive_sent = Some(now);
 
-        assert!(!state.should_send_keepalive_at(now + interval - Duration::from_millis(1)));
-        assert!(state.should_send_keepalive_at(now + interval));
+        let margin = interval.mul_f64(KEEPALIVE_SEND_MARGIN);
+        assert!(!state.should_send_keepalive_at(now + interval));
+        assert!(
+            !state.should_send_keepalive_at(now + interval + margin - Duration::from_millis(1))
+        );
+        assert!(state.should_send_keepalive_at(now + interval + margin));
+        // The responder's reply check passes for a request that left a margin.
+        let mut responder = KeepaliveState::new(false);
+        responder.keepalive_interval = interval;
+        responder.last_outbound = Some(now + Duration::from_millis(20));
+        assert!(!responder.should_respond_to_keepalive_at(now + interval));
+        assert!(responder.should_respond_to_keepalive_at(now + interval + margin));
     }
 
     #[test]
