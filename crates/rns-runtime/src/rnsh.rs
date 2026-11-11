@@ -54,8 +54,10 @@ const STREAM_HEADER_LEN: usize = 2;
 const PROCESS_READ_LEN: usize = 4096;
 /// Session prune delay floor: `max(rtt*3, PROCESS_PIPE_TIME+5)` in rnsh/session.py.
 const LISTENER_PRUNE_DELAY: Duration = Duration::from_secs(6);
+const LISTENER_PRUNE_RTT_FACTOR: f64 = 3.0;
 /// Post-CommandExited check floor: `max(rtt*5, 10)` in rnsh/session.py.
 const COMMAND_EXITED_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_EXITED_RTT_FACTOR: f64 = 5.0;
 /// Grace between "Shutting down" and link teardown in rnsh/listener.py.
 const LISTENER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// Version reply floor: `max(rtt*20, 5)` in rnsh/initiator.py.
@@ -425,7 +427,37 @@ async fn terminate_session(
         .await;
     }
     session.close();
-    close_link_after(command_tx.clone(), link_id, LISTENER_PRUNE_DELAY);
+    let delay = rtt_scaled(
+        command_tx,
+        link_id,
+        LISTENER_PRUNE_RTT_FACTOR,
+        LISTENER_PRUNE_DELAY,
+    )
+    .await;
+    close_link_after(command_tx.clone(), link_id, delay);
+}
+
+/// `max(link.rtt * factor, floor)`, the rnsh/session.py timer form.
+async fn rtt_scaled(
+    command_tx: &mpsc::Sender<LinkManagerCommand>,
+    link_id: [u8; 16],
+    factor: f64,
+    floor: Duration,
+) -> Duration {
+    let (result_tx, result_rx) = oneshot::channel();
+    if command_tx
+        .send(LinkManagerCommand::LinkRtt { link_id, result_tx })
+        .await
+        .is_err()
+    {
+        return floor;
+    }
+    result_rx
+        .await
+        .ok()
+        .flatten()
+        .and_then(|rtt| Duration::try_from_secs_f64(rtt * factor).ok())
+        .map_or(floor, |scaled| scaled.max(floor))
 }
 
 /// Open a Link, negotiate rnsh and execute one remote command session. Return
@@ -1743,9 +1775,16 @@ async fn pump_listener_process(
         {
             let _ =
                 send_manager_message(&command_tx, link_id, CommandExitedMessage::new(code)).await;
+            let exited_timeout = rtt_scaled(
+                &command_tx,
+                link_id,
+                COMMAND_EXITED_RTT_FACTOR,
+                COMMAND_EXITED_TIMEOUT,
+            )
+            .await;
             tokio::select! {
                 _ = &mut stop_rx => {}
-                _ = tokio::time::sleep(COMMAND_EXITED_TIMEOUT) => {
+                _ = tokio::time::sleep(exited_timeout) => {
                     let _ = exited_tx.send(link_id);
                 }
             }
@@ -2480,6 +2519,24 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    #[tokio::test]
+    async fn session_timers_scale_with_link_rtt_above_their_floors() {
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let floor = Duration::from_secs(6);
+        for (rtt, expected) in [(4.0, Duration::from_secs(12)), (0.5, floor)] {
+            let answer = async {
+                match command_rx.recv().await {
+                    Some(LinkManagerCommand::LinkRtt { result_tx, .. }) => {
+                        let _ = result_tx.send(Some(rtt));
+                    }
+                    _ => panic!("expected a link RTT query"),
+                }
+            };
+            let (scaled, ()) = tokio::join!(rtt_scaled(&command_tx, [1; 16], 3.0, floor), answer);
+            assert_eq!(scaled, expected);
+        }
+    }
+
     #[test]
     fn rnsh_channel_registration_accepts_every_protocol_type() {
         let mut channel = LinkChannel::new([0xA2; 16], 0.1);
@@ -3074,6 +3131,12 @@ mod tests {
                             sequence: 0,
                             packet_hash: [0; 32],
                         }));
+                    match command_rx.recv().await {
+                        Some(LinkManagerCommand::LinkRtt { result_tx, .. }) => {
+                            let _ = result_tx.send(Some(0.1));
+                        }
+                        _ => panic!("expected a link RTT query"),
+                    }
                     decoded
                 }
                 _ => panic!("expected an ErrorMessage"),

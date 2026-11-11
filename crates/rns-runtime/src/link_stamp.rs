@@ -6,8 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use rns_link::handshake::EphemeralKeys;
 use rns_link::link::Link;
-use rns_link::stamp::{LinkRequestStamper, LinkStampError, LinkStampPolicy};
+use rns_link::stamp::{
+    LinkRequestStamper, LinkStampError, LinkStampPolicy, generate_stamped_ephemeral_keys,
+};
 use rns_transport::messages::{TransportMessage, TransportQuery, TransportQueryResponse};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
@@ -112,14 +115,14 @@ pub async fn signalled_link_mtu(
         .unwrap_or(base)
 }
 
-/// Create an initiator Link whose request carries the stamp upstream would
-/// send to `destination_hash` and the MTU it would signal. Dropping the future
-/// cancels the grind.
-pub async fn new_initiator(
+/// The request keys upstream would use for a link to `destination_hash`:
+/// stamped at the destination's announced cost (Link.py:310-316@1.6.0), with
+/// the grind on the blocking pool. Synchronous owners hand the result to
+/// their `provide_link_request_keys`. Dropping the future cancels the grind.
+pub async fn link_request_keys(
     transport_tx: &mpsc::Sender<TransportMessage>,
     destination_hash: [u8; 16],
-    hops: u8,
-) -> Result<(Link, Vec<u8>), LinkStampError> {
+) -> Result<EphemeralKeys, LinkStampError> {
     let policy = link_stamp_policy();
     let recalled = if policy.stamp_lrs {
         recall_link_cost(transport_tx, destination_hash).await
@@ -127,21 +130,14 @@ pub async fn new_initiator(
         None
     };
     let Some(cost) = policy.request_cost(recalled) else {
-        let mtu = signalled_link_mtu(transport_tx, destination_hash).await;
-        return Ok(Link::new_initiator_with_keys(
-            destination_hash,
-            hops,
-            rns_link::handshake::EphemeralKeys::generate(),
-            mtu,
-        ));
+        return Ok(EphemeralKeys::generate());
     };
-    let mtu = signalled_link_mtu(transport_tx, destination_hash).await;
     let _permit = grind_permits().acquire_owned().await.ok();
     let ctl = policy.control(cost);
     let _cancel = CancelOnDrop(ctl.cancel.clone());
     let started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        Link::new_stamped_initiator(destination_hash, hops, Some(cost), &ctl, mtu)
+        generate_stamped_ephemeral_keys(&destination_hash, cost, &ctl)
     })
     .await
     .map_err(|_| LinkStampError::Stopped)?;
@@ -162,10 +158,29 @@ pub async fn new_initiator(
     result
 }
 
+/// Create an initiator Link whose request carries the stamp upstream would
+/// send to `destination_hash` and the MTU it would signal. Dropping the future
+/// cancels the grind.
+pub async fn new_initiator(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    destination_hash: [u8; 16],
+    hops: u8,
+) -> Result<(Link, Vec<u8>), LinkStampError> {
+    let keys = link_request_keys(transport_tx, destination_hash).await?;
+    let mtu = signalled_link_mtu(transport_tx, destination_hash).await;
+    Ok(Link::new_initiator_with_keys(
+        destination_hash,
+        hops,
+        keys,
+        mtu,
+    ))
+}
+
 /// A stamper for synchronous Link owners on a multi-threaded runtime: link
 /// costs are recalled from Transport by blocking in place, and MTU discovery
 /// follows the running instance. Elsewhere no cost is recalled and requests
-/// are stamped only under `always_stamp_lrs`.
+/// are stamped only under `always_stamp_lrs`; such owners take keys from
+/// [`link_request_keys`] instead.
 pub fn blocking_stamper(transport_tx: mpsc::Sender<TransportMessage>) -> LinkRequestStamper {
     let mut stamper = LinkRequestStamper::new(
         link_stamp_policy(),
@@ -182,4 +197,32 @@ pub fn blocking_stamper(transport_tx: mpsc::Sender<TransportMessage>) -> LinkReq
     );
     stamper.link_mtu_discovery = link_mtu_discovery();
     stamper
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rns_link::handshake::LinkRequestData;
+    use rns_link::mtu_discovery::SignallingData;
+    use rns_link::stamp::link_request_stamp_valid;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_keys_meet_the_announced_cost_on_a_current_thread_runtime() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let dest = [0x3C; 16];
+        let keys = tokio::spawn(async move { link_request_keys(&tx, dest).await });
+        match rx.recv().await.unwrap() {
+            TransportMessage::Rpc {
+                query: TransportQuery::RecallLinkCost { dest: asked },
+                response_tx,
+            } => {
+                assert_eq!(asked, dest);
+                let _ = response_tx.send(TransportQueryResponse::FloatResult(Some(6.0)));
+            }
+            other => panic!("expected link cost recall, got {other:?}"),
+        }
+        let keys = keys.await.unwrap().unwrap();
+        let request = LinkRequestData::pack(&keys, SignallingData::new(1, 500));
+        assert!(link_request_stamp_valid(&dest, &request, 6.0));
+    }
 }

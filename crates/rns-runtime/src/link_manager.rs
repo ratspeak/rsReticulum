@@ -533,8 +533,10 @@ pub enum ChannelSendError {
     NoSessionKeys,
     #[error("channel error: {0}")]
     Channel(#[from] ChannelError),
-    #[error("transport channel is full or closed")]
+    #[error("transport channel is full")]
     TransportUnavailable,
+    #[error("transport channel is closed")]
+    TransportClosed,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -581,6 +583,11 @@ pub enum LinkManagerCommand {
     ChannelMdu {
         link_id: [u8; 16],
         result_tx: oneshot::Sender<Option<usize>>,
+    },
+    /// The Link's measured RTT in seconds (`link.rtt`), `None` for an unknown Link.
+    LinkRtt {
+        link_id: [u8; 16],
+        result_tx: oneshot::Sender<Option<f64>>,
     },
     /// Channel readiness and the Python Buffer close wait, `link.rtt * len(tx_ring)`.
     ChannelCloseWait {
@@ -2423,6 +2430,14 @@ impl LinkManager {
                     .get(&link_id)
                     .map(|active| rns_protocol::channel::Channel::channel_mdu(active.link.mdu));
                 let _ = result_tx.send(mdu);
+                true
+            }
+            LinkManagerCommand::LinkRtt { link_id, result_tx } => {
+                let rtt = self
+                    .active_links
+                    .get(&link_id)
+                    .map(|active| active.link.rtt_secs());
+                let _ = result_tx.send(rtt);
                 true
             }
             LinkManagerCommand::ChannelCloseWait { link_id, result_tx } => {
@@ -7566,9 +7581,10 @@ impl LinkManager {
         }
 
         let transport_tx = self.transport_tx.clone();
-        let permit = transport_tx
-            .try_reserve()
-            .map_err(|_| ChannelSendError::TransportUnavailable)?;
+        let permit = transport_tx.try_reserve().map_err(|error| match error {
+            mpsc::error::TrySendError::Full(()) => ChannelSendError::TransportUnavailable,
+            mpsc::error::TrySendError::Closed(()) => ChannelSendError::TransportClosed,
+        })?;
 
         let active = self
             .active_links
@@ -12276,6 +12292,39 @@ mod tests {
 
         assert!(next_transport_message(&mut transport_rx).is_err());
         assert!(channel_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn channel_send_on_a_closed_transport_is_an_error_not_backpressure() {
+        let (initiator, _responder, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = initiator.link_id;
+        let (tx, rx) = mpsc::channel(16);
+        drop(rx);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(tx, event_rx, [0xA2; 16], None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: initiator,
+                _interface_id: 1,
+                interface_owner: None,
+                endpoint_authority: None,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        lm.get_channel(&link_id)
+            .unwrap()
+            .register_message_type(TEST_CHANNEL_MSG_TYPE)
+            .unwrap();
+        assert!(matches!(
+            lm.send_channel_message(&link_id, &TestChannelNoop),
+            Err(ChannelSendError::TransportClosed)
+        ));
     }
 
     /// 1.3.8 stats parity (Packet.py:291): tx counts the link payload after
