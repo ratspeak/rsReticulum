@@ -123,7 +123,14 @@ impl KeepaliveState {
     }
 
     pub(crate) fn is_stale_at(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.peer_evidence()) >= self.stale_time
+        // The initiator's watchdog runs on the stretched interval, so its second
+        // keepalive and the STALE transition still share one pass (Link.py:836-843).
+        let stale_time = if self.is_initiator {
+            self.stale_time.mul_f64(1.0 + KEEPALIVE_SEND_MARGIN)
+        } else {
+            self.stale_time
+        };
+        now.saturating_duration_since(self.peer_evidence()) >= stale_time
     }
 
     /// Latest of inbound traffic, packet proof and activation (Link.py watchdog).
