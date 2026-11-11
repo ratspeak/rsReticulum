@@ -486,11 +486,6 @@ impl TransportActor {
     ) {
         let is_from_local_client = self.is_local_client_interface(interface_id);
 
-        if self.local_destinations.contains(&header.destination_hash) {
-            debug!("dropping own announce");
-            return;
-        }
-
         if data_offset >= raw.len() {
             tracing::warn!(
                 dest = hex::encode(header.destination_hash),
@@ -727,6 +722,12 @@ impl TransportActor {
                 });
                 self.state_dirty = true;
             }
+        }
+
+        // Own announces are validated and remembered but route nothing (Transport.py:2453-2454).
+        if self.local_destinations.contains(&header.destination_hash) {
+            debug!("not routing own announce");
+            return;
         }
 
         if header.hops >= PATHFINDER_M {

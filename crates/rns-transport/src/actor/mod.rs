@@ -4789,6 +4789,24 @@ mod tests {
         assert!(!actor.path_requests.contains_key(&dest_hash));
     }
 
+    #[test]
+    fn outbound_no_path_data_is_only_broadcast() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, mut rx) = make_test_interface("iface1");
+        actor.interfaces.insert(1, entry);
+
+        let dest_hash = [0x43; 16];
+        let raw = make_data_packet(dest_hash, 0);
+        actor.on_outbound(OutboundRequest {
+            raw: raw.clone(),
+            destination_hash: dest_hash,
+        });
+
+        assert_eq!(rx.try_recv().expect("data should broadcast"), raw);
+        assert!(rx.try_recv().is_err(), "no path request follows the packet");
+        assert!(!actor.path_requests.contains_key(&dest_hash));
+    }
+
     fn assert_link_request_pins_to_path_owner(
         owner_name: &str,
         owner_mode: InterfaceMode,
@@ -12609,6 +12627,34 @@ mod tests {
             received += 1;
         }
         assert_eq!(received, 3, "None-filter handler must receive all aspects");
+    }
+
+    #[test]
+    fn own_announce_is_validated_and_remembered_without_a_path() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("test_iface");
+        entry.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, entry);
+        let identity = rns_identity::identity::Identity::new();
+        let (raw, dest_hash) = make_announce_for(&identity, "own.app", 1);
+        actor.local_destinations.insert(dest_hash);
+
+        let mut forged = raw.to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        for raw in [Bytes::from(forged), raw] {
+            actor.on_inbound(crate::messages::InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+        }
+
+        assert_eq!(actor.interfaces[&1].protocol_violations, 1);
+        assert!(actor.recent_announces.contains_key(&dest_hash));
+        assert!(actor.path_table.get(&dest_hash).is_none());
     }
 
     #[test]

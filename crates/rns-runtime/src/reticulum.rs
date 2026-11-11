@@ -7050,7 +7050,7 @@ fn discovery_config_for_interface(
             #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
             interface_factory::InterfaceConfig::RNode(c) => (
                 "RNodeInterface",
-                configured_reachable_on(section),
+                None,
                 None,
                 Some(c.frequency as u64),
                 Some(c.bandwidth as u64),
@@ -7060,40 +7060,12 @@ fn discovery_config_for_interface(
             #[cfg(feature = "ble")]
             interface_factory::InterfaceConfig::BleRNode(c) => (
                 "RNodeInterface",
-                configured_reachable_on(section),
+                None,
                 None,
                 Some(c.frequency as u64),
                 Some(c.bandwidth as u64),
                 Some(c.spreading_factor),
                 Some(c.coding_rate),
-            ),
-            #[cfg(feature = "serial")]
-            interface_factory::InterfaceConfig::KissSerial(_c) => (
-                "KISSInterface",
-                configured_reachable_on(section),
-                None,
-                section.get_uint("discovery_frequency"),
-                section.get_uint("discovery_bandwidth"),
-                section
-                    .get_uint("discovery_spreading_factor")
-                    .map(|v| v.min(u8::MAX as u64) as u8),
-                section
-                    .get_uint("discovery_coding_rate")
-                    .map(|v| v.min(u8::MAX as u64) as u8),
-            ),
-            #[cfg(feature = "serial")]
-            interface_factory::InterfaceConfig::AX25KISS(_c) => (
-                "KISSInterface",
-                configured_reachable_on(section),
-                None,
-                section.get_uint("discovery_frequency"),
-                section.get_uint("discovery_bandwidth"),
-                section
-                    .get_uint("discovery_spreading_factor")
-                    .map(|v| v.min(u8::MAX as u64) as u8),
-                section
-                    .get_uint("discovery_coding_rate")
-                    .map(|v| v.min(u8::MAX as u64) as u8),
             ),
             _ => return Ok(None),
         };
@@ -7105,7 +7077,8 @@ fn discovery_config_for_interface(
         let value = section
             .get_int("discovery_modulation")
             .ok_or_else(|| key_error("discovery_modulation", "value is not an integer"))?;
-        Some(rns_transport::discovery::app_data::DiscoveryModulation::Int(value))
+        (interface_type == "KISSInterface")
+            .then_some(rns_transport::discovery::app_data::DiscoveryModulation::Int(value))
     } else {
         None
     };
@@ -7116,15 +7089,14 @@ fn discovery_config_for_interface(
         }
         address
     });
-    let frequency = uint_key("discovery_frequency")?.or(frequency);
-    let bandwidth = uint_key("discovery_bandwidth")?.or(bandwidth);
-    let spreading_factor = uint_key("discovery_spreading_factor")?
-        .map(|v| v.min(u8::MAX as u64) as u8)
-        .or(spreading_factor);
-    let coding_rate = uint_key("discovery_coding_rate")?
-        .map(|v| v.min(u8::MAX as u64) as u8)
-        .or(coding_rate);
-    let channel = uint_key("discovery_channel")?.map(|v| v.min(u16::MAX as u64) as u16);
+    // Only KISS announces the discovery_* radio keys; RNode sends its own (Discovery.py:216-232).
+    let discovery_frequency = uint_key("discovery_frequency")?;
+    let discovery_bandwidth = uint_key("discovery_bandwidth")?;
+    let (frequency, bandwidth) = if interface_type == "KISSInterface" {
+        (discovery_frequency, discovery_bandwidth)
+    } else {
+        (frequency, bandwidth)
+    };
     let latitude = float_key("discovery_latitude")?.or(float_key("latitude")?);
     let longitude = float_key("discovery_longitude")?.or(float_key("longitude")?);
     let height = float_key("discovery_height")?.or(float_key("height")?);
@@ -7154,7 +7126,7 @@ fn discovery_config_for_interface(
         spreading_factor,
         coding_rate,
         modulation,
-        channel,
+        channel: None,
         operator_lxmf_address,
         latitude,
         longitude,
@@ -14699,7 +14671,7 @@ loglevel = 7
     /// discovery radio parameters and no address (Discovery.py:182-185, :230-234).
     #[test]
     fn a_kiss_framed_tcp_client_is_discovered_as_a_kiss_interface() {
-        let config = Config::parse("[interfaces]\n[[kiss tnc]]\ntype = TCPClientInterface\nenabled = yes\nkiss_framing = yes\ntarget_host = 10.0.0.2\ntarget_port = 8001\ndiscoverable = yes\ndiscovery_frequency = 433775000\ndiscovery_modulation = 2\n").unwrap();
+        let config = Config::parse("[interfaces]\n[[kiss tnc]]\ntype = TCPClientInterface\nenabled = yes\nkiss_framing = yes\ntarget_host = 10.0.0.2\ntarget_port = 8001\ndiscoverable = yes\ndiscovery_frequency = 433775000\ndiscovery_modulation = 2\ndiscovery_spreading_factor = 7\ndiscovery_coding_rate = 5\ndiscovery_channel = 3\nreachable_on = 10.0.0.2\n").unwrap();
         let interfaces = synthesize_interfaces(&config, false).unwrap();
         let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
         let discovery = discovery_config_for_interface(
@@ -14717,6 +14689,45 @@ loglevel = 7
         assert_eq!(
             discovery.modulation,
             Some(rns_transport::discovery::app_data::DiscoveryModulation::Int(2))
+        );
+        assert_eq!(
+            (
+                discovery.spreading_factor,
+                discovery.coding_rate,
+                discovery.channel
+            ),
+            (None, None, None)
+        );
+    }
+
+    /// Serial KISS/AX.25 never announce; RNode announces its own radio, no address (Interface.py:118).
+    #[cfg(feature = "serial")]
+    #[test]
+    fn only_upstream_discoverable_radio_types_announce() {
+        let discovery = |iface: &str| {
+            let config = Config::parse(&format!("[interfaces]\n[[radio]]\nenabled = yes\ndiscoverable = yes\nreachable_on = 10.0.0.2\ndiscovery_frequency = 1\ndiscovery_spreading_factor = 12\ndiscovery_modulation = 2\n{iface}")).unwrap();
+            let interfaces = synthesize_interfaces(&config, false).unwrap();
+            let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
+            discovery_config_for_interface(
+                &config,
+                &interfaces[0],
+                &post_init,
+                true,
+                &rns_transport::stamps::StampPolicy::default(),
+            )
+            .unwrap()
+        };
+        for kiss in [
+            "type = KISSInterface\nport = /dev/null\n",
+            "type = AX25KISSInterface\nport = /dev/null\ncallsign = NOCALL\nssid = 0\n",
+        ] {
+            assert!(discovery(kiss).is_none(), "{kiss}");
+        }
+        let rnode = discovery("type = RNodeInterface\nport = /dev/null\nfrequency = 868000000\nbandwidth = 125000\nspreadingfactor = 8\ncodingrate = 5\ntxpower = 7\n").unwrap();
+        assert_eq!(rnode.reachable_on, None);
+        assert_eq!(
+            (rnode.frequency, rnode.spreading_factor, rnode.modulation),
+            (Some(868_000_000), Some(8), None)
         );
     }
 
