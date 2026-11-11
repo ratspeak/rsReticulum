@@ -315,6 +315,13 @@ struct PendingIdentityCheck {
     buffered: VecDeque<DestinationEvent>,
 }
 
+/// A responder answers requests that overtake the initiator's LRRTT, so their
+/// Resource responses may start before activation too.
+fn request_resource_state_ready(link: &Link) -> bool {
+    matches!(link.state, LinkState::Active | LinkState::Stale)
+        || (!link.is_initiator && link.state == LinkState::Handshake)
+}
+
 async fn wait_identity_checks(pending: &mut HashMap<[u8; 16], PendingIdentityCheck>) {
     use std::future::Future;
     use std::pin::Pin;
@@ -6563,7 +6570,7 @@ impl LinkManager {
         let Some(active) = self.active_links.get(&link_id) else {
             return false;
         };
-        if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
+        if !request_resource_state_ready(&active.link) {
             return false;
         }
         let Some(keys) = active.link.session_keys() else {
@@ -6662,7 +6669,7 @@ impl LinkManager {
         let Some(active) = self.active_links.get_mut(&link_id) else {
             return;
         };
-        if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
+        if !request_resource_state_ready(&active.link) {
             return warn("link is not active");
         }
         let resource_key = first.logical_hash;

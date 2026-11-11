@@ -1903,6 +1903,116 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn fetch_requested_before_lrrtt_still_advertises_the_file() {
+        use rns_transport::messages::{LinkEndpointBindResult, LinkEndpointSendResult};
+        use rns_wire::context::PacketContext;
+
+        let jail = tempfile::tempdir().unwrap();
+        std::fs::write(jail.path().join("file.bin"), vec![0x5a; 4000]).unwrap();
+        let identity = Identity::new();
+        let public_key = identity.get_public_key();
+        let (transport_tx, mut transport_rx) = mpsc::channel(256);
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let cfg = RncpListenerConfig {
+            identity,
+            allow_all: true,
+            allow_fetch: true,
+            fetch_jail: Some(jail.path().to_path_buf()),
+            ..RncpListenerConfig::default()
+        };
+        let listener = spawn_rncp_listener(transport_tx, cfg, events_tx)
+            .await
+            .unwrap();
+        let dest_hash = listener.destination_hash();
+        let Some(TransportMessage::RegisterDestination {
+            delivery_tx: Some(delivery_tx),
+            ..
+        }) = transport_rx.recv().await
+        else {
+            panic!("listener must register its destination");
+        };
+
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel::<Bytes>();
+        tokio::spawn(async move {
+            while let Some(message) = transport_rx.recv().await {
+                match message {
+                    TransportMessage::BindLinkEndpoint {
+                        lifecycle_tx,
+                        result_tx,
+                        ..
+                    } => {
+                        let _ = result_tx.send(LinkEndpointBindResult::Bound);
+                        std::mem::forget(lifecycle_tx);
+                    }
+                    TransportMessage::SendLinkEndpoint {
+                        request, result_tx, ..
+                    }
+                    | TransportMessage::SendLinkEndpointBestEffort {
+                        request, result_tx, ..
+                    } => {
+                        let _ = result_tx.send(LinkEndpointSendResult::Sent);
+                        let _ = sent_tx.send(request.raw);
+                    }
+                    TransportMessage::OutboundAttached { request, .. }
+                    | TransportMessage::Outbound(request) => {
+                        let _ = sent_tx.send(request.raw);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let next_sent = async |rx: &mut mpsc::UnboundedReceiver<Bytes>, context| loop {
+            let raw = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("listener sent no {context:?}"))
+                .unwrap();
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+            if header.context == context {
+                break raw[offset..].to_vec();
+            }
+        };
+        let inbound = |raw: Bytes| DestinationEvent::InboundPacket {
+            interface_owner: None,
+            raw,
+            interface_id: 1,
+            metrics: Default::default(),
+        };
+
+        let (mut link, request_data) = Link::new_initiator(dest_hash, 1);
+        delivery_tx
+            .send(DestinationEvent::LinkRequest {
+                interface_owner: None,
+                raw: build_link_request_packet(dest_hash, &request_data),
+                interface_id: 1,
+                metrics: Default::default(),
+            })
+            .await
+            .unwrap();
+        let proof = next_sent(&mut sent_rx, PacketContext::Lrproof).await;
+        let ed25519: [u8; 32] = public_key[32..].try_into().unwrap();
+        let verify_key = Ed25519PublicKey::from_bytes(&ed25519).unwrap();
+        link.validate_proof(&proof, &verify_key, &ed25519).unwrap();
+
+        // The initiator is active, but its LRRTT has not reached the listener.
+        let (request, _) = link
+            .request_str(FETCH_PATH_NAME, "file.bin", Duration::from_secs(5))
+            .unwrap();
+        delivery_tx
+            .send(inbound(build_data_packet(
+                link.link_id,
+                PacketContext::Request,
+                &request,
+            )))
+            .await
+            .unwrap();
+        let response = next_sent(&mut sent_rx, PacketContext::Response).await;
+        let (_, reply) = link.handle_response(&response).unwrap();
+        assert_eq!(reply, FetchReply::Found.packed());
+        next_sent(&mut sent_rx, PacketContext::ResourceAdv).await;
+        listener.shutdown().await;
+    }
+
     #[test]
     fn metadata_roundtrip() {
         let packed = pack_metadata("hello.txt");
