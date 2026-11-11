@@ -1173,6 +1173,23 @@ async fn remote_query(
     {
         // A timed-out receipt has no response; callers report it as a failed request.
         Err(LinkClientError::RequestFailed(RequestFailure::TimedOut)) => Ok(Vec::new()),
+        // Upstream's link-closed callback prints, but its exit() runs off the
+        // main thread, so the pending request still fails (rnpath.py:61-76).
+        Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed(reason))) => {
+            use rns_runtime::prelude::CloseReason;
+            let text = match reason {
+                Some(CloseReason::InitiatorClosed) => None,
+                Some(CloseReason::Timeout) => Some("The link timed out, exiting now"),
+                Some(CloseReason::DestinationClosed) => {
+                    Some("The link was closed by the server, exiting now")
+                }
+                _ => Some("Link closed unexpectedly, exiting now"),
+            };
+            if let Some(text) = text {
+                println!("{OUTPUT_RST}{text}");
+            }
+            Ok(Vec::new())
+        }
         result => result.map_err(|e| {
             print!("{OUTPUT_RST}");
             match e {

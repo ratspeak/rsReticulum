@@ -20,7 +20,7 @@ use rmpv::Value;
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
 use rns_runtime::lifecycle::ShutdownSignal;
-use rns_runtime::link_client::{LinkClient, LinkClientError};
+use rns_runtime::link_client::{LinkClient, LinkClientError, RequestFailure};
 use rns_runtime::platform::{StoragePaths, resolve_config_dir};
 use rns_runtime::reticulum::{
     InitOptions, InstanceMode, ReticulumConfig, ReticulumHandle, SharedInstanceRpcEndpoint,
@@ -627,12 +627,19 @@ impl Session {
             .await;
         let bytes = match answer {
             Ok(bytes) => bytes,
-            // No response to the identified request, or the server closed the
-            // link while it was pending: upstream's request timeout fires first.
+            // No response to the identified request, or the link closed while
+            // it was pending. Upstream's link-closed callback prints its line but
+            // its exit() runs off the main thread, so the request failure follows.
             Err(e) if request_went_unanswered(&e) => {
                 if !no_output {
                     if first {
                         outp!(out, "{CLR}Sending request... ");
+                    }
+                    if let LinkClientError::RequestFailed(RequestFailure::LinkClosed(reason)) = &e
+                        && let Some(text) = link_closed_text(*reason)
+                    {
+                        outp!(out, "{CLR}");
+                        outln!(out, "{text}");
                     }
                     outp!(out, "{CLR}");
                     outln!(
@@ -740,6 +747,19 @@ impl Session {
 
 fn request_went_unanswered(error: &LinkClientError) -> bool {
     matches!(error, LinkClientError::RequestFailed(_))
+}
+
+/// rnstatus.py:87-100: the line for each `teardown_reason`, none for a local close.
+fn link_closed_text(reason: Option<rns_runtime::prelude::CloseReason>) -> Option<&'static str> {
+    use rns_runtime::prelude::CloseReason;
+    match reason {
+        Some(CloseReason::InitiatorClosed) => None,
+        Some(CloseReason::Timeout) => Some("The link timed out, exiting now"),
+        Some(CloseReason::DestinationClosed) => {
+            Some("The link was closed by the server, exiting now")
+        }
+        _ => Some("Link closed unexpectedly, exiting now"),
+    }
 }
 
 /// The stored info dictionary as `list_discovered_interfaces` returns it:

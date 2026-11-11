@@ -53,6 +53,21 @@ fn write_config(tmp: &TempDir, enable_transport: bool) {
     .expect("write config");
 }
 
+/// Debug output goes to a file: a piped stderr nobody reads can fill and stall the child.
+#[cfg(unix)]
+fn log_file(tmp: &TempDir) -> fs::File {
+    fs::File::create(tmp.path().join("listener.log")).expect("create listener log")
+}
+
+#[cfg(unix)]
+fn read_logs(paths: &[&Path]) -> String {
+    paths
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(unix)]
 fn wait_until_running(child: &mut Child, settle: Duration) -> bool {
     let deadline = Instant::now() + settle;
@@ -97,6 +112,7 @@ fn assert_signal_exits(
     signal_name: &str,
     signal_number: i32,
     ready_log: Option<&Path>,
+    progress_logs: &[&Path],
 ) {
     use std::os::unix::process::ExitStatusExt;
 
@@ -145,17 +161,24 @@ fn assert_signal_exits(
             Some(status) => {
                 let output = child.wait_with_output().expect("collect child output");
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                let progress = read_logs(progress_logs);
                 let booting = status.signal() == Some(signal_number)
-                    || stderr.contains("runtime shutdown during interface initialization");
+                    || [
+                        &stderr[..],
+                        &String::from_utf8_lossy(&output.stdout),
+                        &progress,
+                    ]
+                    .iter()
+                    .any(|text| text.contains("runtime shutdown during interface initialization"));
                 if ready_log.is_none() && attempt < last_attempt && booting {
                     continue;
                 }
                 panic!(
-                    "{name} exited unsuccessfully after {signal_name}: {status}\nstdout:\n{}\nstderr:\n{stderr}\nreadiness log:\n{}",
+                    "{name} exited unsuccessfully after {signal_name}: {status}\nstdout:\n{}\nstderr:\n{stderr}\nlog:\n{}",
                     String::from_utf8_lossy(&output.stdout),
                     ready_log
                         .and_then(|log| fs::read_to_string(log).ok())
-                        .unwrap_or_default(),
+                        .unwrap_or(progress),
                 );
             }
             None => {
@@ -163,13 +186,14 @@ fn assert_signal_exits(
                 let output = child
                     .wait_with_output()
                     .expect("collect killed child output");
+                // The debug log's last lines show which start-up or shutdown step was pending.
                 panic!(
-                    "{name} did not exit after {signal_name}\nstdout:\n{}\nstderr:\n{}\nreadiness log:\n{}",
+                    "{name} did not exit after {signal_name}\nstdout:\n{}\nstderr:\n{}\nlog:\n{}",
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr),
                     ready_log
                         .and_then(|log| fs::read_to_string(log).ok())
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| read_logs(progress_logs)),
                 );
             }
         }
@@ -177,9 +201,19 @@ fn assert_signal_exits(
     unreachable!("attempt loop either returns or panics");
 }
 
+/// A background job inherits SIGINT ignored, and so would the child: a signal
+/// that lands before its handler is installed is then dropped, not fatal.
+#[cfg(unix)]
+fn children_take_sigint() {
+    unsafe {
+        nix::libc::signal(nix::libc::SIGINT, nix::libc::SIG_DFL);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn rncp_listener_exits_on_sigint() {
+    children_take_sigint();
     let tmp = TempDir::new("rncp-sigint");
     write_config(&tmp, false);
     assert_signal_exits(
@@ -190,8 +224,9 @@ fn rncp_listener_exits_on_sigint() {
                 .arg("-l")
                 .arg("-n")
                 .arg("-S")
+                .arg("-vvv")
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(log_file(&tmp))
                 .spawn()
                 .expect("spawn rncp-rs listener")
         },
@@ -199,12 +234,14 @@ fn rncp_listener_exits_on_sigint() {
         "INT",
         2,
         None,
+        &[&tmp.path().join("listener.log")],
     );
 }
 
 #[cfg(unix)]
 #[test]
 fn rnsh_listener_exits_on_sigint() {
+    children_take_sigint();
     let tmp = TempDir::new("rnsh-sigint");
     write_config(&tmp, false);
     assert_signal_exits(
@@ -212,10 +249,13 @@ fn rnsh_listener_exits_on_sigint() {
             Command::new(env!("CARGO_BIN_EXE_rnsh-rs"))
                 .arg("--config")
                 .arg(tmp.path())
+                .arg("--rnsconfig")
+                .arg(tmp.path())
                 .arg("-l")
                 .arg("-n")
+                .arg("-vvv")
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(log_file(&tmp))
                 .spawn()
                 .expect("spawn rnsh-rs listener")
         },
@@ -223,6 +263,10 @@ fn rnsh_listener_exits_on_sigint() {
         "INT",
         2,
         None,
+        &[
+            &tmp.path().join("listener.log"),
+            &tmp.path().join("logfile"),
+        ],
     );
 }
 
@@ -247,6 +291,7 @@ fn rnsd_flushes_state_and_exits_on_sigterm() {
         "TERM",
         15,
         Some(&ready_log),
+        &[],
     );
     assert!(
         tmp.path().join("storage/packet_hashlist.raw").is_file(),
@@ -274,4 +319,51 @@ fn daemon_readiness_requires_completed_initialization_and_a_live_child() {
     child.kill().expect("stop control");
     child.wait().expect("reap control");
     assert!(!wait_for_ready_log(&mut child, &log, Duration::ZERO));
+}
+
+/// A signal while a TCP client's first connect is still pending (up to 5 s)
+/// must stop start-up at once, as KeyboardInterrupt does upstream.
+#[cfg(unix)]
+#[test]
+fn rncp_listener_exits_on_sigint_during_first_tcp_connect() {
+    children_take_sigint();
+    let tmp = TempDir::new("rncp-sigint-connect");
+    // TEST-NET-1 is unrouted: the connect hangs until its timeout. A network
+    // that refuses at once ends start-up early and the test still passes.
+    fs::write(
+        tmp.path().join("config"),
+        "[reticulum]\nshare_instance = No\nenable_transport = No\n\n[interfaces]\n  [[Unreachable]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 192.0.2.1\n    target_port = 4242\n",
+    )
+    .expect("write config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rncp-rs"))
+        .arg("--config")
+        .arg(tmp.path())
+        .arg("-l")
+        .arg("-n")
+        .arg("-S")
+        .arg("-vvv")
+        .stdout(Stdio::null())
+        .stderr(log_file(&tmp))
+        .spawn()
+        .expect("spawn rncp-rs listener");
+    thread::sleep(Duration::from_secs(1));
+    let status = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send INT");
+    assert!(status.success(), "kill -INT failed with {status}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if child.try_wait().expect("poll child").is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!(
+        "rncp-rs did not exit within 2 s of SIGINT during start-up\nlog:\n{}",
+        fs::read_to_string(tmp.path().join("listener.log")).unwrap_or_default()
+    );
 }

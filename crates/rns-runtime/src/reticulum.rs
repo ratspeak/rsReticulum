@@ -1285,6 +1285,8 @@ pub struct DiscoveryRuntime {
     announcer_started: Mutex<bool>,
     subscriber_started: Mutex<bool>,
     local_interfaces: Mutex<Vec<LocalDiscoveryInterface>>,
+    /// Any configured section is discoverable, enabled or not (Reticulum.py:1074-1080).
+    announcer_configured: AtomicBool,
     autoconnected: Mutex<HashMap<[u8; 32], AutoconnectedInterface>>,
     bootstrap_interfaces: Mutex<Vec<u64>>,
     /// Configs of `bootstrap_only` interfaces, re-spawned when no
@@ -1320,6 +1322,7 @@ impl Default for DiscoveryRuntime {
             announcer_started: Mutex::new(false),
             subscriber_started: Mutex::new(false),
             local_interfaces: Mutex::new(Vec::new()),
+            announcer_configured: AtomicBool::new(false),
             autoconnected: Mutex::new(HashMap::new()),
             bootstrap_interfaces: Mutex::new(Vec::new()),
             bootstrap_configs: Mutex::new(Vec::new()),
@@ -2472,6 +2475,11 @@ impl ReticulumHandle {
             .lock()
             .await
             .retain(|id| *id != entry.id && !spawned.contains(id));
+        self.discovery
+            .local_interfaces
+            .lock()
+            .await
+            .retain(|local| local.id != entry.id && !spawned.contains(&local.id));
         for id in spawned {
             teardown_interface(self, id).await;
         }
@@ -4402,6 +4410,13 @@ pub async fn init_with_policy(
     let interfaces = interfaces;
 
     let discovery_runtime = Arc::new(DiscoveryRuntime::default());
+    discovery_runtime.announcer_configured.store(
+        config
+            .subsections("interfaces")
+            .iter()
+            .any(|(_, section)| section.get_bool("discoverable") == Some(true)),
+        Ordering::Release,
+    );
     if let Ok(store) = DiscoveryStore::open(&paths.storage_dir) {
         *discovery_runtime.store.lock().await = Some(Arc::new(store));
     }
@@ -4473,7 +4488,7 @@ pub async fn init_with_policy(
             let bootstrap_only = interface_bootstrap_only(&config, iface_config);
             let ifac_key = derive_ifac_key_from_post_init(&post_init);
 
-            match spawn_interface_with_rnode_startup_options(
+            let spawning = spawn_interface_with_rnode_startup_options(
                 iface_config,
                 iface_id,
                 transport_tx.clone(),
@@ -4484,9 +4499,21 @@ pub async fn init_with_policy(
                 is_foreground.clone(),
                 rnode_startup_options,
                 &tunnel_identity,
-            )
-            .await
-            {
+            );
+            let spawned = tokio::select! {
+                biased;
+                _ = shutdown.wait(), if spawn_awaits_first_connect(iface_config) => None,
+                spawned = spawning => Some(spawned),
+            };
+            let Some(spawned) = spawned else {
+                drop(spawn_permit);
+                shutdown_coordinator.start_and_wait().await;
+                return Err(ReticulumError::Interface(
+                    "runtime shutdown during interface initialization".to_string(),
+                )
+                .into());
+            };
+            match spawned {
                 Ok(mut iface_handles) => {
                     apply_configured_bitrate_mtu(iface_config, &post_init, &mut iface_handles);
                     let pending_rnode =
@@ -4957,6 +4984,16 @@ fn collect_deferred_android_ble_rnodes(
             _ => None,
         })
         .collect()
+}
+
+/// TCP and Backbone clients spawn nothing before their first connect returns,
+/// so a shutdown may drop the spawn while it waits (up to 5 s).
+fn spawn_awaits_first_connect(config: &interface_factory::InterfaceConfig) -> bool {
+    match config {
+        interface_factory::InterfaceConfig::TcpClient(_) => true,
+        interface_factory::InterfaceConfig::Backbone(c) => c.target_host.is_some(),
+        _ => false,
+    }
 }
 
 fn interface_kind_for_config(config: &interface_factory::InterfaceConfig) -> InterfaceKind {
@@ -7494,14 +7531,18 @@ async fn start_on_network_discovery(handle: ReticulumHandle) {
         }
     }
 
-    let locals = handle.discovery.local_interfaces.lock().await.clone();
-    if handle.instance_mode != InstanceMode::Client && !locals.is_empty() {
+    let announcing = handle
+        .discovery
+        .announcer_configured
+        .load(Ordering::Acquire)
+        || !handle.discovery.local_interfaces.lock().await.is_empty();
+    if handle.instance_mode != InstanceMode::Client && announcing {
         let mut started = handle.discovery.announcer_started.lock().await;
         if !*started {
             *started = true;
             drop(started);
             tokio::spawn(async move {
-                run_discovery_announcer(handle, stamper, locals).await;
+                run_discovery_announcer(handle, stamper).await;
             });
         }
     }
@@ -7543,16 +7584,14 @@ async fn run_discovery_subscription(
 async fn run_discovery_announcer(
     handle: ReticulumHandle,
     stamper: Arc<dyn DiscoveryStamper + Send + Sync>,
-    locals: Vec<LocalDiscoveryInterface>,
 ) {
-    run_discovery_publisher(&handle, stamper, locals).await;
+    run_discovery_publisher(&handle, stamper).await;
     *handle.discovery.announcer_started.lock().await = false;
 }
 
 async fn run_discovery_publisher(
     handle: &ReticulumHandle,
     stamper: Arc<dyn DiscoveryStamper + Send + Sync>,
-    locals: Vec<LocalDiscoveryInterface>,
 ) {
     use rns_transport::announce_dispatch::AnnounceDispatchResult;
     use rns_transport::discovery::announcer::PreparedAnnounce;
@@ -7627,6 +7666,19 @@ async fn run_discovery_publisher(
             _ = handle.transport_tx.closed() => break,
             _ = tick.tick() => {}
         }
+        // Python walks the live interface list on every pass (Discovery.py:108).
+        let locals = handle.discovery.local_interfaces.lock().await.clone();
+        publications.retain(|id, _| locals.iter().any(|local| local.id == *id));
+        if let Some(announcer) = announcer.as_mut() {
+            registered.retain(|id, _| {
+                let live = locals.iter().any(|local| local.id == *id);
+                if !live {
+                    announcer.deregister(*id);
+                    last_announce.remove(id);
+                }
+                live
+            });
+        }
         let now = tokio::time::Instant::now();
         if preparing.as_ref().is_some_and(|job| job.is_finished()) {
             let job = preparing.take().expect("checked above");
@@ -7645,7 +7697,7 @@ async fn run_discovery_publisher(
                     announcer = Some(returned);
                     for prepared in prepared {
                         let id = prepared.request().interface_id;
-                        if committed.contains(&id) {
+                        if committed.contains(&id) || !locals.iter().any(|local| local.id == id) {
                             continue;
                         }
                         publications.entry(id).or_insert(Publication {
@@ -8464,6 +8516,23 @@ async fn spawn_configured_interface(
     config: &interface_factory::InterfaceConfig,
     post_init: &interface_factory::InterfacePostInit,
 ) -> Result<Vec<u64>, String> {
+    spawn_configured_interface_for_discovery(handle, config, post_init)
+        .await
+        .map(|spawned| spawned.into_iter().map(|(id, _, _)| id).collect())
+}
+
+/// Each registered id with its online flag and runtime-learned address.
+type SpawnedForDiscovery = Vec<(
+    u64,
+    Arc<AtomicBool>,
+    Option<tokio::sync::watch::Receiver<Option<String>>>,
+)>;
+
+async fn spawn_configured_interface_for_discovery(
+    handle: &ReticulumHandle,
+    config: &interface_factory::InterfaceConfig,
+    post_init: &interface_factory::InterfacePostInit,
+) -> Result<SpawnedForDiscovery, String> {
     let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = next_id(&handle.id_gen);
     let storage_dir = StoragePaths::from_config_dir(&handle.config_dir).storage_dir;
@@ -8483,6 +8552,18 @@ async fn spawn_configured_interface(
     .await?;
     let mut handles = handles;
     apply_configured_bitrate_mtu(config, post_init, &mut handles);
+    let mut discovery: HashMap<_, _> = handles
+        .iter()
+        .map(|owned| {
+            (
+                owned.interface.id,
+                (
+                    owned.interface.online.clone(),
+                    owned.discovery_address.clone(),
+                ),
+            )
+        })
+        .collect();
     let ids = register_interfaces_with_post_init_batch(
         &handle.transport_tx,
         handles,
@@ -8500,7 +8581,13 @@ async fn spawn_configured_interface(
             record_client_target(&handle.interface_controls, id, &host, port);
         }
     }
-    Ok(ids)
+    Ok(ids
+        .into_iter()
+        .filter_map(|id| {
+            let (online, address) = discovery.remove(&id)?;
+            Some((id, online, address))
+        })
+        .collect())
 }
 
 /// Synthesize and start one interface section after startup, as the startup
@@ -8520,7 +8607,41 @@ async fn attach_interface_section(
     finalize_post_init(&mut post_init, &handle.config);
     interface_factory::validate_config_capacity(&iface_config, &post_init)
         .map_err(|e| e.to_string())?;
-    let ids = spawn_configured_interface(handle, &iface_config, &post_init).await?;
+    let discovery_config = discovery_config_for_interface(
+        config,
+        &iface_config,
+        &post_init,
+        handle.config.enable_transport,
+        &handle.config.stamps,
+    )
+    .map_err(|e| e.to_string())?;
+    let spawned =
+        spawn_configured_interface_for_discovery(handle, &iface_config, &post_init).await?;
+    if let Some(discovery_config) = discovery_config {
+        // As at startup, an I2P interface is announced itself, never its peers.
+        let announced = match iface_config {
+            interface_factory::InterfaceConfig::I2P(_) => &spawned[..spawned.len().min(1)],
+            _ => &spawned[..],
+        };
+        let location_cmd = section.get("location_cmd").map(ToString::to_string);
+        handle
+            .discovery
+            .local_interfaces
+            .lock()
+            .await
+            .extend(
+                announced
+                    .iter()
+                    .map(|(id, online, address)| LocalDiscoveryInterface {
+                        id: *id,
+                        config: discovery_config.clone(),
+                        online: Some(online.clone()),
+                        reachable_on: address.clone(),
+                        location_cmd: location_cmd.clone(),
+                    }),
+            );
+    }
+    let ids: Vec<u64> = spawned.into_iter().map(|(id, _, _)| id).collect();
     // Python never detaches an I2PInterface (Reticulum.py:888).
     if interface_bootstrap_only(config, &iface_config)
         && !matches!(iface_config, interface_factory::InterfaceConfig::I2P(_))
@@ -14197,6 +14318,15 @@ loglevel = 7
         (tx, rx)
     }
 
+    async fn run_discovery_announcer_with(
+        handle: ReticulumHandle,
+        stamper: Arc<dyn DiscoveryStamper + Send + Sync>,
+        locals: Vec<LocalDiscoveryInterface>,
+    ) {
+        *handle.discovery.local_interfaces.lock().await = locals;
+        run_discovery_announcer(handle, stamper).await;
+    }
+
     fn advertised_service(id: u64, encrypted: bool) -> LocalDiscoveryInterface {
         let mut config = DiscoveryInterfaceConfig::backbone(
             Some(format!("service-{id}")),
@@ -14284,7 +14414,7 @@ loglevel = 7
                 radio.config.bandwidth = Some(125_000);
                 radio.config.spreading_factor = Some(8);
                 radio.config.coding_rate = Some(5);
-                let publisher = tokio::spawn(run_discovery_announcer(
+                let publisher = tokio::spawn(run_discovery_announcer_with(
                     handle.clone(),
                     Arc::new(StaticStamper),
                     vec![advertised_service(42, encrypted), radio],
@@ -14349,7 +14479,7 @@ loglevel = 7
         i2p.config.reachable_on = None;
         i2p.config.port = None;
         i2p.reachable_on = Some(reachable_on);
-        let publisher = tokio::spawn(run_discovery_announcer(
+        let publisher = tokio::spawn(run_discovery_announcer_with(
             handle.clone(),
             Arc::new(StaticStamper),
             vec![i2p],
@@ -14392,7 +14522,7 @@ loglevel = 7
         let online = Arc::new(AtomicBool::new(false));
         let mut local = advertised_service(42, false);
         local.online = Some(online.clone());
-        let publisher = tokio::spawn(run_discovery_announcer(
+        let publisher = tokio::spawn(run_discovery_announcer_with(
             handle.clone(),
             Arc::new(StaticStamper),
             vec![local],
@@ -14529,7 +14659,7 @@ loglevel = 7
         let mut local = advertised_service(42, false);
         local.online = Some(online.clone());
         let stamper = Arc::new(CountedStamper(AtomicU64::new(0)));
-        let publisher = tokio::spawn(run_discovery_announcer(
+        let publisher = tokio::spawn(run_discovery_announcer_with(
             handle.clone(),
             stamper.clone(),
             vec![local],
@@ -14625,7 +14755,7 @@ loglevel = 7
         let mut second = advertised_service(43, false);
         second.online = Some(second_online.clone());
         let stamper = GatedStamper::new(1);
-        let publisher = tokio::spawn(run_discovery_announcer(
+        let publisher = tokio::spawn(run_discovery_announcer_with(
             handle.clone(),
             stamper.clone(),
             vec![advertised_service(42, false), second],
@@ -14676,7 +14806,7 @@ loglevel = 7
         for abort in [false, true] {
             let (handle, actor) = discovery_actor();
             let stamper = GatedStamper::new(0);
-            let publisher = tokio::spawn(run_discovery_announcer(
+            let publisher = tokio::spawn(run_discovery_announcer_with(
                 handle.clone(),
                 stamper.clone(),
                 vec![advertised_service(42, false)],

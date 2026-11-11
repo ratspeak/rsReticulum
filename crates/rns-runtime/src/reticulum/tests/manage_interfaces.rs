@@ -141,3 +141,88 @@ async fn management_disabled_refuses_every_operation() {
     assert_eq!(results, [Some(false); 3]);
     assert_eq!(still_running, ["Managed"]);
 }
+
+async fn discovery_ids(handle: &ReticulumHandle) -> Vec<u64> {
+    let mut ids: Vec<u64> = handle
+        .discovery
+        .local_interfaces
+        .lock()
+        .await
+        .iter()
+        .map(|local| local.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attached_discoverable_interfaces_join_and_leave_the_announcer() {
+    let (plain, discoverable) = (free_port(), free_port());
+    let dir = config_dir(&format!(
+        "[reticulum]\n  share_instance = No\n\n[interfaces]\n  \
+         [[Plain]]\n    type = TCPServerInterface\n    enabled = no\n    \
+         listen_ip = 127.0.0.1\n    listen_port = {plain}\n  \
+         [[Published]]\n    type = TCPServerInterface\n    enabled = no\n    discoverable = yes\n    \
+         reachable_on = 127.0.0.1\n    listen_ip = 127.0.0.1\n    listen_port = {discoverable}\n"
+    ));
+    let handle = init(
+        Some(dir.to_str().unwrap()),
+        None,
+        ShutdownSignal::new(),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+    .unwrap();
+    let at_start = discovery_ids(&handle).await;
+    let announcer_configured = handle
+        .discovery
+        .announcer_configured
+        .load(Ordering::Acquire);
+    handle.attach_interface("Plain").await.unwrap();
+    let with_plain = discovery_ids(&handle).await;
+    handle.attach_interface("Published").await.unwrap();
+    let attached = discovery_ids(&handle).await;
+    let published = handle
+        .running_interface("Published")
+        .await
+        .map(|(e, _)| e.id);
+    let entry = handle
+        .discovery
+        .local_interfaces
+        .lock()
+        .await
+        .first()
+        .cloned();
+    handle.reload_interface("Published").await.unwrap();
+    let reloaded = discovery_ids(&handle).await;
+    let republished = handle
+        .running_interface("Published")
+        .await
+        .map(|(e, _)| e.id);
+    handle.detach_interface("Published").await.unwrap();
+    let detached = discovery_ids(&handle).await;
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(at_start.is_empty());
+    assert!(
+        announcer_configured,
+        "a disabled discoverable section enables the announcer"
+    );
+    assert!(
+        with_plain.is_empty(),
+        "a section without discoverable is not announced"
+    );
+    assert_eq!(attached, vec![published.unwrap()]);
+    let entry = entry.unwrap();
+    assert_eq!(entry.config.interface_type, "TCPServerInterface");
+    assert_eq!(entry.config.port, Some(discoverable));
+    assert_eq!(entry.config.reachable_on.as_deref(), Some("127.0.0.1"));
+    // Reload replaces the entry with whatever the re-attach registered.
+    assert!(!reloaded.contains(&published.unwrap()));
+    assert_eq!(reloaded, republished.into_iter().collect::<Vec<_>>());
+    assert!(
+        detached.is_empty(),
+        "a detached interface is still announced"
+    );
+}

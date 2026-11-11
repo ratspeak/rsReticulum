@@ -57,8 +57,10 @@ pub enum LinkClientError {
 pub enum RequestFailure {
     #[error("no response within the request timeout")]
     TimedOut,
-    #[error("link closed while the request was pending")]
-    LinkClosed,
+    /// The link's `teardown_reason`; `None` when the local attachment ended
+    /// without a teardown, such as a lost interface.
+    #[error("link closed while the request was pending ({0:?})")]
+    LinkClosed(Option<CloseReason>),
 }
 
 #[derive(Clone)]
@@ -365,7 +367,9 @@ async fn wait_for_response(
                 ))?,
                 terminal = endpoint.lifecycle_rx.recv() => {
                     tracing::debug!("link endpoint terminated: {terminal:?}");
-                    return Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed));
+                    return Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed(
+                        link.teardown_reason,
+                    )));
                 }
                 _ = tokio::time::sleep(wait) => {
                     poll_response_resources(transport_tx, link, link_id, &mut inbound_resources)
@@ -375,7 +379,9 @@ async fn wait_for_response(
             };
             match ev {
                 DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
-                    return Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed));
+                    return Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed(
+                        link.teardown_reason,
+                    )));
                 }
                 DestinationEvent::InboundPacket {
                     raw,
@@ -663,7 +669,9 @@ async fn wait_for_response(
                         rns_wire::context::PacketContext::LinkClose
                             if link.receive_teardown(body) =>
                         {
-                            return Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed));
+                            return Err(LinkClientError::RequestFailed(
+                                RequestFailure::LinkClosed(link.teardown_reason),
+                            ));
                         }
                         _ => {}
                     }

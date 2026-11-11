@@ -262,11 +262,34 @@ struct PendingResponderEndpointBind {
 }
 
 enum ResponderBindReceiver {
-    Legacy(oneshot::Receiver<LinkEndpointBindResult>),
+    Legacy(
+        oneshot::Receiver<LinkEndpointBindResult>,
+        Option<Result<LinkEndpointBindResult, oneshot::error::RecvError>>,
+    ),
     Exact(rns_transport::link_endpoint_dispatch::LinkEndpointDispatchBindReceipt),
 }
 
 impl ResponderBindReceiver {
+    /// Readiness without consuming the reply; `try_recv` still publishes it.
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::future::Future;
+        match self {
+            Self::Legacy(rx, ready) => {
+                if ready.is_none()
+                    && let std::task::Poll::Ready(result) = std::pin::Pin::new(rx).poll(cx)
+                {
+                    *ready = Some(result);
+                }
+                if ready.is_some() {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+            Self::Exact(receipt) => receipt.poll_ready(cx),
+        }
+    }
+
     fn try_recv(
         &mut self,
     ) -> Result<
@@ -277,7 +300,12 @@ impl ResponderBindReceiver {
         oneshot::error::TryRecvError,
     > {
         match self {
-            Self::Legacy(rx) => rx.try_recv().map(|result| (result, None)),
+            Self::Legacy(rx, ready) => match ready.take() {
+                Some(result) => result
+                    .map(|result| (result, None))
+                    .map_err(|_| oneshot::error::TryRecvError::Closed),
+                None => rx.try_recv().map(|result| (result, None)),
+            },
             Self::Exact(rx) => rx.try_recv().map(|result| match result {
                 Ok(token) => (LinkEndpointBindResult::Bound, Some(token)),
                 Err(result) => (result, None),
@@ -343,6 +371,20 @@ async fn wait_identity_checks(pending: &mut HashMap<[u8; 16], PendingIdentityChe
             }
         }
         Poll::Pending
+    })
+    .await
+}
+
+/// Wakes an event loop when a responder endpoint bind completes, so LRPROOF
+/// leaves at once as in Python `Link.validate_request`.
+async fn wait_endpoint_binds(pending: &mut HashMap<[u8; 16], PendingResponderEndpointBind>) {
+    std::future::poll_fn(|cx| {
+        for bind in pending.values_mut() {
+            if bind.result_rx.poll_ready(cx).is_ready() {
+                return std::task::Poll::Ready(());
+            }
+        }
+        std::task::Poll::Pending
     })
     .await
 }
@@ -1359,6 +1401,7 @@ impl LinkManager {
             _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); true }
             _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => { self.poll_inbound_packet_receipts(); true }
             _ = wait_identity_checks(&mut self.pending_identity_checks) => { self.poll_identity_checks(); true }
+            _ = wait_endpoint_binds(&mut self.pending_endpoint_binds) => { self.poll_link_endpoints(); true }
             _ = tokio::time::sleep_until(inbound_deadline.into()) => { self.poll_inbound_packet_receipts(); true }
             event = self.event_rx.recv() => {
                 let Some(event) = event else { return false; };
@@ -1431,6 +1474,7 @@ impl LinkManager {
             _ = self.inbound_packet_notify.notified() => { self.poll_inbound_packet_receipts(); }
                 _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => { self.poll_inbound_packet_receipts(); }
                 _ = wait_identity_checks(&mut self.pending_identity_checks) => { self.poll_identity_checks(); }
+                _ = wait_endpoint_binds(&mut self.pending_endpoint_binds) => {}
                 _ = tokio::time::sleep_until(inbound_deadline.into()) => { self.poll_inbound_packet_receipts(); }
                 event = self.event_rx.recv() => {
                     match event {
@@ -1500,6 +1544,7 @@ impl LinkManager {
                 _ = self.inbound_packet_notify.notified() => {},
                 _ = crate::inbound_link_packet::wait_dispatch(&mut self.pending_inbound_packets) => {},
                 _ = wait_identity_checks(&mut self.pending_identity_checks) => {},
+                _ = wait_endpoint_binds(&mut self.pending_endpoint_binds) => {},
                 command = command_rx.recv() => {
                     if let Some(command) = command
                         && !self.handle_command(command)
@@ -3422,7 +3467,7 @@ impl LinkManager {
                     lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
                     result_tx,
                 });
-            ResponderBindReceiver::Legacy(result_rx)
+            ResponderBindReceiver::Legacy(result_rx, None)
         };
         self.pending_endpoint_binds.insert(
             link_id,
