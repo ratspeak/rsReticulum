@@ -165,8 +165,6 @@ fn rnstatus_json(tmp: &TempDir) -> Output {
         .arg(tmp.path())
         .arg("--json")
         .arg("--all")
-        .arg("--timeout")
-        .arg("1")
         .output()
         .expect("run rnstatus-rs")
 }
@@ -199,7 +197,7 @@ fn poll_shared_server(
                 .and_then(|v| v.as_array())
                 .is_some_and(|interfaces| {
                     interfaces.iter().any(|entry| {
-                        entry.get("role").and_then(|v| v.as_str()) == Some("LocalServerInterface")
+                        entry.get("type").and_then(|v| v.as_str()) == Some("LocalServerInterface")
                     })
                 });
             if ready {

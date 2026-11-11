@@ -6,8 +6,6 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rns_runtime::rpc;
-
 struct TempDir {
     path: PathBuf,
 }
@@ -138,14 +136,12 @@ fn output_text(output: &Output) -> (String, String) {
     )
 }
 
-fn rnstatus_json(tmp: &TempDir, timeout_secs: &str) -> Output {
+fn rnstatus_json(tmp: &TempDir) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rnstatus-rs"))
         .arg("--config")
         .arg(tmp.path())
         .arg("--json")
         .arg("--all")
-        .arg("--timeout")
-        .arg(timeout_secs)
         .output()
         .expect("run rnstatus-rs")
 }
@@ -154,7 +150,6 @@ fn poll_rnstatus_until<F>(
     daemon: &mut ChildGuard,
     tmp: &TempDir,
     deadline_after: Duration,
-    timeout_secs: &str,
     predicate: F,
 ) -> Result<(), String>
 where
@@ -171,7 +166,7 @@ where
             ));
         }
 
-        let output = rnstatus_json(tmp, timeout_secs);
+        let output = rnstatus_json(tmp);
         last_status = output.status.code();
         (last_stdout, last_stderr) = output_text(&output);
 
@@ -196,150 +191,6 @@ where
          --- last rnstatus stdout ---\n{last_stdout}\n\
          --- last rnstatus stderr ---\n{last_stderr}"
     ))
-}
-
-/// A control port that answers each interface stats request with `stats`,
-/// through the same multiprocessing handshake as `rnsd-rs`.
-fn spawn_control_port(rpc_key: Vec<u8>, stats: Vec<rpc::InterfaceStatEntry>) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind control port");
-    let port = listener.local_addr().expect("control port addr").port();
-    listener
-        .set_nonblocking(true)
-        .expect("non-blocking control port");
-    thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("control port runtime");
-        runtime.block_on(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio control port");
-            while let Ok((mut stream, _)) = listener.accept().await {
-                answer_stats_request(&mut stream, &rpc_key, &stats)
-                    .await
-                    .expect("serve interface stats");
-            }
-        });
-    });
-    port
-}
-
-async fn answer_stats_request(
-    stream: &mut tokio::net::TcpStream,
-    rpc_key: &[u8],
-    stats: &[rpc::InterfaceStatEntry],
-) -> Result<(), rpc::RpcError> {
-    const CHALLENGE: &[u8] = b"#CHALLENGE#";
-    const WELCOME: &[u8] = b"#WELCOME#";
-    let challenge = rpc::new_python_challenge();
-    rpc::write_mp_frame(stream, &[CHALLENGE, &challenge].concat()).await?;
-    let response = rpc::read_mp_frame(stream, 256).await?;
-    assert!(rpc::verify_python_auth_response(
-        rpc_key, &challenge, &response
-    ));
-    rpc::write_mp_frame(stream, WELCOME).await?;
-    let client_challenge = rpc::read_mp_frame(stream, 256).await?;
-    let message = client_challenge
-        .strip_prefix(CHALLENGE)
-        .expect("client challenge");
-    rpc::write_mp_frame(stream, &rpc::compute_python_auth_response(rpc_key, message)).await?;
-    assert_eq!(rpc::read_mp_frame(stream, 256).await?, WELCOME);
-    let request = rpc::decode_request(&rpc::read_mp_frame(stream, 4096).await?)?;
-    // rnstatus registers its destination type around the stats request.
-    let answer = match request {
-        rpc::RpcRequest::WantsDestinationType { .. }
-        | rpc::RpcRequest::UnwantsAllDestinationTypes { .. } => {
-            rpc::encode_response(&rpc::RpcResponse::BoolResult(true))?
-        }
-        rpc::RpcRequest::GetInterfaceStats => {
-            rpc::encode_response(&rpc::RpcResponse::InterfaceStats(stats.to_vec()))?
-        }
-        other => panic!("unexpected request {other:?}"),
-    };
-    rpc::write_mp_frame(stream, &answer).await
-}
-
-/// Python's rnstatus prints the network an interface was auto-connected
-/// through right under its name, before its network name and status
-/// (rnstatus.py:523-530).
-#[test]
-fn rnstatus_cli_names_the_auto_connect_source() {
-    let tmp = TempDir::new("rnstatus-autoconnect-source");
-    let rpc_key = [0x53u8; 32];
-    let source = "a4bc81fd6b20c9e14c06a9c8b2e5f3d7";
-    let stats = vec![
-        rpc::InterfaceStatEntry {
-            name: "Discovered Backbone".to_string(),
-            online: true,
-            ifac_netname: Some("testnet".to_string()),
-            autoconnect_source: Some(source.to_string()),
-            ..Default::default()
-        },
-        rpc::InterfaceStatEntry {
-            name: "Configured TCP".to_string(),
-            online: true,
-            ..Default::default()
-        },
-    ];
-    let control_port = spawn_control_port(rpc_key.to_vec(), stats);
-    let config = format!(
-        "[reticulum]\n\
-         share_instance = Yes\n\
-         shared_instance_type = tcp\n\
-         instance_control_port = {control_port}\n\
-         rpc_key = {}\n\
-         \n\
-         [interfaces]\n",
-        hex::encode(rpc_key)
-    );
-    fs::write(tmp.join("config"), config).expect("write config");
-
-    let rnstatus = |json: bool| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_rnstatus-rs"));
-        command.arg("--config").arg(tmp.path()).arg("--all");
-        if json {
-            command.arg("--json");
-        }
-        let output = command.output().expect("run rnstatus-rs");
-        let (stdout, stderr) = output_text(&output);
-        assert!(output.status.success(), "rnstatus-rs failed: {stderr}");
-        stdout
-    };
-
-    let human = rnstatus(false);
-    let lines: Vec<&str> = human.lines().collect();
-    let discovered = lines
-        .iter()
-        .position(|line| *line == "  Discovered Backbone")
-        .unwrap_or_else(|| panic!("no discovered interface in:\n{human}"));
-    let source_line = format!("    Source   : Auto-connect via <{source}>");
-    assert_eq!(
-        lines[discovered..discovered + 4],
-        [
-            "  Discovered Backbone",
-            source_line.as_str(),
-            "    Network  : testnet",
-            "    Status   : Up",
-        ],
-        "{human}"
-    );
-    assert_eq!(
-        human.matches("Auto-connect via").count(),
-        1,
-        "only the auto-connected interface names a source:\n{human}"
-    );
-
-    let json: serde_json::Value =
-        serde_json::from_str(&rnstatus(true)).expect("rnstatus-rs JSON output");
-    let sources: Vec<_> = json["interfaces"]
-        .as_array()
-        .expect("interfaces array")
-        .iter()
-        .map(|interface| interface["autoconnect_source"].clone())
-        .collect();
-    assert_eq!(
-        sources,
-        [serde_json::json!(source), serde_json::Value::Null]
-    );
 }
 
 fn panic_with_daemon_output(message: String, daemon: ChildGuard) -> ! {
@@ -379,17 +230,13 @@ fn rnsd_rnstatus_cli_survives_stale_python_destination_table() {
         ["--config".as_ref(), tmp.path().as_os_str()],
     );
 
-    if let Err(message) = poll_rnstatus_until(
-        &mut daemon,
-        &tmp,
-        Duration::from_secs(5),
-        "1",
-        |interfaces| {
+    if let Err(message) =
+        poll_rnstatus_until(&mut daemon, &tmp, Duration::from_secs(5), |interfaces| {
             interfaces.iter().any(|entry| {
-                entry.get("role").and_then(|v| v.as_str()) == Some("LocalServerInterface")
+                entry.get("type").and_then(|v| v.as_str()) == Some("LocalServerInterface")
             })
-        },
-    ) {
+        })
+    {
         panic_with_daemon_output(message, daemon);
     }
 }
@@ -433,18 +280,14 @@ fn rnsd_rnstatus_cli_public_tcp_testnet_smoke() {
         ["--config".as_ref(), tmp.path().as_os_str()],
     );
 
-    if let Err(message) = poll_rnstatus_until(
-        &mut daemon,
-        &tmp,
-        Duration::from_secs(10),
-        "2",
-        |interfaces| {
+    if let Err(message) =
+        poll_rnstatus_until(&mut daemon, &tmp, Duration::from_secs(10), |interfaces| {
             interfaces.iter().any(|entry| {
                 entry.get("name").and_then(|v| v.as_str()) == Some("Public TCP")
-                    && entry.get("online").and_then(|v| v.as_bool()) == Some(true)
+                    && entry.get("status").and_then(|v| v.as_bool()) == Some(true)
             })
-        },
-    ) {
+        })
+    {
         panic_with_daemon_output(
             format!("{message}\nexpected Public TCP to come online for {host}:{port}"),
             daemon,

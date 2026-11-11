@@ -1,9 +1,13 @@
-//! rnstatus-rs — interface status viewer.
+//! rnstatus-rs — interface status viewer, following `RNS/Utilities/rnstatus.py`.
 //!
-//! Local: HMAC RPC to local rnsd (TCP or shared Unix socket). Remote
-//! (`-R <hash> -i <identity>`): Link to `rnstransport.remote.management`
-//! `/status`; remote must allow-list our identity hash.
+//! Local: attach to the shared instance as a client and read its stats over
+//! the RPC control port. Remote (`-R <hash> -i <identity>`): request
+//! `/status` from `rnstransport.remote.management` over a link. Both render
+//! the same upstream stats dictionary.
 
+use std::collections::HashSet;
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -11,61 +15,100 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use clap::Parser;
-use serde_json::json;
+use rmpv::Value;
 
-use rns_runtime::config::Config;
+use rns_identity::destination::Destination;
+use rns_identity::identity::Identity;
 use rns_runtime::lifecycle::ShutdownSignal;
 use rns_runtime::link_client::{LinkClient, LinkClientError};
-use rns_runtime::platform::StoragePaths;
-use rns_runtime::platform::resolve_config_dir;
-use rns_runtime::reticulum::{ReticulumConfig, ReticulumHandle, SharedInstanceRpcEndpoint, init};
-use rns_runtime::rpc::{self, RpcRequest, RpcResponse};
-use rns_tools::{format, hash};
+use rns_runtime::platform::{StoragePaths, resolve_config_dir};
+use rns_runtime::reticulum::{
+    InitOptions, InstanceMode, ReticulumConfig, ReticulumHandle, SharedInstanceRpcEndpoint,
+    init_with_options,
+};
+use rns_runtime::rpc::{self, ManageOperation, RpcRequest};
+use rns_tools::RS_RETICULUM_VERSION;
+use rns_transport::constants::PATH_REQUEST_TIMEOUT;
 use rns_transport::discovery::{DiscoveredInterface, DiscoveryStatus, DiscoveryStore};
+use rns_transport::messages::PathRequestOptions;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 5;
-const REMOTE_TIMEOUT_SECS: u64 = 30;
+const LOCAL_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for link establishment and the request once a remote path is known.
+const REMOTE_LINK_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_HOPS: u8 = 8;
 const MGMT_APP: &str = "rnstransport.remote.management";
-use rns_tools::RS_RETICULUM_VERSION;
+/// rnstatus.py:79.
+const CLR: &str = "\r                                                          \r";
 
 #[derive(Parser)]
 #[command(
     name = "rnstatus-rs",
-    about = "Reticulum interface status",
+    about = "Reticulum Network Stack Status",
     disable_version_flag = true
 )]
 struct Args {
-    /// Include internal and peer interface entries normally hidden.
+    /// Path to alternative Reticulum config directory.
+    #[arg(short = 'c', long)]
+    config: Option<String>,
+
+    /// Print version and exit.
+    #[arg(long)]
+    version: bool,
+
+    /// Attach interface by name.
+    #[arg(long, value_name = "name")]
+    attach: Option<String>,
+
+    /// Detach interface by name.
+    #[arg(long, value_name = "name")]
+    detach: Option<String>,
+
+    /// Reload interface by name.
+    #[arg(long, value_name = "name")]
+    reload: Option<String>,
+
+    /// Show all interfaces.
     #[arg(short, long)]
     all: bool,
 
-    /// Show announce queue / frequency stats.
+    /// Show announce stats.
     #[arg(short = 'A', long)]
     announce_stats: bool,
 
-    /// Show path request frequency stats.
+    /// Show path request stats.
     #[arg(short = 'P', long = "pr-stats")]
     pr_stats: bool,
 
-    /// Show link table entry count.
+    /// Show link stats.
     #[arg(short, long)]
     link_stats: bool,
 
-    /// Show interfaces with active announce or path request bursts, plus FILTER matches.
+    /// Only show interfaces with active bursts.
     #[arg(short = 'B', long)]
     burst: bool,
+
+    /// Show blocked IPs per interface.
+    #[arg(short = 'b', long)]
+    blocked_ips: bool,
 
     /// Display traffic totals.
     #[arg(short, long)]
     totals: bool,
 
     /// Display packets per second in totals.
-    #[arg(short = 'p', long = "pps")]
+    #[arg(short = 'p', long)]
     pps: bool,
 
-    /// Sort interfaces by rate, traffic, rx, tx, rxs, txs, announces, arx, atx, arxc, atxc, prx,
-    /// ptx, prxc, ptxc, held, pvs, ivs, flt, txdrp or txdrb.
+    /// Display queue stats.
+    #[arg(short = 'q', long)]
+    queues: bool,
+
+    /// Display live profiling results.
+    #[arg(short = 'z', long)]
+    profiling: bool,
+
+    /// Sort interfaces by [rate, traffic, rx, tx, rxs, txs, anns, arx, atx, arxc, atxc, held,
+    /// prx, ptx, prxc, ptxc, pvs, ivs, flt, txdrp, txdrb, txbuf].
     #[arg(short, long)]
     sort: Option<String>,
 
@@ -73,31 +116,27 @@ struct Args {
     #[arg(short, long)]
     reverse: bool,
 
-    /// JSON output (machine-readable).
+    /// Output in JSON format.
     #[arg(short, long)]
     json: bool,
 
-    /// Alternative config directory.
-    #[arg(short = 'c', long)]
-    config: Option<String>,
-
-    /// Remote transport hash (32 hex chars). Query that node over Reticulum.
-    #[arg(short = 'R', long = "remote")]
+    /// Transport identity hash of remote instance to get status from.
+    #[arg(short = 'R', long = "remote", value_name = "hash")]
     remote: Option<String>,
 
-    /// Identity file used to authenticate to the remote node (required with `-R`).
-    #[arg(short = 'i', long)]
+    /// Path to identity used for remote management.
+    #[arg(short = 'i', long = "identity", value_name = "path")]
     identity: Option<PathBuf>,
 
-    /// Seconds to wait for the response (default 5 local, 30 remote).
-    #[arg(short = 'w', long)]
-    timeout: Option<u64>,
+    /// Timeout before giving up on remote queries.
+    #[arg(short = 'w', long = "timeout", value_name = "seconds", default_value_t = PATH_REQUEST_TIMEOUT)]
+    timeout: f64,
 
-    /// List discovered interfaces from the local discovery store.
+    /// List discovered interfaces.
     #[arg(short = 'd', long)]
     discovered: bool,
 
-    /// Show details and config data for discovered interfaces.
+    /// Show details and config entries for discovered interfaces.
     #[arg(short = 'D')]
     discovered_details: bool,
 
@@ -113,41 +152,113 @@ struct Args {
     #[arg(short = 'm', long)]
     monitor: bool,
 
-    /// Target monitor refresh interval in seconds; each refresh sleeps at least 0.2 seconds.
-    #[arg(short = 'I', long = "monitor-interval", default_value_t = 1.0)]
+    /// Refresh interval for monitor mode (default: 1).
+    #[arg(
+        short = 'I',
+        long = "monitor-interval",
+        value_name = "seconds",
+        default_value_t = 1.0
+    )]
     monitor_interval: f64,
 
-    /// Print version and exit.
-    #[arg(long)]
-    version: bool,
-
-    /// Increase verbosity (default: warnings; -v for info, -vv for debug).
-    #[arg(short, action = clap::ArgAction::Count)]
+    #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Decrease verbosity.
-    #[arg(short, action = clap::ArgAction::Count)]
-    quiet: u8,
-
-    /// Case-insensitive interface-name substring; with --burst, also include matching interfaces.
+    /// Only display interfaces with names including filter.
     filter: Option<String>,
+}
+
+/// Rust-only spellings kept for existing scripts (upstream has `--config`,
+/// `-R`, `-i` and `-w` only).
+const DEPRECATED_SPELLINGS: &[(&str, &str)] = &[
+    ("-c", "--config"),
+    ("--remote", "-R"),
+    ("--identity", "-i"),
+    ("--timeout", "-w"),
+];
+
+fn warn_deprecated_spellings() {
+    for arg in std::env::args().skip(1) {
+        if arg == "--" {
+            break;
+        }
+        for (old, new) in DEPRECATED_SPELLINGS {
+            if arg == *old || arg.starts_with(&format!("{old}=")) {
+                eprintln!("rnstatus-rs: warning: {old} is deprecated, use {new}");
+            }
+        }
+    }
+}
+
+/// Output of one run. Direct output is written out at each progress point;
+/// monitor mode buffers a whole frame, as rnstatus.py:930-951 does.
+struct Out {
+    buf: String,
+    direct: bool,
+}
+
+impl Out {
+    fn new(direct: bool) -> Self {
+        Self {
+            buf: String::new(),
+            direct,
+        }
+    }
+
+    fn flush_now(&mut self) {
+        if self.direct {
+            write_stdout(&self.buf);
+            self.buf.clear();
+        }
+    }
+}
+
+impl std::fmt::Write for Out {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.buf.push_str(s);
+        Ok(())
+    }
+}
+
+fn write_stdout(s: &str) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(s.as_bytes());
+    let _ = stdout.flush();
+}
+
+macro_rules! outln {
+    ($o:expr) => {
+        $o.buf.push('\n')
+    };
+    ($o:expr, $($t:tt)*) => {{
+        let _ = writeln!($o, $($t)*);
+    }};
+}
+
+macro_rules! outp {
+    ($o:expr, $($t:tt)*) => {{
+        let _ = write!($o, $($t)*);
+    }};
+}
+
+/// How a status run ends. `Hard` exits even in monitor mode, where upstream
+/// calls `exit()` regardless of `must_exit`.
+enum Flow {
+    Done(u8),
+    Hard(u8),
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 pub(crate) async fn main() -> ExitCode {
     let args = Args::parse();
-
     if args.version {
         println!("rnstatus-rs {RS_RETICULUM_VERSION}");
         return ExitCode::SUCCESS;
     }
-    if let Err(e) = validate_args(&args) {
-        eprintln!("rnstatus-rs: {e}");
-        return ExitCode::from(2);
-    }
+    warn_deprecated_spellings();
 
-    let level = rns_tools::Utility::Rnstatus.loglevel(None, args.verbose, args.quiet, false);
-    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
+    let level = rns_tools::Utility::Rnstatus.loglevel(None, args.verbose, 0, false);
+    let config_dir = resolve_config_dir(args.config.as_deref());
     rns_tools::init_tracing(
         level,
         rns_tools::config_log_timestamps(&config_dir),
@@ -155,825 +266,1809 @@ pub(crate) async fn main() -> ExitCode {
         std::io::stdout,
     );
 
-    if args.monitor {
-        run_monitor(args).await
-    } else if args.remote.is_some() {
-        run_remote(args).await
+    let session = match Session::open(&args).await {
+        Ok(session) => session,
+        Err(code) => return ExitCode::from(code),
+    };
+    let code = if args.monitor {
+        run_monitor(&args, &session).await
     } else {
-        run_local(args).await
-    }
+        let mut out = Out::new(true);
+        let flow = session.status(&args, &mut out).await;
+        out.flush_now();
+        match flow {
+            Flow::Done(code) | Flow::Hard(code) => code,
+        }
+    };
+    session.close().await;
+    ExitCode::from(code)
 }
 
-async fn run_monitor(args: Args) -> ExitCode {
-    // Python 1.3.8 rnstatus.py:714-744 (commit 32389002): one RNS instance and
-    // one remote destination live across refreshes; only the request repeats.
-    let session = if args.remote.is_some() {
-        match RemoteSession::open(&args).await {
-            Ok(s) => Some(s),
-            Err(code) => return code,
-        }
-    } else {
-        None
-    };
-    let registration = match session {
-        Some(_) => None,
-        None => local_registration(&args).await,
-    };
+/// rnstatus.py:920-955: one instance across refreshes; each frame is
+/// rendered into a buffer, then printed after `ESC[H ESC[2J`.
+async fn run_monitor(args: &Args, session: &Session) -> u8 {
     let interrupt = ShutdownSignal::new();
     let _signal_rx = rns_runtime::lifecycle::install_signal_handlers(interrupt.clone());
     loop {
-        if interrupt.is_triggered() {
-            if let Some(session) = &session {
-                rns_tools::shut_down(&session.handle).await;
-            }
-            if let Some(registration) = registration {
-                registration.release().await;
-            }
-            return ExitCode::SUCCESS;
-        }
         let started = std::time::Instant::now();
-        print!("\x1b[2J\x1b[H");
-        let exit = match &session {
-            Some(session) => session.query_and_print(&args).await,
-            None => run_local_once(&args).await,
-        };
-        if exit != ExitCode::SUCCESS {
-            if let Some(session) = &session {
-                rns_tools::shut_down(&session.handle).await;
-            }
-            if let Some(registration) = registration {
-                registration.release().await;
-            }
-            return exit;
+        let mut out = Out::new(false);
+        if let Flow::Hard(code) = session.status(args, &mut out).await {
+            return code;
         }
+        write_stdout(&format!("\x1b[H\x1b[2J{}", out.buf));
         tokio::select! {
             _ = tokio::time::sleep(monitor_sleep(args.monitor_interval, started.elapsed())) => {}
             _ = interrupt.wait() => {}
         }
+        // rnstatus.py:965-966: KeyboardInterrupt prints an empty line.
+        if interrupt.is_triggered() {
+            write_stdout("\n");
+            return 0;
+        }
     }
 }
 
-/// Python 1.3.8 rnstatus.py:742-744: sleep `max(interval - render time, 0.2)`.
+/// rnstatus.py:953-955: sleep `max(interval - render time, 0.2)`.
 fn monitor_sleep(interval_secs: f64, elapsed: Duration) -> Duration {
     Duration::from_secs_f64((interval_secs - elapsed.as_secs_f64()).max(0.2))
 }
 
-async fn run_local(args: Args) -> ExitCode {
-    let registration = local_registration(&args).await;
-    let exit = run_local_once(&args).await;
-    if let Some(registration) = registration {
-        registration.release().await;
-    }
-    exit
+/// The Reticulum instance rnstatus runs with: a shared-instance client for
+/// local queries, as `RNS.Reticulum(require_shared_instance=True)`, or any
+/// instance for `-R` (rnstatus.py:157-169).
+struct Session {
+    handle: ReticulumHandle,
+    rpc_key: Vec<u8>,
+    first_remote_request: std::sync::atomic::AtomicBool,
 }
 
-/// The type registration upstream rnstatus makes on the shared instance it
-/// reads (rnstatus.py:174, 928); released again before the tool exits.
-async fn local_registration(args: &Args) -> Option<rns_tools::RpcRegistration> {
-    let config_dir = resolve_config_dir(args.config.as_deref());
-    let config = Config::from_file(&config_dir.join("config")).ok()?;
-    let rc = ReticulumConfig::from_config(&config);
-    let rpc_key = local_rpc_key(&config_dir, &rc)?;
-    Some(
-        rns_tools::RpcRegistration::want(
-            rc.shared_rpc_endpoint(&std::env::temp_dir()),
-            rpc_key,
-            &[MGMT_APP],
-            Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS)),
+impl Session {
+    async fn open(args: &Args) -> Result<Self, u8> {
+        let options = InitOptions {
+            require_shared_instance: args.remote.is_none(),
+            ..InitOptions::default()
+        };
+        let handle = match init_with_options(
+            args.config.as_deref(),
+            None,
+            ShutdownSignal::new(),
+            Arc::new(AtomicBool::new(true)),
+            options,
         )
-        .await,
-    )
-}
-
-async fn run_local_once(args: &Args) -> ExitCode {
-    let config_dir = resolve_config_dir(args.config.as_deref());
-    let config_path = config_dir.join("config");
-    let config = match Config::from_file(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "rnstatus-rs: could not read config at {}: {e}",
-                config_path.display()
-            );
-            return ExitCode::from(1);
-        }
-    };
-    let rc = ReticulumConfig::from_config(&config);
-
-    if args.discovered || args.discovered_details {
-        return print_discovered_interfaces(&config_dir, &rc, args);
+        .await
+        {
+            Ok(handle) => handle,
+            Err(_) => {
+                println!("No shared RNS instance available to get status from");
+                return Err(1);
+            }
+        };
+        handle.wants_destination_type(MGMT_APP).await;
+        let rpc_key = local_rpc_key(&handle.config_dir, &handle.config);
+        Ok(Self {
+            handle,
+            rpc_key,
+            first_remote_request: AtomicBool::new(true),
+        })
     }
 
-    let rpc_key = match local_rpc_key(&config_dir, &rc) {
-        Some(k) => k,
-        None => {
-            eprintln!(
-                "rnstatus-rs: no rpc_key configured and no transport identity at {} — nothing to query.",
-                config_path.display()
-            );
-            return ExitCode::from(1);
-        }
-    };
-
-    let timeout = Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
-    let endpoint = rc.shared_rpc_endpoint(&std::env::temp_dir());
-
-    let answer =
-        local_rpc_request_bytes(&endpoint, &rpc_key, &RpcRequest::GetInterfaceStats, timeout).await;
-    let totals = answer
-        .as_ref()
-        .ok()
-        .and_then(|bytes| rpc::decode_interface_stats_totals(bytes).ok());
-    let stats = match answer
-        .and_then(|bytes| rpc::decode_response_for_request(&bytes, &RpcRequest::GetInterfaceStats))
-    {
-        Ok(RpcResponse::InterfaceStats(v)) => v,
-        Ok(RpcResponse::Error(e)) => {
-            eprintln!("rnstatus-rs: {e}");
-            return ExitCode::from(1);
-        }
-        Ok(other) => {
-            eprintln!("rnstatus-rs: unexpected response: {other:?}");
-            return ExitCode::from(1);
-        }
-        Err(e) => {
-            eprintln!(
-                "rnstatus-rs: {}",
-                local_rpc_failure_message(&endpoint, &config_dir, &e)
-            );
-            return ExitCode::from(1);
-        }
-    };
-
-    let link_count = if args.link_stats {
-        match local_rpc_request(&endpoint, &rpc_key, &RpcRequest::GetLinkCount, timeout).await {
-            Ok(RpcResponse::IntResult(n)) => Some(n),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    if args.json {
-        print_local_json(&stats, link_count, args);
-    } else {
-        print_local_human(&stats, totals, link_count, args);
+    async fn close(self) {
+        rns_tools::shut_down(&self.handle).await;
     }
 
-    ExitCode::SUCCESS
+    fn is_client(&self) -> bool {
+        self.handle.instance_mode == InstanceMode::Client
+    }
+
+    /// One shared-instance RPC call, answered as the raw upstream value.
+    async fn rpc(&self, request: &RpcRequest) -> Result<Value, String> {
+        if !self.is_client() {
+            return Err("not connected to a shared instance".to_string());
+        }
+        let endpoint = self
+            .handle
+            .config
+            .shared_rpc_endpoint(&self.handle.socket_base);
+        let bytes = match &endpoint {
+            SharedInstanceRpcEndpoint::Tcp(port) => {
+                rpc::connect_and_request_bytes(*port, &self.rpc_key, request, LOCAL_RPC_TIMEOUT)
+                    .await
+            }
+            SharedInstanceRpcEndpoint::Unix(path) => {
+                rpc::connect_unix_and_request_bytes(path, &self.rpc_key, request, LOCAL_RPC_TIMEOUT)
+                    .await
+            }
+        }
+        .map_err(|e| e.to_string())?;
+        rmpv::decode::read_value(&mut bytes.as_slice()).map_err(|e| e.to_string())
+    }
+
+    /// `program_setup` (rnstatus.py:155-880).
+    async fn status(&self, args: &Args, out: &mut Out) -> Flow {
+        for (name, operation) in [
+            (&args.attach, ManageOperation::Attach),
+            (&args.detach, ManageOperation::Detach),
+            (&args.reload, ManageOperation::Reload),
+        ] {
+            if let Some(name) = name {
+                return Flow::Hard(self.manage(operation, name, out).await);
+            }
+        }
+
+        if args.discovered || args.discovered_details {
+            return Flow::Done(self.discovered(args, out).await);
+        }
+
+        let mut link_count = None;
+        let mut active_link_count = None;
+        let mut profiling_results = None;
+        let stats;
+        let mut remote_hash = None;
+        if let Some(remote) = args.remote.as_deref() {
+            let (hash, identity) = match remote_inputs(remote, args.identity.as_deref()) {
+                Ok(inputs) => inputs,
+                Err(message) => {
+                    outln!(out, "{message}");
+                    return Flow::Hard(20).soft_in_monitor(args);
+                }
+            };
+            remote_hash = Some(hash);
+            match self.remote_status(args, hash, identity, out).await {
+                Ok(Some((s, l, p))) => {
+                    stats = Some(s);
+                    link_count = l;
+                    profiling_results = p;
+                }
+                Ok(None) => stats = None,
+                Err(code) => return Flow::Hard(code),
+            }
+        } else {
+            if args.link_stats {
+                link_count = self.rpc(&RpcRequest::GetLinkCount).await.ok();
+                active_link_count = self.rpc(&RpcRequest::GetActiveLinkCount).await.ok();
+            }
+            if args.profiling {
+                profiling_results = self.rpc(&RpcRequest::GetProfilingResults).await.ok();
+            }
+            stats = match self.rpc(&RpcRequest::GetInterfaceStats).await {
+                Ok(value) if !value.is_nil() => Some(value),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::error!(
+                        "Shared instance RPC failed while getting interface stats: {e}"
+                    );
+                    None
+                }
+            };
+        }
+
+        match stats {
+            Some(mut stats) => {
+                render_status(
+                    out,
+                    &mut stats,
+                    link_count.as_ref(),
+                    active_link_count.as_ref(),
+                    profiling_results.as_ref(),
+                    args,
+                );
+                Flow::Done(0)
+            }
+            None => {
+                match remote_hash {
+                    None => outln!(out, "Could not get RNS status"),
+                    Some(hash) => outln!(
+                        out,
+                        "Could not get RNS status from remote transport instance {}",
+                        pretty_hex(&hash)
+                    ),
+                }
+                Flow::Done(2)
+            }
+        }
+    }
+
+    /// `--attach/--detach/--reload` (rnstatus.py:171-198).
+    async fn manage(&self, operation: ManageOperation, name: &str, out: &mut Out) -> u8 {
+        let (verb, done, doing) = match operation {
+            ManageOperation::Attach => ("attach", "attached", "attaching"),
+            ManageOperation::Detach => ("detach", "detached", "detaching"),
+            ManageOperation::Reload => ("reload", "reloaded", "reloading"),
+        };
+        let request = RpcRequest::ManageInterface {
+            operation,
+            name: name.to_string(),
+        };
+        let result = self.rpc(&request).await;
+        let ok = matches!(&result, Ok(v) if py_eq_bool(v, true));
+        match &result {
+            Ok(v) if py_eq_bool(v, true) => outln!(out, "Interface {name} was {done}"),
+            Ok(v) if py_eq_bool(v, false) => outln!(out, "Could not {verb} interface {name}"),
+            Ok(Value::Nil) => outln!(out, "The interface {name} does not exist"),
+            _ => outln!(out, "Unknown error while {doing} interface {name}"),
+        }
+        if ok { 0 } else { 1 }
+    }
 }
 
-async fn local_rpc_request(
-    endpoint: &SharedInstanceRpcEndpoint,
-    rpc_key: &[u8],
-    request: &RpcRequest,
-    timeout: Duration,
-) -> Result<RpcResponse, rns_runtime::rpc::RpcError> {
-    match endpoint {
-        SharedInstanceRpcEndpoint::Tcp(port) => {
-            rpc::connect_and_request(*port, rpc_key, request, timeout).await
-        }
-        SharedInstanceRpcEndpoint::Unix(socket_path) => {
-            rpc::connect_unix_and_request(socket_path, rpc_key, request, timeout).await
+impl Flow {
+    /// Input errors exit only outside monitor mode (`must_exit`).
+    fn soft_in_monitor(self, args: &Args) -> Flow {
+        match self {
+            Flow::Hard(code) if args.monitor => Flow::Done(code),
+            other => other,
         }
     }
 }
 
-async fn local_rpc_request_bytes(
-    endpoint: &SharedInstanceRpcEndpoint,
-    rpc_key: &[u8],
-    request: &RpcRequest,
-    timeout: Duration,
-) -> Result<Vec<u8>, rns_runtime::rpc::RpcError> {
-    match endpoint {
-        SharedInstanceRpcEndpoint::Tcp(port) => {
-            rpc::connect_and_request_bytes(*port, rpc_key, request, timeout).await
-        }
-        SharedInstanceRpcEndpoint::Unix(socket_path) => {
-            rpc::connect_unix_and_request_bytes(socket_path, rpc_key, request, timeout).await
-        }
-    }
-}
-
-fn local_rpc_key(config_dir: &Path, rc: &ReticulumConfig) -> Option<Vec<u8>> {
+fn local_rpc_key(config_dir: &Path, rc: &ReticulumConfig) -> Vec<u8> {
     if let Some(key) = rc.rpc_key.as_ref() {
-        return Some(key.clone());
+        return key.clone();
     }
-    let paths = rns_runtime::platform::StoragePaths::from_config_dir(config_dir);
-    let identity =
-        rns_identity::identity::Identity::from_file(&paths.storage_dir.join("transport_identity"))
-            .ok()?;
-    let private_key = identity.get_private_key()?;
-    Some(rpc::derive_rpc_key(&*private_key).to_vec())
-}
-
-fn local_rpc_failure_message(
-    endpoint: &SharedInstanceRpcEndpoint,
-    config_dir: &Path,
-    err: &rns_runtime::rpc::RpcError,
-) -> String {
-    let endpoint = endpoint.display();
-    let config_path = config_dir.join("config");
-    let transport_identity_path = rns_runtime::platform::StoragePaths::from_config_dir(config_dir)
+    let path = StoragePaths::from_config_dir(config_dir)
         .storage_dir
         .join("transport_identity");
-
-    match err {
-        rns_runtime::rpc::RpcError::AuthFailed => format!(
-            "local RPC authentication failed for rnsd-rs-compatible daemon at {endpoint}.\n\
-             This usually means a config mismatch (different --config, rpc_key, or \
-             transport_identity) or another app is owning the control port.\n\
-             System Reticulum defaults are 37428/37429; Ratspeak app-private \
-             configs use 37430/37431.\n\
-             Config checked: {}.\n\
-             If rpc_key is unset, the fallback key is derived from {}.",
-            config_path.display(),
-            transport_identity_path.display()
-        ),
-        rns_runtime::rpc::RpcError::Io(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) =>
-        {
-            format!(
-                "could not connect to local rnsd-rs-compatible daemon at {endpoint}: {e}.\n\
-                 Start rnsd-rs with the same --config directory, or check \
-                 shared_instance_type and instance_control_port in {}. \
-                 System Reticulum defaults are 37428/37429; Ratspeak \
-                 app-private configs use 37430/37431.",
-                config_path.display()
-            )
-        }
-        rns_runtime::rpc::RpcError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            format!(
-                "timed out while talking to local rnsd-rs-compatible daemon at {endpoint}: {e}.\n\
-                 If a process is listening there, it may not be rnsd-rs-compatible or may be using \
-                 a different local RPC auth key. Config checked: {}.",
-                config_path.display()
-            )
-        }
-        _ => format!(
-            "could not query local rnsd-rs-compatible daemon at {endpoint} using {}: {err}",
-            config_path.display()
-        ),
+    let identity = Identity::from_file(&path).unwrap_or_else(|_| Identity::new());
+    match identity.get_private_key() {
+        Some(key) => rpc::derive_rpc_key(&*key).to_vec(),
+        None => Vec::new(),
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortKey {
-    Rate,
-    Rx,
-    Tx,
-    RxRate,
-    TxRate,
-    Traffic,
-    Announces,
-    AnnounceRx,
-    AnnounceTx,
-    AnnounceRxCount,
-    AnnounceTxCount,
-    PathRequestRx,
-    PathRequestTx,
-    PathRequestRxCount,
-    PathRequestTxCount,
-    Held,
-    ProtocolViolations,
-    IfacViolations,
-    FilterHits,
-    TxDrops,
-    TxDroppedBytes,
-}
-
-fn validate_args(args: &Args) -> Result<(), String> {
-    parse_sort_key(args.sort.as_deref()).map(|_| ())?;
-    if !(args.monitor_interval > 0.0 && args.monitor_interval.is_finite()) {
-        return Err("--monitor-interval must be a finite number greater than 0".to_string());
-    }
-    if (args.discovered || args.discovered_details) && args.remote.is_some() {
+/// rnstatus.py:373-391: the remote hash and management identity, or the
+/// message upstream prints before exiting 20.
+fn remote_inputs(remote: &str, identity: Option<&Path>) -> Result<([u8; 16], Identity), String> {
+    let Some(identity_path) = identity else {
+        return Err("Remote management requires an identity file. Use -i to specify the path to a management identity.".to_string());
+    };
+    if remote.chars().count() != 32 {
         return Err(
-            "--discovered/-D is local-only and cannot be combined with --remote".to_string(),
+            "Destination length is invalid, must be 32 hexadecimal characters (16 bytes)."
+                .to_string(),
         );
     }
-    Ok(())
-}
-
-fn parse_sort_key(value: Option<&str>) -> Result<Option<SortKey>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let key = match value.to_ascii_lowercase().as_str() {
-        "rate" | "bitrate" => SortKey::Rate,
-        "rx" => SortKey::Rx,
-        "tx" => SortKey::Tx,
-        "rxs" => SortKey::RxRate,
-        "txs" => SortKey::TxRate,
-        "traffic" => SortKey::Traffic,
-        "announces" | "announce" | "anns" => SortKey::Announces,
-        "arx" => SortKey::AnnounceRx,
-        "atx" => SortKey::AnnounceTx,
-        "arxc" => SortKey::AnnounceRxCount,
-        "atxc" => SortKey::AnnounceTxCount,
-        "prx" => SortKey::PathRequestRx,
-        "ptx" => SortKey::PathRequestTx,
-        "prxc" => SortKey::PathRequestRxCount,
-        "ptxc" => SortKey::PathRequestTxCount,
-        "held" => SortKey::Held,
-        "pvs" => SortKey::ProtocolViolations,
-        "ivs" => SortKey::IfacViolations,
-        "flt" => SortKey::FilterHits,
-        "txdrp" => SortKey::TxDrops,
-        "txdrb" => SortKey::TxDroppedBytes,
-        _ => {
-            return Err(format!(
-                "--sort must be one of rate, traffic, rx, tx, rxs, txs, announces, arx, atx, \
-                 arxc, atxc, prx, ptx, prxc, ptxc, held, pvs, ivs, flt, txdrp or txdrb; got {value}"
-            ));
+    let hash: [u8; 16] = hex::decode(remote)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "Invalid destination entered. Check your input.".to_string())?;
+    let path = expand_user(identity_path);
+    match Identity::from_file(&path) {
+        Ok(identity) => Ok((hash, identity)),
+        Err(e) => {
+            tracing::error!("Error while loading identity from {}", path.display());
+            tracing::error!("The contained exception was: {e}");
+            Err(format!(
+                "Could not load management identity from {}",
+                identity_path.display()
+            ))
         }
-    };
-    Ok(Some(key))
-}
-
-fn local_stat_sort_value(e: &rpc::InterfaceStatEntry, key: SortKey) -> f64 {
-    match key {
-        SortKey::Rate => e.bitrate as f64,
-        SortKey::Rx => e.rx_bytes as f64,
-        SortKey::Tx => e.tx_bytes as f64,
-        SortKey::RxRate => e.rx_rate as f64,
-        SortKey::TxRate => e.tx_rate as f64,
-        SortKey::Traffic => e.rx_bytes.saturating_add(e.tx_bytes) as f64,
-        SortKey::Announces => e.incoming_announce_frequency + e.outgoing_announce_frequency,
-        SortKey::AnnounceRx => e.incoming_announce_frequency,
-        SortKey::AnnounceTx => e.outgoing_announce_frequency,
-        SortKey::AnnounceRxCount => e.announces_received as f64,
-        SortKey::AnnounceTxCount => e.announces_sent as f64,
-        SortKey::PathRequestRx => e.incoming_pr_frequency,
-        SortKey::PathRequestTx => e.outgoing_pr_frequency,
-        SortKey::PathRequestRxCount => e.path_requests_received as f64,
-        SortKey::PathRequestTxCount => e.path_requests_sent as f64,
-        SortKey::Held => e.held_announces as f64,
-        SortKey::ProtocolViolations => e.protocol_violations as f64,
-        SortKey::IfacViolations => e.ifac_violations as f64,
-        SortKey::FilterHits => e.packet_filter_hits as f64,
-        SortKey::TxDrops => e.tx_drops as f64,
-        SortKey::TxDroppedBytes => e.tx_dropped_bytes as f64,
     }
 }
 
-/// Python 1.3.8 rnstatus.py:421-427 mode string table (unknown modes render "Full").
-fn mode_display_name(mode: &str) -> &'static str {
-    match mode {
-        "AccessPoint" | "Access Point" => "Access Point",
-        "PointToPoint" | "Point-to-Point" => "Point-to-Point",
-        "Roaming" => "Roaming",
-        "Boundary" => "Boundary",
-        "Gateway" => "Gateway",
-        "Internal" => "Internal",
-        _ => "Full",
+/// Python `os.path.expanduser` for a leading `~`.
+fn expand_user(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match (text.strip_prefix('~'), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            PathBuf::from(format!("{}{rest}", PathBuf::from(home).display()))
+        }
+        _ => path.to_path_buf(),
     }
 }
 
-/// Same table keyed on the numeric mode carried by remote /status responses.
-fn remote_mode_display_name(mode: u64) -> &'static str {
-    match mode {
-        0x02 => "Point-to-Point",
-        0x03 => "Access Point",
-        0x04 => "Roaming",
-        0x05 => "Boundary",
-        0x06 => "Gateway",
-        0x07 => "Internal",
-        _ => "Full",
+impl Session {
+    /// rnstatus.py:66-151 `get_remote_status`: wait for a path, then ask
+    /// `/status` over a link. `Err` carries an exit code.
+    async fn remote_status(
+        &self,
+        args: &Args,
+        identity_hash: [u8; 16],
+        identity: Identity,
+        out: &mut Out,
+    ) -> Result<Option<(Value, Option<Value>, Option<Value>)>, u8> {
+        let no_output = args.json;
+        let destination = Destination::hash_from_name_and_identity(MGMT_APP, Some(&identity_hash));
+        if !self.handle.has_path(destination).await.unwrap_or(false) {
+            if !no_output {
+                outp!(out, "Path to {} requested ", pretty_hex(&destination));
+                out.flush_now();
+            }
+            let _ = self
+                .handle
+                .request_path(destination, PathRequestOptions::default())
+                .await;
+            let started = std::time::Instant::now();
+            while !self.handle.has_path(destination).await.unwrap_or(false) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if started.elapsed().as_secs_f64() > args.timeout {
+                    if !no_output {
+                        outp!(out, "{CLR}");
+                        outln!(out, "Path request timed out");
+                    }
+                    return Err(12);
+                }
+            }
+        }
+
+        let first = self
+            .first_remote_request
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if first && !no_output {
+            outp!(out, "{CLR}");
+            outp!(out, "Establishing link with remote transport instance... ");
+            out.flush_now();
+        }
+        // The first request asks for profiling too; refreshes send only the
+        // link-count flag (rnstatus.py:115,126).
+        let request = if first {
+            Value::Array(vec![
+                Value::Boolean(args.link_stats),
+                Value::Boolean(args.profiling),
+            ])
+        } else {
+            Value::Array(vec![Value::Boolean(args.link_stats)])
+        };
+        let mut payload = Vec::new();
+        let _ = rmpv::encode::write_value(&mut payload, &request);
+        let client = LinkClient::new(self.handle.transport_tx.clone(), identity);
+        let answer = client
+            .query(
+                identity_hash,
+                MGMT_APP,
+                "/status",
+                payload,
+                REMOTE_HOPS,
+                REMOTE_LINK_TIMEOUT,
+            )
+            .await;
+        let bytes = match answer {
+            Ok(bytes) => bytes,
+            // No response to the identified request, or the server closed the
+            // link while it was pending: upstream's request timeout fires first.
+            Err(e) if request_went_unanswered(&e) => {
+                if !no_output {
+                    if first {
+                        outp!(out, "{CLR}Sending request... ");
+                    }
+                    outp!(out, "{CLR}");
+                    outln!(
+                        out,
+                        "The remote status request failed. Likely authentication failure."
+                    );
+                }
+                return Ok(None);
+            }
+            Err(LinkClientError::Timeout(_)) => {
+                if !no_output {
+                    outp!(out, "{CLR}");
+                    outln!(out, "The link timed out, exiting now");
+                }
+                return Err(10);
+            }
+            Err(e) => {
+                tracing::debug!("remote status query failed: {e}");
+                if !no_output {
+                    outp!(out, "{CLR}");
+                    outln!(out, "Link closed unexpectedly, exiting now");
+                }
+                return Err(10);
+            }
+        };
+        if first && !no_output {
+            outp!(out, "{CLR}");
+            outp!(out, "Sending request... ");
+        }
+        let result = match rmpv::decode::read_value(&mut bytes.as_slice()) {
+            Ok(Value::Array(items)) if !items.is_empty() => {
+                let mut items = items.into_iter();
+                let status = items.next().unwrap_or(Value::Nil);
+                Some((status, items.next(), items.next()))
+            }
+            _ => None,
+        };
+        if result.is_some() {
+            outp!(out, "{CLR}");
+        }
+        Ok(result)
+    }
+
+    /// `-d`/`-D` (rnstatus.py:216-367).
+    async fn discovered(&self, args: &Args, out: &mut Out) -> u8 {
+        let paths = StoragePaths::from_config_dir(&self.handle.config_dir);
+        let store = match DiscoveryStore::open(&paths.storage_dir) {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("rnstatus-rs: could not open discovery store: {e}");
+                return 1;
+            }
+        };
+        let sources = &self.handle.config.interface_discovery_sources;
+        let sources = (!sources.is_empty()).then_some(sources.as_slice());
+        let blackholed: HashSet<[u8; 16]> =
+            match self.rpc(&RpcRequest::GetBlackholedIdentities).await {
+                Ok(Value::Map(entries)) => entries
+                    .iter()
+                    .filter_map(|(k, _)| k.as_slice().and_then(|b| b.try_into().ok()))
+                    .collect(),
+                _ => HashSet::new(),
+            };
+        let records = match store.list_filtered(sources, &blackholed) {
+            Ok(records) => records,
+            Err(e) => {
+                eprintln!("rnstatus-rs: could not read discovered interfaces: {e}");
+                return 1;
+            }
+        };
+        let raw: Vec<Value> = records
+            .iter()
+            .map(|record| stored_info(store.root(), record))
+            .collect();
+        outln!(out);
+
+        if args.json {
+            outln!(out, "{}", py_json(&Value::Array(raw)));
+            return 0;
+        }
+
+        let mut filtered = Vec::new();
+        let mut stored = Vec::new();
+        for (record, info) in records.iter().zip(&raw) {
+            let matches = args.filter.as_deref().is_none_or(|needle| {
+                record
+                    .info
+                    .name
+                    .to_lowercase()
+                    .contains(&needle.to_lowercase())
+            });
+            if matches {
+                filtered.push(record);
+                stored.push(info);
+            }
+        }
+        if args.discovered_details {
+            print_discovered_details(out, &filtered, &stored, args.show_stale, args.show_unknown);
+        } else {
+            print_discovered_summary(out, &filtered, args.show_stale, args.show_unknown);
+        }
+        0
     }
 }
 
-fn visible_by_default(name: &str) -> bool {
-    !(name.starts_with("LocalInterface[")
-        || name.starts_with("TCPInterface[Client")
-        || name.starts_with("BackboneInterface[Client on")
-        || name.starts_with("AutoInterfacePeer[")
-        || name.starts_with("WeaveInterfacePeer[")
-        || name.starts_with("I2PInterfacePeer[Connected peer"))
+/// LinkClient reports these only once the request has been sent
+/// (link_client.rs `wait_for_response`).
+fn request_went_unanswered(error: &LinkClientError) -> bool {
+    match error {
+        LinkClientError::Timeout(stage) => *stage == "response",
+        LinkClientError::HandshakeFailed(reason) => {
+            reason == "link closed by remote" || reason.starts_with("link endpoint terminated")
+        }
+        _ => false,
+    }
 }
 
-fn interface_matches_filter(name: &str, filter: Option<&str>) -> bool {
-    filter.is_none_or(|needle| {
-        name.to_ascii_lowercase()
-            .contains(&needle.to_ascii_lowercase())
+/// The stored info dictionary as `list_discovered_interfaces` returns it:
+/// the file's keys in order, the name sanitized, `"None"` IFAC values
+/// dropped, and the status appended (Discovery.py:533-568).
+fn stored_info(root: &Path, record: &DiscoveredInterface) -> Value {
+    let mut map = std::fs::read(root.join(record.filename()))
+        .ok()
+        .and_then(|bytes| rmpv::decode::read_value(&mut bytes.as_slice()).ok())
+        .and_then(|value| match value {
+            Value::Map(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    map.retain(|(k, v)| {
+        !(matches!(k.as_str(), Some("ifac_netname" | "ifac_netkey")) && v.as_str() == Some("None"))
+    });
+    let status = record.status.unwrap_or(DiscoveryStatus::Unknown);
+    set_key(&mut map, "name", Value::from(record.info.name.as_str()));
+    set_key(&mut map, "status", Value::from(status.as_str()));
+    set_key(&mut map, "status_code", Value::from(status.code()));
+    Value::Map(map)
+}
+
+fn set_key(map: &mut Vec<(Value, Value)>, key: &str, value: Value) {
+    match map.iter_mut().find(|(k, _)| k.as_str() == Some(key)) {
+        Some(entry) => entry.1 = value,
+        None => map.push((Value::from(key), value)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The stats renderer: rnstatus.py:410-870.
+
+const HIDDEN_PREFIXES: &[&str] = &[
+    "LocalInterface[",
+    "TCPInterface[Client",
+    "BackboneInterface[Client on",
+    "AutoInterfacePeer[",
+    "WeaveInterfacePeer[",
+    "I2PInterfacePeer[Connected peer",
+];
+
+/// Python's sort keys (rnstatus.py:432-454); an unknown key sorts nothing.
+fn sort_key(name: &str) -> Option<fn(&Value) -> f64> {
+    fn k(i: &Value, key: &str) -> f64 {
+        num(get(i, key)).f()
+    }
+    Some(match name {
+        "rate" | "bitrate" => |i| k(i, "bitrate"),
+        "rx" => |i| k(i, "rxb"),
+        "tx" => |i| k(i, "txb"),
+        "rxs" => |i| k(i, "rxs"),
+        "txs" => |i| k(i, "txs"),
+        "traffic" => |i| k(i, "rxb") + k(i, "txb"),
+        "anns" | "announces" => {
+            |i| k(i, "incoming_announce_frequency") + k(i, "outgoing_announce_frequency")
+        }
+        "arx" => |i| k(i, "incoming_announce_frequency"),
+        "atx" => |i| k(i, "outgoing_announce_frequency"),
+        "arxc" => |i| k(i, "arxc"),
+        "atxc" => |i| k(i, "atxc"),
+        "prx" => |i| k(i, "incoming_pr_frequency"),
+        "ptx" => |i| k(i, "outgoing_pr_frequency"),
+        "prxc" => |i| k(i, "prxc"),
+        "ptxc" => |i| k(i, "ptxc"),
+        "held" => |i| k(i, "held_announces"),
+        "pvs" => |i| k(i, "protocol_violations"),
+        "ivs" => |i| k(i, "ifac_violations"),
+        "flt" => |i| k(i, "packet_filter_hits"),
+        "gravity" | "g" => |i| k(i, "gravity"),
+        "txdrp" => |i| k(i, "txdrp"),
+        "txdrb" => |i| k(i, "txdrb"),
+        "txbuf" => |i| k(i, "txbuffered"),
+        _ => return None,
     })
 }
 
-fn interface_matches_burst_filter(
-    name: &str,
-    burst_active: bool,
-    pr_burst_active: bool,
-    args: &Args,
-) -> bool {
-    if !args.burst {
-        return interface_matches_filter(name, args.filter.as_deref());
+fn mode_name(mode: Option<&Value>) -> &'static str {
+    let m = num(mode).f();
+    if m.fract() != 0.0 {
+        return "Full";
     }
-
-    burst_active
-        || pr_burst_active
-        || args.filter.as_deref().is_some_and(|filter| {
-            name.to_ascii_lowercase()
-                .contains(&filter.to_ascii_lowercase())
-        })
+    match m as i64 {
+        3 => "Access Point",
+        2 => "Point-to-Point",
+        4 => "Roaming",
+        5 => "Boundary",
+        6 => "Gateway",
+        7 => "Internal",
+        _ => "Full",
+    }
 }
 
-fn filtered_local_stats<'a>(
-    stats: &'a [rpc::InterfaceStatEntry],
+fn render_status(
+    out: &mut Out,
+    stats: &mut Value,
+    link_count: Option<&Value>,
+    active_link_count: Option<&Value>,
+    profiling_results: Option<&Value>,
     args: &Args,
-) -> Vec<&'a rpc::InterfaceStatEntry> {
-    let mut entries: Vec<_> = stats
-        .iter()
-        .filter(|entry| args.all || visible_by_default(&entry.name))
-        .filter(|entry| {
-            interface_matches_burst_filter(
-                &entry.name,
-                entry.burst_active,
-                entry.pr_burst_active,
-                args,
-            )
-        })
-        .collect();
-    if let Ok(Some(key)) = parse_sort_key(args.sort.as_deref()) {
-        entries.sort_by(|a, b| {
-            let ord = local_stat_sort_value(a, key)
-                .partial_cmp(&local_stat_sort_value(b, key))
+) {
+    if args.json {
+        outln!(out, "{}", py_json(stats));
+        return;
+    }
+    let astats = args.announce_stats;
+    let pstats = args.pr_stats;
+
+    let mut interfaces: Vec<Value> = match get(stats, "interfaces") {
+        Some(Value::Array(list)) => list.clone(),
+        _ => Vec::new(),
+    };
+    if let Some(key) = args
+        .sort
+        .as_deref()
+        .and_then(|s| sort_key(&s.to_lowercase()))
+    {
+        // Stable, like list.sort(reverse=...): equal keys keep their order.
+        interfaces.sort_by(|a, b| {
+            let ord = key(a)
+                .partial_cmp(&key(b))
                 .unwrap_or(std::cmp::Ordering::Equal);
             if args.reverse { ord } else { ord.reverse() }
         });
     }
-    entries
-}
 
-/// The interface name, then the lines Python's rnstatus prints under it
-/// before the rest (rnstatus.py:523-530).
-fn print_interface_heading(
-    name: &str,
-    autoconnect_source: Option<&str>,
-    ifac_netname: Option<&str>,
-    online: bool,
-) {
-    println!("  {name}");
-    if let Some(source) = autoconnect_source {
-        println!("    Source   : Auto-connect via <{source}>");
+    for ifstat in &interfaces {
+        let name = py_str_opt(get(ifstat, "name"));
+        let i2p_hidden = name.starts_with("I2PInterface[")
+            && get(ifstat, "i2p_connectable").is_some_and(|v| py_eq_bool(v, false));
+        let hidden = HIDDEN_PREFIXES.iter().any(|p| name.starts_with(p)) || i2p_hidden;
+        if i2p_hidden || (hidden && !args.all) {
+            continue;
+        }
+        let show_if = if !args.burst {
+            args.filter
+                .as_deref()
+                .is_none_or(|f| name.to_lowercase().contains(&f.to_lowercase()))
+        } else {
+            let burst_act = has(ifstat, "burst_active")
+                && has(ifstat, "pr_burst_active")
+                && (truthy(get(ifstat, "burst_active")) || truthy(get(ifstat, "pr_burst_active")));
+            let nfilt = args
+                .filter
+                .as_deref()
+                .is_some_and(|f| name.to_lowercase().contains(&f.to_lowercase()));
+            burst_act || nfilt
+        };
+        if show_if {
+            render_interface(out, ifstat, &name, args);
+        }
     }
-    if let Some(netname) = ifac_netname {
-        println!("    Network  : {netname}");
-    }
-    println!("    Status   : {}", if online { "Up" } else { "Down" });
-}
 
-fn print_local_human(
-    stats: &[rpc::InterfaceStatEntry],
-    totals: Option<rpc::InterfaceStatsTotals>,
-    link_count: Option<i64>,
-    args: &Args,
-) {
-    println!(
-        "Reticulum Status [rnstatus-rs {}]",
-        env!("CARGO_PKG_VERSION")
-    );
-    println!();
-
-    let entries = filtered_local_stats(stats, args);
-    if entries.is_empty() {
-        println!("  No interfaces.");
-    } else {
-        for entry in entries {
-            print_interface_heading(
-                &entry.name,
-                entry.autoconnect_source.as_deref(),
-                entry.ifac_netname.as_deref(),
-                entry.online,
-            );
-            println!("    Mode     : {}", mode_display_name(&entry.mode));
-            println!("    Role     : {}", entry.role);
-            println!("    Bitrate  : {}", format::pretty_speed(entry.bitrate));
-            println!("    MTU      : {} B", entry.mtu);
-            if let Some(clients) = entry.clients {
-                println!("    Clients  : {clients}");
-            }
-            if let Some(blocked) = blocked_count_text(entry.blocked_ips) {
-                println!("    Blocked  : {blocked}");
-            }
-            if let Some(access) = ifac_access_text(
-                entry.ifac_signature.as_deref(),
-                entry.ifac_size.map(|size| size as u64),
-            ) {
-                println!("    Access   : {access}");
-            }
-            if args.announce_stats {
-                if let Some(queued) = entry.announce_queue
-                    && queued > 0
-                {
-                    println!(
-                        "    Queued   : {queued} announce{}",
-                        if queued == 1 { "" } else { "s" }
-                    );
-                }
-                if entry.held_announces > 0 {
-                    println!(
-                        "    Held     : {} announce{}",
-                        entry.held_announces,
-                        if entry.held_announces == 1 { "" } else { "s" }
-                    );
-                }
-                if entry.incoming_announce_frequency > 0.0
-                    || entry.outgoing_announce_frequency > 0.0
-                    || entry.burst_active
-                {
-                    print_announce_frequency(
-                        entry.incoming_announce_frequency,
-                        entry.outgoing_announce_frequency,
-                        (entry.announces_received, entry.announces_sent),
-                        entry.clients,
-                        entry.announce_rate_target,
-                        entry.announce_rate_penalty,
-                        entry.announce_rate_grace,
-                        burst_status_text(entry.burst_active, entry.burst_activated),
-                    );
-                }
-            }
-            if args.pr_stats {
-                print_path_request_frequency(
-                    entry.incoming_pr_frequency,
-                    entry.outgoing_pr_frequency,
-                    (entry.path_requests_received, entry.path_requests_sent),
-                    entry.clients,
-                    burst_status_text(entry.pr_burst_active, entry.pr_burst_activated),
-                );
-            }
-            print_violations(
-                entry.protocol_violations,
-                entry.ifac_violations,
-                entry.packet_filter_hits,
-            );
-            println!(
-                "    Traffic  : {} rx / {} tx",
-                format::pretty_size(entry.rx_bytes),
-                format::pretty_size(entry.tx_bytes)
-            );
-            if entry.rx_rate > 0 || entry.tx_rate > 0 {
-                println!(
-                    "    Rates    : {} rx / {} tx",
-                    format::pretty_speed(entry.rx_rate),
-                    format::pretty_speed(entry.tx_rate)
-                );
-            }
-            if entry.tx_drops > 0 {
-                println!(
-                    "    TX drops : {} ({})",
-                    entry.tx_drops,
-                    format::pretty_size(entry.tx_dropped_bytes)
-                );
-            }
-            println!();
+    let mut lstr = String::new();
+    if let Some(lc) = link_count.filter(|v| !v.is_nil())
+        && args.link_stats
+    {
+        let ms = if num(Some(lc)).f() == 1.0 { "y" } else { "ies" };
+        let lc = py_str(lc);
+        lstr = if not_none(stats, "transport_id").is_some() {
+            format!(", {lc} entr{ms} in link table")
+        } else {
+            format!(" {lc} entr{ms} in link table")
+        };
+        if let Some(alc) = active_link_count.filter(|v| truthy(Some(v))) {
+            lstr = format!("{lstr} ({} active)", py_str(alc));
         }
     }
 
     if args.totals {
-        let totals = totals.unwrap_or_else(|| {
-            let (rxb, txb) = stats
-                .iter()
-                .fold((0u64, 0u64), |(r, t), e| (r + e.rx_bytes, t + e.tx_bytes));
-            rpc::InterfaceStatsTotals {
-                rxb,
-                txb,
-                ..Default::default()
-            }
-        });
-        println!("  Totals:");
-        println!(
-            "    RX : {}{}",
-            format::pretty_size(totals.rxb),
-            pps_suffix(args.pps, totals.rxpps)
-        );
-        println!(
-            "    TX : {}{}",
-            format::pretty_size(totals.txb),
-            pps_suffix(args.pps, totals.txpps)
-        );
-        println!();
+        render_totals(out, stats, astats, pstats, args.pps);
+    }
+    if args.queues {
+        render_queues(out, stats);
+    }
+    if let Some(results) = profiling_results.filter(|v| truthy(Some(v))) {
+        outln!(out, "\n Profiling    :\n{}", format_profiling(results));
     }
 
-    if let Some(n) = link_count {
-        println!("  Active links: {n}");
+    if let Some(tid) = not_none(stats, "transport_id") {
+        outln!(
+            out,
+            "\n Transport Instance {} running",
+            pretty_hex_value(tid)
+        );
+        if let Some(v) = not_none(stats, "network_id") {
+            outln!(out, " Network Identity   {}", pretty_hex_value(v));
+        }
+        if let Some(v) = not_none(stats, "probe_responder") {
+            outln!(out, " Probe responder at {} active", pretty_hex_value(v));
+        }
+        if let Some(v) = not_none(stats, "transport_uptime") {
+            outln!(out, " Uptime is {}{lstr}", prettytime(num(Some(v)), false));
+        }
+    } else if !lstr.is_empty() {
+        outln!(out, "\n{lstr}");
     }
+    outln!(out);
 }
 
-/// Python `-p` appends `prettysize(pps, suffix="pps")` to the totals (rnstatus.py:792-796).
-fn pps_suffix(pps: bool, value: u64) -> String {
-    if pps {
-        format!(", {}", format::pretty_size(value).replace('B', "pps"))
+/// One interface block (rnstatus.py:481-758).
+fn render_interface(out: &mut Out, ifstat: &Value, name: &str, args: &Args) {
+    let astats = args.announce_stats;
+    let pstats = args.pr_stats;
+    outln!(out);
+
+    let mut ss = if truthy(get(ifstat, "status")) {
+        "Up".to_string()
+    } else {
+        "Down".to_string()
+    };
+    if let Some(g) = get(ifstat, "gravity").filter(|v| truthy(Some(v))) {
+        ss = format!("{ss}, gravity {}", py_str(g));
+    }
+    let mut modestr = mode_name(get(ifstat, "mode")).to_string();
+    if truthy(get(ifstat, "announces_to_internal")) {
+        modestr.push_str(" (a>i)");
+    }
+
+    let mut clients = not_none(ifstat, "clients").map(|v| num(Some(v)));
+    let mut clients_string = String::new();
+    if let Some(c) = clients {
+        if name.starts_with("Shared Instance[") {
+            let cnum = Num::Int((c.i() - 1).max(0));
+            let spec = if cnum.f() == 1.0 {
+                " program"
+            } else {
+                " programs"
+            };
+            clients_string = format!("Serving   : {}{spec}", cnum.py_str());
+        } else if name.starts_with("I2PInterface[") {
+            if get(ifstat, "i2p_connectable").is_some_and(|v| py_eq_bool(v, true)) {
+                let spec = if c.f() == 1.0 {
+                    " connected I2P endpoint"
+                } else {
+                    " connected I2P endpoints"
+                };
+                clients_string = format!("Peers     : {}{spec}", c.py_str());
+            }
+        } else {
+            clients_string = format!("Clients   : {}", c.py_str());
+            if let Some(b) = get(ifstat, "blocked_ips")
+                && num(Some(b)).f() > 0.0
+            {
+                // Upstream's conditional covers the whole suffix, so one IP reads "IPs".
+                clients_string.push_str(&format!("\n    Blocked   : {} IPs", py_str(b)));
+            }
+        }
+        if args.blocked_ips
+            && let Some(Value::Array(list)) = get(ifstat, "blocked_ip_list")
+        {
+            for bip in list {
+                clients_string.push_str(&format!("\n                {}", py_str(bip)));
+            }
+        }
+    }
+
+    outln!(out, " {name}");
+    if let Some(v) = not_none(ifstat, "autoconnect_source") {
+        outln!(out, "    Source    : Auto-connect via <{}>", py_str(v));
+    }
+    if let Some(v) = not_none(ifstat, "ifac_netname") {
+        outln!(out, "    Network   : {}", py_str(v));
+    }
+    outln!(out, "    Status    : {ss}");
+    if clients.is_some() && !clients_string.is_empty() {
+        outln!(out, "    {clients_string}");
+    }
+    if !(name.starts_with("Shared Instance[")
+        || name.starts_with("TCPInterface[Client")
+        || name.starts_with("LocalInterface["))
+    {
+        outln!(out, "    Mode      : {modestr}");
+    }
+    if truthy(get(ifstat, "txdrp")) {
+        outln!(
+            out,
+            "    TX Drops  : {} ({})",
+            py_str_opt(get(ifstat, "txdrp")),
+            prettysize(num(get(ifstat, "txdrb")).f(), "B")
+        );
+    }
+    if let Some(bitrate) = not_none(ifstat, "bitrate") {
+        outln!(
+            out,
+            "    Rate      : {}, MTU {}",
+            speed_str(num(Some(bitrate)).f()),
+            py_str_opt(get(ifstat, "mtu"))
+        );
+    }
+
+    render_radio_lines(out, ifstat);
+
+    if astats
+        && let Some(q) = not_none(ifstat, "announce_queue")
+        && num(Some(q)).f() > 0.0
+    {
+        let s = if num(Some(q)).f() == 1.0 { "" } else { "s" };
+        outln!(out, "    Queued    : {} announce{s}", py_str(q));
+    }
+    if astats
+        && let Some(h) = not_none(ifstat, "held_announces")
+        && num(Some(h)).f() > 0.0
+    {
+        let s = if num(Some(h)).f() == 1.0 { "" } else { "s" };
+        outln!(out, "    Held      : {} announce{s}", py_str(h));
+    }
+
+    let (art, arp, arg) = if astats {
+        (
+            get(ifstat, "announce_rate_target"),
+            get(ifstat, "announce_rate_penalty"),
+            get(ifstat, "announce_rate_grace"),
+        )
+    } else {
+        (None, None, None)
+    };
+    let arp_set = arp.is_some_and(|v| !v.is_nil());
+    let art_str = if truthy(art) && arp_set && truthy(arg) {
+        format!(
+            "(t:{}/p:{}/g:{})",
+            prettytime(num(art), false),
+            prettytime(num(arp), false),
+            py_str_opt(arg)
+        )
+    } else if truthy(art) && arp_set {
+        format!(
+            "(t:{}/p:{})",
+            prettytime(num(art), false),
+            prettytime(num(arp), false)
+        )
+    } else if truthy(art) {
+        format!("(t:{})", prettytime(num(art), false))
     } else {
         String::new()
+    };
+
+    let now = unix_now();
+    let mut burst_str = String::new();
+    if truthy(get(ifstat, "burst_active")) {
+        let bcstr = match get(ifstat, "burst_count").filter(|v| truthy(Some(v))) {
+            Some(c) => format!("on {} ", py_str(c)),
+            None => String::new(),
+        };
+        let for_str = prettytime(
+            Num::Float(now - num(get(ifstat, "burst_activated")).f()),
+            false,
+        );
+        burst_str = format!(" burst {bcstr}for {for_str}");
     }
+    let mut pburst_str = String::new();
+    if truthy(get(ifstat, "pr_burst_active")) {
+        let bcstr = match get(ifstat, "pr_burst_count").filter(|v| truthy(Some(v))) {
+            Some(c) => format!("on {} ", py_str(c)),
+            None => String::new(),
+        };
+        let for_str = prettytime(
+            Num::Float(now - num(get(ifstat, "pr_burst_activated")).f()),
+            false,
+        );
+        pburst_str = format!("burst {bcstr}for {for_str}");
+    }
+
+    let mut rxb_str = format!("↓{}", prettysize(num(get(ifstat, "rxb")).f(), "B"));
+    let mut txb_str = format!("↑{}", prettysize(num(get(ifstat, "txb")).f(), "B"));
+    let flow_keys = ["prxs", "rxs", "ptxs", "txs"]
+        .iter()
+        .all(|k| has(ifstat, k));
+    let pct = |part: &str, whole: &str| -> i64 {
+        let (p, w) = (get(ifstat, part), get(ifstat, whole));
+        if truthy(w) && truthy(p) {
+            (100.0f64).min(num(p).f() / num(w).f() * 100.0) as i64
+        } else {
+            0
+        }
+    };
+
+    let (mut iaf, mut oaf, mut pc_str) = (String::new(), String::new(), String::new());
+    let mut asr = false;
+    if astats && not_none(ifstat, "incoming_announce_frequency").is_some() {
+        let mut oan = num(get(ifstat, "outgoing_announce_frequency"));
+        let ian = num(get(ifstat, "incoming_announce_frequency"));
+        if name.starts_with("Shared Instance[")
+            && let Some(c) = clients
+            && c.f() > 0.0
+        {
+            oan = Num::Float(oan.f() - oan.f() / c.f());
+        }
+        oaf = prettyfrequency(oan, "Hz", 1, true);
+        iaf = prettyfrequency(ian, "Hz", 1, true);
+        let mut cspec = "c";
+        if clients.is_none() && truthy(get(ifstat, "peers")) {
+            clients = Some(num(get(ifstat, "peers")));
+            cspec = "p";
+        }
+        if let Some(c) = clients.filter(|c| c.f() > 0.0) {
+            let per = num(get(ifstat, "outgoing_announce_frequency")).f() / c.f();
+            pc_str = format!(
+                " {}/{cspec}",
+                prettyfrequency(Num::Float(per), "Hz", 1, true)
+            );
+        }
+        if flow_keys {
+            let apct = format!(
+                "(↓{}% / ↑{}% of flow)",
+                pct("arxs", "rxs"),
+                pct("atxs", "txs")
+            );
+            pc_str = if pc_str.is_empty() {
+                apct
+            } else {
+                format!("{pc_str} {apct}")
+            };
+        }
+        asr = true;
+    }
+
+    let (mut ipf, mut opf, mut rpc_str) = (String::new(), String::new(), String::new());
+    let mut psr = false;
+    if pstats && not_none(ifstat, "incoming_pr_frequency").is_some() {
+        let mut opn = num(get(ifstat, "outgoing_pr_frequency"));
+        let ipn = num(get(ifstat, "incoming_pr_frequency"));
+        if name.starts_with("Shared Instance[")
+            && let Some(c) = clients
+            && c.f() > 0.0
+        {
+            opn = Num::Float(opn.f() - opn.f() / c.f());
+        }
+        if astats {
+            opf = format!("↑{}", prettyfrequency(opn, "Hz", 1, true));
+            ipf = format!("↓{}", prettyfrequency(ipn, "Hz", 1, true));
+        } else {
+            opf = format!("{}↑", prettyfrequency(opn, "Hz", 1, true));
+            ipf = format!("{}↓", prettyfrequency(ipn, "Hz", 1, true));
+        }
+        let mut cspec = "c";
+        if clients.is_none() && truthy(get(ifstat, "peers")) {
+            clients = Some(num(get(ifstat, "peers")));
+            cspec = "p";
+        }
+        if let Some(c) = clients.filter(|c| c.f() > 0.0) {
+            let per = num(get(ifstat, "outgoing_pr_frequency")).f() / c.f();
+            rpc_str = format!(
+                " {}/{cspec}",
+                prettyfrequency(Num::Float(per), "Hz", 1, true)
+            );
+        }
+        if flow_keys {
+            let ppct = format!(
+                "(↓{}% / ↑{}% of flow)",
+                pct("prxs", "rxs"),
+                pct("ptxs", "txs")
+            );
+            rpc_str = if rpc_str.is_empty() {
+                ppct
+            } else {
+                format!("{rpc_str} {ppct}")
+            };
+        }
+        psr = true;
+    }
+
+    if !asr {
+        iaf.clear();
+        oaf.clear();
+    }
+    if !psr {
+        ipf.clear();
+        opf.clear();
+    }
+    let amlen = clen(&iaf).max(clen(&oaf));
+    pad(&mut iaf, amlen);
+    iaf.push('↓');
+    pad(&mut oaf, amlen);
+    oaf.push('↑');
+    let mlen = [&iaf, &oaf, &rxb_str, &txb_str, &ipf, &opf]
+        .iter()
+        .map(|s| clen(s))
+        .max()
+        .unwrap_or(0)
+        .max(10);
+    for s in [
+        &mut iaf,
+        &mut oaf,
+        &mut ipf,
+        &mut opf,
+        &mut rxb_str,
+        &mut txb_str,
+    ] {
+        pad(s, mlen);
+    }
+
+    if has(ifstat, "protocol_violations") && has(ifstat, "ifac_violations") {
+        let (pv, iv) = (
+            get(ifstat, "protocol_violations"),
+            get(ifstat, "ifac_violations"),
+        );
+        if truthy(pv) || truthy(iv) {
+            let sep = if truthy(iv) { ", " } else { "" };
+            let ivstr = if truthy(iv) {
+                format!("{} IFAC", py_str_opt(iv))
+            } else {
+                String::new()
+            };
+            outln!(
+                out,
+                "    Violatns. : {} protocol{sep}{ivstr}",
+                py_str_opt(pv)
+            );
+        }
+    }
+    if let Some(hits) = get(ifstat, "packet_filter_hits").filter(|v| truthy(Some(v))) {
+        outln!(out, "    Flt. Hits : {}", py_str(hits));
+    }
+
+    if psr {
+        if truthy(get(ifstat, "prxc")) && truthy(get(ifstat, "ptxc")) {
+            outln!(
+                out,
+                "    Path Rqs. : {}↓ {}↑ total",
+                py_str_opt(get(ifstat, "prxc")),
+                py_str_opt(get(ifstat, "ptxc"))
+            );
+            outln!(out, "                {opf} {rpc_str}");
+        } else {
+            outln!(out, "    Path Rqs. : {opf} {rpc_str}");
+        }
+        outln!(out, "                {ipf}  {pburst_str}");
+    }
+    if asr {
+        if truthy(get(ifstat, "arxc")) && truthy(get(ifstat, "atxc")) {
+            outln!(
+                out,
+                "    Announces : {}↓ {}↑ total",
+                py_str_opt(get(ifstat, "arxc")),
+                py_str_opt(get(ifstat, "atxc"))
+            );
+            outln!(out, "                {oaf} {pc_str}");
+        } else {
+            outln!(out, "    Announces : {oaf} {pc_str}");
+        }
+        outln!(out, "                {iaf} {art_str}{burst_str}");
+    }
+
+    let mut rxstat = rxb_str;
+    let mut txstat = txb_str;
+    if has(ifstat, "rxs") && has(ifstat, "txs") {
+        rxstat.push_str(&format!("  {}", prettyspeed(num(get(ifstat, "rxs")).f())));
+        txstat.push_str(&format!("  {}", prettyspeed(num(get(ifstat, "txs")).f())));
+    }
+    if truthy(get(ifstat, "txbuffered")) {
+        let stl = if truthy(get(ifstat, "txstalled")) {
+            ", stalled"
+        } else {
+            ""
+        };
+        txstat.push_str(&format!(
+            " ({} waiting{stl})",
+            prettysize(num(get(ifstat, "txbuffered")).f(), "B")
+        ));
+    }
+    outln!(out, "    Traffic   : {txstat}\n                {rxstat}");
 }
 
-fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, args: &Args) {
-    let (total_rxb, total_txb) = stats
-        .iter()
-        .fold((0u64, 0u64), |(r, t), e| (r + e.rx_bytes, t + e.tx_bytes));
-    let entries = filtered_local_stats(stats, args);
-
-    print!("{{\"interfaces\":[");
-    for (i, e) in entries.iter().enumerate() {
-        if i > 0 {
-            print!(",");
+/// The optional radio, Weave and I2P lines (rnstatus.py:554-619), with
+/// upstream's labels as printed.
+fn render_radio_lines(out: &mut Out, ifstat: &Value) {
+    if has(ifstat, "noise_floor") {
+        let nstr = if !has(ifstat, "interference") {
+            String::new()
+        } else {
+            let nf = get(ifstat, "interference");
+            let mut lstr = ", no interference".to_string();
+            if has(ifstat, "interference_last_ts") && has(ifstat, "interference_last_dbm") {
+                let lago = unix_now() - num(get(ifstat, "interference_last_ts")).f();
+                lstr = format!(
+                    "\n    Intrfrnc. : {} dBm {} ago",
+                    py_str_opt(get(ifstat, "interference_last_dbm")),
+                    prettytime(Num::Float(lago), true)
+                );
+            }
+            if truthy(nf) {
+                format!("\n    Intrfrnc. : {} dBm", py_str_opt(nf))
+            } else {
+                lstr
+            }
+        };
+        match not_none(ifstat, "noise_floor") {
+            Some(v) => outln!(out, "    Noise Fl. : {} dBm{nstr}", py_str(v)),
+            None => outln!(out, "    Noise Fl. : Unknown"),
         }
-        print!(
-            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{},\"autoconnect_source\":{},\"tx_drops\":{},\"tx_dropped_bytes\":{},\"arxc\":{},\"atxc\":{},\"prxc\":{},\"ptxc\":{},\"protocol_violations\":{},\"ifac_violations\":{},\"packet_filter_hits\":{}}}",
-            json_str(&e.name),
-            e.online,
-            json_str(&e.mode),
-            json_str(&e.role),
-            e.bitrate,
-            e.mtu,
-            e.rx_bytes,
-            e.tx_bytes,
-            e.rx_rate,
-            e.tx_rate,
-            e.announce_queue
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            e.held_announces,
-            e.incoming_announce_frequency,
-            e.outgoing_announce_frequency,
-            e.incoming_pr_frequency,
-            e.outgoing_pr_frequency,
-            e.burst_active,
-            e.burst_activated,
-            e.pr_burst_active,
-            e.pr_burst_activated,
-            opt_u64_json(e.clients),
-            opt_u64_json(e.blocked_ips),
-            opt_f64_json(e.announce_rate_target),
-            opt_u32_json(e.announce_rate_grace),
-            opt_f64_json(e.announce_rate_penalty),
-            opt_hex_json(e.ifac_signature.as_deref()),
-            opt_u64_json(e.ifac_size.map(|size| size as u64)),
-            opt_str_json(e.ifac_netname.as_deref()),
-            opt_str_json(e.autoconnect_source.as_deref()),
-            e.tx_drops,
-            e.tx_dropped_bytes,
-            e.announces_received,
-            e.announces_sent,
-            e.path_requests_received,
-            e.path_requests_sent,
-            e.protocol_violations,
-            e.ifac_violations,
-            e.packet_filter_hits,
+    }
+    if has(ifstat, "cpu_load") {
+        match not_none(ifstat, "cpu_load") {
+            Some(v) => outln!(out, "    CPU load  : {} %", py_str(v)),
+            None => outln!(out, "    CPU load  : Unknown"),
+        }
+    }
+    if has(ifstat, "cpu_temp") {
+        match not_none(ifstat, "cpu_temp") {
+            Some(v) => outln!(out, "    CPU temp  : {}°C", py_str(v)),
+            None => outln!(out, "    CPU load  : Unknown"),
+        }
+    }
+    if has(ifstat, "mem_load") {
+        // Upstream tests cpu_load here.
+        if not_none(ifstat, "cpu_load").is_some() {
+            outln!(
+                out,
+                "    Mem usage : {} %",
+                py_str_opt(get(ifstat, "mem_load"))
+            );
+        } else {
+            outln!(out, "    Mem usage : Unknown");
+        }
+    }
+    if let Some(bp) = not_none(ifstat, "battery_percent")
+        && let Some(bpi) = py_int(bp)
+        && let Some(bss) = get(ifstat, "battery_state")
+    {
+        outln!(out, "    Battery   : {bpi}% ({})", py_str(bss));
+    }
+    if has(ifstat, "airtime_short") && has(ifstat, "airtime_long") {
+        outln!(
+            out,
+            "    Airtime   : {}% (15s), {}% (1h)",
+            py_str_opt(get(ifstat, "airtime_short")),
+            py_str_opt(get(ifstat, "airtime_long"))
         );
     }
-    print!("]");
-    if args.totals {
-        print!(",\"rxb_total\":{total_rxb},\"txb_total\":{total_txb}");
+    if has(ifstat, "channel_load_short") && has(ifstat, "channel_load_long") {
+        outln!(
+            out,
+            "    Ch. Load  : {}% (15s), {}% (1h)",
+            py_str_opt(get(ifstat, "channel_load_short")),
+            py_str_opt(get(ifstat, "channel_load_long"))
+        );
     }
-    if let Some(n) = link_count {
-        print!(",\"link_count\":{n}");
+    for (key, label) in [
+        ("switch_id", "Switch ID :"),
+        ("endpoint_id", "Endpoint  :"),
+        ("via_switch_id", "Via       :"),
+    ] {
+        if has(ifstat, key) {
+            match not_none(ifstat, key) {
+                Some(v) => outln!(out, "    {label} {}", py_str(v)),
+                None => outln!(out, "    {label} Unknown"),
+            }
+        }
     }
-    println!("}}");
+    if let Some(v) = not_none(ifstat, "peers") {
+        outln!(out, "    Peers     : {} reachable", py_str(v));
+    }
+    if let Some(v) = not_none(ifstat, "tunnelstate") {
+        outln!(out, "    I2P       : {}", py_str(v));
+    }
+    if let Some(sig) = not_none(ifstat, "ifac_signature") {
+        let bytes = sig.as_slice().unwrap_or_default();
+        let tail = &bytes[bytes.len().saturating_sub(5)..];
+        let size = num(get(ifstat, "ifac_size"));
+        let nb = match size {
+            Num::Int(n) => Num::Int(n * 8),
+            Num::Float(f) => Num::Float(f * 8.0),
+        };
+        outln!(
+            out,
+            "    Access    : {}-bit IFAC by <…{}>",
+            nb.py_str(),
+            hex::encode(tail)
+        );
+    }
+    if let Some(v) = not_none(ifstat, "i2p_b32") {
+        outln!(out, "    I2P B32   : {}", py_str(v));
+    }
 }
 
-fn print_discovered_interfaces(config_dir: &Path, rc: &ReticulumConfig, args: &Args) -> ExitCode {
-    let paths = StoragePaths::from_config_dir(config_dir);
-    let store = match DiscoveryStore::open(&paths.storage_dir) {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("rnstatus-rs: could not open discovery store: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let sources = if rc.interface_discovery_sources.is_empty() {
-        None
-    } else {
-        Some(rc.interface_discovery_sources.as_slice())
-    };
-    let records = match store.list(sources) {
-        Ok(records) => records,
-        Err(e) => {
-            eprintln!("rnstatus-rs: could not read discovered interfaces: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    println!();
-
-    // Python lists every record as JSON, without the name filter (rnstatus.py:227-233).
-    if args.json {
-        let value = records
+/// The traffic totals blocks (rnstatus.py:770-833).
+fn render_totals(out: &mut Out, stats: &Value, astats: bool, pstats: bool, pps: bool) {
+    let n = |k: &str| num(get(stats, k)).f();
+    let (mut rxb_str, mut txb_str) = pair(n("rxb"), n("txb"));
+    let rxs = n("rxs");
+    let txs = n("txs");
+    let mut rxstat = format!("{rxb_str}  {}", prettyspeed(rxs));
+    let mut txstat = format!("{txb_str}  {}", prettyspeed(txs));
+    if (pstats || astats)
+        && ["prxs", "ptxs", "arxs", "atxs"]
             .iter()
-            .map(discovered_json)
-            .collect::<Vec<serde_json::Value>>();
-        println!("{}", serde_json::Value::Array(value));
-        return ExitCode::SUCCESS;
+            .all(|k| has(stats, k))
+    {
+        let parxs = n("prxs") + n("arxs");
+        let patxs = n("ptxs") + n("atxs");
+        let drxpct = if truthy(get(stats, "rxs")) {
+            100.0 - (100.0f64).min(parxs / rxs * 100.0)
+        } else {
+            100.0
+        };
+        let dtxpct = if truthy(get(stats, "txs")) {
+            100.0 - (100.0f64).min(patxs / txs * 100.0)
+        } else {
+            100.0
+        };
+        if rxs > 0.0 {
+            rxstat = format!(
+                "{rxstat}, {}% data ({})",
+                drxpct as i64,
+                prettyspeed(rxs * (drxpct / 100.0))
+            );
+        }
+        if txs > 0.0 {
+            txstat = format!(
+                "{txstat}, {}% data ({})",
+                dtxpct as i64,
+                prettyspeed(txs * (dtxpct / 100.0))
+            );
+        }
     }
-
-    let filtered: Vec<&DiscoveredInterface> = records
-        .iter()
-        .filter(|record| interface_matches_filter(&record.info.name, args.filter.as_deref()))
-        .collect();
-    if args.discovered_details {
-        print_discovered_details(&filtered, args.show_stale, args.show_unknown);
-    } else {
-        print_discovered_summary(&filtered, args.show_stale, args.show_unknown);
+    if pps {
+        rxstat = format!("{rxstat}, {}", prettysize(n("rxpps"), "pps"));
+        txstat = format!("{txstat}, {}", prettysize(n("txpps"), "pps"));
     }
-    ExitCode::SUCCESS
-}
+    outln!(out, "\n Totals       : {txstat}\n                {rxstat}");
 
-/// The record as Python's `list_discovered_interfaces` returns it, bytes as
-/// hex (Discovery.py:357-450, :549-556; rnstatus.py:227-233).
-fn discovered_json(record: &DiscoveredInterface) -> serde_json::Value {
-    let info = &record.info;
-    let status = record.status.unwrap_or(DiscoveryStatus::Unknown);
-    let mut value = json!({
-        "type": info.interface_type,
-        "impl_name": info.impl_name,
-        "version": info.impl_version,
-        "transport": info.transport_enabled,
-        "name": info.name,
-        "received": record.last_heard,
-        "stamp": hex::encode(&record.stamp),
-        "value": record.stamp_value,
-        "transport_id": hex::encode(info.transport_id),
-        "network_id": hex::encode(record.network_id),
-        "dst_cost": info.dst_cost,
-        "pr_cost": info.pr_cost,
-        "hops": record.hops,
-        "latitude": finite_location(info.latitude),
-        "longitude": finite_location(info.longitude),
-        "height": finite_location(info.height),
-        "discovery_hash": hex::encode(record.discovery_hash()),
-        "discovered": record.discovered,
-        "last_heard": record.last_heard,
-        "heard_count": record.heard_count,
-        "status": status.as_str(),
-        "status_code": status.code(),
-    });
-    let map = value.as_object_mut().expect("object literal");
-    let mut optional = |key: &str, field: Option<serde_json::Value>| {
-        if let Some(field) = field {
-            map.insert(key.to_string(), field);
+    let flow_pct = |part: &str, whole: &str| -> i64 {
+        if truthy(get(stats, whole)) && truthy(get(stats, part)) {
+            (100.0f64).min(n(part) / n(whole) * 100.0) as i64
+        } else {
+            0
         }
     };
-    optional("ifac_netname", info.ifac_netname.clone().map(Into::into));
-    optional("ifac_netkey", info.ifac_netkey.clone().map(Into::into));
-    optional("reachable_on", info.reachable_on.clone().map(Into::into));
-    optional("port", info.port.map(Into::into));
-    optional("frequency", info.frequency.map(Into::into));
-    optional("bandwidth", info.bandwidth.map(Into::into));
-    optional("sf", info.spreading_factor.map(Into::into));
-    optional("cr", info.coding_rate.map(Into::into));
-    optional(
-        "modulation",
-        info.modulation
-            .as_ref()
-            .and_then(|m| serde_json::to_value(m).ok()),
-    );
-    optional("channel", info.channel.map(Into::into));
-    optional(
-        "operator_lxmf_address",
-        info.operator_lxmf_address.map(|a| hex::encode(a).into()),
-    );
-    let config_entry = discovered_config_entry(record);
-    if !config_entry.is_empty() {
-        map.insert("config_entry".to_string(), config_entry.into());
-    }
-    value
-}
-
-fn finite_location(value: Option<f64>) -> Option<f64> {
-    value.filter(|number| number.is_finite())
-}
-
-/// Python's `impl_name version`, when the record names both (rnstatus.py:250-251).
-fn discovered_stack(record: &DiscoveredInterface) -> Option<String> {
-    match (&record.info.impl_name, &record.info.impl_version) {
-        (Some(name), Some(version)) if !name.is_empty() && !version.is_empty() => {
-            Some(format!("{name} {version}"))
+    for (enabled, b, label) in [(pstats, 'p', "Path Rqs.   "), (astats, 'a', "Announces   ")] {
+        let k = |s: &str| format!("{b}{s}");
+        if !enabled
+            || !["rxb", "txb", "rxs", "txs"]
+                .iter()
+                .all(|s| has(stats, &k(s)))
+        {
+            continue;
         }
+        (rxb_str, txb_str) = pair(n(&k("rxb")), n(&k("txb")));
+        let rxf = prettyfrequency(num(get(stats, &k("rxf"))), "Hz", 2, false);
+        let txf = prettyfrequency(num(get(stats, &k("txf"))), "Hz", 2, false);
+        let rx = format!(
+            "{rxb_str}  {}, {}% of flow, {rxf}",
+            prettyspeed(n(&k("rxs"))),
+            flow_pct(&k("rxs"), "rxs")
+        );
+        let tx = format!(
+            "{txb_str}  {}, {}% of flow, {txf}",
+            prettyspeed(n(&k("txs"))),
+            flow_pct(&k("txs"), "txs")
+        );
+        outln!(out, "\n {label} : {tx}\n                {rx}");
+    }
+}
+
+/// `↓rx` and `↑tx` sizes padded to the same width.
+fn pair(rx: f64, tx: f64) -> (String, String) {
+    let mut rx = format!("↓{}", prettysize(rx, "B"));
+    let mut tx = format!("↑{}", prettysize(tx, "B"));
+    let width = clen(&rx).max(clen(&tx));
+    pad(&mut rx, width);
+    pad(&mut tx, width);
+    (rx, tx)
+}
+
+/// `-q` (rnstatus.py:836-853).
+fn render_queues(out: &mut Out, stats: &Value) {
+    let line = |pressure: &str, count: &str, dropped: &str, label: &str| {
+        let d = get(stats, dropped);
+        let dstr = if truthy(d) {
+            format!(", {} dropped", py_str_opt(d))
+        } else {
+            String::new()
+        };
+        let p = py_round(num(get(stats, pressure)).f() * 100.0, 1);
+        format!(
+            "{}% {label}, {} pkts{dstr}",
+            py_float_repr(p),
+            py_str_opt(get(stats, count))
+        )
+    };
+    outln!(
+        out,
+        "\n Qu. Pressure : {}",
+        line("tqpressure", "rxqt", "rxqtd", "total")
+    );
+    outln!(
+        out,
+        "                {}",
+        line("dqpressure", "rxqd", "rxqdd", "data")
+    );
+    outln!(
+        out,
+        "                {}",
+        line("aqpressure", "rxqa", "rxqad", "announce")
+    );
+    outln!(
+        out,
+        "                {}",
+        line("pqpressure", "rxqp", "rxqpd", "path request")
+    );
+    outln!(
+        out,
+        "                {}",
+        line("ilqpressure", "rxqil", "rxqild", "ingress limiter")
+    );
+}
+
+/// `RNS.Profiler.format_results` (RNS/__init__.py:581-620).
+fn format_profiling(results: &Value) -> String {
+    let tags: Vec<&Value> = match results {
+        Value::Map(entries) => entries.iter().map(|(_, v)| v).collect(),
+        _ => Vec::new(),
+    };
+    fn pst(time: Option<&Value>) -> String {
+        match time.filter(|v| !v.is_nil()) {
+            Some(t) => prettyshorttime(num(Some(t)).f()),
+            None => "-----".to_string(),
+        }
+    }
+    fn tag_results(tag: &Value, level: usize) -> String {
+        let ind = "  ".repeat(level);
+        let stats_all = get(tag, "stats_all");
+        let mut s = format!(" {ind}{}\n", py_str_opt(get(tag, "name")));
+        let threads = num(stats_all.and_then(|v| get(v, "threads")));
+        s += &format!(
+            " {ind}  Samples  : {} from {} thread{}\n",
+            py_str_opt(stats_all.and_then(|v| get(v, "count"))),
+            threads.py_str(),
+            if threads.f() > 1.0 { "s" } else { "" }
+        );
+        let row = |label: &str, stats: &Value| {
+            let f = |k: &str| pst(get(stats, k));
+            format!(
+                " {ind}{label}({:^15} | {:^15} | {:^15} | {:^15} | {:^15} | {:^15})\n",
+                f("mean"),
+                f("median"),
+                f("min"),
+                f("max"),
+                f("stdev"),
+                f("sum")
+            )
+        };
+        if let Some(all) = stats_all.filter(|v| !v.is_nil()) {
+            s += &format!(
+                " {ind}              {:^15} | {:^15} | {:^15} | {:^15} | {:^15} | {:^15}\n",
+                "Mean", "Median", "Min", "Max", "St. dev", "Total"
+            );
+            s += &row("  Stats    : ", all);
+        }
+        for (key, label) in [
+            ("stats_1m", "   0-1m    : "),
+            ("stats_5m", "   1-5m    : "),
+            ("stats_30m", "  5-30m    : "),
+            ("stats_60m", " 30-60m    : "),
+        ] {
+            if let Some(v) = not_none(tag, key) {
+                s += &row(label, v);
+            }
+        }
+        s
+    }
+    fn recursive(tag: &Value, tags: &[&Value], level: usize) -> String {
+        let mut s = tag_results(tag, level + 1) + "\n";
+        for sub in tags {
+            if values_eq(get(sub, "super"), get(tag, "name")) {
+                s += &recursive(sub, tags, level + 1);
+            }
+        }
+        s
+    }
+    let mut s = String::new();
+    for tag in &tags {
+        if not_none(tag, "super").is_none() {
+            s += &recursive(tag, &tags, 0);
+        }
+    }
+    s
+}
+
+fn values_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => true,
+        (Some(v), None) | (None, Some(v)) => v.is_nil(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Python value semantics over the decoded msgpack.
+
+fn get<'a>(map: &'a Value, key: &str) -> Option<&'a Value> {
+    map.as_map()?
+        .iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
+}
+
+fn has(map: &Value, key: &str) -> bool {
+    get(map, key).is_some()
+}
+
+/// Present and not None.
+fn not_none<'a>(map: &'a Value, key: &str) -> Option<&'a Value> {
+    get(map, key).filter(|v| !v.is_nil())
+}
+
+fn truthy(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Nil) => false,
+        Some(Value::Boolean(b)) => *b,
+        Some(Value::Integer(i)) => i.as_i64() != Some(0) && i.as_u64() != Some(0),
+        Some(Value::F32(f)) => *f != 0.0,
+        Some(Value::F64(f)) => *f != 0.0,
+        Some(Value::String(s)) => !s.as_bytes().is_empty(),
+        Some(Value::Binary(b)) => !b.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Map(m)) => !m.is_empty(),
+        Some(Value::Ext(..)) => true,
+    }
+}
+
+/// Python `value == True` / `value == False`.
+fn py_eq_bool(value: &Value, b: bool) -> bool {
+    let want = if b { 1.0 } else { 0.0 };
+    match value {
+        Value::Boolean(v) => *v == b,
+        Value::Integer(_) | Value::F32(_) | Value::F64(_) => num(Some(value)).f() == want,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Num {
+    Int(i64),
+    Float(f64),
+}
+
+impl Num {
+    fn f(self) -> f64 {
+        match self {
+            Num::Int(i) => i as f64,
+            Num::Float(f) => f,
+        }
+    }
+
+    fn i(self) -> i64 {
+        match self {
+            Num::Int(i) => i,
+            Num::Float(f) => f as i64,
+        }
+    }
+
+    fn py_str(self) -> String {
+        match self {
+            Num::Int(i) => i.to_string(),
+            Num::Float(f) => py_float_repr(f),
+        }
+    }
+}
+
+fn num(value: Option<&Value>) -> Num {
+    match value {
+        Some(Value::Integer(i)) => i
+            .as_i64()
+            .map(Num::Int)
+            .unwrap_or_else(|| Num::Float(i.as_f64().unwrap_or(0.0))),
+        Some(Value::F32(f)) => Num::Float(f64::from(*f)),
+        Some(Value::F64(f)) => Num::Float(*f),
+        Some(Value::Boolean(b)) => Num::Int(i64::from(*b)),
+        _ => Num::Int(0),
+    }
+}
+
+/// Python `int(value)` for a number or numeric string.
+fn py_int(value: &Value) -> Option<i64> {
+    match value {
+        Value::Integer(_) | Value::F32(_) | Value::F64(_) | Value::Boolean(_) => {
+            Some(num(Some(value)).i())
+        }
+        Value::String(s) => s.as_str()?.trim().parse().ok(),
         _ => None,
     }
 }
 
-/// Whether Python lists this record: stale and stack-less records are hidden
-/// unless asked for (rnstatus.py:255-256).
-fn discovered_shown(record: &DiscoveredInterface, show_stale: bool, show_unknown: bool) -> bool {
-    (show_stale || record.status != Some(DiscoveryStatus::Stale))
-        && (show_unknown || discovered_stack(record).is_some())
+/// Python `str(value)`.
+fn py_str(value: &Value) -> String {
+    match value {
+        Value::Nil => "None".to_string(),
+        Value::Boolean(true) => "True".to_string(),
+        Value::Boolean(false) => "False".to_string(),
+        Value::Integer(_) | Value::F32(_) | Value::F64(_) => num(Some(value)).py_str(),
+        Value::String(s) => s.as_str().unwrap_or_default().to_string(),
+        Value::Binary(b) => format!("b'{}'", b.escape_ascii()),
+        Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(py_repr).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Map(entries) => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(k, v)| format!("{}: {}", py_repr(k), py_repr(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Ext(..) => "None".to_string(),
+    }
 }
 
+fn py_repr(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("'{}'", s.as_str().unwrap_or_default()),
+        other => py_str(other),
+    }
+}
+
+fn py_str_opt(value: Option<&Value>) -> String {
+    value.map(py_str).unwrap_or_else(|| "None".to_string())
+}
+
+fn pretty_hex(bytes: &[u8]) -> String {
+    format!("<{}>", hex::encode(bytes))
+}
+
+fn pretty_hex_value(value: &Value) -> String {
+    match value {
+        Value::Binary(b) => pretty_hex(b),
+        Value::String(s) => pretty_hex(s.as_bytes()),
+        other => py_str(other),
+    }
+}
+
+/// Characters, as Python's `len` counts them.
+fn clen(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn pad(s: &mut String, width: usize) {
+    let n = width.saturating_sub(clen(s));
+    s.extend(std::iter::repeat_n(' ', n));
+}
+
+/// `json.dumps` with default separators; bytes are written as hex, which
+/// is what rnstatus converts them to before dumping (rnstatus.py:227-233,412-425).
+fn py_json(value: &Value) -> String {
+    match value {
+        Value::Nil | Value::Ext(..) => "null".to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::F32(_) | Value::F64(_) => {
+            let f = num(Some(value)).f();
+            if f.is_nan() {
+                "NaN".to_string()
+            } else if f.is_infinite() {
+                if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+            } else {
+                py_float_repr(f)
+            }
+        }
+        Value::String(s) => py_json_str(s.as_str().unwrap_or_default()),
+        Value::Binary(b) => py_json_str(&hex::encode(b)),
+        Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(py_json).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Map(entries) => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(k, v)| {
+                    let key = match k {
+                        Value::String(_) => py_json(k),
+                        Value::Binary(b) => py_json_str(&hex::encode(b)),
+                        other => py_json_str(&py_json(other)),
+                    };
+                    format!("{key}: {}", py_json(v))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// A `json.dumps` string with the default `ensure_ascii`.
+fn py_json_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if c.is_ascii() && !c.is_ascii_control() => out.push(c),
+            c => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    let _ = write!(out, "\\u{unit:04x}");
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Upstream's formatting helpers (RNS/__init__.py, rnstatus.py:971-984).
+
+/// Python `round(x, n)` for a float.
+fn py_round(value: f64, digits: usize) -> f64 {
+    format!("{value:.digits$}").parse().unwrap_or(value)
+}
+
+/// Python `repr(float)`.
+fn py_float_repr(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    let sci = format!("{value:e}");
+    let (mantissa, exponent) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    if value == 0.0 || (-4..16).contains(&exponent) {
+        let fixed = format!("{value}");
+        if fixed.contains('.') {
+            fixed
+        } else {
+            format!("{fixed}.0")
+        }
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    }
+}
+
+/// `RNS.prettysize`.
+fn prettysize(num: f64, suffix: &str) -> String {
+    let mut num = num;
+    for unit in ["", "K", "M", "G", "T", "P", "E", "Z"] {
+        if num.abs() < 1000.0 {
+            return if unit.is_empty() {
+                format!("{num:.0} {unit}{suffix}")
+            } else {
+                format!("{num:.2} {unit}{suffix}")
+            };
+        }
+        num /= 1000.0;
+    }
+    format!("{num:.2}Y{suffix}")
+}
+
+/// `RNS.prettyspeed`: `prettysize(num/8, suffix="b")+"ps"`.
+fn prettyspeed(num: f64) -> String {
+    format!("{}ps", prettysize(num, "b"))
+}
+
+/// rnstatus.py `speed_str`.
+fn speed_str(num: f64) -> String {
+    let mut num = num;
+    for unit in ["", "k", "M", "G", "T", "P", "E", "Z"] {
+        if num.abs() < 1000.0 {
+            return format!("{num:3.2} {unit}bps");
+        }
+        num /= 1000.0;
+    }
+    format!("{num:.2} Ybps")
+}
+
+/// `RNS.prettyfrequency`.
+fn prettyfrequency(hz: Num, suffix: &str, d: usize, lpf: bool) -> String {
+    if hz.f() == 0.0 {
+        return "0 Hz".to_string();
+    }
+    let mut num = if lpf { hz } else { Num::Float(hz.f() * 1e6) };
+    let units: &[&str] = if lpf {
+        &["", "K", "M", "G", "T", "P", "E", "Z"]
+    } else {
+        &["µ", "m", "", "K", "M", "G", "T", "P", "E", "Z"]
+    };
+    for unit in units {
+        if num.f().abs() < 1000.0 {
+            return if d == 2 {
+                format!("{:.2} {unit}{suffix}", num.f())
+            } else {
+                let rounded = match num {
+                    Num::Int(i) => Num::Int(i),
+                    Num::Float(f) => Num::Float(py_round(f, d)),
+                };
+                format!("{} {unit}{suffix}", rounded.py_str())
+            };
+        }
+        num = Num::Float(num.f() / 1000.0);
+    }
+    format!("{:.2}Y{suffix}", num.f())
+}
+
+/// `RNS.prettytime(t, compact=...)`, not verbose.
+fn prettytime(time: Num, compact: bool) -> String {
+    let neg = time.f() < 0.0;
+    let (days, hours, minutes, seconds) = match time {
+        Num::Int(t) => {
+            let t = t.abs();
+            let rest = t % 86400;
+            (
+                t / 86400,
+                rest / 3600,
+                (rest % 3600) / 60,
+                Num::Int(rest % 3600 % 60),
+            )
+        }
+        Num::Float(t) => {
+            let t = t.abs();
+            let days = (t / 86400.0).floor();
+            let mut rest = t % 86400.0;
+            let hours = (rest / 3600.0).floor();
+            rest %= 3600.0;
+            let minutes = (rest / 60.0).floor();
+            rest %= 60.0;
+            let seconds = if compact {
+                Num::Int(rest as i64)
+            } else {
+                Num::Float(py_round(rest, 2))
+            };
+            (days as i64, hours as i64, minutes as i64, seconds)
+        }
+    };
+    let mut components = Vec::new();
+    for (value, unit) in [(days, "d"), (hours, "h"), (minutes, "m")] {
+        if value > 0 && (!compact || components.len() < 2) {
+            components.push(format!("{value}{unit}"));
+        }
+    }
+    if seconds.f() > 0.0 && (!compact || components.len() < 2) {
+        components.push(format!("{}s", seconds.py_str()));
+    }
+    let count = components.len();
+    let mut out = String::new();
+    for (i, c) in components.iter().enumerate() {
+        if i > 0 {
+            out.push_str(if i + 1 < count { ", " } else { " and " });
+        }
+        out.push_str(c);
+    }
+    if out.is_empty() {
+        "0s".to_string()
+    } else if neg {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// `RNS.prettyshorttime(t, tight=True)`.
+fn prettyshorttime(time: f64) -> String {
+    let neg = time < 0.0;
+    let mut time = (time * 1e6).abs();
+    let seconds = (time / 1e6).floor() as i64;
+    time %= 1e6;
+    let millis = (time / 1e3).floor() as i64;
+    time %= 1e3;
+    let micros = py_round(time, 2);
+    let mut components = Vec::new();
+    if seconds > 0 {
+        components.push(format!("{seconds}s"));
+    }
+    if millis > 0 {
+        components.push(format!("{millis}ms"));
+    }
+    if micros > 0.0 {
+        components.push(format!("{}µs", py_float_repr(micros)));
+    }
+    let out = components.join(" ");
+    if out.is_empty() {
+        "0us".to_string()
+    } else if neg {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// `RNS.prettycost`: the quantized cost to three decimals, `n` for
+/// anything but a number.
+fn pretty_cost(cost: Option<f64>) -> String {
+    match cost.map(rns_identity::stamps::quantize_cost) {
+        Some(Ok(cost)) => format!("{cost:.3}"),
+        _ => "n".to_string(),
+    }
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+// ---------------------------------------------------------------------------
+// Discovered interfaces (rnstatus.py:236-367).
+
 fn print_discovered_summary(
+    out: &mut Out,
     records: &[&DiscoveredInterface],
     show_stale: bool,
     show_unknown: bool,
 ) {
-    println!(
+    outln!(
+        out,
         "{:<25} {:<10}   {:<10} {:<12} {:<7} {:<16} {:<15}",
-        "Name", "Type", "Status", "Last Heard", "Value", "Running", "Location"
+        "Name",
+        "Type",
+        "Status",
+        "Last Heard",
+        "Value",
+        "Running",
+        "Location"
     );
-    println!("{}", "-".repeat(110));
+    outln!(out, "{}", "-".repeat(110));
     let now = unix_now_secs();
     for record in records {
         if !discovered_shown(record, show_stale, show_unknown) {
@@ -1008,7 +2103,8 @@ fn print_discovered_summary(
             (Some(lat), Some(lon)) => format!("{}, {}", py_round4(lat), py_round4(lon)),
             _ => "N/A".to_string(),
         };
-        println!(
+        outln!(
+            out,
             "{:<25} {:<10} {:<12} {:<12} {:<7} {:<16} {:<15}",
             name,
             info.interface_type.replace("Interface", ""),
@@ -1022,7 +2118,9 @@ fn print_discovered_summary(
 }
 
 fn print_discovered_details(
+    out: &mut Out,
     records: &[&DiscoveredInterface],
+    stored: &[&Value],
     show_stale: bool,
     show_unknown: bool,
 ) {
@@ -1034,22 +2132,24 @@ fn print_discovered_details(
         let info = &record.info;
         // Python numbers the separator by the filtered list, hidden records included.
         if idx > 0 {
-            println!("\n{}\n", "=".repeat(47));
+            outln!(out, "\n{}\n", "=".repeat(47));
         }
         if record.network_id != info.transport_id {
-            println!("Network   ID : {}", hex::encode(record.network_id));
+            outln!(out, "Network   ID : {}", hex::encode(record.network_id));
         }
-        println!("Transport ID : {}", hex::encode(info.transport_id));
+        outln!(out, "Transport ID : {}", hex::encode(info.transport_id));
         if let Some(address) = info.operator_lxmf_address {
-            println!("LXMF address : {}", hex::encode(address));
+            outln!(out, "LXMF address : {}", hex::encode(address));
         }
-        println!("Name         : {}", info.name);
-        println!("Type         : {}", info.interface_type);
-        println!(
+        outln!(out, "Name         : {}", info.name);
+        outln!(out, "Type         : {}", info.interface_type);
+        outln!(
+            out,
             "Stack        : {}",
             discovered_stack(record).unwrap_or_else(|| "Unknown".into())
         );
-        println!(
+        outln!(
+            out,
             "Status       : {}",
             match record.status {
                 Some(DiscoveryStatus::Available) => "Available",
@@ -1057,7 +2157,8 @@ fn print_discovered_details(
                 _ => "Unknown",
             }
         );
-        println!(
+        outln!(
+            out,
             "Transport    : {}",
             if info.transport_enabled {
                 "Enabled"
@@ -1065,23 +2166,33 @@ fn print_discovered_details(
                 "Disabled"
             }
         );
-        println!("Stamp Value  : {}", pretty_cost(Some(record.stamp_value)));
-        // Stored records always carry both cost keys, possibly nil (Discovery.py:357-358).
-        println!(
-            "Costs        : Dst {}, PR {}",
-            pretty_cost(info.dst_cost),
-            pretty_cost(info.pr_cost)
+        outln!(
+            out,
+            "Stamp Value  : {}",
+            pretty_cost(Some(record.stamp_value))
         );
-        println!(
+        let info_dict = stored[idx];
+        if has(info_dict, "dst_cost") && has(info_dict, "pr_cost") {
+            outln!(
+                out,
+                "Costs        : Dst {}, PR {}",
+                pretty_cost(info.dst_cost),
+                pretty_cost(info.pr_cost)
+            );
+        }
+        outln!(
+            out,
             "Distance     : {} hop{}",
             record.hops,
             if record.hops == 1 { "" } else { "s" }
         );
-        println!(
+        outln!(
+            out,
             "Discovered   : {} ago",
             pretty_time_compact(now.saturating_sub(record.discovered))
         );
-        println!(
+        outln!(
+            out,
             "Last Heard   : {} ago",
             pretty_time_compact(now.saturating_sub(record.last_heard))
         );
@@ -1097,100 +2208,57 @@ fn print_discovered_details(
             }
             _ => "Unknown".to_string(),
         };
-        println!("Location     : {location}");
+        outln!(out, "Location     : {location}");
         if let Some(freq) = info.frequency {
-            println!("Frequency    : {} Hz", thousands(freq));
+            outln!(out, "Frequency    : {} Hz", thousands(freq));
         }
         if let Some(bw) = info.bandwidth {
-            println!("Bandwidth    : {} Hz", thousands(bw));
+            outln!(out, "Bandwidth    : {} Hz", thousands(bw));
         }
         if let Some(sf) = info.spreading_factor {
-            println!("Sprd. Factor : {sf}");
+            outln!(out, "Sprd. Factor : {sf}");
         }
         if let Some(cr) = info.coding_rate {
-            println!("Coding Rate  : {cr}");
+            outln!(out, "Coding Rate  : {cr}");
         }
         if let Some(modu) = &info.modulation {
-            println!("Modulation   : {modu}");
+            outln!(out, "Modulation   : {modu}");
         }
         if let Some(addr) = &info.reachable_on {
-            println!("Address      : {addr}");
+            outln!(out, "Address      : {addr}");
         }
         if let Some(port) = info.port {
-            println!("Port         : {port}");
+            outln!(out, "Port         : {port}");
         }
-        println!("\nConfiguration Entry:");
-        for line in discovered_config_entry(record).split('\n') {
-            println!("  {line}");
+        outln!(out, "\nConfiguration Entry:");
+        // Upstream prints the header, then fails on a record without an entry.
+        if let Some(entry) = get(info_dict, "config_entry") {
+            for line in py_str(entry).split('\n') {
+                outln!(out, "  {line}");
+            }
         }
     }
 }
 
-/// The config entry Python stores with a discovered interface
-/// (Discovery.py:380-450).
-fn discovered_config_entry(record: &DiscoveredInterface) -> String {
-    let info = &record.info;
-    let name = &info.name;
-    let identity = format!(
-        "\n  transport_identity = {}",
-        hex::encode(info.transport_id)
-    );
-    let netname = info
-        .ifac_netname
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(|value| format!("\n  network_name = {value}"))
-        .unwrap_or_default();
-    let netkey = info
-        .ifac_netkey
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(|value| format!("\n  passphrase = {value}"))
-        .unwrap_or_default();
-    let opt = |value: Option<String>| value.unwrap_or_else(|| "None".to_string());
-    match info.interface_type.as_str() {
-        "BackboneInterface" | "TCPServerInterface" => {
-            let (kind, remote) = if cfg!(any(windows, target_os = "macos")) {
-                ("TCPClientInterface", "target_host")
-            } else {
-                ("BackboneInterface", "remote")
-            };
-            format!(
-                "[[{name}]]\n  type = {kind}\n  enabled = yes\n  {remote} = {}\n  target_port = {}{identity}{netname}{netkey}",
-                opt(info.reachable_on.clone()),
-                opt(info.port.map(|port| port.to_string())),
-            )
+fn finite_location(value: Option<f64>) -> Option<f64> {
+    value.filter(|number| number.is_finite())
+}
+
+/// Python's `impl_name version`, when the record names both (rnstatus.py:250-251).
+fn discovered_stack(record: &DiscoveredInterface) -> Option<String> {
+    match (&record.info.impl_name, &record.info.impl_version) {
+        (Some(name), Some(version)) if !name.is_empty() && !version.is_empty() => {
+            Some(format!("{name} {version}"))
         }
-        "I2PInterface" => format!(
-            "[[{name}]]\n  type = I2PInterface\n  enabled = yes\n  peers = {}.b32.i2p{identity}{netname}{netkey}",
-            opt(info.reachable_on.clone()),
-        ),
-        "RNodeInterface" => format!(
-            "[[{name}]]\n  type = RNodeInterface\n  enabled = yes\n  port = \n  frequency = {}\n  bandwidth = {}\n  spreadingfactor = {}\n  codingrate = {}\n  txpower = {netname}{netkey}",
-            opt(info.frequency.map(|v| v.to_string())),
-            opt(info.bandwidth.map(|v| v.to_string())),
-            opt(info.spreading_factor.map(|v| v.to_string())),
-            opt(info.coding_rate.map(|v| v.to_string())),
-        ),
-        "WeaveInterface" => format!(
-            "[[{name}]]\n  type = WeaveInterface\n  enabled = yes\n  port = {netname}{netkey}"
-        ),
-        "KISSInterface" => format!(
-            "[[{name}]]\n  type = KISSInterface\n  enabled = yes\n  port = \n  # Frequency: {}\n  # Bandwidth: {}\n  # Modulation: {}{identity}{netname}{netkey}",
-            opt(info.frequency.map(|v| v.to_string())),
-            opt(info.bandwidth.map(|v| v.to_string())),
-            opt(info.modulation.as_ref().map(ToString::to_string)),
-        ),
-        _ => String::new(),
+        _ => None,
     }
 }
 
-/// Python's `RNS.prettycost`: the quantized cost to three places, or `n`.
-fn pretty_cost(cost: Option<f64>) -> String {
-    match cost.map(rns_identity::stamps::quantize_cost) {
-        Some(Ok(cost)) => format!("{cost:.3}"),
-        _ => "n".to_string(),
-    }
+/// Whether Python lists this record: stale and stack-less records are hidden
+/// unless asked for (rnstatus.py:255-256).
+fn discovered_shown(record: &DiscoveredInterface, show_stale: bool, show_unknown: bool) -> bool {
+    (show_stale || record.status != Some(DiscoveryStatus::Stale))
+        && (show_unknown || discovered_stack(record).is_some())
 }
 
 /// Python's `RNS.prettytime(t, compact=True)` for whole seconds.
@@ -1256,1072 +2324,4 @@ fn unix_now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-async fn run_remote(args: Args) -> ExitCode {
-    let session = match RemoteSession::open(&args).await {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let exit = session.query_and_print(&args).await;
-    rns_tools::shut_down(&session.handle).await;
-    exit
-}
-
-/// Remote-management state reused across monitor refreshes: one runtime,
-/// one identity, one client — only the /status request repeats.
-struct RemoteSession {
-    remote_hash: [u8; 16],
-    client: LinkClient,
-    handle: ReticulumHandle,
-    timeout: Duration,
-}
-
-impl RemoteSession {
-    async fn open(args: &Args) -> Result<Self, ExitCode> {
-        let remote_hex = args.remote.as_deref().expect("checked in main");
-        let remote_hash = match hash::parse_dest_hash(remote_hex) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("rnstatus-rs: --remote: {e}");
-                return Err(ExitCode::from(2));
-            }
-        };
-
-        let identity_path = match args.identity.as_ref() {
-            Some(p) => p.clone(),
-            None => {
-                eprintln!("rnstatus-rs: --remote requires --identity <path>.");
-                return Err(ExitCode::from(2));
-            }
-        };
-        let identity = match rns_identity::identity::Identity::from_file(&identity_path) {
-            Ok(id) => id,
-            Err(e) => {
-                eprintln!(
-                    "rnstatus-rs: could not load identity from {}: {e:?}",
-                    identity_path.display()
-                );
-                return Err(ExitCode::from(1));
-            }
-        };
-
-        let shutdown = ShutdownSignal::new();
-        let foreground = Arc::new(AtomicBool::new(true));
-        let handle = match init(args.config.as_deref(), None, shutdown.clone(), foreground).await {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("rnstatus-rs: failed to initialize Reticulum runtime: {e:?}");
-                return Err(ExitCode::from(1));
-            }
-        };
-
-        // rnstatus.py:174, 928
-        handle.wants_destination_type(MGMT_APP).await;
-        Ok(Self {
-            remote_hash,
-            client: LinkClient::new(handle.transport_tx.clone(), identity),
-            handle,
-            timeout: Duration::from_secs(args.timeout.unwrap_or(REMOTE_TIMEOUT_SECS)),
-        })
-    }
-
-    async fn query_and_print(&self, args: &Args) -> ExitCode {
-        // Wire format: msgpack 1-tuple `(include_link_count,)`.
-        let payload = match rmp_serde::to_vec(&(args.link_stats,)) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("rnstatus-rs: msgpack encode failed: {e}");
-                return ExitCode::from(1);
-            }
-        };
-
-        let response_bytes = match self
-            .client
-            .query(
-                self.remote_hash,
-                MGMT_APP,
-                "/status",
-                payload,
-                REMOTE_HOPS,
-                self.timeout,
-            )
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("rnstatus-rs: remote query failed: {}", remote_err(&e));
-                return match e {
-                    LinkClientError::Timeout(_) => ExitCode::from(124),
-                    _ => ExitCode::from(1),
-                };
-            }
-        };
-
-        print_remote_status(&response_bytes, args)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RemoteInterface {
-    name: String,
-    online: bool,
-    mode: u64,
-    bitrate: u64,
-    rxb: u64,
-    txb: u64,
-    rxs: u64,
-    txs: u64,
-    announce_queue: Option<u64>,
-    held_announces: u64,
-    incoming_announce_frequency: f64,
-    outgoing_announce_frequency: f64,
-    incoming_pr_frequency: f64,
-    outgoing_pr_frequency: f64,
-    burst_active: bool,
-    burst_activated: f64,
-    pr_burst_active: bool,
-    pr_burst_activated: f64,
-    clients: Option<u64>,
-    blocked_ips: Option<u64>,
-    announce_rate_target: Option<f64>,
-    announce_rate_grace: Option<u32>,
-    announce_rate_penalty: Option<f64>,
-    ifac_signature: Option<Vec<u8>>,
-    ifac_size: Option<u64>,
-    ifac_netname: Option<String>,
-    autoconnect_source: Option<String>,
-    announces_received: u64,
-    announces_sent: u64,
-    path_requests_received: u64,
-    path_requests_sent: u64,
-    protocol_violations: u64,
-    ifac_violations: u64,
-    packet_filter_hits: u64,
-    tx_drops: u64,
-    tx_dropped_bytes: u64,
-}
-
-impl RemoteInterface {
-    fn sort_value(&self, key: SortKey) -> f64 {
-        match key {
-            SortKey::Rate => self.bitrate as f64,
-            SortKey::Rx => self.rxb as f64,
-            SortKey::Tx => self.txb as f64,
-            SortKey::RxRate => self.rxs as f64,
-            SortKey::TxRate => self.txs as f64,
-            SortKey::Traffic => self.rxb.saturating_add(self.txb) as f64,
-            SortKey::Announces => {
-                self.incoming_announce_frequency + self.outgoing_announce_frequency
-            }
-            SortKey::AnnounceRx => self.incoming_announce_frequency,
-            SortKey::AnnounceTx => self.outgoing_announce_frequency,
-            SortKey::AnnounceRxCount => self.announces_received as f64,
-            SortKey::AnnounceTxCount => self.announces_sent as f64,
-            SortKey::PathRequestRx => self.incoming_pr_frequency,
-            SortKey::PathRequestTx => self.outgoing_pr_frequency,
-            SortKey::PathRequestRxCount => self.path_requests_received as f64,
-            SortKey::PathRequestTxCount => self.path_requests_sent as f64,
-            SortKey::Held => self.held_announces as f64,
-            SortKey::ProtocolViolations => self.protocol_violations as f64,
-            SortKey::IfacViolations => self.ifac_violations as f64,
-            SortKey::FilterHits => self.packet_filter_hits as f64,
-            SortKey::TxDrops => self.tx_drops as f64,
-            SortKey::TxDroppedBytes => self.tx_dropped_bytes as f64,
-        }
-    }
-}
-
-// Wire format: outer array is [stats] or [stats, link_count].
-fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
-    let value: rmpv::Value = match rmp_serde::from_slice(bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("rnstatus-rs: malformed response: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let arr = match value.as_array() {
-        Some(a) => a,
-        None => {
-            eprintln!("rnstatus-rs: response is not a msgpack array");
-            return ExitCode::from(1);
-        }
-    };
-    let stats = match arr.first().and_then(|v| v.as_map()) {
-        Some(m) => m,
-        None => {
-            eprintln!("rnstatus-rs: response missing stats dict");
-            return ExitCode::from(1);
-        }
-    };
-    let link_count = arr.get(1).and_then(|v| v.as_u64());
-
-    let interfaces = stats
-        .iter()
-        .find(|(k, _)| k.as_str() == Some("interfaces"))
-        .and_then(|(_, v)| v.as_array());
-    let total_rxb = stats
-        .iter()
-        .find(|(k, _)| k.as_str() == Some("rxb"))
-        .and_then(|(_, v)| v.as_u64())
-        .unwrap_or(0);
-    let total_txb = stats
-        .iter()
-        .find(|(k, _)| k.as_str() == Some("txb"))
-        .and_then(|(_, v)| v.as_u64())
-        .unwrap_or(0);
-    let stat_u64 = |key: &str| {
-        stats
-            .iter()
-            .find(|(k, _)| k.as_str() == Some(key))
-            .and_then(|(_, v)| v.as_u64())
-            .unwrap_or(0)
-    };
-    let (rxpps, txpps) = (stat_u64("rxpps"), stat_u64("txpps"));
-
-    let mut parsed_interfaces = interfaces
-        .map(|ifs| {
-            ifs.iter()
-                .filter_map(|iface| iface.as_map().map(|m| remote_interface_from_map(m)))
-                .filter(|iface| args.all || visible_by_default(&iface.name))
-                .filter(|iface| {
-                    interface_matches_burst_filter(
-                        &iface.name,
-                        iface.burst_active,
-                        iface.pr_burst_active,
-                        args,
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if let Ok(Some(key)) = parse_sort_key(args.sort.as_deref()) {
-        parsed_interfaces.sort_by(|a, b| {
-            let ord = a
-                .sort_value(key)
-                .partial_cmp(&b.sort_value(key))
-                .unwrap_or(std::cmp::Ordering::Equal);
-            if args.reverse { ord } else { ord.reverse() }
-        });
-    }
-
-    if args.json {
-        print!("{{");
-        print!("\"interfaces\":[");
-        for (i, iface) in parsed_interfaces.iter().enumerate() {
-            if i > 0 {
-                print!(",");
-            }
-            print!(
-                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"blocked_ips\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"ifac_signature\":{},\"ifac_size\":{},\"ifac_netname\":{},\"autoconnect_source\":{},\"tx_drops\":{},\"tx_dropped_bytes\":{},\"arxc\":{},\"atxc\":{},\"prxc\":{},\"ptxc\":{},\"protocol_violations\":{},\"ifac_violations\":{},\"packet_filter_hits\":{}}}",
-                json_str(&iface.name),
-                iface.online,
-                iface.mode,
-                iface.bitrate,
-                iface.rxb,
-                iface.txb,
-                iface.rxs,
-                iface.txs,
-                iface
-                    .announce_queue
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "null".to_string()),
-                iface.held_announces,
-                iface.incoming_announce_frequency,
-                iface.outgoing_announce_frequency,
-                iface.incoming_pr_frequency,
-                iface.outgoing_pr_frequency,
-                iface.burst_active,
-                iface.burst_activated,
-                iface.pr_burst_active,
-                iface.pr_burst_activated,
-                opt_u64_json(iface.clients),
-                opt_u64_json(iface.blocked_ips),
-                opt_f64_json(iface.announce_rate_target),
-                opt_u32_json(iface.announce_rate_grace),
-                opt_f64_json(iface.announce_rate_penalty),
-                opt_hex_json(iface.ifac_signature.as_deref()),
-                opt_u64_json(iface.ifac_size),
-                opt_str_json(iface.ifac_netname.as_deref()),
-                opt_str_json(iface.autoconnect_source.as_deref()),
-                iface.tx_drops,
-                iface.tx_dropped_bytes,
-                iface.announces_received,
-                iface.announces_sent,
-                iface.path_requests_received,
-                iface.path_requests_sent,
-                iface.protocol_violations,
-                iface.ifac_violations,
-                iface.packet_filter_hits,
-            );
-        }
-        print!("]");
-        if args.totals {
-            print!(",\"rxb_total\":{total_rxb},\"txb_total\":{total_txb}");
-        }
-        if let Some(n) = link_count {
-            print!(",\"link_count\":{n}");
-        }
-        println!("}}");
-        return ExitCode::SUCCESS;
-    }
-
-    println!("Remote Reticulum Status");
-    println!();
-
-    if !parsed_interfaces.is_empty() {
-        for iface in &parsed_interfaces {
-            print_interface_heading(
-                &iface.name,
-                iface.autoconnect_source.as_deref(),
-                iface.ifac_netname.as_deref(),
-                iface.online,
-            );
-            println!("    Mode     : {}", remote_mode_display_name(iface.mode));
-            println!("    Bitrate  : {}", format::pretty_speed(iface.bitrate));
-            if let Some(clients) = iface.clients {
-                println!("    Clients  : {clients}");
-            }
-            if let Some(blocked) = blocked_count_text(iface.blocked_ips) {
-                println!("    Blocked  : {blocked}");
-            }
-            if let Some(access) = ifac_access_text(iface.ifac_signature.as_deref(), iface.ifac_size)
-            {
-                println!("    Access   : {access}");
-            }
-            if args.announce_stats {
-                if let Some(queued) = iface.announce_queue
-                    && queued > 0
-                {
-                    println!(
-                        "    Queued   : {queued} announce{}",
-                        if queued == 1 { "" } else { "s" }
-                    );
-                }
-                if iface.held_announces > 0 {
-                    println!(
-                        "    Held     : {} announce{}",
-                        iface.held_announces,
-                        if iface.held_announces == 1 { "" } else { "s" }
-                    );
-                }
-                if iface.incoming_announce_frequency > 0.0
-                    || iface.outgoing_announce_frequency > 0.0
-                    || iface.burst_active
-                {
-                    print_announce_frequency(
-                        iface.incoming_announce_frequency,
-                        iface.outgoing_announce_frequency,
-                        (iface.announces_received, iface.announces_sent),
-                        iface.clients,
-                        iface.announce_rate_target,
-                        iface.announce_rate_penalty,
-                        iface.announce_rate_grace,
-                        burst_status_text(iface.burst_active, iface.burst_activated),
-                    );
-                }
-            }
-            if args.pr_stats {
-                print_path_request_frequency(
-                    iface.incoming_pr_frequency,
-                    iface.outgoing_pr_frequency,
-                    (iface.path_requests_received, iface.path_requests_sent),
-                    iface.clients,
-                    burst_status_text(iface.pr_burst_active, iface.pr_burst_activated),
-                );
-            }
-            print_violations(
-                iface.protocol_violations,
-                iface.ifac_violations,
-                iface.packet_filter_hits,
-            );
-            println!(
-                "    Traffic  : {} rx / {} tx",
-                format::pretty_size(iface.rxb),
-                format::pretty_size(iface.txb)
-            );
-            if iface.rxs > 0 || iface.txs > 0 {
-                println!(
-                    "    Rates    : {} rx / {} tx",
-                    format::pretty_speed(iface.rxs),
-                    format::pretty_speed(iface.txs)
-                );
-            }
-            println!();
-        }
-    } else {
-        println!("  No interfaces reported.");
-    }
-
-    if args.totals {
-        println!("  Totals:");
-        println!(
-            "    RX : {}{}",
-            format::pretty_size(total_rxb),
-            pps_suffix(args.pps, rxpps)
-        );
-        println!(
-            "    TX : {}{}",
-            format::pretty_size(total_txb),
-            pps_suffix(args.pps, txpps)
-        );
-        println!();
-    }
-    if let Some(n) = link_count {
-        println!("  Active links: {n}");
-    }
-
-    ExitCode::SUCCESS
-}
-
-fn remote_interface_from_map(m: &[(rmpv::Value, rmpv::Value)]) -> RemoteInterface {
-    RemoteInterface {
-        name: map_str(m, "name").unwrap_or_else(|| "(unnamed)".to_string()),
-        online: map_bool(m, "status")
-            .or_else(|| map_bool(m, "online"))
-            .unwrap_or(false),
-        mode: map_u64(m, "mode").unwrap_or(0),
-        bitrate: map_u64(m, "bitrate").unwrap_or(0),
-        rxb: map_u64(m, "rxb").unwrap_or(0),
-        txb: map_u64(m, "txb").unwrap_or(0),
-        rxs: map_u64(m, "rxs").unwrap_or(0),
-        txs: map_u64(m, "txs").unwrap_or(0),
-        announce_queue: map_u64(m, "announce_queue"),
-        held_announces: map_u64(m, "held_announces").unwrap_or(0),
-        incoming_announce_frequency: map_f64_or_u64(m, "incoming_announce_frequency")
-            .unwrap_or(0.0),
-        outgoing_announce_frequency: map_f64_or_u64(m, "outgoing_announce_frequency")
-            .unwrap_or(0.0),
-        incoming_pr_frequency: map_f64_or_u64(m, "incoming_pr_frequency").unwrap_or(0.0),
-        outgoing_pr_frequency: map_f64_or_u64(m, "outgoing_pr_frequency").unwrap_or(0.0),
-        burst_active: map_bool(m, "burst_active").unwrap_or(false),
-        burst_activated: map_f64_or_u64(m, "burst_activated").unwrap_or(0.0),
-        pr_burst_active: map_bool(m, "pr_burst_active").unwrap_or(false),
-        pr_burst_activated: map_f64_or_u64(m, "pr_burst_activated").unwrap_or(0.0),
-        clients: map_u64(m, "clients"),
-        blocked_ips: map_u64(m, "blocked_ips"),
-        announce_rate_target: map_f64_or_u64(m, "announce_rate_target"),
-        announce_rate_grace: map_u64(m, "announce_rate_grace")
-            .map(|v| v.min(u32::MAX as u64) as u32),
-        announce_rate_penalty: map_f64_or_u64(m, "announce_rate_penalty"),
-        ifac_signature: map_bytes(m, "ifac_signature"),
-        ifac_size: map_u64(m, "ifac_size"),
-        ifac_netname: map_str(m, "ifac_netname"),
-        autoconnect_source: map_str(m, "autoconnect_source"),
-        announces_received: map_u64(m, "arxc").unwrap_or(0),
-        announces_sent: map_u64(m, "atxc").unwrap_or(0),
-        path_requests_received: map_u64(m, "prxc").unwrap_or(0),
-        path_requests_sent: map_u64(m, "ptxc").unwrap_or(0),
-        protocol_violations: map_u64(m, "protocol_violations").unwrap_or(0),
-        ifac_violations: map_u64(m, "ifac_violations").unwrap_or(0),
-        packet_filter_hits: map_u64(m, "packet_filter_hits").unwrap_or(0),
-        tx_drops: map_u64(m, "txdrp").unwrap_or(0),
-        tx_dropped_bytes: map_u64(m, "txdrb").unwrap_or(0),
-    }
-}
-
-fn map_bytes(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<Vec<u8>> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .and_then(|(_, v)| v.as_slice().map(<[u8]>::to_vec))
-}
-
-fn map_str(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<String> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .and_then(|(_, v)| v.as_str().map(|s| s.to_string()))
-}
-
-fn map_u64(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<u64> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .and_then(|(_, v)| v.as_u64())
-}
-
-fn map_f64_or_u64(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<f64> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .and_then(|(_, v)| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64)))
-}
-
-fn map_bool(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<bool> {
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .and_then(|(_, v)| v.as_bool())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn print_announce_frequency(
-    incoming: f64,
-    outgoing: f64,
-    (received, sent): (u64, u64),
-    clients: Option<u64>,
-    target: Option<f64>,
-    penalty: Option<f64>,
-    grace: Option<u32>,
-    burst_text: String,
-) {
-    let outgoing_text = format!("{}↑", format::pretty_frequency(outgoing));
-    let incoming_text = format!("{}↓", format::pretty_frequency(incoming));
-    let per_client = clients
-        .filter(|clients| *clients > 0)
-        .map(|clients| format!(" {}/c", format::pretty_frequency(outgoing / clients as f64)))
-        .unwrap_or_default();
-    let limits = announce_rate_limits_text(target, penalty, grace);
-    print_frequency_lines(
-        "Announces",
-        (received, sent),
-        format!("{outgoing_text}{per_client}"),
-        format!("{incoming_text} {limits}{burst_text}"),
-    );
-}
-
-fn print_path_request_frequency(
-    incoming: f64,
-    outgoing: f64,
-    (received, sent): (u64, u64),
-    clients: Option<u64>,
-    burst_text: String,
-) {
-    let outgoing_text = format!("{}↑", format::pretty_frequency(outgoing));
-    let incoming_text = format!("{}↓", format::pretty_frequency(incoming));
-    let per_client = clients
-        .filter(|clients| *clients > 0)
-        .map(|clients| format!(" {}/c", format::pretty_frequency(outgoing / clients as f64)))
-        .unwrap_or_default();
-    print_frequency_lines(
-        "Path Rqs.",
-        (received, sent),
-        format!("{outgoing_text}{per_client}"),
-        format!("{incoming_text} {burst_text}"),
-    );
-}
-
-/// Python leads with the totals when both directions have any
-/// (rnstatus.py:723-735).
-fn print_frequency_lines(
-    label: &str,
-    (received, sent): (u64, u64),
-    outgoing: String,
-    incoming: String,
-) {
-    if received > 0 && sent > 0 {
-        println!("    {label:<9}: {received}↓ {sent}↑ total");
-        println!("               {outgoing}");
-    } else {
-        println!("    {label:<9}: {outgoing}");
-    }
-    println!("               {incoming}");
-}
-
-/// Python's violation and filter lines (rnstatus.py:712-720).
-fn print_violations(protocol: u64, ifac: u64, filtered: u64) {
-    if protocol > 0 || ifac > 0 {
-        let ifac_text = if ifac > 0 {
-            format!(", {ifac} IFAC")
-        } else {
-            String::new()
-        };
-        println!("    Violatns.: {protocol} protocol{ifac_text}");
-    }
-    if filtered > 0 {
-        println!("    Flt. Hits: {filtered}");
-    }
-}
-
-fn burst_status_text(active: bool, activated: f64) -> String {
-    if !active || activated <= 0.0 {
-        return String::new();
-    }
-    let age = (unix_now() - activated).max(0.0);
-    format!(" burst for {}", format::pretty_time(age))
-}
-
-fn unix_now() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
-}
-
-fn announce_rate_limits_text(
-    target: Option<f64>,
-    penalty: Option<f64>,
-    grace: Option<u32>,
-) -> String {
-    match (target, penalty, grace) {
-        (Some(t), Some(p), Some(g)) if t > 0.0 => {
-            format!(
-                "(t:{}/p:{}/g:{g})",
-                format::pretty_time(t),
-                format::pretty_time(p)
-            )
-        }
-        (Some(t), Some(p), _) if t > 0.0 => {
-            format!(
-                "(t:{}/p:{})",
-                format::pretty_time(t),
-                format::pretty_time(p)
-            )
-        }
-        (Some(t), _, _) if t > 0.0 => format!("(t:{})", format::pretty_time(t)),
-        _ => String::new(),
-    }
-}
-
-fn opt_u64_json(value: Option<u64>) -> String {
-    value
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn blocked_count_text(blocked_ips: Option<u64>) -> Option<String> {
-    let count = blocked_ips.filter(|count| *count > 0)?;
-    let noun = if count == 1 { "IP" } else { "IPs" };
-    Some(format!("{count} {noun}"))
-}
-
-fn opt_u32_json(value: Option<u32>) -> String {
-    value
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn opt_f64_json(value: Option<f64>) -> String {
-    value
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn opt_hex_json(value: Option<&[u8]>) -> String {
-    value
-        .map(|bytes| json_str(&hex::encode(bytes)))
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn opt_str_json(value: Option<&str>) -> String {
-    value.map(json_str).unwrap_or_else(|| "null".to_string())
-}
-
-/// Python's `Access` line, present only when the interface has IFAC: the tag
-/// size and the last five bytes of the IFAC signature.
-fn ifac_access_text(signature: Option<&[u8]>, size: Option<u64>) -> Option<String> {
-    let (signature, size) = (signature?, size?);
-    let tail = &signature[signature.len().saturating_sub(5)..];
-    Some(format!(
-        "{}-bit IFAC by <…{}>",
-        size.saturating_mul(8),
-        hex::encode(tail)
-    ))
-}
-
-fn remote_err(e: &LinkClientError) -> String {
-    match e {
-        LinkClientError::PubkeyNotDiscovered => {
-            "remote node not discovered (no announce received). \
-             Verify the transport hash and that the local rnsd has connectivity."
-                .to_string()
-        }
-        LinkClientError::Timeout(stage) => format!("timeout while waiting for {stage}"),
-        other => other.to_string(),
-    }
-}
-
-fn json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn discovery_location_display_preserves_absence_and_real_zero() {
-        assert_eq!(finite_location(None), None);
-        assert_eq!(finite_location(Some(0.0)), Some(0.0));
-        assert_eq!(finite_location(Some(f64::NAN)), None);
-        let record = DiscoveredInterface {
-            info: rns_transport::discovery::app_data::DiscoveryInfo {
-                height: Some(0.0),
-                ..Default::default()
-            },
-            network_id: [0; 16],
-            hops: 0,
-            stamp_value: 14.0,
-            stamp: vec![0; 32],
-            discovered: 1,
-            last_heard: 2,
-            heard_count: 1,
-            status: None,
-        };
-        let rendered = discovered_json(&record);
-        assert!(rendered["latitude"].is_null());
-        assert!(rendered["longitude"].is_null());
-        assert_eq!(rendered["height"], 0.0);
-    }
-
-    fn test_args() -> Args {
-        Args {
-            all: true,
-            announce_stats: false,
-            pr_stats: false,
-            link_stats: false,
-            burst: false,
-            totals: false,
-            pps: false,
-            sort: None,
-            reverse: false,
-            json: false,
-            config: None,
-            remote: None,
-            identity: None,
-            timeout: None,
-            discovered: false,
-            discovered_details: false,
-            show_stale: false,
-            show_unknown: false,
-            monitor: false,
-            monitor_interval: 1.0,
-            version: false,
-            verbose: 0,
-            quiet: 0,
-            filter: None,
-        }
-    }
-
-    fn local_entry(
-        name: &str,
-        burst_active: bool,
-        pr_burst_active: bool,
-    ) -> rpc::InterfaceStatEntry {
-        rpc::InterfaceStatEntry {
-            id: 1,
-            name: name.to_string(),
-            rx_bytes: 0,
-            tx_bytes: 0,
-            rx_rate: 0,
-            tx_rate: 0,
-            online: true,
-            bitrate: 1,
-            mtu: 500,
-            mode: "Full".to_string(),
-            role: "normal".to_string(),
-            announce_queue: None,
-            held_announces: 0,
-            incoming_announce_frequency: 0.0,
-            outgoing_announce_frequency: 0.0,
-            incoming_pr_frequency: 2.0,
-            outgoing_pr_frequency: 3.0,
-            burst_active,
-            burst_activated: if burst_active { 1_700_000_000.0 } else { 0.0 },
-            pr_burst_active,
-            pr_burst_activated: if pr_burst_active {
-                1_700_000_001.0
-            } else {
-                0.0
-            },
-            clients: None,
-            blocked_ips: None,
-            announce_rate_target: None,
-            announce_rate_grace: None,
-            announce_rate_penalty: None,
-            announce_cap: 0.0,
-            ifac_signature: None,
-            ifac_size: None,
-            ifac_netname: None,
-            tx_drops: 0,
-            ..Default::default()
-        }
-    }
-
-    /// Upstream signature for the `testnet`/`password` IFAC key.
-    const UPSTREAM_IFAC_SIGNATURE: &str = "ce6b8bc4028852077243868e4b5f7faadb715c7a2fb75d1a211d30035f65b0c1\
-                                            fc4271ef61e91599e7bcc42723afe97503e3c432b01264185233274e3603e708";
-
-    #[test]
-    fn access_line_appears_only_with_ifac() {
-        // A configured size alone is not IFAC: RNode defaults to 8 bytes.
-        assert_eq!(ifac_access_text(None, Some(8)), None);
-        let signature = hex::decode(UPSTREAM_IFAC_SIGNATURE.replace(' ', "")).unwrap();
-        assert_eq!(
-            ifac_access_text(Some(&signature), Some(8)).as_deref(),
-            Some("64-bit IFAC by <…4e3603e708>"),
-            "matches upstream rnstatus for the same signature"
-        );
-    }
-
-    #[test]
-    fn remote_stats_carry_ifac_only_when_present() {
-        let key = |name: &str| rmpv::Value::from(name);
-        let enabled = vec![
-            (key("name"), rmpv::Value::from("IFAC Link")),
-            (key("ifac_signature"), rmpv::Value::Binary(vec![0xCD; 64])),
-            (key("ifac_size"), rmpv::Value::from(16u64)),
-            (key("ifac_netname"), rmpv::Value::from("testnet")),
-        ];
-        let iface = remote_interface_from_map(&enabled);
-        assert_eq!(iface.ifac_signature.as_deref(), Some(&[0xCD; 64][..]));
-        assert_eq!(iface.ifac_size, Some(16));
-        assert_eq!(iface.ifac_netname.as_deref(), Some("testnet"));
-
-        let plain = vec![
-            (key("name"), rmpv::Value::from("Plain Link")),
-            (key("ifac_signature"), rmpv::Value::Nil),
-            (key("ifac_size"), rmpv::Value::Nil),
-            (key("ifac_netname"), rmpv::Value::Nil),
-        ];
-        let iface = remote_interface_from_map(&plain);
-        assert_eq!(
-            (iface.ifac_signature, iface.ifac_size, iface.ifac_netname),
-            (None, None, None)
-        );
-    }
-
-    #[test]
-    fn remote_stats_carry_the_auto_connect_source() {
-        let source = |value: rmpv::Value| {
-            remote_interface_from_map(&[
-                (rmpv::Value::from("name"), rmpv::Value::from("Discovered")),
-                (rmpv::Value::from("autoconnect_source"), value),
-            ])
-            .autoconnect_source
-        };
-        assert_eq!(
-            source(rmpv::Value::from("a4bc81fd6b20c9e1")).as_deref(),
-            Some("a4bc81fd6b20c9e1")
-        );
-        assert_eq!(source(rmpv::Value::Nil), None);
-    }
-
-    #[test]
-    fn sort_key_accepts_path_request_rates() {
-        assert_eq!(
-            parse_sort_key(Some("prx")).unwrap(),
-            Some(SortKey::PathRequestRx)
-        );
-        assert_eq!(
-            parse_sort_key(Some("ptx")).unwrap(),
-            Some(SortKey::PathRequestTx)
-        );
-
-        let entry = local_entry("SortIf", false, false);
-        assert_eq!(local_stat_sort_value(&entry, SortKey::PathRequestRx), 2.0);
-        assert_eq!(local_stat_sort_value(&entry, SortKey::PathRequestTx), 3.0);
-    }
-
-    /// Python 1.5.5 `rnstatus -s` count and violation keys (rnstatus.py:432-443).
-    #[test]
-    fn sort_keys_accept_python_counts_and_violations() {
-        let mut entry = local_entry("CountIf", false, false);
-        entry.announces_received = 11;
-        entry.announces_sent = 12;
-        entry.path_requests_received = 13;
-        entry.path_requests_sent = 14;
-        entry.protocol_violations = 15;
-        entry.ifac_violations = 16;
-        entry.packet_filter_hits = 17;
-        entry.tx_drops = 18;
-        entry.tx_dropped_bytes = 19;
-        for (key, expected) in [
-            ("arxc", 11.0),
-            ("atxc", 12.0),
-            ("prxc", 13.0),
-            ("ptxc", 14.0),
-            ("pvs", 15.0),
-            ("ivs", 16.0),
-            ("flt", 17.0),
-            ("txdrp", 18.0),
-            ("txdrb", 19.0),
-        ] {
-            let sort = parse_sort_key(Some(key)).unwrap().unwrap();
-            assert_eq!(local_stat_sort_value(&entry, sort), expected, "{key}");
-        }
-        assert_eq!(
-            parse_sort_key(Some("anns")).unwrap(),
-            Some(SortKey::Announces)
-        );
-    }
-
-    #[test]
-    fn remote_stats_carry_python_counters() {
-        let key = |name: &str| rmpv::Value::from(name);
-        let map = vec![
-            (key("name"), rmpv::Value::from("Counted")),
-            (key("arxc"), rmpv::Value::from(21u64)),
-            (key("atxc"), rmpv::Value::from(22u64)),
-            (key("prxc"), rmpv::Value::from(23u64)),
-            (key("ptxc"), rmpv::Value::from(24u64)),
-            (key("protocol_violations"), rmpv::Value::from(25u64)),
-            (key("ifac_violations"), rmpv::Value::from(26u64)),
-            (key("packet_filter_hits"), rmpv::Value::from(27u64)),
-            (key("txdrp"), rmpv::Value::from(28u64)),
-            (key("txdrb"), rmpv::Value::from(29u64)),
-        ];
-        let iface = remote_interface_from_map(&map);
-        for (sort, expected) in [
-            (SortKey::AnnounceRxCount, 21.0),
-            (SortKey::AnnounceTxCount, 22.0),
-            (SortKey::PathRequestRxCount, 23.0),
-            (SortKey::PathRequestTxCount, 24.0),
-            (SortKey::ProtocolViolations, 25.0),
-            (SortKey::IfacViolations, 26.0),
-            (SortKey::FilterHits, 27.0),
-            (SortKey::TxDrops, 28.0),
-            (SortKey::TxDroppedBytes, 29.0),
-        ] {
-            assert_eq!(iface.sort_value(sort), expected, "{sort:?}");
-        }
-    }
-
-    #[test]
-    fn pr_and_burst_flags_parse() {
-        let args = Args::try_parse_from(["rnstatus-rs", "-P", "-B"]).unwrap();
-        assert!(args.pr_stats);
-        assert!(args.burst);
-    }
-
-    #[test]
-    fn burst_filter_includes_active_bursts_or_name_matches() {
-        let stats = vec![
-            local_entry("InactiveIf", false, false),
-            local_entry("AnnounceBurstIf", true, false),
-            local_entry("PrBurstIf", false, true),
-            local_entry("ManualMatchIf", false, false),
-        ];
-        let mut args = test_args();
-        args.burst = true;
-        args.filter = Some("manual".to_string());
-
-        let names: Vec<_> = filtered_local_stats(&stats, &args)
-            .into_iter()
-            .map(|entry| entry.name.as_str())
-            .collect();
-
-        assert_eq!(names, vec!["AnnounceBurstIf", "PrBurstIf", "ManualMatchIf"]);
-    }
-
-    #[test]
-    fn remote_status_parser_defaults_missing_125_fields() {
-        let iface = remote_interface_from_map(&[
-            (rmpv::Value::from("name"), rmpv::Value::from("LegacyIf")),
-            (rmpv::Value::from("status"), rmpv::Value::from(true)),
-        ]);
-
-        assert_eq!(iface.incoming_pr_frequency, 0.0);
-        assert_eq!(iface.outgoing_pr_frequency, 0.0);
-        assert!(!iface.burst_active);
-        assert_eq!(iface.burst_activated, 0.0);
-        assert!(!iface.pr_burst_active);
-        assert_eq!(iface.pr_burst_activated, 0.0);
-        assert_eq!(iface.blocked_ips, None);
-    }
-
-    #[test]
-    fn remote_status_parser_accepts_only_scalar_blocked_count() {
-        let iface = remote_interface_from_map(&[
-            (rmpv::Value::from("name"), rmpv::Value::from("BackboneIf")),
-            (rmpv::Value::from("blocked_ips"), rmpv::Value::from(2)),
-            (
-                rmpv::Value::from("blocked_ip_list"),
-                rmpv::Value::Array(vec![
-                    rmpv::Value::from("198.51.100.2"),
-                    rmpv::Value::from("203.0.113.7"),
-                ]),
-            ),
-        ]);
-
-        assert_eq!(iface.blocked_ips, Some(2));
-        assert_eq!(blocked_count_text(iface.blocked_ips), Some("2 IPs".into()));
-    }
-
-    #[test]
-    fn blocked_count_text_omits_empty_counts_and_pluralizes() {
-        assert_eq!(blocked_count_text(None), None);
-        assert_eq!(blocked_count_text(Some(0)), None);
-        assert_eq!(blocked_count_text(Some(1)), Some("1 IP".into()));
-        assert_eq!(blocked_count_text(Some(2)), Some("2 IPs".into()));
-    }
-
-    #[test]
-    fn mode_display_names_match_python_138_table() {
-        assert_eq!(mode_display_name("Full"), "Full");
-        assert_eq!(mode_display_name("PointToPoint"), "Point-to-Point");
-        assert_eq!(mode_display_name("AccessPoint"), "Access Point");
-        assert_eq!(mode_display_name("Roaming"), "Roaming");
-        assert_eq!(mode_display_name("Boundary"), "Boundary");
-        assert_eq!(mode_display_name("Gateway"), "Gateway");
-        assert_eq!(mode_display_name("Internal"), "Internal");
-        // Python rnstatus.py:427 falls back to "Full" for unknown modes.
-        assert_eq!(mode_display_name("Bogus"), "Full");
-
-        assert_eq!(remote_mode_display_name(0x01), "Full");
-        assert_eq!(remote_mode_display_name(0x02), "Point-to-Point");
-        assert_eq!(remote_mode_display_name(0x03), "Access Point");
-        assert_eq!(remote_mode_display_name(0x04), "Roaming");
-        assert_eq!(remote_mode_display_name(0x05), "Boundary");
-        assert_eq!(remote_mode_display_name(0x06), "Gateway");
-        assert_eq!(remote_mode_display_name(0x07), "Internal");
-        assert_eq!(remote_mode_display_name(0x08), "Full");
-    }
-
-    #[test]
-    fn monitor_sleep_compensates_render_time_with_floor() {
-        // Python rnstatus.py:742-744: max(interval - elapsed, 0.2).
-        assert_eq!(
-            monitor_sleep(1.0, Duration::from_millis(250)),
-            Duration::from_secs_f64(0.75)
-        );
-        assert_eq!(
-            monitor_sleep(1.0, Duration::from_secs(5)),
-            Duration::from_secs_f64(0.2)
-        );
-        assert_eq!(
-            monitor_sleep(0.05, Duration::ZERO),
-            Duration::from_secs_f64(0.2)
-        );
-    }
-
-    #[test]
-    fn monitor_interval_must_be_finite_positive() {
-        let mut args = test_args();
-        args.monitor_interval = 0.0;
-        assert!(validate_args(&args).is_err());
-        args.monitor_interval = f64::INFINITY;
-        assert!(validate_args(&args).is_err());
-        args.monitor_interval = f64::NAN;
-        assert!(validate_args(&args).is_err());
-        args.monitor_interval = 0.5;
-        assert!(validate_args(&args).is_ok());
-    }
-
-    #[test]
-    fn local_rpc_auth_failure_explains_config_mismatch_and_port_owner() {
-        let endpoint = SharedInstanceRpcEndpoint::Tcp(37429);
-        let msg = local_rpc_failure_message(
-            &endpoint,
-            Path::new("/tmp/rns-auth-test"),
-            &rns_runtime::rpc::RpcError::AuthFailed,
-        );
-
-        assert!(msg.contains("config mismatch"));
-        assert!(msg.contains("another app is owning the control port"));
-        assert!(msg.contains("rpc_key"));
-        assert!(msg.contains("transport_identity"));
-        assert!(msg.contains("37430/37431"));
-    }
 }
