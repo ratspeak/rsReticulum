@@ -28,6 +28,7 @@ pub(crate) struct RpcBackend {
     transport: Option<TransportStatsSource>,
     inbound_queues: Option<Arc<rns_transport::inbound_queues::InboundQueues>>,
     lowest_interface_bitrate: Arc<Mutex<Option<u64>>>,
+    interface_manager: Option<Arc<std::sync::OnceLock<crate::reticulum::ReticulumHandle>>>,
 }
 
 impl RpcBackend {
@@ -41,7 +42,17 @@ impl RpcBackend {
             transport: None,
             inbound_queues: None,
             lowest_interface_bitrate: Arc::default(),
+            interface_manager: None,
         }
+    }
+
+    /// The runtime that answers `manage` requests, set once it has started.
+    pub(crate) fn with_interface_manager(
+        mut self,
+        manager: Arc<std::sync::OnceLock<crate::reticulum::ReticulumHandle>>,
+    ) -> Self {
+        self.interface_manager = Some(manager);
+        self
     }
 
     pub(crate) fn with_transport(mut self, transport: Option<TransportStatsSource>) -> Self {
@@ -477,10 +488,17 @@ async fn respond(request: RpcRequest, backend: &RpcBackend) -> Result<Vec<u8>, R
         }
         RpcRequest::GetLinkDistribution => return rpc::encode_empty_dict(),
         RpcRequest::GetProfilingResults => return rpc::encode_none(),
-        // The runtime cannot attach or detach configured interfaces yet, so it
-        // answers as Python does with `enable_interface_management = no`
-        // (Reticulum.py:851, 878, 907).
-        RpcRequest::ManageInterface { .. } => return rpc::encode_optional_bool(Some(false)),
+        RpcRequest::ManageInterface { operation, name } => {
+            let Some(handle) = backend.interface_manager.as_ref().and_then(|m| m.get()) else {
+                return rpc::encode_optional_bool(Some(false));
+            };
+            let result = match operation {
+                rpc::ManageOperation::Attach => handle.attach_interface(&name).await,
+                rpc::ManageOperation::Detach => handle.detach_interface(&name).await,
+                rpc::ManageOperation::Reload => handle.reload_interface(&name).await,
+            };
+            return rpc::encode_optional_bool(result.unwrap_or(Some(false)));
+        }
         _ => {}
     }
     match process_rpc_request(request, &backend.transport_tx, backend.ifac.as_ref()).await {

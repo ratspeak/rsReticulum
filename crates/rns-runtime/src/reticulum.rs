@@ -2333,6 +2333,190 @@ impl ReticulumHandle {
         }
     }
 
+    /// Python `Reticulum.attach_interface`: brings up a configured interface
+    /// that is not running, even one disabled in its section. True, false, or
+    /// `None` when the configuration has no such section. A shared-instance
+    /// client forwards the call to the instance (Reticulum.py:850-875, 2141-2148).
+    pub async fn attach_interface(&self, name: &str) -> Result<Option<bool>, ControlError> {
+        if self.instance_mode == InstanceMode::Client {
+            return self
+                .forward_manage(crate::rpc::ManageOperation::Attach, name)
+                .await;
+        }
+        if !self.config.enable_interface_management {
+            return Ok(Some(false));
+        }
+        Ok(self.attach_configured_interface(name).await)
+    }
+
+    /// Python `Reticulum.detach_interface`: stops and removes a running
+    /// interface and the connections it spawned. `None` when no interface has
+    /// that name (Reticulum.py:877-904, 2150-2157).
+    pub async fn detach_interface(&self, name: &str) -> Result<Option<bool>, ControlError> {
+        if self.instance_mode == InstanceMode::Client {
+            return self
+                .forward_manage(crate::rpc::ManageOperation::Detach, name)
+                .await;
+        }
+        if !self.config.enable_interface_management {
+            return Ok(Some(false));
+        }
+        Ok(self.detach_running_interface(name).await)
+    }
+
+    /// Python `Reticulum.reload_interface`: detaches a running interface and
+    /// attaches it again from the current configuration (Reticulum.py:906-920).
+    pub async fn reload_interface(&self, name: &str) -> Result<Option<bool>, ControlError> {
+        if self.instance_mode == InstanceMode::Client {
+            return self
+                .forward_manage(crate::rpc::ManageOperation::Reload, name)
+                .await;
+        }
+        if !self.config.enable_interface_management {
+            return Ok(Some(false));
+        }
+        if self.running_interface(name).await.is_none() {
+            return Ok(None);
+        }
+        let reloaded = self.detach_running_interface(name).await == Some(true)
+            && self.attach_configured_interface(name).await == Some(true);
+        if reloaded {
+            rns_transport::notice!("Interface \"{name}\" was reloaded");
+        } else {
+            rns_transport::notice!("Could not reload interface \"{name}\"");
+        }
+        Ok(Some(reloaded))
+    }
+
+    async fn forward_manage(
+        &self,
+        operation: crate::rpc::ManageOperation,
+        name: &str,
+    ) -> Result<Option<bool>, ControlError> {
+        let target = self
+            .shared_rpc_target()
+            .ok_or(ControlError::NotConnectedToSharedInstance)?;
+        let request = crate::rpc::RpcRequest::ManageInterface {
+            operation,
+            name: name.to_string(),
+        };
+        match target
+            .request(&request)
+            .await
+            .map_err(|error| control_error_from_rpc(error, SharedRpcTarget::TIMEOUT))?
+        {
+            crate::rpc::RpcResponse::BoolResult(v) => Ok(Some(v)),
+            crate::rpc::RpcResponse::StringResult(None) => Ok(None),
+            crate::rpc::RpcResponse::Error(error) => Err(ControlError::Rpc(error)),
+            _ => Err(ControlError::UnexpectedResponse {
+                operation: "interface management request",
+            }),
+        }
+    }
+
+    /// The last running interface with this name, as Python's name map keeps
+    /// the last of `Transport.interfaces`, with every interface it spawned.
+    async fn running_interface(
+        &self,
+        name: &str,
+    ) -> Option<(
+        rns_transport::messages::InterfaceStatRpcEntry,
+        Vec<rns_transport::messages::InterfaceId>,
+    )> {
+        let Ok(TransportQueryResponse::InterfaceStats(entries)) = self
+            .query_transport_result(TransportQuery::GetInterfaceStats)
+            .await
+        else {
+            return None;
+        };
+        let entry = entries
+            .iter()
+            .rfind(|entry| {
+                entry
+                    .identity
+                    .as_ref()
+                    .map_or(entry.name.as_str(), |identity| identity.short_name.as_str())
+                    == name
+            })?
+            .clone();
+        let spawned = entries
+            .iter()
+            .filter(|child| child.parent_id == Some(entry.id))
+            .map(|child| child.id)
+            .collect();
+        Some((entry, spawned))
+    }
+
+    async fn detach_running_interface(&self, name: &str) -> Option<bool> {
+        use rns_transport::messages::InterfaceRole;
+        let Some((entry, spawned)) = self.running_interface(name).await else {
+            tracing::warn!("Attempt to detach non-existing interface \"{name}\"");
+            return None;
+        };
+        let i2p = entry
+            .identity
+            .as_ref()
+            .is_some_and(|identity| identity.class_name == "I2PInterface");
+        let local = [
+            InterfaceRole::SharedServer,
+            InterfaceRole::LocalClient,
+            InterfaceRole::SharedInstancePeer,
+        ]
+        .iter()
+        .any(|role| role.as_str() == entry.role);
+        if i2p || local {
+            return Some(false);
+        }
+        self.discovery
+            .bootstrap_interfaces
+            .lock()
+            .await
+            .retain(|id| *id != entry.id && !spawned.contains(id));
+        for id in spawned {
+            teardown_interface(self, id).await;
+        }
+        teardown_interface(self, entry.id).await;
+        rns_transport::notice!("Interface \"{name}\" was detached");
+        Some(true)
+    }
+
+    async fn attach_configured_interface(&self, name: &str) -> Option<bool> {
+        if self.running_interface(name).await.is_some() {
+            tracing::warn!("Attempt to attach existing interface \"{name}\"");
+            return Some(false);
+        }
+        let config = match Config::from_file(&self.config_dir.join("config")) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "Could not parse the configuration during interface attach"
+                );
+                return None;
+            }
+        };
+        if config.section("interfaces").is_none() {
+            return Some(false);
+        }
+        let Some(section) = config.subsection("interfaces", name) else {
+            tracing::error!("Cannot attach interface \"{name}\", no configuration entry exists");
+            return None;
+        };
+        // Python's `force_attach` ignores the section's own flags; subinterfaces still read `enabled`.
+        let mut forced = section.clone();
+        forced.set("interface_enabled", "yes");
+        match attach_interface_section(self, &config, name, &forced).await {
+            Ok(_) => {
+                rns_transport::notice!("Interface \"{name}\" was attached");
+                Some(true)
+            }
+            Err(error) => {
+                tracing::error!("Error while attaching interface \"{name}\": {error}");
+                Some(false)
+            }
+        }
+    }
+
     /// Python `Reticulum.required_announces_only`: only shared-instance
     /// clients may restrict their own announce ingress (Reticulum.py:2216-2222).
     pub async fn required_announces_only(&self, enabled: bool) -> bool {
@@ -2930,6 +3114,8 @@ pub struct ReticulumConfig {
     pub panic_on_interface_error: bool,
     pub link_mtu_discovery: bool,
     pub enable_remote_management: bool,
+    /// Whether the `manage` RPC may attach, detach or reload interfaces.
+    pub enable_interface_management: bool,
     pub remote_management_allowed: Vec<Vec<u8>>,
     pub rpc_key: Option<Vec<u8>>,
     /// Simulated shared-link bitrate in bits per second. A positive value
@@ -3021,6 +3207,7 @@ impl Default for ReticulumConfig {
             panic_on_interface_error: false,
             link_mtu_discovery: true,
             enable_remote_management: false,
+            enable_interface_management: true,
             remote_management_allowed: Vec::new(),
             rpc_key: None,
             force_shared_instance_bitrate: None,
@@ -3362,6 +3549,9 @@ impl ReticulumConfig {
             }
             if let Some(value) = config_bool("reticulum", sec, "enable_remote_management")? {
                 rc.enable_remote_management = value;
+            }
+            if let Some(value) = config_bool("reticulum", sec, "enable_interface_management")? {
+                rc.enable_interface_management = value;
             }
             rc.force_shared_instance_bitrate =
                 config_uint("reticulum", sec, "force_shared_instance_bitrate")?;
@@ -3779,6 +3969,7 @@ pub async fn init_with_policy(
         }
     });
     let mut shared_instance_status = None;
+    let interface_manager = Arc::new(OnceLock::new());
     let configured_policy = matches!(policy, InstancePolicy::Configured);
     let mut would_own_shared_instance = false;
     let instance_mode = if matches!(
@@ -3857,7 +4048,8 @@ pub async fn init_with_policy(
                         Some(InterfaceIfacStats(interface_controls.clone())),
                     )
                     .with_transport(transport_stats.clone())
-                    .with_inbound_queues(inbound_queues.clone()),
+                    .with_inbound_queues(inbound_queues.clone())
+                    .with_interface_manager(interface_manager.clone()),
                     shutdown.clone(),
                 ),
             ));
@@ -4472,6 +4664,7 @@ pub async fn init_with_policy(
         )
         .into());
     }
+    let _ = interface_manager.set(handle.clone());
 
     let mut management_announces = Vec::new();
     let mut blackhole_announce = None;
@@ -4507,7 +4700,8 @@ pub async fn init_with_policy(
             Some(InterfaceIfacStats(interface_controls.clone())),
         )
         .with_transport(transport_stats.clone())
-        .with_inbound_queues(inbound_queues.clone());
+        .with_inbound_queues(inbound_queues.clone())
+        .with_interface_manager(interface_manager.clone());
         let rpc_shutdown = shutdown.clone();
         if rc.shared_instance_type == SharedInstanceType::Unix {
             let rpc_socket = shared_unix_rpc_socket_path(&rc.instance_name, &socket_base);
@@ -8285,6 +8479,8 @@ async fn spawn_configured_interface(
         &tunnel_identity,
     )
     .await?;
+    let mut handles = handles;
+    apply_configured_bitrate_mtu(config, post_init, &mut handles);
     let ids = register_interfaces_with_post_init_batch(
         &handle.transport_tx,
         handles,
@@ -8301,6 +8497,38 @@ async fn spawn_configured_interface(
         for &id in &ids {
             record_client_target(&handle.interface_controls, id, &host, port);
         }
+    }
+    Ok(ids)
+}
+
+/// Synthesize and start one interface section after startup, as the startup
+/// loop does for each enabled section.
+async fn attach_interface_section(
+    handle: &ReticulumHandle,
+    config: &Config,
+    name: &str,
+    section: &ConfigSection,
+) -> Result<Vec<u64>, String> {
+    interface_factory::validate_stamp_costs(name, section).map_err(|e| e.to_string())?;
+    let mut iface_config =
+        interface_factory::synthesize_interface(name, section).map_err(|e| e.to_string())?;
+    apply_discovery_mode_autocorrect(config, &mut iface_config);
+    let mut post_init =
+        get_post_init_for_config(config, &iface_config).map_err(|e| e.to_string())?;
+    finalize_post_init(&mut post_init, &handle.config);
+    interface_factory::validate_config_capacity(&iface_config, &post_init)
+        .map_err(|e| e.to_string())?;
+    let ids = spawn_configured_interface(handle, &iface_config, &post_init).await?;
+    // Python never detaches an I2PInterface (Reticulum.py:888).
+    if interface_bootstrap_only(config, &iface_config)
+        && !matches!(iface_config, interface_factory::InterfaceConfig::I2P(_))
+    {
+        handle
+            .discovery
+            .bootstrap_interfaces
+            .lock()
+            .await
+            .extend(&ids);
     }
     Ok(ids)
 }
@@ -10520,6 +10748,7 @@ mod tests {
 
     mod autoconnect;
     mod interface_stats;
+    mod manage_interfaces;
     mod tunnels;
 
     async fn wait_for_registry_len(registry: &InterfaceRegistry, expected: usize) {
