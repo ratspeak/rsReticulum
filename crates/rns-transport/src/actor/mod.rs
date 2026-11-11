@@ -164,9 +164,11 @@ pub struct TransportActor {
     /// Destination and path hops of each pending local Link request, Python's
     /// `link.expected_hops` (Link.py:307), until a proof re-balances it.
     pending_local_link_hops: HashMap<[u8; 16], ([u8; 16], Option<u8>)>,
-    /// Destination of each sent local Link request until the Link is bound
-    /// (established) or abandoned; Python's `pending_links`.
-    pending_local_link_destinations: HashMap<[u8; 16], [u8; 16]>,
+    /// Destination of each sent local Link request, with the route it was
+    /// sent on, until the Link is bound (established) or abandoned; Python's
+    /// `pending_links`.
+    pending_local_link_destinations:
+        HashMap<[u8; 16], ([u8; 16], Option<path_recovery::RouteVersion>)>,
     /// Locally-owned established-Link endpoints. This is intentionally not
     /// the transit `link_table`: transit forwarding and local session
     /// ownership have different lifetimes and authority.
@@ -1770,8 +1772,18 @@ impl TransportActor {
     /// Transport.py:839-866@1.6.0: a Link that was never established expires
     /// the path on a non-transport instance and, unless this is a
     /// shared-instance client, queues a throttled rediscovery request.
-    fn rediscover_after_failed_link(&mut self, destination: [u8; 16]) {
+    /// Unlike upstream, a route newer than the one the request used is kept.
+    fn rediscover_after_failed_link(
+        &mut self,
+        destination: [u8; 16],
+        route: Option<path_recovery::RouteVersion>,
+    ) {
         if self.is_transport_enabled {
+            return;
+        }
+        if let Some(path) = self.path_table.get(&destination)
+            && Some(path_recovery::RouteVersion::from_path(path)) != route
+        {
             return;
         }
         if let Some(path) = self.path_table.get_mut(&destination) {
@@ -1843,8 +1855,8 @@ impl TransportActor {
     }
 
     fn deregister_destination(&mut self, hash: [u8; 16]) {
-        if let Some(destination) = self.pending_local_link_destinations.remove(&hash) {
-            self.rediscover_after_failed_link(destination);
+        if let Some((destination, route)) = self.pending_local_link_destinations.remove(&hash) {
+            self.rediscover_after_failed_link(destination, route);
         }
         self.pending_local_link_requests.remove(&hash);
         self.pending_local_link_hops.remove(&hash);
@@ -1964,8 +1976,13 @@ impl TransportActor {
                     self.pending_local_link_hops
                         .entry(link_id)
                         .or_insert((destination_hash, hops));
+                    let route = self
+                        .path_table
+                        .get(&destination_hash)
+                        .map(path_recovery::RouteVersion::from_path);
                     self.pending_local_link_destinations
-                        .insert(link_id, destination_hash);
+                        .entry(link_id)
+                        .or_insert((destination_hash, route));
                 }
                 InterfaceSendOutcome::Sent
             }
