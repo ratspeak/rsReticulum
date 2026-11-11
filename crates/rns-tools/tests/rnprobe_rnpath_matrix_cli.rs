@@ -6,9 +6,6 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rns_identity::destination::Destination;
-use rns_identity::identity::Identity;
-
 const PROBE_APP: &str = "rnstransport.probe";
 const COMMAND_TIMEOUT_SECS: &str = "4";
 
@@ -218,32 +215,33 @@ fn poll_shared_server(
 }
 
 fn read_probe_hash(responder: &mut ChildGuard, tmp: &TempDir) -> Result<[u8; 16], String> {
-    // The probe destination is derived from the transport identity, as in Python.
-    let path = tmp.join("storage").join("transport_identity");
+    // Ask the daemon. A status poll that raced its start runs standalone and may
+    // leave its own transport identity in the storage directory.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last_error = String::new();
     while Instant::now() < deadline {
         if let Some(status) = responder.try_wait() {
             return Err(format!(
-                "{} exited before transport identity was ready: {status}",
+                "{} exited before its probe responder was reported: {status}",
                 responder.label
             ));
         }
 
-        match Identity::from_file(&path) {
-            Ok(identity) => {
-                return Ok(Destination::hash_from_name_and_identity(
-                    PROBE_APP,
-                    Some(&identity.hash),
-                ));
-            }
-            Err(e) => last_error = e.to_string(),
+        let output = rnstatus_json(tmp);
+        let (stdout, stderr) = output_text(&output);
+        let reported = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .and_then(|value| value.get("probe_responder")?.as_str().map(str::to_owned))
+            .and_then(|text| hex::decode(text).ok())
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok());
+        match reported {
+            Some(hash) => return Ok(hash),
+            None => last_error = format!("stdout: {stdout}\nstderr: {stderr}"),
         }
         thread::sleep(Duration::from_millis(100));
     }
     Err(format!(
-        "transport identity was not readable at {}\nlast error: {last_error}",
-        path.display()
+        "rnstatus-rs did not report a probe responder\nlast output: {last_error}"
     ))
 }
 
