@@ -3008,6 +3008,10 @@ pub struct InitOptions {
     /// Python `Reticulum(enforce_stamps=True)`: enforce announce, path request
     /// and link request stamps. `false` never clears a configured switch.
     pub enforce_stamps: bool,
+    /// Embedder choice: an interface that fails to build or start is recorded
+    /// in [`ReticulumHandle::startup_interface_failures`] and the rest start.
+    /// Off, startup stops as upstream does (Reticulum.py:1306-1311).
+    pub keep_starting_after_interface_failure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4400,7 +4404,13 @@ pub async fn init_with_policy(
             }
         }
     }
-    let mut interfaces = match synthesize_interfaces(&config, rc.panic_on_interface_error) {
+    let mut startup_interface_failures = Vec::new();
+    let mut interfaces = match synthesize_interfaces(
+        &config,
+        options
+            .keep_starting_after_interface_failure
+            .then_some(&mut startup_interface_failures),
+    ) {
         Ok(interfaces) => interfaces,
         Err(e) => {
             shutdown_coordinator.start_and_wait().await;
@@ -4427,7 +4437,6 @@ pub async fn init_with_policy(
         *discovery_runtime.store.lock().await = Some(Arc::new(store));
     }
     let mut startup_rnode_runtimes = Vec::new();
-    let mut startup_interface_failures = Vec::new();
     #[cfg(feature = "ble")]
     let deferred_android_ble_rnodes = collect_deferred_android_ble_rnodes(
         &interfaces,
@@ -4461,26 +4470,18 @@ pub async fn init_with_policy(
             let mut post_init = match get_post_init_for_config(&config, iface_config) {
                 Ok(post_init) => post_init,
                 Err(error) => {
-                    let message = error.to_string();
-                    if rc.panic_on_interface_error {
-                        return Err(ReticulumError::Interface(message).into());
-                    }
-                    startup_interface_failures
-                        .push((interface_config_name(iface_config).to_string(), message));
-                    continue;
+                    drop(spawn_permit);
+                    shutdown_coordinator.start_and_wait().await;
+                    return Err(ReticulumError::Interface(error.to_string()).into());
                 }
             };
             finalize_post_init(&mut post_init, &rc);
             if let Err(error) =
                 interface_factory::validate_config_capacity(iface_config, &post_init)
             {
-                let message = error.to_string();
-                if rc.panic_on_interface_error {
-                    return Err(ReticulumError::Interface(message).into());
-                }
-                startup_interface_failures
-                    .push((interface_config_name(iface_config).to_string(), message));
-                continue;
+                drop(spawn_permit);
+                shutdown_coordinator.start_and_wait().await;
+                return Err(ReticulumError::Interface(error.to_string()).into());
             }
 
             let discovery_config = discovery_config_for_interface(
@@ -4646,17 +4647,17 @@ pub async fn init_with_policy(
                         }
                     }
                 }
+                Err(e) if options.keep_starting_after_interface_failure => {
+                    drop(spawn_permit);
+                    tracing::warn!("failed to start interface: {e}");
+                    startup_interface_failures
+                        .push((interface_config_name(iface_config).to_string(), e));
+                }
+                // Upstream panics when a constructor raises, e.g. on an occupied port.
                 Err(e) => {
-                    if rc.panic_on_interface_error {
-                        drop(spawn_permit);
-                        shutdown_coordinator.start_and_wait().await;
-                        return Err(ReticulumError::Interface(e).into());
-                    } else {
-                        drop(spawn_permit);
-                        startup_interface_failures
-                            .push((interface_config_name(iface_config).to_string(), e.clone()));
-                        tracing::warn!("failed to spawn interface: {}", e);
-                    }
+                    drop(spawn_permit);
+                    shutdown_coordinator.start_and_wait().await;
+                    return Err(ReticulumError::Interface(e).into());
                 }
             }
         }
@@ -5032,13 +5033,13 @@ struct OwnedInterfaceHandle {
     driver: Option<rns_interface::rnode::RNodeDriverHandle>,
     /// The address a discoverable interface learns at runtime (I2P b32).
     discovery_address: Option<tokio::sync::watch::Receiver<Option<String>>>,
-    hardware_failures: Option<HardwareFailureWatch>,
+    hardware_failures: Option<InterfaceFailureWatch>,
 }
 
 /// A driver's failures Python answers with `RNS.panic()` when
 /// `panic_on_interface_error` is set.
 #[derive(Clone)]
-enum HardwareFailureWatch {
+enum InterfaceFailureWatch {
     #[cfg(any(feature = "serial", feature = "rnode-tcp", target_os = "android"))]
     RNode(rns_interface::rnode::RNodeDriverSubscription),
     #[cfg(feature = "serial")]
@@ -5050,7 +5051,7 @@ enum HardwareFailureWatch {
     Serial(rns_interface::serial::SerialFailures),
 }
 
-impl HardwareFailureWatch {
+impl InterfaceFailureWatch {
     /// True at the first failure, false if the driver ends without one.
     async fn failed(&mut self) -> bool {
         match self {
@@ -5090,7 +5091,7 @@ fn client_with_teardown(
     spawned: rns_interface::tcp::SpawnedClientInterface,
 ) -> Vec<OwnedInterfaceHandle> {
     vec![OwnedInterfaceHandle {
-        hardware_failures: Some(HardwareFailureWatch::ClientTeardown(spawned.teardown)),
+        hardware_failures: Some(InterfaceFailureWatch::ClientTeardown(spawned.teardown)),
         ..spawned.interface.into()
     }]
 }
@@ -5100,14 +5101,14 @@ fn serial_with_failures(
     spawned: rns_interface::serial::SpawnedSerialInterface,
 ) -> Vec<OwnedInterfaceHandle> {
     vec![OwnedInterfaceHandle {
-        hardware_failures: Some(HardwareFailureWatch::Serial(spawned.failures)),
+        hardware_failures: Some(InterfaceFailureWatch::Serial(spawned.failures)),
         ..spawned.interface.into()
     }]
 }
 
 fn spawn_interface_panic_monitor(
     name: String,
-    mut failures: HardwareFailureWatch,
+    mut failures: InterfaceFailureWatch,
     coordinator: &RuntimeShutdownCoordinator,
 ) {
     let shutdown = coordinator.inner.shutdown.clone();
@@ -8289,10 +8290,14 @@ async fn spawn_discovered_backbone_client(
     ));
     // Discovery.py:884 adds the interface with configured_bitrate=5E6.
     config.bitrate = 5_000_000;
-    let iface_handle =
-        rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
-            .await
-            .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
+    let spawned = rns_interface::backbone::spawn_backbone_client_observed(
+        config,
+        id,
+        handle.transport_tx.clone(),
+    )
+    .await
+    .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
+    let iface_handle = spawned.interface;
     let online = iface_handle.online.clone();
 
     let mut post_init =
@@ -8326,6 +8331,7 @@ async fn spawn_discovered_backbone_client(
         control.client_target = Some((host.to_string(), port));
         control.autoconnect_source = Some(hex::encode(record.network_id));
     });
+    watch_runtime_client_teardown(handle, name, spawned.teardown);
     rns_transport::notice!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
     Ok((id, online))
 }
@@ -9063,6 +9069,21 @@ fn ensure_runtime_interface_admission(
         .map_err(|_| "runtime is shutting down; interface spawn rejected".to_string())
 }
 
+/// Any initiator that gives up panics the instance (TCPInterface.py:435-442).
+fn watch_runtime_client_teardown(
+    handle: &ReticulumHandle,
+    name: &str,
+    teardown: rns_interface::tcp::ClientTeardown,
+) {
+    if handle.config.panic_on_interface_error {
+        spawn_interface_panic_monitor(
+            name.to_string(),
+            InterfaceFailureWatch::ClientTeardown(teardown),
+            &handle.shutdown_coordinator,
+        );
+    }
+}
+
 /// Spawn a TCP client interface at runtime; returns the interface ID.
 pub async fn spawn_tcp_client_runtime(
     handle: &ReticulumHandle,
@@ -9101,10 +9122,11 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
         .map_err(|e| e.to_string())?;
     }
 
-    let iface_handle =
-        rns_interface::tcp::spawn_tcp_client(config, id, handle.transport_tx.clone())
+    let spawned =
+        rns_interface::tcp::spawn_tcp_client_observed(config, id, handle.transport_tx.clone())
             .await
             .map_err(|e| format!("TCP client spawn failed: {e}"))?;
+    let iface_handle = spawned.interface;
 
     if let Some(post_init) = post_init {
         let ifac_key = derive_ifac_key_from_post_init(&post_init);
@@ -9132,6 +9154,7 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
         .map_err(|error| format!("TCP client registration failed: {error}"))?;
     }
     record_client_target(&handle.interface_controls, id, host, port);
+    watch_runtime_client_teardown(handle, name, spawned.teardown);
     tracing::info!(name = %name, id, "runtime TCP client interface spawned");
     Ok(id)
 }
@@ -9261,10 +9284,14 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
         config.ifac_size = post_init.ifac_size.unwrap_or(post_init.default_ifac_size);
     }
 
-    let iface_handle =
-        rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
-            .await
-            .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
+    let spawned = rns_interface::backbone::spawn_backbone_client_observed(
+        config,
+        id,
+        handle.transport_tx.clone(),
+    )
+    .await
+    .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
+    let iface_handle = spawned.interface;
 
     if let Some(post_init) = post_init {
         let ifac_key = derive_ifac_key_from_post_init(&post_init);
@@ -9297,6 +9324,7 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
         runtime_config.host,
         runtime_config.port,
     );
+    watch_runtime_client_teardown(handle, runtime_config.name, spawned.teardown);
     tracing::info!(name = %runtime_config.name, id, "runtime Backbone client interface spawned");
     Ok(id)
 }
@@ -9655,7 +9683,7 @@ pub async fn spawn_rnode_runtime_observed_with_options(
     if handle.config.panic_on_interface_error {
         spawn_interface_panic_monitor(
             name.to_string(),
-            HardwareFailureWatch::RNode(state.clone()),
+            InterfaceFailureWatch::RNode(state.clone()),
             &handle.shutdown_coordinator,
         );
     }
@@ -10445,7 +10473,7 @@ async fn spawn_interface_with_rnode_startup_options(
                 )
                 .await
                 .map(|spawned| {
-                    let failures = HardwareFailureWatch::RNode(spawned.driver.watch());
+                    let failures = InterfaceFailureWatch::RNode(spawned.driver.watch());
                     vec![OwnedInterfaceHandle {
                         hardware_failures: Some(failures),
                         ..spawned.into()
@@ -10467,7 +10495,7 @@ async fn spawn_interface_with_rnode_startup_options(
                 )
                 .await
                 .map(|spawned| {
-                    let failures = HardwareFailureWatch::RNode(spawned.driver.watch());
+                    let failures = InterfaceFailureWatch::RNode(spawned.driver.watch());
                     vec![OwnedInterfaceHandle {
                         hardware_failures: Some(failures),
                         ..spawned.into()
@@ -10619,7 +10647,7 @@ async fn spawn_interface_with_rnode_startup_options(
                 let mut handles: Vec<OwnedInterfaceHandle> =
                     spawned.handles.into_iter().map(Into::into).collect();
                 handles[0].hardware_failures =
-                    Some(HardwareFailureWatch::RNodeMulti(spawned.failures));
+                    Some(InterfaceFailureWatch::RNodeMulti(spawned.failures));
                 handles
             })
             .map_err(|e| format!("RNodeMulti: {e}"))
@@ -10762,9 +10790,13 @@ fn load_or_create_network_identity(path: &Path) -> Result<Arc<Identity>, Reticul
     Ok(Arc::new(identity))
 }
 
+/// A section that fails to build stops startup whatever
+/// `panic_on_interface_error` says (Reticulum.py:1307-1311); an unknown type
+/// is only logged, as upstream does for a missing external module. With
+/// `failures`, a failed section is recorded there and the rest are built.
 fn synthesize_interfaces(
     config: &Config,
-    panic_on_interface_error: bool,
+    mut failures: Option<&mut Vec<(String, String)>>,
 ) -> Result<Vec<interface_factory::InterfaceConfig>, ReticulumError> {
     let mut interfaces = Vec::new();
 
@@ -10777,15 +10809,20 @@ fn synthesize_interfaces(
             Err(interface_factory::InterfaceFactoryError::Disabled(_)) => {
                 tracing::debug!("interface {name} is disabled");
             }
-            Err(e) => {
-                if panic_on_interface_error {
-                    return Err(ReticulumError::Interface(format!(
-                        "failed to synthesize interface {name}: {e}"
-                    )));
-                } else {
-                    tracing::warn!("failed to synthesize interface {name}: {e}");
-                }
+            Err(e @ interface_factory::InterfaceFactoryError::UnknownType(_)) => {
+                tracing::error!("failed to synthesize interface {name}: {e}");
             }
+            Err(e) => match failures.as_deref_mut() {
+                Some(failures) => {
+                    tracing::warn!("failed to synthesize interface {name}: {e}");
+                    failures.push((name.to_string(), e.to_string()));
+                }
+                None => {
+                    return Err(ReticulumError::Interface(format!(
+                        "The interface \"{name}\" could not be created: {e}"
+                    )));
+                }
+            },
         }
     }
 
@@ -14918,7 +14955,7 @@ loglevel = 7
                 "[interfaces]\n[[relay]]\nenabled = yes\ndiscoverable = yes\n{endpoint}"
             ))
             .unwrap();
-            let interfaces = synthesize_interfaces(&config, false).unwrap();
+            let interfaces = synthesize_interfaces(&config, None).unwrap();
             let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
             assert!(
                 discovery_config_for_interface(
@@ -14944,7 +14981,7 @@ loglevel = 7
                 "[interfaces]\n[[relay]]\nenabled = yes\ndiscoverable = yes\n{endpoint}{key} = published.example.org\n"
             ))
             .unwrap();
-            let interfaces = synthesize_interfaces(&config, false).unwrap();
+            let interfaces = synthesize_interfaces(&config, None).unwrap();
             let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
             discovery_config_for_interface(
                 &config,
@@ -14982,7 +15019,7 @@ loglevel = 7
             ),
         ] {
             let config = Config::parse(&format!("[interfaces]\n[[relay]]\ntype = TCPServerInterface\nenabled = yes\nlisten_ip = 127.0.0.1\nlisten_port = 4242\ndiscoverable = yes\nreachable_on = relay.example.org\n{extra}")).unwrap();
-            let interfaces = synthesize_interfaces(&config, false).unwrap();
+            let interfaces = synthesize_interfaces(&config, None).unwrap();
             let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
             let discovery = discovery_config_for_interface(
                 &config,
@@ -15007,7 +15044,7 @@ loglevel = 7
     fn discovery_keys_parse_like_upstream() {
         let discovery = |extra: &str| {
             let config = Config::parse(&format!("[interfaces]\n[[relay]]\ntype = TCPServerInterface\nenabled = yes\nlisten_ip = 127.0.0.1\nlisten_port = 4242\ndiscoverable = yes\n{extra}")).unwrap();
-            let interfaces = synthesize_interfaces(&config, false).unwrap();
+            let interfaces = synthesize_interfaces(&config, None).unwrap();
             let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
             discovery_config_for_interface(
                 &config,
@@ -15055,7 +15092,7 @@ loglevel = 7
     #[test]
     fn a_kiss_framed_tcp_client_is_discovered_as_a_kiss_interface() {
         let config = Config::parse("[interfaces]\n[[kiss tnc]]\ntype = TCPClientInterface\nenabled = yes\nkiss_framing = yes\ntarget_host = 10.0.0.2\ntarget_port = 8001\ndiscoverable = yes\ndiscovery_frequency = 433775000\ndiscovery_modulation = 2\ndiscovery_spreading_factor = 7\ndiscovery_coding_rate = 5\ndiscovery_channel = 3\nreachable_on = 10.0.0.2\n").unwrap();
-        let interfaces = synthesize_interfaces(&config, false).unwrap();
+        let interfaces = synthesize_interfaces(&config, None).unwrap();
         let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
         let discovery = discovery_config_for_interface(
             &config,
@@ -15089,7 +15126,7 @@ loglevel = 7
     fn only_upstream_discoverable_radio_types_announce() {
         let discovery = |iface: &str| {
             let config = Config::parse(&format!("[interfaces]\n[[radio]]\nenabled = yes\ndiscoverable = yes\nreachable_on = 10.0.0.2\ndiscovery_frequency = 1\ndiscovery_spreading_factor = 12\ndiscovery_modulation = 2\n{iface}")).unwrap();
-            let interfaces = synthesize_interfaces(&config, false).unwrap();
+            let interfaces = synthesize_interfaces(&config, None).unwrap();
             let post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
             discovery_config_for_interface(
                 &config,
@@ -15322,7 +15359,7 @@ loglevel = 7
                      listen_port = 4242\n\
                      discoverable = yes\n";
         let config = Config::parse(input).unwrap();
-        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
+        let mut interfaces = synthesize_interfaces(&config, None).unwrap();
         apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
         match &interfaces[0] {
             interface_factory::InterfaceConfig::TcpServer(c) => {
@@ -15340,7 +15377,7 @@ loglevel = 7
                          discoverable = yes\n\
                          ignore_config_warnings = yes\n";
         let config = Config::parse(opted_out).unwrap();
-        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
+        let mut interfaces = synthesize_interfaces(&config, None).unwrap();
         apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
         match &interfaces[0] {
             interface_factory::InterfaceConfig::TcpServer(c) => {
@@ -15371,7 +15408,7 @@ egress_control = Yes
 "#;
         let config = Config::parse(input).unwrap();
         let rc = ReticulumConfig::from_config(&config);
-        let interfaces = synthesize_interfaces(&config, false).unwrap();
+        let interfaces = synthesize_interfaces(&config, None).unwrap();
         let mut post_init = get_post_init_for_config(&config, &interfaces[0]).unwrap();
 
         finalize_post_init(&mut post_init, &rc);
@@ -15513,7 +15550,7 @@ egress_control = Yes
         let base = "[interfaces]\n\n[[Test TCP]]\ntype = TCPClientInterface\nenabled = yes\n\
                     target_host = 127.0.0.1\ntarget_port = 4242\nmode = internal\n";
         let config = Config::parse(base).unwrap();
-        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
+        let mut interfaces = synthesize_interfaces(&config, None).unwrap();
         assert_eq!(
             *interface_config_mode_mut(&mut interfaces[0]),
             rns_interface::traits::InterfaceMode::Internal
@@ -15522,7 +15559,7 @@ egress_control = Yes
         // Reticulum.py:856-863 in RNS 1.4.0: Internal is a supported
         // discovery mode and must not be auto-corrected.
         let config = Config::parse(&format!("{base}discoverable = yes\n")).unwrap();
-        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
+        let mut interfaces = synthesize_interfaces(&config, None).unwrap();
         apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
         assert_eq!(
             *interface_config_mode_mut(&mut interfaces[0]),
@@ -15533,7 +15570,7 @@ egress_control = Yes
             "{base}discoverable = yes\nignore_config_warnings = yes\n"
         ))
         .unwrap();
-        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
+        let mut interfaces = synthesize_interfaces(&config, None).unwrap();
         apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
         assert_eq!(
             *interface_config_mode_mut(&mut interfaces[0]),
@@ -17294,7 +17331,7 @@ type = UDPInterface
 listen_port = 5556
 "#;
         let config = Config::parse(input).unwrap();
-        let interfaces = synthesize_interfaces(&config, false).unwrap();
+        let interfaces = synthesize_interfaces(&config, None).unwrap();
         // Upstream skips a section with neither `enabled` nor `interface_enabled`.
         assert_eq!(interfaces.len(), 2);
     }
@@ -17384,7 +17421,7 @@ codingrate = 6
 txpower = 17
 "#;
         let config = Config::parse(input).unwrap();
-        let interfaces = synthesize_interfaces(&config, true).unwrap();
+        let interfaces = synthesize_interfaces(&config, None).unwrap();
         let deferred = collect_deferred_android_ble_rnodes(&interfaces, true);
         assert_eq!(deferred.len(), 1);
         assert_eq!(deferred[0].name, "Enabled BLE");
@@ -17392,19 +17429,27 @@ txpower = 17
     }
 
     #[test]
-    fn test_panic_on_interface_error_fails_bad_config() {
-        let input = r#"
-[interfaces]
-
-[[Broken Interface]]
-enabled = yes
-"#;
-        let config = Config::parse(input).unwrap();
-        let err = synthesize_interfaces(&config, true).unwrap_err();
+    fn interface_build_error_fails_synthesis_without_panic_on_interface_error() {
+        let broken = Config::parse(
+            "[reticulum]\npanic_on_interface_error = no\n\n[interfaces]\n\n[[Broken Interface]]\nenabled = yes\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            synthesize_interfaces(&broken, None),
+            Err(ReticulumError::Interface(_))
+        ));
+        let mut failures = Vec::new();
         assert!(
-            matches!(err, ReticulumError::Interface(_)),
-            "panic_on_interface_error should fail interface synthesis"
+            synthesize_interfaces(&broken, Some(&mut failures))
+                .unwrap()
+                .is_empty()
         );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "Broken Interface");
+        let unknown =
+            Config::parse("[interfaces]\n\n[[External]]\ntype = FooInterface\nenabled = yes\n")
+                .unwrap();
+        assert!(synthesize_interfaces(&unknown, None).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -17786,6 +17831,51 @@ enabled = yes
         .expect("a torn-down TCP client must take the runtime down");
         handle.shutdown_and_wait().await;
         assert_eq!(handle.interface_panic(), Some("Unreachable"));
+    }
+
+    /// TCPInterface.py:435-442 / BackboneInterface.py:1088-1091: a client
+    /// added at runtime that gives up also panics the instance.
+    #[tokio::test]
+    async fn runtime_backbone_client_teardown_stops_the_runtime_when_panic_on_interface_error_is_set()
+     {
+        let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = refused.local_addr().unwrap().port();
+        drop(refused);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config"),
+            "[reticulum]\nshare_instance = No\nenable_transport = No\npanic_on_interface_error = Yes\n\n[interfaces]\n",
+        )
+        .unwrap();
+        let shutdown = ShutdownSignal::new();
+        let handle = init(
+            Some(dir.path().to_str().unwrap()),
+            None,
+            shutdown.clone(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("init");
+        spawn_backbone_client_runtime(
+            &handle,
+            "Runtime Unreachable",
+            "127.0.0.1",
+            port,
+            false,
+            Some(1),
+            Some(0),
+        )
+        .await
+        .expect("runtime backbone client");
+
+        tokio::time::timeout(
+            Duration::from_secs(rns_interface::tcp::RECONNECT_WAIT + 10),
+            shutdown.wait(),
+        )
+        .await
+        .expect("a torn-down runtime client must take the runtime down");
+        handle.shutdown_and_wait().await;
+        assert_eq!(handle.interface_panic(), Some("Runtime Unreachable"));
     }
 
     #[tokio::test]
@@ -18459,7 +18549,7 @@ enabled = yes
 port = 37428
 "#;
         let config = Config::parse(input).unwrap();
-        let interfaces = synthesize_interfaces(&config, false).unwrap();
+        let interfaces = synthesize_interfaces(&config, None).unwrap();
         assert_eq!(interfaces.len(), 6);
         let rnode_multi = interfaces.iter().find_map(|iface| match iface {
             interface_factory::InterfaceConfig::RNodeMulti(c) => Some(c),

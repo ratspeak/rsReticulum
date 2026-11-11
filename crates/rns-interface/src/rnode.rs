@@ -380,16 +380,17 @@ impl RNodeSpawnError {
 const RNODE_READ_TIMEOUT_MS: u64 = 100;
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 const RNODE_TCP_CONNECT_TIMEOUT_SECS: u64 = 5;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "ios"),
+    any(feature = "serial", feature = "rnode-tcp")
+))]
 const RNODE_TCP_KEEPIDLE_SECS: u64 = 5;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(all(target_os = "linux", any(feature = "serial", feature = "rnode-tcp")))]
 const RNODE_TCP_KEEPINTVL_SECS: u64 = 2;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(all(target_os = "linux", any(feature = "serial", feature = "rnode-tcp")))]
 const RNODE_TCP_KEEPCNT: u32 = 12;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+#[cfg(all(target_os = "linux", any(feature = "serial", feature = "rnode-tcp")))]
 const RNODE_TCP_USER_TIMEOUT_SECS: u64 = 24;
-#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
-const RNODE_TCP_BUFFER_BYTES: usize = 131_072;
 
 /// Local transport category for the generic RNode driver.
 ///
@@ -2458,6 +2459,9 @@ impl RNodeStream {
         // the same read timeout as a serial port.
         stream.set_read_timeout(Some(Duration::from_millis(RNODE_READ_TIMEOUT_MS)))?;
         stream.set_nodelay(true)?;
+        // RNodeInterface.py:1516-1527,1557-1558: the full set on Linux only,
+        // keepalive with the idle time on Apple, nothing elsewhere.
+        #[cfg(target_os = "linux")]
         crate::socket_tuning::set_keepalive_tuned(
             &stream,
             Duration::from_secs(RNODE_TCP_KEEPIDLE_SECS),
@@ -2465,7 +2469,14 @@ impl RNodeStream {
             RNODE_TCP_KEEPCNT,
             Duration::from_secs(RNODE_TCP_USER_TIMEOUT_SECS),
         );
-        crate::socket_tuning::set_socket_buffers(&stream, RNODE_TCP_BUFFER_BYTES);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(Duration::from_secs(RNODE_TCP_KEEPIDLE_SECS));
+            if let Err(e) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+                tracing::warn!(error = %e, "set_tcp_keepalive failed");
+            }
+        }
         Ok(Self {
             link: Box::new(stream),
         })

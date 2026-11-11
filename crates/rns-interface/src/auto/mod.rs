@@ -564,6 +564,14 @@ impl Shared {
         ))
     }
 
+    /// Address enumeration can block (JNI on Android), so it runs off the async workers.
+    async fn enumerate_blocking(self: &Arc<Self>) -> Vec<NicAddrs> {
+        let shared = Arc::clone(self);
+        tokio::task::spawn_blocking(move || shared.enumerate())
+            .await
+            .unwrap_or_default()
+    }
+
     fn running(&self) -> bool {
         self.online.load(Ordering::SeqCst) && self.final_init_done.load(Ordering::SeqCst)
     }
@@ -904,7 +912,8 @@ impl Shared {
             let now = Instant::now();
             self.expire_peers(now);
             self.reverse_peering(now).await;
-            self.refresh_nics();
+            let current = self.enumerate_blocking().await;
+            self.refresh_nics(current);
             self.check_echoes(now);
         }
     }
@@ -943,8 +952,7 @@ impl Shared {
     /// Re-read the link-local addresses. A changed address restarts that
     /// NIC's sockets, as upstream restarts its data listener; NICs that
     /// appear or vanish after startup are adopted or released.
-    fn refresh_nics(self: &Arc<Self>) {
-        let current = self.enumerate();
+    fn refresh_nics(self: &Arc<Self>, current: Vec<NicAddrs>) {
         let mut restart = Vec::new();
         {
             let mut nics = self.nics.lock().expect("auto nic mutex poisoned");
@@ -1134,7 +1142,7 @@ pub async fn spawn_auto_interface(
     };
 
     let mut suitable = 0usize;
-    for nic in shared.enumerate() {
+    for nic in shared.enumerate_blocking().await {
         if shared.adopt_nic(&nic)? {
             suitable += 1;
         }
