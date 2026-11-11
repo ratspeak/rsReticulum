@@ -51,8 +51,8 @@ fn discovered(name: &str, host: &str, port: u16) -> DiscoveredInterface {
         hops: 1,
         stamp_value: 16.0,
         stamp: Vec::new(),
-        discovered: 0,
-        last_heard: 0,
+        discovered: 0.0,
+        last_heard: 0.0,
         heard_count: 1,
         status: None,
     }

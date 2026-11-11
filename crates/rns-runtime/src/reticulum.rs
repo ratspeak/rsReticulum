@@ -1775,14 +1775,17 @@ impl ReticulumHandle {
     }
 
     async fn default_packet_receipt_timeout(&self, destination_hash: [u8; 16]) -> Duration {
-        let first_hop = match self.first_hop_timeout(destination_hash).await {
-            Ok(timeout) => timeout,
-            Err(_) => return Duration::from_secs(180),
-        };
-        let hops = match self.hops_to(destination_hash).await {
-            Ok(hops) => hops,
-            Err(_) => return Duration::from_secs(180),
-        };
+        // Reticulum.py:1985-1987 and Transport.py:3488@1.6.0 fallbacks.
+        let first_hop =
+            self.first_hop_timeout(destination_hash)
+                .await
+                .unwrap_or(Duration::from_secs_f64(
+                    rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
+                ));
+        let hops = self
+            .hops_to(destination_hash)
+            .await
+            .unwrap_or(rns_transport::constants::PATHFINDER_M);
         rns_wire::receipt::receipt_timeout_for_route(first_hop, hops)
     }
 
@@ -2021,23 +2024,16 @@ impl ReticulumHandle {
         }
     }
 
-    /// Return the next-hop interface MTU in bytes, when available. In Client
-    /// mode the owner is queried by interface name; an ambiguous name or a zero
-    /// MTU yields `None`. This interface value is not a negotiated Link payload
+    /// Return the next-hop interface MTU in bytes, when available. A Client's
+    /// next hop is its own local shared-instance interface (Transport.py:3508,
+    /// 3517-3524@1.6.0). This interface value is not a negotiated Link payload
     /// budget or the MTU of every hop on the path.
     pub async fn next_hop_hardware_mtu(
         &self,
         destination_hash: [u8; 16],
     ) -> Result<Option<u32>, ControlError> {
-        if self.instance_mode == InstanceMode::Client {
-            return Ok(self
-                .shared_next_hop_interface(destination_hash)
-                .await?
-                .and_then(|interface| (interface.mtu != 0).then_some(interface.mtu)));
-        }
-
         match self
-            .query_control_result(TransportQuery::GetNextHopHardwareMtu {
+            .query_transport_result(TransportQuery::GetNextHopHardwareMtu {
                 dest: destination_hash,
             })
             .await?
@@ -2778,11 +2774,11 @@ fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::
         } => RpcRequest::BlackholeIdentity {
             identity_hash: hash.to_vec(),
             until: ttl.map(|ttl| unix_now() + ttl),
-            reason: Some(
-                reason_label
-                    .clone()
-                    .unwrap_or_else(|| reason.as_str().to_string()),
-            ),
+            // Reticulum.py:2196@1.6.0 forwards the caller's reason, None when unlabelled.
+            reason: reason_label.clone().or_else(|| {
+                (*reason != rns_transport::blackhole::BlackholeReason::Manual)
+                    .then(|| reason.as_str().to_string())
+            }),
         },
         TransportQuery::UnblackholeIdentity { hash } => RpcRequest::UnblackholeIdentity {
             identity_hash: hash.to_vec(),
@@ -4877,8 +4873,11 @@ async fn run_accepted_child_registration_pump(
         };
         let (role, ingress_overrides, ifac_key, ifac_size) =
             child_registration_from_parent(&interface_controls, sub_handle.parent_id);
-        if role == rns_transport::messages::InterfaceRole::LocalClient {
-            apply_forced_shared_instance_bitrate(&mut sub_handle, forced_shared_bitrate);
+        // LocalInterface.py:429,455@1.6.0: a spawned client copies the bitrate, not the MTU.
+        if role == rns_transport::messages::InterfaceRole::LocalClient
+            && let Some(bitrate) = forced_shared_bitrate.filter(|bitrate| *bitrate > 0)
+        {
+            sub_handle.bitrate = bitrate;
         }
         // The coordinator retains and joins this pump before waiting producer
         // permits, so accepted children do not need a separate spawn permit.
@@ -5236,6 +5235,12 @@ fn apply_forced_shared_instance_bitrate(
     handle.bitrate = bitrate;
     handle.mtu =
         rns_interface::traits::optimise_mtu(bitrate).unwrap_or(rns_wire::constants::MTU as u32);
+    // HDLC.py ReceiveBuffer and Transport.py:2014@1.6.0 bound frames by the optimised HW_MTU.
+    handle.packet_capacity = rns_transport::messages::InterfacePacketCapacity::new(
+        handle.mtu,
+        handle.mtu,
+        handle.packet_capacity.link_mtu_upgrade,
+    );
 }
 
 /// Register a freshly connected shared-instance client (TCP or local socket)
@@ -5268,7 +5273,8 @@ async fn adopt_shared_instance_client(
             role: rns_transport::messages::InterfaceRole::SharedInstancePeer,
             ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
             ifac_key: None,
-            ifac_size: 0,
+            // LocalInterface.py:66@1.6.0 bounds frames at HW_MTU + DEFAULT_IFAC_SIZE.
+            ifac_size: rns_interface::tcp::DEFAULT_IFAC_SIZE,
             kind: InterfaceKind::Standard,
             multipoint: false,
         },
@@ -13155,8 +13161,15 @@ loglevel = 7
             rns_interface::traits::optimise_mtu(1_000_000).unwrap()
         );
 
+        assert_eq!(handle.packet_capacity.max_wire_packet_bytes, handle.mtu);
+
         apply_forced_shared_instance_bitrate(&mut handle, Some(0));
         assert_eq!(handle.bitrate, 1_000_000, "zero is not a usable bitrate");
+
+        apply_forced_shared_instance_bitrate(&mut handle, Some(1_000_000_000));
+        assert_eq!(handle.mtu, 524_288);
+        assert_eq!(handle.packet_capacity.max_clear_packet_bytes, 524_288);
+        assert_eq!(handle.packet_capacity.max_wire_packet_bytes, 524_288);
     }
 
     #[tokio::test]
@@ -14025,6 +14038,43 @@ loglevel = 7
     }
 
     #[tokio::test]
+    async fn receipt_timeout_without_transport_answers_uses_upstream_fallbacks() {
+        let handle = dummy_handle();
+        assert_eq!(
+            handle.default_packet_receipt_timeout([0x41; 16]).await,
+            Duration::from_secs_f64(
+                rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
+                    * (1.0 + f64::from(rns_transport::constants::PATHFINDER_M))
+            )
+        );
+    }
+
+    #[test]
+    fn client_blackhole_forwards_no_reason_for_an_unlabelled_entry() {
+        use rns_transport::blackhole::BlackholeReason;
+        let reason_of = |reason, reason_label: Option<&str>| match transport_query_to_rpc_request(
+            &TransportQuery::BlackholeIdentity {
+                hash: [0x31; 16],
+                ttl: None,
+                reason,
+                reason_label: reason_label.map(str::to_string),
+            },
+        ) {
+            Some(crate::rpc::RpcRequest::BlackholeIdentity { reason, .. }) => reason,
+            other => panic!("unexpected request: {other:?}"),
+        };
+        assert_eq!(reason_of(BlackholeReason::Manual, None), None);
+        assert_eq!(
+            reason_of(BlackholeReason::Manual, Some("spam")).as_deref(),
+            Some("spam")
+        );
+        assert_eq!(
+            reason_of(BlackholeReason::RateLimit, None).as_deref(),
+            Some("rate_limit")
+        );
+    }
+
+    #[tokio::test]
     async fn client_control_failures_never_enqueue_local_actor_work() {
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
         let mut handle = dummy_handle();
@@ -14250,13 +14300,6 @@ loglevel = 7
         );
         assert_eq!(
             handle
-                .next_hop_hardware_mtu(destination_hash)
-                .await
-                .unwrap(),
-            Some(1_200)
-        );
-        assert_eq!(
-            handle
                 .next_hop_per_bit_latency(destination_hash)
                 .await
                 .unwrap(),
@@ -14271,27 +14314,11 @@ loglevel = 7
         );
         assert_eq!(
             handle
-                .next_hop_hardware_mtu(missing_mtu_destination)
-                .await
-                .unwrap(),
-            None,
-            "Python-compatible stats without MTU must remain unknown"
-        );
-        assert_eq!(
-            handle
                 .next_hop_bitrate(ambiguous_destination)
                 .await
                 .unwrap(),
             None,
             "duplicate interface names must not select an arbitrary bitrate"
-        );
-        assert_eq!(
-            handle
-                .next_hop_hardware_mtu(ambiguous_destination)
-                .await
-                .unwrap(),
-            None,
-            "duplicate interface names must not select an arbitrary MTU"
         );
         assert_eq!(
             handle
@@ -14305,6 +14332,14 @@ loglevel = 7
             local_query_count.load(Ordering::Relaxed),
             0,
             "typed client metrics must ignore divergent local actor state"
+        );
+        assert_eq!(
+            handle
+                .next_hop_hardware_mtu(destination_hash)
+                .await
+                .unwrap(),
+            Some(9),
+            "a client's next hop is its own shared-instance interface"
         );
 
         rpc_shutdown.trigger();
@@ -15230,8 +15265,8 @@ loglevel = 7
                 hops: 1,
                 stamp_value: 16.0,
                 stamp: vec![0; 32],
-                discovered: 0,
-                last_heard: 0,
+                discovered: 0.0,
+                last_heard: 0.0,
                 heard_count: 1,
                 status: None,
             }
@@ -18034,6 +18069,20 @@ txpower = 17
         let (result, client_dir) = init_requiring_shared_instance("client", config).await;
         let client = result.expect("a running shared instance satisfies the requirement");
         assert_eq!(client.instance_mode, InstanceMode::Client);
+        let Some(TransportQueryResponse::InterfaceStats(stats)) = client
+            .query_transport(TransportQuery::GetInterfaceStats)
+            .await
+        else {
+            panic!("client interface stats");
+        };
+        let peer = stats
+            .iter()
+            .find(|entry| entry.role == "shared_instance_peer")
+            .expect("shared-instance peer interface");
+        assert_eq!(
+            peer.ifac_size, 16,
+            "the local interface admits HW_MTU plus the default IFAC size"
+        );
 
         client.shutdown_and_wait().await;
         owner.shutdown_and_wait().await;

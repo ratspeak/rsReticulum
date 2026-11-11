@@ -699,6 +699,7 @@ impl TransportActor {
                 e.stamp = validated.stamp;
                 e.stamp_value = announce_stamp_value;
                 e.lr_cost = validated.lr_cost;
+                self.known_destinations_dirty = true;
             }
             std::collections::hash_map::Entry::Occupied(_) => {}
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -721,6 +722,7 @@ impl TransportActor {
                     lr_cost: validated.lr_cost,
                 });
                 self.state_dirty = true;
+                self.known_destinations_dirty = true;
             }
         }
 
@@ -1001,6 +1003,7 @@ impl TransportActor {
             e.remember_ratchet(announce_ratchet, now_f64());
             e.packet_hash = Some(announce_packet_hash);
             e.is_path_response = is_path_response;
+            self.known_destinations_dirty = true;
         }
         let app_data_for_handlers = announce_app_data;
 
@@ -1671,7 +1674,9 @@ impl TransportActor {
                 if !admitted || !signal_valid {
                     return;
                 }
-                self.rebalance_at_link_terminus(raw, header);
+                if !self.rebalance_at_link_terminus(raw, header) {
+                    return;
+                }
                 if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
                     let _ = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                         raw: raw.clone(),
@@ -2116,11 +2121,17 @@ impl TransportActor {
     /// signed proof for a pending local Link ends its pending state and, when
     /// its hops differ from the path hops at request time, rewrites the path
     /// hops and marks the path responsive.
-    fn rebalance_at_link_terminus(&mut self, raw: &[u8], header: &rns_wire::header::PacketHeader) {
+    /// Returns whether the proof goes on to the Link: only with the expected
+    /// hops, after any re-balance (Transport.py:2988-2992).
+    fn rebalance_at_link_terminus(
+        &mut self,
+        raw: &[u8],
+        header: &rns_wire::header::PacketHeader,
+    ) -> bool {
         let Some(&(destination_hash, expected_hops)) =
             self.pending_local_link_hops.get(&header.destination_hash)
         else {
-            return;
+            return true;
         };
         if self.lrproof_signature_valid(
             &raw[header.size()..],
@@ -2128,13 +2139,13 @@ impl TransportActor {
             &destination_hash,
         ) != Some(true)
         {
-            return;
+            return expected_hops == Some(header.hops);
         }
         // A valid proof ends the pending state, so a replay cannot re-balance (Transport.py:2954).
         self.pending_local_link_hops
             .remove(&header.destination_hash);
         if expected_hops == Some(header.hops) {
-            return;
+            return true;
         }
         pathing!(
             dest = hex::encode(destination_hash),
@@ -2146,6 +2157,7 @@ impl TransportActor {
             path.hops = header.hops;
         }
         self.mark_path_responsive(&destination_hash);
+        true
     }
 
     /// Verify an LRPROOF signature against the destination's announced key;

@@ -994,7 +994,7 @@ pub async fn spawn_backbone_client_observed(
                     return;
                 }
             }
-            let after_outage = std::mem::replace(&mut attempted, true);
+            attempted = true;
             let attempt = match initial_attempt.take() {
                 Some(attempt) => attempt,
                 None => connect_backbone_target(&config, initial_timeout).await,
@@ -1015,7 +1015,7 @@ pub async fn spawn_backbone_client_observed(
                 .tunnel_identity
                 .as_ref()
                 .and_then(|identity| identity.synthesis(&python_name));
-            open_client_connection(&rx, after_outage, &transport_tx, synthesis, &online2).await;
+            open_client_connection(&rx, &transport_tx, synthesis, &online2).await;
 
             {
                 let mut outbound = rx.lock().await;

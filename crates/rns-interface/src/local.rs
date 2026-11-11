@@ -450,11 +450,15 @@ async fn run_local_client_connection(
 ) -> LocalClientConnectionEnd {
     let interface_id = io.interface_id;
     let mut buf = [0u8; 8192];
-    let mut deframer = hdlc::HdlcDeframer::with_limits(
-        LOCAL_HW_MTU,
-        rns_wire::constants::HEADER_MINSIZE,
-        Some(LOCAL_HW_MTU),
-    );
+    // LocalInterface.py:81-82@1.6.0: the receive buffer follows HW_MTU, which a
+    // forced bitrate re-optimises (Reticulum.py:443-448@1.6.0).
+    let hw_mtu = io
+        .force_bitrate
+        .filter(|bitrate| *bitrate > 0)
+        .and_then(crate::traits::optimise_mtu)
+        .map_or(LOCAL_HW_MTU, |mtu| mtu as usize);
+    let mut deframer =
+        hdlc::HdlcDeframer::with_limits(hw_mtu, rns_wire::constants::HEADER_MINSIZE, Some(hw_mtu));
     let mut keepalive = phy_keepalive.then(|| {
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
@@ -567,7 +571,7 @@ fn wire_accepted_stream(
     let read_task = tokio::spawn(async move {
         let _client_count = client_count;
         accepted_read_loop(reader, id, transport_tx, online_r, rxb_r, pause).await;
-        tracing::info!(name = %task_name, "local client disconnected");
+        tracing::debug!(name = %task_name, "local client disconnected");
         // Proactively notify so transport drops immediately.
         let _ = dereg_tx
             .send(TransportMessage::DeregisterInterface { id })
@@ -670,7 +674,7 @@ pub async fn spawn_local_server(
                 Ok((reader, writer, peer)) => {
                     let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
                     let client_name = format!("{}/client_{}", config.name, client_id);
-                    tracing::info!(name = %client_name, %peer, "local client connected");
+                    tracing::debug!(name = %client_name, %peer, "local client connected");
                     // LocalInterface.py:351-353, :420-424 and :443.
                     let identity = match &unix_path {
                         Some(path) => InterfaceIdentity::new(
@@ -937,6 +941,40 @@ mod tests {
             _ = task => panic!("connection ended"),
             _ = check => {}
         }
+    }
+
+    #[tokio::test]
+    async fn forced_gigabit_client_accepts_frames_up_to_its_optimised_mtu() {
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let transport_tx = crate::traits::test_registered_sender(7, transport_tx);
+        let (client, mut server) = tokio::io::duplex(1 << 20);
+        let (reader, writer) = tokio::io::split(client);
+        let (_tx, mut rx) = mpsc::channel::<Bytes>(1);
+        let (rxb, txb) = (AtomicU64::new(0), AtomicU64::new(0));
+        let frame = vec![0x11u8; 400_000];
+        server.write_all(&hdlc::frame(&frame)).await.unwrap();
+        let task = async {
+            let io = LocalClientIo {
+                interface_id: 7,
+                transport_tx: &transport_tx,
+                rxb: &rxb,
+                txb: &txb,
+                force_bitrate: Some(1_000_000_000),
+            };
+            run_local_client_connection(Box::new(reader), Box::new(writer), &mut rx, &io, false)
+                .await
+        };
+        let delivered = tokio::select! {
+            _ = task => panic!("connection ended"),
+            message = tokio::time::timeout(Duration::from_secs(5), transport_rx.recv()) => message,
+        };
+        let Ok(Some(TransportMessage::InterfaceEvent { message, .. })) = delivered else {
+            panic!("frame above 262144 bytes was not delivered: {delivered:?}");
+        };
+        let TransportMessage::Inbound(packet) = *message else {
+            panic!("unexpected event");
+        };
+        assert_eq!(packet.raw.len(), frame.len());
     }
 
     #[test]

@@ -27,7 +27,7 @@ impl TransportActor {
         // addition to `on_shutdown` because mobile force-quit kills the
         // process without delivering Shutdown. Hashlist is saved separately.
         if self.storage_dir.is_some()
-            && (self.state_dirty || self.routing_save_pending)
+            && self.state_dirty
             && now - self.last_state_save >= STATE_SAVE_INTERVAL_SECS
         {
             // Async: the fsync chain (F_FULLFSYNC per file on macOS) stalls
@@ -37,7 +37,7 @@ impl TransportActor {
         }
 
         if self.storage_dir.is_some()
-            && self.state_dirty
+            && self.known_destinations_dirty
             && now - self.last_known_destinations_flush >= KD_FLUSH_INTERVAL
         {
             self.flush_known_destinations_async();
@@ -663,6 +663,7 @@ impl TransportActor {
                 self.recent_announces.remove(hash);
             }
             self.state_dirty = true;
+            self.known_destinations_dirty = true;
             pathing!(
                 removed = to_drop.len(),
                 remaining = self.recent_announces.len(),
@@ -682,6 +683,7 @@ impl TransportActor {
         }
         if expired > 0 {
             self.state_dirty = true;
+            self.known_destinations_dirty = true;
             debug!(
                 expired,
                 "known-destinations cleanup expired remembered ratchets"

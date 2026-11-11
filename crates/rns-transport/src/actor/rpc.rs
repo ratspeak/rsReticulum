@@ -367,6 +367,7 @@ impl TransportActor {
                 let cleared = self.recent_announces.len();
                 self.recent_announces.clear();
                 self.state_dirty = true;
+                self.known_destinations_dirty = true;
                 self.save_routing_state();
                 TransportQueryResponse::IntResult(cleared as i64)
             }
@@ -988,8 +989,11 @@ impl TransportActor {
                 .filter(|(_, entry)| entry.validated)
                 .count() as u64,
             path_count,
-            // Path use is not recorded, so every path reads as never used.
-            unused_path_count: path_count,
+            unused_path_count: self
+                .path_table
+                .iter()
+                .filter(|(_, entry)| entry.used == 0.0)
+                .count() as u64,
             ..self.traffic_count.totals
         }
     }

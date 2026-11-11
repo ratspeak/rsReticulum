@@ -574,7 +574,7 @@ pub async fn spawn_tcp_client_observed(
                     return;
                 }
             }
-            let after_outage = std::mem::replace(&mut attempted, true);
+            attempted = true;
             let attempt = match initial_attempt.take() {
                 Some(attempt) => attempt,
                 None => {
@@ -613,7 +613,7 @@ pub async fn spawn_tcp_client_observed(
                 .as_ref()
                 .filter(|_| !kiss_framing)
                 .and_then(|identity| identity.synthesis(&python_name));
-            open_client_connection(&rx, after_outage, &transport_tx, synthesis, &online2).await;
+            open_client_connection(&rx, &transport_tx, synthesis, &online2).await;
 
             let (reader, writer) = stream.into_split();
 

@@ -673,8 +673,8 @@ pub fn spawn_with_metrics(
     (handle, tx, metrics)
 }
 
-fn now_unix() -> u64 {
-    crate::now_f64() as u64
+fn now_unix() -> f64 {
+    crate::now_f64()
 }
 
 #[cfg(test)]

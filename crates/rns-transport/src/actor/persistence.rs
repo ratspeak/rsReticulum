@@ -286,6 +286,7 @@ impl TransportActor {
     /// in-flight guard. The routing tables keep their own periodic save.
     pub(super) fn flush_known_destinations_async(&mut self) {
         if self.shared_instance_client_mode {
+            self.known_destinations_dirty = false;
             self.last_known_destinations_flush = now();
             return;
         }
@@ -323,16 +324,20 @@ impl TransportActor {
             }
             Err(_) => write(),
         }
-        if self.state_dirty {
-            self.state_dirty = false;
-            self.routing_save_pending = true;
-        }
+        self.known_destinations_dirty = false;
         self.last_known_destinations_flush = now();
     }
 
     /// Full persist of routing state, known destinations and the hashlist
     /// (Python `Reticulum.__persist_data`), off-actor.
     pub(super) fn persist_data_async(&mut self) {
+        // Reticulum.py:1415@1.6.0: a persist already running skips this one untimed.
+        if self
+            .routing_save_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         self.save_state_async();
         self.last_data_persist = now();
     }
@@ -399,7 +404,7 @@ impl TransportActor {
             }
         }
         self.state_dirty = false;
-        self.routing_save_pending = false;
+        self.known_destinations_dirty = false;
         self.last_state_save = now();
     }
 
@@ -519,7 +524,7 @@ impl TransportActor {
             write_routing_snapshot(&dir, &snapshot);
         }
         self.state_dirty = false;
-        self.routing_save_pending = false;
+        self.known_destinations_dirty = false;
         self.last_state_save = now();
     }
 
@@ -1556,6 +1561,12 @@ mod async_save_tests {
         actor.last_known_destinations_flush = now - KD_FLUSH_INTERVAL - 1.0;
 
         actor.on_tick();
+        assert!(
+            !dir.join("announce_cache.msgpack").exists(),
+            "a routing-only change leaves known destinations unwritten"
+        );
+        actor.known_destinations_dirty = true;
+        actor.on_tick();
 
         let announces =
             crate::persistence::load_announce_cache(&dir.join("announce_cache.msgpack")).unwrap();
@@ -1598,8 +1609,20 @@ mod async_save_tests {
             "inside the gracious interval nothing persists"
         );
 
-        actor.last_data_persist = crate::now_f64() - GRACIOUS_PERSIST_INTERVAL - 1.0;
+        let late = crate::now_f64() - GRACIOUS_PERSIST_INTERVAL - 1.0;
+        actor.last_data_persist = late;
+        actor
+            .routing_save_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
         actor.deregister_interface(9);
+        assert_eq!(
+            actor.last_data_persist, late,
+            "a persist skipped behind a running one is not timed"
+        );
+        actor
+            .routing_save_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+        actor.maybe_gracious_persist();
         assert!(path.exists(), "a late disconnect persists");
         let _ = std::fs::remove_dir_all(&dir);
     }

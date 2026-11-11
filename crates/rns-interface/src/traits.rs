@@ -129,17 +129,17 @@ pub(crate) fn python_host(host: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Start a client connection as Python does: traffic queued during an outage
-/// is dropped (TCPInterface.py:314-315), then the connection's synthesis is
-/// queued, and only then does the interface report online.
+/// Start a client connection as Python does: traffic queued while offline,
+/// before the first connect or during an outage, is dropped
+/// (TCPInterface.py:314-315), then the connection's synthesis is queued, and
+/// only then does the interface report online.
 pub(crate) async fn open_client_connection(
     outbound: &tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
-    after_outage: bool,
     transport_tx: &rns_transport::messages::InterfaceTransportSender,
     synthesis: Option<Bytes>,
     online: &AtomicBool,
 ) {
-    if after_outage {
+    {
         let mut queued = outbound.lock().await;
         while queued.try_recv().is_ok() {}
     }
@@ -379,6 +379,24 @@ mod tests {
                 let _ = exited.send(());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn first_connect_drops_frames_queued_while_offline() {
+        let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(4);
+        frame_tx.send(Bytes::from_static(b"early")).await.unwrap();
+        let outbound = tokio::sync::Mutex::new(frame_rx);
+        let (actor_tx, _actor_rx) = mpsc::channel(4);
+        let transport_tx = rns_transport::messages::InterfaceTransportSender::new(7, actor_tx);
+        let online = AtomicBool::new(false);
+
+        open_client_connection(&outbound, &transport_tx, None, &online).await;
+
+        assert!(
+            outbound.lock().await.try_recv().is_err(),
+            "a frame queued before the first connect is not written"
+        );
+        assert!(online.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -1881,7 +1881,7 @@ fn print_discovered_summary(
         "Location"
     );
     outln!(out, "{}", "-".repeat(110));
-    let now = unix_now_secs();
+    let now = unix_now();
     for record in records {
         if !discovered_shown(record, show_stale, show_unknown) {
             continue;
@@ -1898,7 +1898,7 @@ fn print_discovered_summary(
             Some(DiscoveryStatus::Stale) => "× Stale",
             None => "? Unknown",
         };
-        let diff = now.saturating_sub(record.last_heard);
+        let diff = (now - record.last_heard).max(0.0) as u64;
         let last_heard = if diff < 60 {
             "Just now".to_string()
         } else if diff < 3600 {
@@ -1936,7 +1936,7 @@ fn print_discovered_details(
     show_stale: bool,
     show_unknown: bool,
 ) {
-    let now = unix_now_secs();
+    let now = unix_now();
     for (idx, record) in records.iter().enumerate() {
         if !discovered_shown(record, show_stale, show_unknown) {
             continue;
@@ -2001,12 +2001,12 @@ fn print_discovered_details(
         outln!(
             out,
             "Discovered   : {} ago",
-            pretty_time_compact(now.saturating_sub(record.discovered))
+            pretty_time_compact((now - record.discovered).max(0.0) as u64)
         );
         outln!(
             out,
             "Last Heard   : {} ago",
-            pretty_time_compact(now.saturating_sub(record.last_heard))
+            pretty_time_compact((now - record.last_heard).max(0.0) as u64)
         );
         let location = match (
             finite_location(info.latitude),
@@ -2129,11 +2129,4 @@ fn truncate_ellipsis(s: &str, limit: usize) -> String {
     } else {
         s.to_string()
     }
-}
-
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

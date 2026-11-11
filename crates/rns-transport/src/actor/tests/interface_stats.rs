@@ -441,3 +441,19 @@ fn traffic_totals_are_cumulative_over_top_level_interfaces() {
     actor.count_traffic(1_002.0);
     assert_eq!(totals(&mut actor).rxb, 100, "totals survive deregistration");
 }
+
+/// `unupcount` counts paths never used and `actpcount` the rest
+/// (Transport.py:3564-3569, Reticulum.py:1848-1850).
+#[test]
+fn traffic_totals_count_never_used_paths() {
+    let mut actor = hub();
+    for (byte, used) in [(1u8, 0.0), (2, 0.0), (3, 1_000.0)] {
+        let mut entry =
+            crate::path_table::PathEntry::new(None, 1, 1, crate::constants::InterfaceMode::Full);
+        entry.used = used;
+        actor.path_table.insert([byte; 16], entry);
+    }
+    let measured = totals(&mut actor);
+    assert_eq!(measured.path_count, 3);
+    assert_eq!(measured.unused_path_count, 2);
+}

@@ -290,9 +290,9 @@ pub struct TransportActor {
     /// set it; queued/synchronous save paths can clear it before success is known.
     /// It is not a reliable comparison between memory and durable disk state.
     pub state_dirty: bool,
-    /// A known-destination flush took `state_dirty`; the routing tables still
-    /// wait for their periodic save.
-    routing_save_pending: bool,
+    /// Known-destination metadata changed since the last `announce_cache.msgpack`
+    /// flush (Python `Identity._kd_mark_dirty`).
+    known_destinations_dirty: bool,
     /// Whether an asynchronous routing writer is in flight. The separate
     /// publication lock and generation counter coordinate queued and synchronous
     /// snapshots; this flag alone is not a cross-process writer lock.
@@ -581,7 +581,7 @@ impl TransportActor {
             hashlist_load_attempted: false,
             last_state_save: 0.0,
             state_dirty: false,
-            routing_save_pending: false,
+            known_destinations_dirty: false,
             routing_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             routing_save_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             routing_save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
@@ -1653,6 +1653,7 @@ impl TransportActor {
         if let Some(entry) = self.recent_announces.get_mut(dest_hash) {
             entry.retained = true;
             self.state_dirty = true;
+            self.known_destinations_dirty = true;
             true
         } else {
             false
@@ -1675,6 +1676,7 @@ impl TransportActor {
         }
         if retained {
             self.state_dirty = true;
+            self.known_destinations_dirty = true;
         }
         retained
     }
@@ -1689,6 +1691,7 @@ impl TransportActor {
         {
             entry.last_used = Some(now_f64());
             self.state_dirty = true;
+            self.known_destinations_dirty = true;
             true
         } else {
             false
@@ -1701,6 +1704,7 @@ impl TransportActor {
             entry.retained = false;
             entry.last_used = Some(now_f64());
             self.state_dirty = true;
+            self.known_destinations_dirty = true;
             true
         } else {
             false

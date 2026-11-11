@@ -62,9 +62,9 @@ pub struct DiscoveredInterface {
     /// The actual stamp bytes last observed (useful for diagnostics).
     pub stamp: Vec<u8>,
     /// Unix seconds — first time this interface was learned.
-    pub discovered: u64,
+    pub discovered: f64,
     /// Unix seconds — most recent announce.
-    pub last_heard: u64,
+    pub last_heard: f64,
     /// Sightings after the first, as upstream counts them: 0 when first
     /// written, then one more per upsert, saturating at `u64::MAX`.
     pub heard_count: u64,
@@ -150,7 +150,7 @@ impl DiscoveryStore {
                 .filter(|l| l.contains_key("discovered") && l.contains_key("heard_count"));
             if let Some(existing) = existing {
                 let discovered = timestamp(&existing, "discovered");
-                if discovered != 0 {
+                if discovered != 0.0 {
                     record.discovered = discovered;
                 }
                 record.heard_count = u64_opt(&existing, "heard_count").unwrap_or(0);
@@ -244,8 +244,8 @@ impl DiscoveryStore {
                 }
             };
             let mut rec = record_from_lookup(&lookup);
-            let heard_delta = now.saturating_sub(rec.last_heard);
-            if heard_delta > THRESHOLD_REMOVE_SECS
+            let heard_delta = now - rec.last_heard;
+            if heard_delta > THRESHOLD_REMOVE_SECS as f64
                 || !id_present(&lookup, "transport_id")
                 || !id_present(&lookup, "network_id")
             {
@@ -306,7 +306,7 @@ impl DiscoveryStore {
             let sb = b.status.map(DiscoveryStatus::code).unwrap_or(0);
             sb.cmp(&sa)
                 .then(b.stamp_value.total_cmp(&a.stamp_value))
-                .then(b.last_heard.cmp(&a.last_heard))
+                .then(b.last_heard.total_cmp(&a.last_heard))
         });
 
         Ok(out)
@@ -322,18 +322,18 @@ impl DiscoveryStore {
 /// Classify elapsed seconds: `Available` through 24 hours, `Unknown` above
 /// 24 hours through three days, and `Stale` above three days. This helper does
 /// not apply the separate seven-day removal rule or probe an endpoint.
-pub fn classify(heard_delta_secs: u64) -> DiscoveryStatus {
-    if heard_delta_secs > THRESHOLD_STALE_SECS {
+pub fn classify(heard_delta_secs: f64) -> DiscoveryStatus {
+    if heard_delta_secs > THRESHOLD_STALE_SECS as f64 {
         DiscoveryStatus::Stale
-    } else if heard_delta_secs > THRESHOLD_UNKNOWN_SECS {
+    } else if heard_delta_secs > THRESHOLD_UNKNOWN_SECS as f64 {
         DiscoveryStatus::Unknown
     } else {
         DiscoveryStatus::Available
     }
 }
 
-fn unix_now() -> u64 {
-    crate::now_f64() as u64
+fn unix_now() -> f64 {
+    crate::now_f64()
 }
 
 // On-disk msgpack format mirrors Python's key schema for interop.
@@ -351,7 +351,7 @@ fn encode_record(rec: &DiscoveredInterface) -> Result<Vec<u8>, StorageError> {
     }
     map.push((s("transport"), Value::from(i.transport_enabled)));
     map.push((s("name"), Value::from(i.name.clone())));
-    map.push((s("received"), Value::from(rec.last_heard)));
+    map.push((s("received"), Value::F64(rec.last_heard)));
     map.push((s("transport_id"), Value::from(hex::encode(i.transport_id))));
     map.push((s("network_id"), Value::from(hex::encode(rec.network_id))));
     map.push((s("hops"), Value::from(rec.hops)));
@@ -402,8 +402,8 @@ fn encode_record(rec: &DiscoveredInterface) -> Result<Vec<u8>, StorageError> {
     if let Some(addr) = i.operator_lxmf_address {
         map.push((s("operator_lxmf_address"), Value::from(hex::encode(addr))));
     }
-    map.push((s("discovered"), Value::from(rec.discovered)));
-    map.push((s("last_heard"), Value::from(rec.last_heard)));
+    map.push((s("discovered"), Value::F64(rec.discovered)));
+    map.push((s("last_heard"), Value::F64(rec.last_heard)));
     map.push((s("heard_count"), Value::from(rec.heard_count)));
 
     let value = Value::Map(map);
@@ -587,11 +587,11 @@ fn f64_optional(lookup: &HashMap<String, Value>, k: &str) -> Option<f64> {
     }
 }
 
-/// Python stores `time.time()` floats; Rust writes whole seconds.
-fn timestamp(lookup: &HashMap<String, Value>, k: &str) -> u64 {
+/// Python stores `time.time()` floats; integer timestamps from older Rust stores still read.
+fn timestamp(lookup: &HashMap<String, Value>, k: &str) -> f64 {
     f64_optional(lookup, k)
         .filter(|t| t.is_finite() && *t > 0.0)
-        .map_or(0, |t| t as u64)
+        .unwrap_or(0.0)
 }
 
 fn u64_opt(lookup: &HashMap<String, Value>, k: &str) -> Option<u64> {
@@ -653,8 +653,8 @@ mod tests {
             hops: 2,
             stamp_value: 14.0,
             stamp: vec![0xAA; STAMP_SIZE],
-            discovered: 1_000_000,
-            last_heard: 1_000_010,
+            discovered: 1_000_000.0,
+            last_heard: 1_000_010.0,
             heard_count: 0,
             status: None,
         }
@@ -684,7 +684,7 @@ mod tests {
             assert_eq!(read.heard_count, 0);
             assert_eq!(read.network_id, original.network_id);
             let mut update = original.clone();
-            update.discovered += 123;
+            update.discovered += 123.0;
             reopened.upsert(update).unwrap();
             let read = reopened
                 .load_raw(&reopened.root().join(original.filename()))
@@ -702,7 +702,7 @@ mod tests {
         let Value::Map(mut entries) = rmpv::decode::read_value(&mut &encoded[..]).unwrap() else {
             panic!("map");
         };
-        let now = unix_now() as f64 + 0.75;
+        let now = unix_now() + 0.75;
         for (k, v) in &mut entries {
             match k.as_str() {
                 Some("discovered") | Some("last_heard") => *v = Value::F64(now),
@@ -713,8 +713,8 @@ mod tests {
         let mut bytes = Vec::new();
         rmpv::encode::write_value(&mut bytes, &Value::Map(entries)).unwrap();
         let read = decode_record(&bytes).unwrap();
-        assert_eq!(read.last_heard, now as u64);
-        assert_eq!(read.discovered, now as u64);
+        assert_eq!(read.last_heard, now);
+        assert_eq!(read.discovered, now);
         assert_eq!(read.stamp_value, 8.58203125);
 
         let dir = tmpdir("float_records");
@@ -804,18 +804,18 @@ mod tests {
         let store = DiscoveryStore::open(&dir).unwrap();
         let now = unix_now();
         let mut first = record("alpha", [0x11; 16]);
-        first.discovered = 42;
+        first.discovered = 42.0;
         first.last_heard = now;
         store.upsert(first.clone()).unwrap();
 
         let mut second = record("alpha", [0x11; 16]);
-        second.discovered = 999; // should be ignored on merge
-        second.last_heard = now + 1;
+        second.discovered = 999.0; // should be ignored on merge
+        second.last_heard = now + 1.0;
         store.upsert(second).unwrap();
 
         let listed = store.list(None).unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].discovered, 42);
+        assert_eq!(listed[0].discovered, 42.0);
         assert_eq!(listed[0].heard_count, 1);
     }
 
@@ -907,7 +907,7 @@ mod tests {
         let dir = tmpdir("expired");
         let store = DiscoveryStore::open(&dir).unwrap();
         let mut r = record("old", [0x11; 16]);
-        r.last_heard = 0; // ancient
+        r.last_heard = 0.0; // ancient
         store.upsert(r).unwrap();
 
         let listed = store.list(None).unwrap();
@@ -923,14 +923,14 @@ mod tests {
         // Available, low stamp value, old
         let mut a = record("a", [0x01; 16]);
         a.stamp_value = 10.0;
-        a.last_heard = now - 100;
+        a.last_heard = now - 100.0;
         // Available, high stamp value, recent
         let mut b = record("b", [0x02; 16]);
         b.stamp_value = 20.0;
-        b.last_heard = now - 10;
+        b.last_heard = now - 10.0;
         // Unknown (freshness bucket)
         let mut c = record("c", [0x03; 16]);
-        c.last_heard = now - THRESHOLD_UNKNOWN_SECS - 1;
+        c.last_heard = now - THRESHOLD_UNKNOWN_SECS as f64 - 1.0;
         c.stamp_value = 30.0;
 
         store.upsert(a).unwrap();
@@ -970,11 +970,14 @@ mod tests {
 
     #[test]
     fn classify_thresholds() {
-        assert_eq!(classify(0), DiscoveryStatus::Available);
+        assert_eq!(classify(0.0), DiscoveryStatus::Available);
         assert_eq!(
-            classify(THRESHOLD_UNKNOWN_SECS + 1),
+            classify(THRESHOLD_UNKNOWN_SECS as f64 + 1.0),
             DiscoveryStatus::Unknown
         );
-        assert_eq!(classify(THRESHOLD_STALE_SECS + 1), DiscoveryStatus::Stale);
+        assert_eq!(
+            classify(THRESHOLD_STALE_SECS as f64 + 1.0),
+            DiscoveryStatus::Stale
+        );
     }
 }
