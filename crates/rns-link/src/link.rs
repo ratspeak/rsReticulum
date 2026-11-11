@@ -296,7 +296,12 @@ impl Link {
         ),
     )]
     pub fn new_initiator(destination_hash: [u8; 16], hops: u8) -> (Self, Vec<u8>) {
-        Self::new_initiator_with_keys(destination_hash, hops, EphemeralKeys::generate())
+        Self::new_initiator_with_keys(
+            destination_hash,
+            hops,
+            EphemeralKeys::generate(),
+            rns_wire::constants::MTU as u32,
+        )
     }
 
     /// Create an outbound link whose request is stamped at `cost`, as Python's
@@ -307,6 +312,7 @@ impl Link {
         hops: u8,
         cost: Option<f64>,
         ctl: &rns_identity::stamps::StampControl,
+        signalled_mtu: u32,
     ) -> Result<(Self, Vec<u8>), crate::stamp::LinkStampError> {
         let keys = match cost {
             Some(cost) => {
@@ -314,17 +320,25 @@ impl Link {
             }
             None => EphemeralKeys::generate(),
         };
-        Ok(Self::new_initiator_with_keys(destination_hash, hops, keys))
+        Ok(Self::new_initiator_with_keys(
+            destination_hash,
+            hops,
+            keys,
+            signalled_mtu,
+        ))
     }
 
     /// Create an outbound link with caller-supplied ephemeral keys, such as
-    /// keys from [`crate::stamp::generate_stamped_ephemeral_keys`].
+    /// keys from [`crate::stamp::generate_stamped_ephemeral_keys`], signalling
+    /// `signalled_mtu` as Link.py:392-397@1.6.0 does.
     pub fn new_initiator_with_keys(
         destination_hash: [u8; 16],
         hops: u8,
         ephemeral_keys: EphemeralKeys,
+        signalled_mtu: u32,
     ) -> (Self, Vec<u8>) {
-        let signalling = SignallingData::new(DEFAULT_MODE, rns_wire::constants::MTU as u32);
+        let signalling = SignallingData::new(DEFAULT_MODE, signalled_mtu);
+        let offered_mtu = LinkMtu::try_from_signal(Some(signalling.mtu)).unwrap_or(LinkMtu::BASE);
         let request_data = LinkRequestData::pack(&ephemeral_keys, signalling);
         let link_id = compute_link_id(&destination_hash, &request_data);
 
@@ -342,7 +356,7 @@ impl Link {
             is_initiator: true,
             mode: DEFAULT_MODE,
             offered_mode: DEFAULT_MODE,
-            offered_mtu: LinkMtu::BASE,
+            offered_mtu,
             ephemeral_keys: Some(ephemeral_keys),
             peer_x25519_pub: None,
             peer_packet_proof_key: None,
@@ -570,10 +584,8 @@ impl Link {
         if !ENABLED_MODES.contains(&request.signalling.mode) {
             return Err(HandshakeError::UnsupportedMode(request.signalling.mode));
         }
-        // Current host endpoints are deliberately base-only; transit upgrade
-        // support does not imply high-MTU Resource support at an endpoint.
-        let offered = LinkMtu::try_from_signal(Some(request.signalling.mtu))?;
-        let accepted_mtu = offered.min(LinkMtu::BASE);
+        // The offered MTU is adopted unclamped (Link.py:202-207@1.6.0).
+        let accepted_mtu = LinkMtu::try_from_signal(Some(request.signalling.mtu))?;
         let accepted_mdu = accepted_mtu.checked_mdu()?;
 
         let responder_keys = EphemeralKeys::generate();
@@ -1883,6 +1895,12 @@ impl Link {
         self.establishment_rate.map(|rate| rate * 8.0)
     }
 
+    /// Resource part size on this Link: `mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE`
+    /// (Resource.py:346-347@1.6.0).
+    pub fn resource_sdu(&self) -> usize {
+        (self.mtu as usize).saturating_sub(rns_wire::constants::HEADER_MAXSIZE + 1)
+    }
+
     /// Negotiated MTU for an active Link.
     pub fn get_mtu(&self) -> Option<u32> {
         (self.state == LinkState::Active).then_some(self.mtu)
@@ -2184,33 +2202,39 @@ mod tests {
     }
 
     #[test]
-    fn responder_mtu_boundary_matrix_is_base_only_and_never_wraps() {
+    fn responder_adopts_any_offered_mtu_and_echoes_it() {
         let identity = Ed25519PrivateKey::generate();
         let (_, request) = Link::new_initiator([5; 16], 1);
-        for mtu in 1..500 {
-            let mut candidate = request.clone();
-            candidate[64..].copy_from_slice(&SignallingData::new(DEFAULT_MODE, mtu).pack());
-            assert!(
-                Link::new_responder(&candidate, &identity, [5; 16], 1).is_err(),
-                "mtu {mtu}"
-            );
-        }
-        for mtu in [0, 500, 501, MTU_BYTEMASK] {
+        for (mtu, mdu) in [
+            (400, 319),
+            (500, 431),
+            (1196, 1119),
+            (MTU_BYTEMASK, 2097071),
+        ] {
             let mut candidate = request.clone();
             candidate[64..].copy_from_slice(&SignallingData::new(DEFAULT_MODE, mtu).pack());
             let (responder, proof) =
                 Link::new_responder(&candidate, &identity, [5; 16], 1).unwrap();
-            assert_eq!(responder.mtu, 500);
-            assert_eq!(responder.mdu, rns_wire::constants::LINK_MDU);
-            assert_eq!(LinkProofData::unpack(&proof).unwrap().signalling.mtu, 500);
+            assert_eq!((responder.mtu, responder.mdu), (mtu, mdu));
+            assert_eq!(LinkProofData::unpack(&proof).unwrap().signalling.mtu, mtu);
         }
-        assert_eq!(
-            Link::new_responder(&request[..64], &identity, [5; 16], 1)
+        // Too small to carry an encrypted unit.
+        let mut tiny = request.clone();
+        tiny[64..].copy_from_slice(&SignallingData::new(DEFAULT_MODE, 83).pack());
+        assert!(Link::new_responder(&tiny, &identity, [5; 16], 1).is_err());
+        for candidate in [
+            &request[..64],
+            &{
+                let mut zero = request.clone();
+                zero[64..].copy_from_slice(&SignallingData::new(DEFAULT_MODE, 0).pack());
+                zero
+            }[..],
+        ] {
+            let responder = Link::new_responder(candidate, &identity, [5; 16], 1)
                 .unwrap()
-                .0
-                .mtu,
-            500
-        );
+                .0;
+            assert_eq!(responder.mtu, 500);
+        }
     }
 
     #[test]
@@ -2221,7 +2245,7 @@ mod tests {
         let (_responder, good) = Link::new_responder(&request, &identity, [6; 16], 1).unwrap();
         let parsed = LinkProofData::unpack(&good).unwrap();
         let cost = initiator.establishment_cost;
-        for mtu in (1..500).chain([501, MTU_BYTEMASK]) {
+        for mtu in [501, MTU_BYTEMASK] {
             let invalid = LinkProofData::create(
                 &identity,
                 &parsed.responder_x25519_pub,

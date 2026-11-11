@@ -4,7 +4,7 @@
 //! TCP_USER_TIMEOUT where supported. The shared HDLC deframer caps each
 //! encoded frame; this is not a bound on total connection memory.
 
-use rns_transport::messages::{InterfacePacketCapacity, InterfaceTransportSender};
+use rns_transport::messages::InterfaceTransportSender;
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,9 +34,6 @@ pub const HW_MTU: u32 = 1_048_576;
 
 /// Python `BackboneInterface.BITRATE_GUESS` and `BackboneClientInterface.BITRATE_GUESS`.
 pub const BITRATE_GUESS: u64 = 100_000_000;
-
-/// Largest packet a Backbone peer carries (the shared HDLC deframer bound).
-const WIRE_BUDGET: u32 = crate::tcp::TCP_HW_MTU;
 
 pub const RECONNECT_WAIT: u64 = 5;
 pub const INITIAL_CONNECT_TIMEOUT: u64 = 5;
@@ -96,6 +93,10 @@ pub struct BackboneServerConfig {
     pub fast_flapping_grace: u64,
     /// Time since the latest short connection before its state expires.
     pub fast_flapping_block_time: Duration,
+    /// Bitrate the hardware MTU is optimised for; accepted peers inherit it.
+    pub bitrate: u64,
+    /// IFAC size in bytes; accepted peers inherit it.
+    pub ifac_size: usize,
 }
 
 impl BackboneServerConfig {
@@ -111,6 +112,8 @@ impl BackboneServerConfig {
             fast_flapping_threshold: FAST_FLAPPING_THRESHOLD,
             fast_flapping_grace: FAST_FLAPPING_GRACE,
             fast_flapping_block_time: FAST_FLAPPING_BLOCK_TIME,
+            bitrate: BITRATE_GUESS,
+            ifac_size: crate::tcp::DEFAULT_IFAC_SIZE,
         }
     }
 }
@@ -130,6 +133,10 @@ pub struct BackboneClientConfig {
     /// Identity used to request a signed tunnel synthesis for each connection.
     /// `None`, or an identity without signing material, sends no synthesis.
     pub tunnel_identity: Option<TunnelIdentity>,
+    /// Bitrate the hardware MTU is optimised for.
+    pub bitrate: u64,
+    /// IFAC size in bytes; frames may exceed the hardware MTU by this much.
+    pub ifac_size: usize,
 }
 
 impl BackboneClientConfig {
@@ -143,6 +150,8 @@ impl BackboneClientConfig {
             max_reconnect_tries: None,
             mode: InterfaceMode::Full,
             tunnel_identity: None,
+            bitrate: BITRATE_GUESS,
+            ifac_size: crate::tcp::DEFAULT_IFAC_SIZE,
         }
     }
 
@@ -395,24 +404,20 @@ fn tune_accepted_stream(stream: &TcpStream) {
     let _ = socket2::SockRef::from(stream).set_recv_buffer_size(DP_IC_RCVBUF);
 }
 
-fn autoconfigured_mtu() -> (u32, InterfacePacketCapacity) {
-    crate::traits::hardware_mtu_capacity(crate::traits::optimise_mtu(BITRATE_GUESS), WIRE_BUDGET)
-}
-
 async fn backbone_read_loop(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     interface_id: InterfaceId,
     transport_tx: InterfaceTransportSender,
     online: Arc<AtomicBool>,
     rxb: ByteCounter,
+    (bitrate, ifac_size): (u64, usize),
 ) {
-    // Upstream bounds receive at its optimised HW_MTU (32768 at 100 Mbps); this
-    // stays at the wire budget until a transit node clamps link MTU to that too.
-    // Transport applies IFAC, so allow the largest tag.
+    // ReceiveBuffer(HW_MTU, HEADER_MINSIZE, HW_MTU + ifac_size) (BackboneInterface.py:892-893@1.6.0).
+    let hw_mtu = crate::tcp::hardware_mtu(bitrate, None) as usize;
     let mut deframer = hdlc::HdlcDeframer::with_limits(
-        WIRE_BUDGET as usize,
+        hw_mtu,
         rns_wire::constants::HEADER_MINSIZE,
-        Some(WIRE_BUDGET as usize + 64),
+        Some(hw_mtu + ifac_size),
     );
     // Large buffer to amortise syscalls.
     let mut buf = vec![0u8; 65536];
@@ -639,10 +644,11 @@ async fn backbone_connection(
     txb: ByteCounter,
     name: &str,
     state: &EgressState,
+    sizing: (u64, usize),
 ) {
     let (reader, mut writer) = stream.into_split();
     tokio::select! {
-        _ = backbone_read_loop(reader, interface_id, transport_tx, online.clone(), rxb) => {}
+        _ = backbone_read_loop(reader, interface_id, transport_tx, online.clone(), rxb, sizing) => {}
         _ = backbone_write_loop(&mut writer, rx, &txb, name, state) => {}
     }
     state.buffered.store(0, Ordering::Relaxed);
@@ -723,6 +729,7 @@ fn spawn_backbone_server_on_listener(
     let name = config.name.clone();
     let mode = config.mode;
     let fast_flap_policy = FastFlapPolicy::from(&config);
+    let sizing = (config.bitrate, config.ifac_size);
     let active_clients = Arc::new(AtomicU64::new(0));
     let inspection_runtime = fast_flap_runtime.clone();
     let inspection_active_clients = Arc::clone(&active_clients);
@@ -813,6 +820,7 @@ fn spawn_backbone_server_on_listener(
                             c_txb_w,
                             &cname,
                             &task_egress,
+                            sizing,
                         )
                         .await;
                         fast_flap_connection.disconnected();
@@ -823,7 +831,8 @@ fn spawn_backbone_server_on_listener(
                             .await;
                     });
 
-                    let (child_mtu, packet_capacity) = autoconfigured_mtu();
+                    let (child_mtu, packet_capacity) =
+                        crate::tcp::hardware_capacity(sizing.0, None, sizing.1);
                     let spawned_name = format!("Client on {}", config.name);
                     let child_identity = InterfaceIdentity::new(
                         python_address_name(
@@ -848,7 +857,7 @@ fn spawn_backbone_server_on_listener(
                             forward: false,
                             repeat: false,
                         },
-                        bitrate: BITRATE_GUESS,
+                        bitrate: sizing.0,
                         mtu: child_mtu,
                         online: c_online,
                         rxb: Some(c_rxb),
@@ -876,7 +885,8 @@ fn spawn_backbone_server_on_listener(
         online2.store(false, Ordering::SeqCst);
     });
 
-    let (mtu, packet_capacity) = autoconfigured_mtu();
+    let (mtu, packet_capacity) =
+        crate::tcp::hardware_capacity(config.bitrate, None, config.ifac_size);
     Ok(InterfaceHandle {
         id,
         owner,
@@ -890,7 +900,7 @@ fn spawn_backbone_server_on_listener(
             forward: false,
             repeat: false,
         },
-        bitrate: BITRATE_GUESS,
+        bitrate: config.bitrate,
         mtu,
         online,
         rxb: Some(parent_rxb),
@@ -948,6 +958,7 @@ pub async fn spawn_backbone_client_observed(
     let task_txb = shared_txb.clone();
 
     let python_name = config.python_name();
+    let sizing = (config.bitrate, config.ifac_size);
     let identity = InterfaceIdentity::new(&python_name, &config.name, "BackboneClientInterface");
     let egress = Arc::new(EgressState::default());
     let task_egress = egress.clone();
@@ -1018,6 +1029,7 @@ pub async fn spawn_backbone_client_observed(
                     ByteCounter::new(task_txb.clone(), None),
                     &python_name,
                     &task_egress,
+                    sizing,
                 )
                 .await;
             }
@@ -1031,7 +1043,7 @@ pub async fn spawn_backbone_client_observed(
         }
     });
 
-    let (mtu, packet_capacity) = autoconfigured_mtu();
+    let (mtu, packet_capacity) = crate::tcp::hardware_capacity(sizing.0, None, sizing.1);
     Ok(crate::tcp::SpawnedClientInterface {
         interface: InterfaceHandle {
             id,
@@ -1046,7 +1058,7 @@ pub async fn spawn_backbone_client_observed(
                 forward: false,
                 repeat: false,
             },
-            bitrate: BITRATE_GUESS,
+            bitrate: sizing.0,
             mtu,
             online,
             rxb: Some(shared_rxb),

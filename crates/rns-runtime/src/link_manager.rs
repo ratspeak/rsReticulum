@@ -207,9 +207,10 @@ fn prepare_next_segment(
     source: &mut PreparedResourceSource,
     keys: &rns_link::key_derivation::LinkKeys,
     rtt: std::time::Duration,
+    link_sdu: usize,
 ) -> Result<PreparedResourceSegment, String> {
     source
-        .next_segment(keys, rtt)
+        .next_segment(keys, rtt, link_sdu)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Resource source ended early".to_string())
 }
@@ -4133,7 +4134,10 @@ impl LinkManager {
                                     previous_eifr: previous.and_then(|(_, eifr)| eifr),
                                 },
                             ) {
-                                Ok(transfer) => transfer,
+                                Ok(mut transfer) => {
+                                    transfer.resource.sdu = active.link.resource_sdu();
+                                    transfer
+                                }
                                 Err(error) => {
                                     Self::reject_inbound_advertisement(
                                         &self.transport_tx,
@@ -6688,10 +6692,11 @@ impl LinkManager {
             .link
             .rtt
             .unwrap_or(std::time::Duration::from_millis(500));
+        let link_sdu = active.link.resource_sdu();
         let output = spawn_segment_job(&self.deferred_request_notify, move || {
             SegmentJobOutput::First(prepare().map_err(|error| error.to_string()).and_then(
                 |mut prepared| {
-                    let first = prepare_next_segment(&mut prepared, &keys, rtt)?;
+                    let first = prepare_next_segment(&mut prepared, &keys, rtt, link_sdu)?;
                     Ok((Box::new(prepared), first))
                 },
             ))
@@ -6711,8 +6716,9 @@ impl LinkManager {
     ) -> Option<oneshot::Receiver<SegmentJobOutput>> {
         let keys = link.session_keys()?;
         let rtt = link.rtt.unwrap_or(std::time::Duration::from_millis(500));
+        let link_sdu = link.resource_sdu();
         Some(spawn_segment_job(notify, move || {
-            let result = prepare_next_segment(&mut source, &keys, rtt);
+            let result = prepare_next_segment(&mut source, &keys, rtt, link_sdu);
             SegmentJobOutput::Next(source, result)
         }))
     }
@@ -8180,24 +8186,16 @@ impl LinkManager {
             return None;
         }
         let metadata_wire_size = metadata.as_ref().map(|m| 3 + m.len()).unwrap_or(0);
+        let link_sdu = Some(active.link.resource_sdu());
         let resources = if metadata_wire_size + data.len() <= MAX_EFFICIENT_SIZE {
-            let mut resource = if metadata.is_some() {
-                rns_protocol::resource::OutboundResource::with_options(
-                    data,
-                    auto_compress,
-                    metadata,
-                    None,
-                    Some(&encrypt_fn),
-                )
-                .ok()?
-            } else {
-                rns_protocol::resource::OutboundResource::new(
-                    data,
-                    auto_compress,
-                    Some(&encrypt_fn),
-                )
-                .ok()?
-            };
+            let mut resource = rns_protocol::resource::OutboundResource::with_options(
+                data,
+                auto_compress,
+                metadata,
+                link_sdu,
+                Some(&encrypt_fn),
+            )
+            .ok()?;
             resource.flags.is_response = is_response;
             resource.request_id = request_id.clone();
             vec![resource]
@@ -8209,6 +8207,7 @@ impl LinkManager {
                 request_id.clone(),
                 is_response,
                 Some(&encrypt_fn),
+                link_sdu,
             )
             .ok()?
             .segments
@@ -10211,15 +10210,22 @@ mod tests {
             PreparedResourceSource::prepare_response(source, [3; 16], None, AutoCompress::Off)
                 .unwrap();
         let first = prepared
-            .next_segment(&keys, std::time::Duration::from_millis(100))
+            .next_segment(
+                &keys,
+                std::time::Duration::from_millis(100),
+                rns_protocol::resource::SDU,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(first.total_segments, 2);
         assert!(!prepared.is_exhausted());
 
-        let Err(reason) =
-            prepare_next_segment(&mut prepared, &keys, std::time::Duration::from_millis(100))
-        else {
+        let Err(reason) = prepare_next_segment(
+            &mut prepared,
+            &keys,
+            std::time::Duration::from_millis(100),
+            rns_protocol::resource::SDU,
+        ) else {
             panic!("a failed read must not produce a segment");
         };
         let mut queue = OutboundSplitQueue::Source(Box::new(StreamedSegments {
@@ -14446,6 +14452,7 @@ mod tests {
             None,
             false,
             Some(&encrypt_fn),
+            None,
         )
         .unwrap();
         assert_eq!(multi.total_segments, 1);

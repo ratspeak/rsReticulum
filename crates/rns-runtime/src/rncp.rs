@@ -772,11 +772,12 @@ async fn send_segments(
         .session_keys()
         .ok_or_else(|| RncpError::LinkCrypto("no session keys".into()))?;
     let rtt = rl.link.rtt.unwrap_or(Duration::from_millis(500));
+    let link_sdu = rl.link.resource_sdu();
     let mut data_size = 0;
     loop {
         let segment_keys = keys.clone();
         let (returned, segment) = tokio::task::spawn_blocking(move || {
-            let segment = prepared.next_segment(&segment_keys, rtt);
+            let segment = prepared.next_segment(&segment_keys, rtt, link_sdu);
             (prepared, segment)
         })
         .await
@@ -1702,6 +1703,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                     ) else {
                         continue;
                     };
+                    t.resource.sdu = link.resource_sdu();
                     if let TransferAction::SendRequest(req_data) = t.request_next()
                         && let Ok(encrypted) = link.encrypt(&req_data)
                     {

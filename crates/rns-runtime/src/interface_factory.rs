@@ -315,6 +315,10 @@ pub struct BackboneInterfaceConfig {
     /// Listener-only block duration. The configuration file uses minutes;
     /// the runtime field is a `Duration`. Parser default: 720 minutes.
     pub fast_flapping_block_time: Duration,
+    /// Bitrate the hardware MTU is optimised for. Parser default: the Backbone guess.
+    pub bitrate: u64,
+    /// IFAC size in bytes a frame may add to the hardware MTU.
+    pub ifac_size: usize,
 }
 
 fn parse_interface_mode(s: &str) -> Option<InterfaceMode> {
@@ -797,11 +801,31 @@ fn synthesize_tcp_client(
         config.max_reconnect_tries = Some(retries as usize);
     }
 
-    let config = InterfaceConfig::TcpClient(config);
+    let mut config = InterfaceConfig::TcpClient(config);
     let post_init = InterfacePostInit::try_from_section(section)?
         .with_default_ifac_size(default_ifac_size_for(&config));
     validate_config_capacity(&config, &post_init)?;
+    if let InterfaceConfig::TcpClient(tcp) = &mut config {
+        (tcp.bitrate, tcp.ifac_size) = receive_sizing(section, &post_init, tcp.bitrate);
+    }
     Ok(config)
+}
+
+/// The bitrate `optimise_mtu` uses and the IFAC size a frame may add to the
+/// hardware MTU (Reticulum.py:1018-1020, :1127-1131@1.6.0).
+fn receive_sizing(
+    section: &ConfigSection,
+    post_init: &InterfacePostInit,
+    guess: u64,
+) -> (u64, usize) {
+    let bitrate = section
+        .get_uint("bitrate")
+        .filter(|bitrate| *bitrate >= crate::constants::MINIMUM_BITRATE)
+        .unwrap_or(guess);
+    (
+        bitrate,
+        post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
+    )
 }
 
 /// Reads an IFAC credential the way the reference config loader does: both
@@ -892,6 +916,8 @@ fn synthesize_tcp_server(
     if let Some(device) = section.get("device") {
         config.device = Some(device.to_string());
     }
+    let post_init = InterfacePostInit::try_from_section(section)?.with_default_ifac_size(16);
+    (config.bitrate, config.ifac_size) = receive_sizing(section, &post_init, config.bitrate);
 
     Ok(InterfaceConfig::TcpServer(config))
 }
@@ -1918,6 +1944,9 @@ fn synthesize_backbone(
         60.0,
         rns_interface::backbone::FAST_FLAPPING_BLOCK_TIME,
     )?;
+    let post_init = InterfacePostInit::try_from_section(section)?.with_default_ifac_size(16);
+    let (bitrate, ifac_size) =
+        receive_sizing(section, &post_init, rns_interface::backbone::BITRATE_GUESS);
 
     Ok(InterfaceConfig::Backbone(BackboneInterfaceConfig {
         name: name.to_string(),
@@ -1934,6 +1963,8 @@ fn synthesize_backbone(
         fast_flapping_threshold,
         fast_flapping_grace,
         fast_flapping_block_time,
+        bitrate,
+        ifac_size,
     }))
 }
 

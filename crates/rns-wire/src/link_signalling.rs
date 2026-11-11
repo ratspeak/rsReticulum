@@ -20,8 +20,8 @@ pub enum LinkSignallingError {
         /// Modern payload size.
         modern: usize,
     },
-    /// A nonzero MTU below the qualified base or above the wire field.
-    #[error("invalid Link MTU {0}; expected zero or 500..=2097151")]
+    /// An MTU above the 21-bit wire field.
+    #[error("invalid Link MTU {0}; expected 0..=2097151")]
     InvalidMtu(u32),
     /// Raw mode cannot be represented in three bits.
     #[error("invalid Link mode {0}; expected 0..=7")]
@@ -37,11 +37,12 @@ pub struct LinkMtu(u32);
 impl LinkMtu {
     /// Qualified base used for legacy and current host endpoint traffic.
     pub const BASE: Self = Self(BASE_LINK_MTU);
-    /// Validate protocol domain without truncation or saturation.
+    /// Validate protocol domain without truncation or saturation. Any nonzero
+    /// 21-bit value is adopted, as `Link.mtu_from_lr_packet` (Link.py:155-158@1.6.0).
     pub fn try_from_signal(signal: Option<u32>) -> Result<Self, LinkSignallingError> {
         match signal {
             None | Some(0) => Ok(Self::BASE),
-            Some(value @ BASE_LINK_MTU..=MAX_SIGNALLED_LINK_MTU) => Ok(Self(value)),
+            Some(value @ 1..=MAX_SIGNALLED_LINK_MTU) => Ok(Self(value)),
             Some(value) => Err(LinkSignallingError::InvalidMtu(value)),
         }
     }
@@ -155,10 +156,7 @@ mod tests {
     use super::*;
     #[test]
     fn mtu_domain_does_not_mask_or_wrap() {
-        for invalid in 1..500 {
-            assert!(LinkMtu::try_from_signal(Some(invalid)).is_err());
-        }
-        for value in [500, 501, MAX_SIGNALLED_LINK_MTU] {
+        for value in [1, 400, 499, 500, 501, MAX_SIGNALLED_LINK_MTU] {
             assert_eq!(LinkMtu::try_from_signal(Some(value)).unwrap().get(), value);
         }
         for value in [MAX_SIGNALLED_LINK_MTU + 1, u32::MAX] {

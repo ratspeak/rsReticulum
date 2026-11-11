@@ -262,11 +262,10 @@ impl TransportActor {
         interface_id: InterfaceId,
         request: crate::messages::OutboundRequest,
     ) -> Option<Bytes> {
-        // The packet-count FIFO is also a hard byte bound because every
-        // admitted packet must fit Reticulum's wire MTU. Do not let a caller
-        // smuggle an arbitrarily large allocation into an established-Link
-        // queue through the raw transport API.
-        if request.raw.len() > rns_wire::constants::MTU
+        // The packet-count FIFO is also a hard byte bound: every admitted
+        // packet must fit the negotiated Link MTU's signalling field and the
+        // bound interface's capacity.
+        if request.raw.len() > rns_wire::link_signalling::MAX_SIGNALLED_LINK_MTU as usize
             || (interface_id != LOCAL_LINK_INITIATOR_INTERFACE
                 && interface_id != LOCAL_LINK_RESPONDER_INTERFACE
                 && !self

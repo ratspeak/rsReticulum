@@ -33,17 +33,28 @@ pub const TCP_HW_MTU: u32 = 262144;
 /// Python `TCPClientInterface.BITRATE_GUESS` and `TCPServerInterface.BITRATE_GUESS`.
 pub const BITRATE_GUESS: u64 = 10_000_000;
 
-fn autoconfigured_mtu() -> (u32, InterfacePacketCapacity) {
-    crate::traits::hardware_mtu_capacity(crate::traits::optimise_mtu(BITRATE_GUESS), TCP_HW_MTU)
+/// Python `Interface.DEFAULT_IFAC_SIZE` for TCP, the IFAC size when none is configured.
+pub const DEFAULT_IFAC_SIZE: usize = 16;
+
+/// The hardware MTU after `optimise_mtu()` (Interface.py:255-267@1.6.0), or a
+/// fixed MTU. Upstream leaves `HW_MTU = None` below 62.5 kbps; that is the base MTU here.
+pub(crate) fn hardware_mtu(bitrate: u64, fixed_mtu: Option<u32>) -> u32 {
+    fixed_mtu
+        .or_else(|| crate::traits::optimise_mtu(bitrate))
+        .unwrap_or(rns_wire::constants::MTU as u32)
 }
 
-/// Receive bound. Upstream's is its `HW_MTU` after `optimise_mtu()` (16384 at
-/// the 10 Mbps guess); this stays at the wire budget until a transit node
-/// clamps link MTU to the optimised value too.
-const TCP_RECEIVE_HW_MTU: usize = TCP_HW_MTU as usize;
-
-/// Largest IFAC tag a frame can carry on top of the hardware MTU.
-const MAX_IFAC_SIZE: usize = 64;
+/// Reported MTU and packet capacity: packets up to the hardware MTU, frames up
+/// to the hardware MTU plus the IFAC size (TCPInterface.py:338-341@1.6.0).
+pub(crate) fn hardware_capacity(
+    bitrate: u64,
+    fixed_mtu: Option<u32>,
+    ifac_size: usize,
+) -> (u32, InterfacePacketCapacity) {
+    let hw_mtu = fixed_mtu.or_else(|| crate::traits::optimise_mtu(bitrate));
+    let wire = hardware_mtu(bitrate, fixed_mtu).saturating_add(ifac_size as u32);
+    crate::traits::hardware_mtu_capacity(hw_mtu, wire)
+}
 
 // Python TCPClientInterface: TCP_PROBE_AFTER / TCP_PROBE_INTERVAL / TCP_PROBES.
 // Dead-peer detection: 5s idle + 12 probes × 2s ≈ 29s.
@@ -179,8 +190,11 @@ pub struct TcpClientConfig {
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
     /// Fixed hardware MTU instead of the bitrate-derived one; at least 500.
-    /// Packets stay within the 262,144-byte driver budget.
     pub fixed_mtu: Option<u32>,
+    /// Bitrate the hardware MTU is optimised for: the configured `bitrate`, else [`BITRATE_GUESS`].
+    pub bitrate: u64,
+    /// IFAC size in bytes; frames may exceed the hardware MTU by this much.
+    pub ifac_size: usize,
     /// Identity used to request a signed tunnel synthesis for each non-KISS
     /// connection. `None`, or an identity without signing material, sends none.
     pub tunnel_identity: Option<TunnelIdentity>,
@@ -198,6 +212,8 @@ impl TcpClientConfig {
             max_reconnect_tries: None,
             mode: InterfaceMode::Full,
             fixed_mtu: None,
+            bitrate: BITRATE_GUESS,
+            ifac_size: DEFAULT_IFAC_SIZE,
             tunnel_identity: None,
         }
     }
@@ -227,6 +243,10 @@ pub struct TcpServerConfig {
     pub device: Option<String>,
     /// Accepted clients take the I2P socket timeouts (TCPInterface.py:589).
     pub i2p_tunneled: bool,
+    /// Bitrate the hardware MTU is optimised for; accepted clients inherit it.
+    pub bitrate: u64,
+    /// IFAC size in bytes; accepted clients inherit it.
+    pub ifac_size: usize,
 }
 
 impl TcpServerConfig {
@@ -240,6 +260,8 @@ impl TcpServerConfig {
             mode: InterfaceMode::Full,
             device: None,
             i2p_tunneled: false,
+            bitrate: BITRATE_GUESS,
+            ifac_size: DEFAULT_IFAC_SIZE,
         }
     }
 }
@@ -329,6 +351,7 @@ async fn tcp_read_loop(
     state: Arc<TcpInterfaceState>,
     kiss_framing: bool,
     hw_mtu: usize,
+    ifac_size: usize,
 ) {
     let mut buf = [0u8; 32768];
 
@@ -366,11 +389,10 @@ async fn tcp_read_loop(
             }
         }
     } else {
-        // The IFAC size is applied by transport, so allow the largest tag.
         let mut deframer = hdlc::HdlcDeframer::with_limits(
             hw_mtu,
             rns_wire::constants::HEADER_MINSIZE,
-            Some(hw_mtu + MAX_IFAC_SIZE),
+            Some(hw_mtu + ifac_size),
         );
         loop {
             match reader.read(&mut buf).await {
@@ -508,6 +530,8 @@ pub async fn spawn_tcp_client_observed(
     let mode = config.mode;
     let kiss_framing = config.kiss_framing;
     let fixed_mtu = config.fixed_mtu;
+    let receive_mtu = hardware_mtu(config.bitrate, fixed_mtu) as usize;
+    let ifac_size = config.ifac_size;
 
     // Wrap rx so it survives reconnects; forwarder task feeds per-connection channel.
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
@@ -613,7 +637,8 @@ pub async fn spawn_tcp_client_observed(
                 transport_tx.clone(),
                 state.clone(),
                 kiss_framing,
-                fixed_mtu.map_or(TCP_RECEIVE_HW_MTU, |mtu| mtu as usize),
+                receive_mtu,
+                ifac_size,
             )
             .await;
 
@@ -628,10 +653,7 @@ pub async fn spawn_tcp_client_observed(
         }
     });
 
-    let (mtu, packet_capacity) = match fixed_mtu {
-        Some(mtu) => crate::traits::hardware_mtu_capacity(Some(mtu), TCP_HW_MTU),
-        None => autoconfigured_mtu(),
-    };
+    let (mtu, packet_capacity) = hardware_capacity(config.bitrate, fixed_mtu, ifac_size);
     Ok(SpawnedClientInterface {
         interface: InterfaceHandle {
             id,
@@ -646,7 +668,7 @@ pub async fn spawn_tcp_client_observed(
                 forward: false,
                 repeat: false,
             },
-            bitrate: BITRATE_GUESS,
+            bitrate: config.bitrate,
             mtu,
             online,
             rxb: Some(shared_rxb),
@@ -679,6 +701,7 @@ async fn spawn_tcp_accepted(
     kiss_framing: bool,
     i2p_tunneled: bool,
     mode: InterfaceMode,
+    (bitrate, ifac_size): (u64, usize),
 ) -> InterfaceHandle {
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
@@ -716,7 +739,8 @@ async fn spawn_tcp_accepted(
             transport_tx,
             state,
             kiss_framing,
-            TCP_RECEIVE_HW_MTU,
+            hardware_mtu(bitrate, None) as usize,
+            ifac_size,
         )
         .await;
         online2.store(false, Ordering::SeqCst);
@@ -727,7 +751,7 @@ async fn spawn_tcp_accepted(
             .await;
     });
 
-    let (mtu, packet_capacity) = autoconfigured_mtu();
+    let (mtu, packet_capacity) = hardware_capacity(bitrate, None, ifac_size);
     InterfaceHandle {
         id,
         owner,
@@ -741,7 +765,7 @@ async fn spawn_tcp_accepted(
             forward: false,
             repeat: false,
         },
-        bitrate: BITRATE_GUESS,
+        bitrate,
         mtu,
         online,
         rxb: Some(shared_rxb),
@@ -828,6 +852,7 @@ pub async fn spawn_tcp_server(
                         kiss_framing,
                         config.i2p_tunneled,
                         mode,
+                        (config.bitrate, config.ifac_size),
                     )
                     .await;
                     if handoff_accepted_interface(&handle_tx, handle)
@@ -847,7 +872,7 @@ pub async fn spawn_tcp_server(
         online2.store(false, Ordering::SeqCst);
     });
 
-    let (mtu, packet_capacity) = autoconfigured_mtu();
+    let (mtu, packet_capacity) = hardware_capacity(config.bitrate, None, config.ifac_size);
     Ok(InterfaceHandle {
         id,
         owner,
@@ -861,7 +886,7 @@ pub async fn spawn_tcp_server(
             forward: false,
             repeat: false,
         },
-        bitrate: BITRATE_GUESS,
+        bitrate: config.bitrate,
         mtu,
         online,
         rxb: Some(parent_rxb),
@@ -1074,6 +1099,8 @@ mod tests {
             max_reconnect_tries: Some(1),
             mode: InterfaceMode::Full,
             fixed_mtu: None,
+            bitrate: BITRATE_GUESS,
+            ifac_size: DEFAULT_IFAC_SIZE,
             tunnel_identity: None,
         };
         let client_handle = spawn_tcp_client(client_cfg, 1, transport_tx.clone())
@@ -1088,7 +1115,7 @@ mod tests {
 
         assert_ne!(accepted.owner, server_handle.owner);
         assert_ne!(accepted.owner, client_handle.owner);
-        assert_eq!(accepted.packet_capacity.max_wire_packet_bytes, 262144);
+        assert_eq!(accepted.packet_capacity.max_wire_packet_bytes, 16384 + 16);
         let payload = Bytes::from_static(b"hello from client packet payload");
         client_handle.tx.send(payload.clone()).await.unwrap();
         assert!(
@@ -1189,6 +1216,8 @@ mod tests {
             max_reconnect_tries: Some(1),
             mode: InterfaceMode::Full,
             fixed_mtu: None,
+            bitrate: BITRATE_GUESS,
+            ifac_size: DEFAULT_IFAC_SIZE,
             tunnel_identity: None,
         };
         let client_handle = spawn_tcp_client(client_cfg, 321, transport_tx.clone())

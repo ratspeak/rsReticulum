@@ -71,8 +71,46 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// The MTU a new link request to `destination_hash` signals (Link.py:392-397@1.6.0):
+/// the next-hop interface's hardware MTU when discovery is on and that interface
+/// autoconfigures or fixes its MTU, otherwise the base MTU.
+pub async fn signalled_link_mtu(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    destination_hash: [u8; 16],
+) -> u32 {
+    let base = rns_wire::constants::MTU as u32;
+    let discovery =
+        crate::reticulum::get_instance().is_none_or(|handle| handle.link_mtu_discovery());
+    if !discovery {
+        return base;
+    }
+    let (response_tx, response_rx) = oneshot::channel();
+    let query = async {
+        transport_tx
+            .send(TransportMessage::Rpc {
+                query: TransportQuery::GetNextHopHardwareMtu {
+                    dest: destination_hash,
+                },
+                response_tx,
+            })
+            .await
+            .ok()?;
+        match response_rx.await {
+            Ok(TransportQueryResponse::IntResult(mtu)) => u32::try_from(mtu).ok(),
+            _ => None,
+        }
+    };
+    tokio::time::timeout(RECALL_TIMEOUT, query)
+        .await
+        .ok()
+        .flatten()
+        .filter(|mtu| *mtu != 0)
+        .unwrap_or(base)
+}
+
 /// Create an initiator Link whose request carries the stamp upstream would
-/// send to `destination_hash`. Dropping the future cancels the grind.
+/// send to `destination_hash` and the MTU it would signal. Dropping the future
+/// cancels the grind.
 pub async fn new_initiator(
     transport_tx: &mpsc::Sender<TransportMessage>,
     destination_hash: [u8; 16],
@@ -85,14 +123,21 @@ pub async fn new_initiator(
         None
     };
     let Some(cost) = policy.request_cost(recalled) else {
-        return Ok(Link::new_initiator(destination_hash, hops));
+        let mtu = signalled_link_mtu(transport_tx, destination_hash).await;
+        return Ok(Link::new_initiator_with_keys(
+            destination_hash,
+            hops,
+            rns_link::handshake::EphemeralKeys::generate(),
+            mtu,
+        ));
     };
+    let mtu = signalled_link_mtu(transport_tx, destination_hash).await;
     let _permit = grind_permits().acquire_owned().await.ok();
     let ctl = policy.control(cost);
     let _cancel = CancelOnDrop(ctl.cancel.clone());
     let started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        Link::new_stamped_initiator(destination_hash, hops, Some(cost), &ctl)
+        Link::new_stamped_initiator(destination_hash, hops, Some(cost), &ctl, mtu)
     })
     .await
     .map_err(|_| LinkStampError::Stopped)?;

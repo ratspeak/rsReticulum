@@ -610,17 +610,17 @@ mod tests {
             prop_assert_eq!(unpacked.pack(), packed);
         }
 
-        /// The representation packer remains permissive, but both handshake
-        /// parsers reject every nonzero offer below the supported Link floor.
+        /// Both handshake parsers keep a nonzero offer below the base MTU, as
+        /// `Link.mtu_from_lr_packet` and `mtu_from_lp_packet` do.
         #[test]
-        fn proptest_handshake_rejects_sub_base_mtu(mode in 0u8..=7, mtu in 1u32..500) {
+        fn proptest_handshake_keeps_sub_base_mtu(mode in 0u8..=7, mtu in 1u32..500) {
             let signalling = SignallingData::new(mode, mtu).pack();
             let mut request = vec![0u8; ECPUBSIZE];
             request.extend_from_slice(&signalling);
-            prop_assert!(LinkRequestData::unpack(&request).is_err());
+            prop_assert_eq!(LinkRequestData::unpack(&request).unwrap().signalling.mtu, mtu);
             let mut proof = vec![0u8; 96];
             proof.extend_from_slice(&signalling);
-            prop_assert!(LinkProofData::unpack(&proof).is_err());
+            prop_assert_eq!(LinkProofData::unpack(&proof).unwrap().signalling.mtu, mtu);
         }
     }
 }

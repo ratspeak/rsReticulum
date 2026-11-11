@@ -468,6 +468,7 @@ async fn wait_for_response(
                                     "resource transfer: {e:?}"
                                 ))
                             })?;
+                            transfer.resource.sdu = link.resource_sdu();
 
                             if let TransferAction::SendRequest(req) = transfer.request_next() {
                                 send_link_data(

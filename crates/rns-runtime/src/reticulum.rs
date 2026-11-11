@@ -8229,6 +8229,8 @@ async fn spawn_discovered_backbone_client(
     config.tunnel_identity = Some(rns_interface::traits::TunnelIdentity(
         handle.transport_identity.clone(),
     ));
+    // Discovery.py:884 adds the interface with configured_bitrate=5E6.
+    config.bitrate = 5_000_000;
     let iface_handle =
         rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
             .await
@@ -8962,6 +8964,9 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
         handle.transport_identity.clone(),
     ));
     if let Some(post_init) = &post_init {
+        config.ifac_size = post_init.ifac_size.unwrap_or(post_init.default_ifac_size);
+    }
+    if let Some(post_init) = &post_init {
         interface_factory::validate_config_capacity(
             &interface_factory::InterfaceConfig::TcpClient(config.clone()),
             post_init,
@@ -9026,7 +9031,10 @@ pub async fn spawn_tcp_server_runtime_with_ifac(
     let spawn_permit = ensure_runtime_interface_admission(handle)?;
     let id = next_id(&handle.id_gen);
     let post_init = runtime_ifac_post_init(ifac, 16)?;
-    let config = rns_interface::tcp::TcpServerConfig::new(name, listen_ip, port);
+    let mut config = rns_interface::tcp::TcpServerConfig::new(name, listen_ip, port);
+    if let Some(post_init) = &post_init {
+        config.ifac_size = post_init.ifac_size.unwrap_or(post_init.default_ifac_size);
+    }
     if let Some(post_init) = &post_init {
         interface_factory::validate_config_capacity(
             &interface_factory::InterfaceConfig::TcpServer(config.clone()),
@@ -9122,6 +9130,9 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
     config.tunnel_identity = Some(rns_interface::traits::TunnelIdentity(
         handle.transport_identity.clone(),
     ));
+    if let Some(post_init) = &post_init {
+        config.ifac_size = post_init.ifac_size.unwrap_or(post_init.default_ifac_size);
+    }
 
     let iface_handle =
         rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
@@ -9201,6 +9212,9 @@ pub async fn spawn_backbone_server_runtime_with_ifac(
     let mut config = rns_interface::backbone::BackboneServerConfig::new(name, listen_ip, port);
     config.prefer_ipv6 = prefer_ipv6;
     config.device = device.map(ToString::to_string);
+    if let Some(post_init) = &post_init {
+        config.ifac_size = post_init.ifac_size.unwrap_or(post_init.default_ifac_size);
+    }
 
     let iface_handle = rns_interface::backbone::spawn_backbone_server(
         config,
@@ -10542,6 +10556,8 @@ async fn spawn_interface_with_rnode_startup_options(
                 config.connect_timeout_secs = c.connect_timeout;
                 config.max_reconnect_tries = c.max_reconnect_tries;
                 config.tunnel_identity = Some(tunnel_identity.clone());
+                config.bitrate = c.bitrate;
+                config.ifac_size = c.ifac_size;
                 rns_interface::backbone::spawn_backbone_client_observed(config, id, transport_tx)
                     .await
                     .map(client_with_teardown)
@@ -10557,6 +10573,8 @@ async fn spawn_interface_with_rnode_startup_options(
                 config.fast_flapping_threshold = c.fast_flapping_threshold;
                 config.fast_flapping_grace = c.fast_flapping_grace;
                 config.fast_flapping_block_time = c.fast_flapping_block_time;
+                config.bitrate = c.bitrate;
+                config.ifac_size = c.ifac_size;
                 rns_interface::backbone::spawn_backbone_server(
                     config,
                     id,

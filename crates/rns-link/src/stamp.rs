@@ -113,7 +113,13 @@ impl LinkRequestStamper {
     ) -> Result<(crate::link::Link, Vec<u8>), LinkStampError> {
         let cost = self.request_cost(&destination_hash);
         let ctl = self.policy.control(cost.unwrap_or(0.0));
-        crate::link::Link::new_stamped_initiator(destination_hash, hops, cost, &ctl)
+        crate::link::Link::new_stamped_initiator(
+            destination_hash,
+            hops,
+            cost,
+            &ctl,
+            rns_wire::constants::MTU as u32,
+        )
     }
 }
 

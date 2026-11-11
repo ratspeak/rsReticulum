@@ -68,3 +68,31 @@ pub(crate) fn attenuate_request(
         clamped & rns_wire::link_signalling::MAX_SIGNALLED_LINK_MTU,
     ))
 }
+
+/// Python's clamp of a request to a local destination (Transport.py:2816-2836@1.6.0):
+/// an offer above the receiving interface's hardware MTU, or above the base MTU
+/// when that interface cannot upgrade, is lowered to it. `None` keeps the bytes.
+pub(crate) fn clamp_local_request(
+    payload: &[u8],
+    ingress: &InterfaceEntry,
+) -> Result<Option<Vec<u8>>, LinkTransitError> {
+    // A malformed request is left for the destination to reject, as upstream does.
+    if !parse_request_signalling(payload).is_ok_and(|signal| signal.signalling_present) {
+        return Ok(None);
+    }
+    let raw = SignallingData::unpack(&payload[64..]).expect("modern request");
+    let nh_mtu = if ingress.packet_capacity.link_mtu_upgrade {
+        ingress.mtu
+    } else {
+        rns_wire::link_signalling::BASE_LINK_MTU
+    };
+    if raw.mtu == 0 || nh_mtu >= raw.mtu {
+        return Ok(None);
+    }
+    if raw.mode != DEFAULT_LINK_MODE {
+        return Err(LinkTransitError::UnsupportedTransitModeTransform);
+    }
+    let mut clamped = payload[..64].to_vec();
+    clamped.extend_from_slice(&SignallingData::new(raw.mode, nh_mtu).pack());
+    Ok(Some(clamped))
+}

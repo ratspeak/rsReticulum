@@ -1923,7 +1923,6 @@ impl TransportActor {
                 return InterfaceSendOutcome::TooLarge;
             };
             if signal.mode != rns_wire::link_signalling::DEFAULT_LINK_MODE
-                || signal.mtu.get() > 500
                 || entry
                     .packet_capacity
                     .link_ceiling(id, entry.active_ifac_bytes())

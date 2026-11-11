@@ -334,7 +334,12 @@ fn dispatch_private_lane_and_packet_allocation_are_bounded() {
     let mut huge = token
         .try_send(
             OutboundRequest {
-                raw: Bytes::from(vec![0; 501]),
+                raw: Bytes::from(vec![
+                    0;
+                    rns_wire::link_signalling::MAX_SIGNALLED_LINK_MTU
+                        as usize
+                        + 1
+                ]),
                 destination_hash: binding().link_id,
             },
             Instant::now() + Duration::from_secs(1),

@@ -52,10 +52,7 @@ impl TransportActor {
             || header.flags.packet_type != rns_wire::flags::PacketType::LinkRequest
             || header.flags.destination_type != rns_wire::flags::DestinationType::Single
             || !rns_wire::link_signalling::parse_request_signalling(&request.raw[offset..])
-                .is_ok_and(|signal| {
-                    signal.mode == rns_wire::link_signalling::DEFAULT_LINK_MODE
-                        && signal.mtu.get() <= 500
-                })
+                .is_ok_and(|signal| signal.mode == rns_wire::link_signalling::DEFAULT_LINK_MODE)
         {
             return Err(LinkRequestDispatchError::InvalidRequest);
         }
@@ -126,10 +123,7 @@ impl TransportActor {
 
         if parsed.flags.packet_type == rns_wire::flags::PacketType::LinkRequest
             && !rns_wire::link_signalling::parse_request_signalling(&request.raw[parsed.size()..])
-                .is_ok_and(|signal| {
-                    signal.mode == rns_wire::link_signalling::DEFAULT_LINK_MODE
-                        && signal.mtu.get() <= 500
-                })
+                .is_ok_and(|signal| signal.mode == rns_wire::link_signalling::DEFAULT_LINK_MODE)
         {
             return false;
         }

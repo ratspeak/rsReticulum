@@ -262,8 +262,9 @@ impl LinkEndpointDispatchToken {
     /// receipt. Other packet/binding checks happen in the actor.
     ///
     /// At most 256 packets are retained per endpoint, each limited to the
-    /// 500-byte inner wire MTU. Exhausting that FIFO terminates the endpoint
-    /// and rejects its pending tracked operations. This method consumes the
+    /// largest signallable Link MTU and then to the bound interface's capacity.
+    /// Exhausting that FIFO terminates the endpoint and rejects its pending
+    /// tracked operations. This method consumes the
     /// request even when control-queue admission fails.
     pub fn try_send(
         &self,
@@ -299,7 +300,7 @@ impl LinkEndpointDispatchToken {
         };
         // Bound bytes before admitting the private control lane, not only
         // after the actor dequeues and validates the packet.
-        if request.raw.len() > rns_wire::constants::MTU {
+        if request.raw.len() > rns_wire::link_signalling::MAX_SIGNALLED_LINK_MTU as usize {
             let _ = result_tx.send(LinkEndpointDispatchOutcome::Rejected(
                 LinkEndpointSendResult::InvalidPacket,
             ));

@@ -291,6 +291,7 @@ impl PreparedResourceSource {
         &mut self,
         keys: &LinkKeys,
         rtt: Duration,
+        link_sdu: usize,
     ) -> Result<Option<PreparedResourceSegment>, ResourceSourceError> {
         let encrypt = |plaintext: &[u8]| {
             rns_link::encryption::link_encrypt(keys, plaintext)
@@ -311,7 +312,7 @@ impl PreparedResourceSource {
                     data,
                     options.auto_compress,
                     options.metadata.take(),
-                    None,
+                    Some(link_sdu),
                     Some(&encrypt),
                 )?;
                 let mut resource = resource;
@@ -369,7 +370,7 @@ impl PreparedResourceSource {
                     data,
                     options.auto_compress,
                     metadata,
-                    None,
+                    Some(link_sdu),
                     Some(&encrypt),
                 )?;
                 purpose.apply(&mut resource);
@@ -442,7 +443,11 @@ mod tests {
         let mut prepared =
             PreparedResourceSource::prepare_request(Cursor::new(vec![0u8; 4096]), [7; 16]).unwrap();
         let segment = prepared
-            .next_segment(&test_keys(), Duration::from_millis(100))
+            .next_segment(
+                &test_keys(),
+                Duration::from_millis(100),
+                rns_protocol::resource::SDU,
+            )
             .unwrap()
             .unwrap();
         assert!(segment.transfer.resource.flags.compressed);
@@ -457,7 +462,11 @@ mod tests {
         )
         .unwrap();
         let segment = prepared
-            .next_segment(&test_keys(), Duration::from_millis(100))
+            .next_segment(
+                &test_keys(),
+                Duration::from_millis(100),
+                rns_protocol::resource::SDU,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(segment.total_segments, 1);
@@ -469,7 +478,11 @@ mod tests {
         );
         assert!(
             prepared
-                .next_segment(&test_keys(), Duration::from_millis(100))
+                .next_segment(
+                    &test_keys(),
+                    Duration::from_millis(100),
+                    rns_protocol::resource::SDU
+                )
                 .unwrap()
                 .is_none()
         );
@@ -483,11 +496,19 @@ mod tests {
                 .unwrap();
         let keys = test_keys();
         let first = prepared
-            .next_segment(&keys, Duration::from_millis(100))
+            .next_segment(
+                &keys,
+                Duration::from_millis(100),
+                rns_protocol::resource::SDU,
+            )
             .unwrap()
             .unwrap();
         let second = prepared
-            .next_segment(&keys, Duration::from_millis(100))
+            .next_segment(
+                &keys,
+                Duration::from_millis(100),
+                rns_protocol::resource::SDU,
+            )
             .unwrap()
             .unwrap();
 
@@ -500,7 +521,11 @@ mod tests {
         assert_eq!(first.data_size, data.len());
         assert!(
             prepared
-                .next_segment(&keys, Duration::from_millis(100))
+                .next_segment(
+                    &keys,
+                    Duration::from_millis(100),
+                    rns_protocol::resource::SDU
+                )
                 .unwrap()
                 .is_none()
         );
@@ -516,7 +541,11 @@ mod tests {
 
         for expected_segment in 1..=2 {
             let segment = prepared
-                .next_segment(&keys, Duration::from_millis(100))
+                .next_segment(
+                    &keys,
+                    Duration::from_millis(100),
+                    rns_protocol::resource::SDU,
+                )
                 .unwrap()
                 .unwrap();
             assert_eq!(segment.segment_index, expected_segment);

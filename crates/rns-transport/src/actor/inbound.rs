@@ -1289,13 +1289,28 @@ impl TransportActor {
         // attached shared-owner ingress). Exact LinkID ownership is committed
         // only after successful egress admission below.
         if self.local_destinations.contains(&header.destination_hash) {
+            let mut raw = raw.clone();
+            if let Some(ingress) = self.interfaces.get(&interface_id) {
+                match crate::link_transit::clamp_local_request(&raw[header.size()..], ingress) {
+                    Ok(None) => {}
+                    Ok(Some(payload)) => {
+                        let mut clamped = raw[..header.size()].to_vec();
+                        clamped.extend_from_slice(&payload);
+                        raw = bytes::Bytes::from(clamped);
+                    }
+                    Err(_) => {
+                        self.protocol_violation(interface_id);
+                        return;
+                    }
+                }
+            }
             if let Some(tx) = self.destination_channels.get(&header.destination_hash)
                 && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
                     interface_owner: self
                         .interfaces
                         .get(&interface_id)
                         .map(|entry| entry.owner.id()),
-                    raw: raw.clone(),
+                    raw,
                     interface_id,
                     metrics,
                 })
@@ -1652,7 +1667,6 @@ impl TransportActor {
                     rns_wire::link_signalling::parse_proof_signalling(&raw[header.size()..])
                         .is_ok_and(|signal| {
                             signal.mode == rns_wire::link_signalling::DEFAULT_LINK_MODE
-                                && signal.mtu.get() <= 500
                         });
                 if !admitted || !signal_valid {
                     return;

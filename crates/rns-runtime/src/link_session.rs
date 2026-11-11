@@ -1856,7 +1856,7 @@ async fn handle_resource_command(
                 return false;
             };
             let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
-            let segment = match source.next_segment(&keys, rtt) {
+            let segment = match source.next_segment(&keys, rtt, link.resource_sdu()) {
                 Ok(Some(segment)) => segment,
                 Ok(None) => {
                     let _ = result_tx.send(Err(LinkSessionResourceError::Failed(
@@ -2500,7 +2500,10 @@ async fn handle_outbound_resource_proof(
             .await;
     };
     let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
-    match outbound.source.next_segment(&keys, rtt) {
+    match outbound
+        .source
+        .next_segment(&keys, rtt, link.resource_sdu())
+    {
         Ok(Some(segment)) => {
             outbound.replace_segment(segment);
             match begin_outbound_resource(
@@ -2650,6 +2653,10 @@ fn inbound_transfer_from_advertisement(
             previous_eifr: previous.and_then(|(_, eifr)| eifr),
         },
     )
+    .map(|mut transfer| {
+        transfer.resource.sdu = link.resource_sdu();
+        transfer
+    })
     .map_err(|error| LinkSessionResourceError::InvalidAdvertisement(error.to_string()))
 }
 
@@ -3925,7 +3932,7 @@ async fn send_link_request(
         };
         let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
         let mut segment = source
-            .next_segment(&keys, rtt)
+            .next_segment(&keys, rtt, link.resource_sdu())
             .map_err(|error| {
                 link.fail_pending_request(&initial_request_id);
                 LinkSessionError::RequestResourceFailed(error.to_string())
@@ -4972,6 +4979,7 @@ mod tests {
             .next_segment(
                 &initiator.session_keys().unwrap(),
                 Duration::from_millis(100),
+                initiator.resource_sdu(),
             )
             .unwrap()
             .unwrap();
@@ -5942,6 +5950,15 @@ mod tests {
                 let _ = response_tx.send(TransportQueryResponse::FloatResult(None));
             }
             other => panic!("expected link cost recall, got {other:?}"),
+        }
+        match rx.recv().await.unwrap() {
+            TransportMessage::Rpc {
+                query: TransportQuery::GetNextHopHardwareMtu { .. },
+                response_tx,
+            } => {
+                let _ = response_tx.send(TransportQueryResponse::IntResult(-1));
+            }
+            other => panic!("expected next-hop MTU query, got {other:?}"),
         }
     }
 

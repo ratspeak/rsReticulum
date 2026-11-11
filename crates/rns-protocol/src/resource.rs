@@ -901,6 +901,7 @@ pub struct LazyMultiSegmentOutbound {
     request_id: Option<Vec<u8>>,
     is_response: bool,
     app_flag: bool,
+    link_sdu: Option<usize>,
     next_offset: usize,
     next_segment_index: usize,
     pub original_hash: [u8; 32],
@@ -935,7 +936,7 @@ impl MultiSegmentOutbound {
         auto_compress: bool,
         encrypt_fn: Option<&ResourceEncryptor<'_>>,
     ) -> Result<Self, ResourceError> {
-        Self::with_options(data, auto_compress, None, None, false, encrypt_fn)
+        Self::with_options(data, auto_compress, None, None, false, encrypt_fn, None)
     }
 
     /// Split a resource while preserving its request ID and response flag.
@@ -949,6 +950,7 @@ impl MultiSegmentOutbound {
         request_id: Option<Vec<u8>>,
         is_response: bool,
         encrypt_fn: Option<&ResourceEncryptor<'_>>,
+        link_sdu: Option<usize>,
     ) -> Result<Self, ResourceError> {
         let mut lazy = LazyMultiSegmentOutbound::with_options(
             data,
@@ -956,7 +958,8 @@ impl MultiSegmentOutbound {
             metadata,
             request_id,
             is_response,
-        )?;
+        )?
+        .with_link_sdu(link_sdu);
         let original_hash = lazy.original_hash;
         let total_segments = lazy.total_segments;
         let data_size = lazy.data_size;
@@ -1060,6 +1063,7 @@ impl LazyMultiSegmentOutbound {
             request_id,
             is_response,
             app_flag: false,
+            link_sdu: None,
             next_offset: 0,
             next_segment_index: 1,
             original_hash,
@@ -1071,6 +1075,12 @@ impl LazyMultiSegmentOutbound {
     /// Set the application flag carried by every segment.
     pub fn with_app_flag(mut self, app_flag: bool) -> Self {
         self.app_flag = app_flag;
+        self
+    }
+
+    /// Slice every segment into parts of the Link's resource SDU.
+    pub fn with_link_sdu(mut self, link_sdu: Option<usize>) -> Self {
+        self.link_sdu = link_sdu;
         self
     }
 
@@ -1113,7 +1123,7 @@ impl LazyMultiSegmentOutbound {
             chunk,
             self.auto_compress,
             segment_metadata,
-            None,
+            self.link_sdu,
             encrypt_fn,
         )?;
         resource.flags.split = true;
@@ -4610,6 +4620,7 @@ mod tests {
             Some(metadata.clone()),
             None,
             false,
+            None,
             None,
         )
         .unwrap();

@@ -78,9 +78,20 @@ fn packet_capacity_opaque_modes_relay_unless_a_clamp_is_needed() {
             vec![0x42; 64]
         );
     }
+    // A sub-base offer is relayed without a range check (Transport.py:2338-2361).
     for mtu in [1, 499] {
-        assert!(
-            crate::link_transit::attenuate_request(&payload(1, mtu), 1, &high, 2, &base).is_err()
+        let exact = payload(1, mtu);
+        assert_eq!(
+            crate::link_transit::attenuate_request(&exact, 1, &high, 2, &narrow)
+                .unwrap()
+                .0,
+            exact
+        );
+        assert_eq!(
+            crate::link_transit::attenuate_request(&exact, 1, &high, 2, &base)
+                .unwrap()
+                .0,
+            vec![0x42; 64]
         );
     }
 }
@@ -239,11 +250,7 @@ fn packet_capacity_authenticated_proof_obeys_request_ceiling_and_keeps_original_
             accepted_mtu_ceiling: 1000,
         },
     );
-    for signal in [
-        SignallingData::new(2, 500),
-        SignallingData::new(1, 1001),
-        SignallingData::new(1, 499),
-    ] {
+    for signal in [SignallingData::new(2, 500), SignallingData::new(1, 1001)] {
         ingress(
             &mut actor,
             2,
