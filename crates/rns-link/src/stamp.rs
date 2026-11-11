@@ -72,6 +72,9 @@ pub type LinkCostRecall = Arc<dyn Fn(&[u8; 16]) -> Option<f64> + Send + Sync>;
 #[derive(Clone)]
 pub struct LinkRequestStamper {
     pub policy: LinkStampPolicy,
+    /// Python `Reticulum.link_mtu_discovery()`: whether requests signal the
+    /// next hop's hardware MTU instead of the base MTU.
+    pub link_mtu_discovery: bool,
     recall: LinkCostRecall,
 }
 
@@ -79,13 +82,18 @@ impl std::fmt::Debug for LinkRequestStamper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LinkRequestStamper")
             .field("policy", &self.policy)
+            .field("link_mtu_discovery", &self.link_mtu_discovery)
             .finish_non_exhaustive()
     }
 }
 
 impl LinkRequestStamper {
     pub fn new(policy: LinkStampPolicy, recall: LinkCostRecall) -> Self {
-        Self { policy, recall }
+        Self {
+            policy,
+            link_mtu_discovery: true,
+            recall,
+        }
     }
 
     /// Upstream default policy with no announced costs: requests are stamped
@@ -105,21 +113,17 @@ impl LinkRequestStamper {
     }
 
     /// Create an initiator Link with a stamped request where upstream stamps
-    /// one. Blocks the calling thread while grinding, up to the policy timeout.
+    /// one, signalling `signalled_mtu` (Link.py:392-397@1.6.0). Blocks the
+    /// calling thread while grinding, up to the policy timeout.
     pub fn new_initiator(
         &self,
         destination_hash: [u8; 16],
         hops: u8,
+        signalled_mtu: u32,
     ) -> Result<(crate::link::Link, Vec<u8>), LinkStampError> {
         let cost = self.request_cost(&destination_hash);
         let ctl = self.policy.control(cost.unwrap_or(0.0));
-        crate::link::Link::new_stamped_initiator(
-            destination_hash,
-            hops,
-            cost,
-            &ctl,
-            rns_wire::constants::MTU as u32,
-        )
+        crate::link::Link::new_stamped_initiator(destination_hash, hops, cost, &ctl, signalled_mtu)
     }
 }
 
@@ -212,6 +216,18 @@ mod tests {
         assert!(link_request_stamp_value(&dest, &request).unwrap() >= 6.5);
         assert!(link_request_stamp_valid(&dest, &request[..64], 6.5));
         assert!(!link_request_stamp_valid(&dest, &request[..63], 0.0));
+    }
+
+    #[test]
+    fn stamper_initiator_signals_the_given_mtu() {
+        let stamper = LinkRequestStamper::without_recall(LinkStampPolicy::default());
+        for mtu in [500, 262_144] {
+            let (_, request) = stamper.new_initiator([0x5A; 16], 1, mtu).unwrap();
+            assert_eq!(
+                LinkRequestData::unpack(&request).unwrap().signalling.mtu,
+                mtu
+            );
+        }
     }
 
     #[test]

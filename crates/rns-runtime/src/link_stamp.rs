@@ -71,6 +71,12 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Python `Reticulum.link_mtu_discovery()`: the running instance's setting,
+/// on by default.
+pub fn link_mtu_discovery() -> bool {
+    crate::reticulum::get_instance().is_none_or(|handle| handle.link_mtu_discovery())
+}
+
 /// The MTU a new link request to `destination_hash` signals (Link.py:392-397@1.6.0):
 /// the next-hop interface's hardware MTU when discovery is on and that interface
 /// autoconfigures or fixes its MTU, otherwise the base MTU.
@@ -79,9 +85,7 @@ pub async fn signalled_link_mtu(
     destination_hash: [u8; 16],
 ) -> u32 {
     let base = rns_wire::constants::MTU as u32;
-    let discovery =
-        crate::reticulum::get_instance().is_none_or(|handle| handle.link_mtu_discovery());
-    if !discovery {
+    if !link_mtu_discovery() {
         return base;
     }
     let (response_tx, response_rx) = oneshot::channel();
@@ -159,10 +163,11 @@ pub async fn new_initiator(
 }
 
 /// A stamper for synchronous Link owners on a multi-threaded runtime: link
-/// costs are recalled from Transport by blocking in place. Elsewhere no cost
-/// is recalled and requests are stamped only under `always_stamp_lrs`.
+/// costs are recalled from Transport by blocking in place, and MTU discovery
+/// follows the running instance. Elsewhere no cost is recalled and requests
+/// are stamped only under `always_stamp_lrs`.
 pub fn blocking_stamper(transport_tx: mpsc::Sender<TransportMessage>) -> LinkRequestStamper {
-    LinkRequestStamper::new(
+    let mut stamper = LinkRequestStamper::new(
         link_stamp_policy(),
         Arc::new(move |destination_hash: &[u8; 16]| {
             let handle = tokio::runtime::Handle::try_current().ok()?;
@@ -174,5 +179,7 @@ pub fn blocking_stamper(transport_tx: mpsc::Sender<TransportMessage>) -> LinkReq
                 handle.block_on(recall_link_cost(&transport_tx, destination_hash))
             })
         }),
-    )
+    );
+    stamper.link_mtu_discovery = link_mtu_discovery();
+    stamper
 }
