@@ -2484,6 +2484,12 @@ impl ReticulumHandle {
             teardown_interface(self, id).await;
         }
         teardown_interface(self, entry.id).await;
+        // Upstream's detach is synchronous: a reload attaches straight after it.
+        let gone_by = tokio::time::Instant::now() + Duration::from_secs(5);
+        while self.running_interface(name).await.is_some() && tokio::time::Instant::now() < gone_by
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         rns_transport::notice!("Interface \"{name}\" was detached");
         Some(true)
     }
