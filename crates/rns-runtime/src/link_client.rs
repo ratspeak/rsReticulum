@@ -34,6 +34,8 @@ pub enum LinkClientError {
     TransportUnavailable,
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
+    #[error("request sent but failed: {0}")]
+    RequestFailed(RequestFailure),
     #[error("could not discover remote identity public key for destination")]
     PubkeyNotDiscovered,
     #[error("link proof validation failed: {0}")]
@@ -48,6 +50,15 @@ pub enum LinkClientError {
     UnexpectedResponse(String),
     #[error("link request stamp failed: {0}")]
     StampFailure(#[from] rns_link::stamp::LinkStampError),
+}
+
+/// Why a sent request ended without a response (`RequestReceipt.FAILED`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RequestFailure {
+    #[error("no response within the request timeout")]
+    TimedOut,
+    #[error("link closed while the request was pending")]
+    LinkClosed,
 }
 
 #[derive(Clone)]
@@ -77,7 +88,10 @@ impl LinkClient {
     /// `payload` is one encoded MessagePack value, or empty to send nil.
     ///
     /// `overall_timeout` supplies remaining budgets for discovery, Link proof and
-    /// response waits. Registration, endpoint binding, sends and teardown can
+    /// response waits. The response wait is also bounded by the request timeout
+    /// `Link.request` derives from the measured RTT; when that expires, or the
+    /// link closes with the request pending, the result is
+    /// [`LinkClientError::RequestFailed`]. Registration, endpoint binding, sends and teardown can
     /// await transport admission/replies outside that budget. Wrap the call in
     /// an outer timeout when the entire operation needs a deadline.
     pub async fn query(
@@ -203,7 +217,7 @@ impl LinkClient {
         );
         self.send_link_packet(link_id, identify_pkt).await?;
 
-        let req_timeout = Duration::from_secs(5);
+        let req_timeout = link.default_request_timeout();
         // An empty payload sends nil, as Link.request(path) does.
         let packed_data = (!payload.is_empty()).then_some(payload.as_slice());
         let (encrypted_req, request_id) = link
@@ -311,10 +325,12 @@ async fn wait_for_response(
     deadline: Duration,
     req_timeout: Duration,
 ) -> Result<Vec<u8>, LinkClientError> {
-    // The request deadline applies until a response Resource is accepted;
+    // The request timeout, capped by the overall deadline, applies until a
+    // response Resource is accepted;
     // after that the Resource watchdog ends a stalled transfer (Link.py:1475-1522).
     // Between segments no watchdog runs, so the request timeout bounds each gap.
-    let deadline_at = Instant::now() + deadline;
+    let request_bound = deadline >= req_timeout;
+    let deadline_at = Instant::now() + deadline.min(req_timeout);
     let mut segment_gap_since: Option<Instant> = None;
     let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
     // Split response: segment payloads in order, file metadata flag of segment 1.
@@ -327,7 +343,11 @@ async fn wait_for_response(
             let wait = if !receiving {
                 let remaining = deadline_at.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(LinkClientError::Timeout("response"));
+                    return Err(if request_bound {
+                        LinkClientError::RequestFailed(RequestFailure::TimedOut)
+                    } else {
+                        LinkClientError::Timeout("response")
+                    });
                 }
                 remaining.min(WATCHDOG_TICK)
             } else if let Some(since) = segment_gap_since {
@@ -344,9 +364,8 @@ async fn wait_for_response(
                     "destination channel closed".into(),
                 ))?,
                 terminal = endpoint.lifecycle_rx.recv() => {
-                    return Err(LinkClientError::HandshakeFailed(format!(
-                        "link endpoint terminated: {terminal:?}"
-                    )));
+                    tracing::debug!("link endpoint terminated: {terminal:?}");
+                    return Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed));
                 }
                 _ = tokio::time::sleep(wait) => {
                     poll_response_resources(transport_tx, link, link_id, &mut inbound_resources)
@@ -356,7 +375,7 @@ async fn wait_for_response(
             };
             match ev {
                 DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
-                    return Err(LinkClientError::HandshakeFailed("link closed".into()));
+                    return Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed));
                 }
                 DestinationEvent::InboundPacket {
                     raw,
@@ -643,9 +662,7 @@ async fn wait_for_response(
                         rns_wire::context::PacketContext::LinkClose
                             if link.receive_teardown(body) =>
                         {
-                            return Err(LinkClientError::HandshakeFailed(
-                                "link closed by remote".into(),
-                            ));
+                            return Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed));
                         }
                         _ => {}
                     }

@@ -18,7 +18,7 @@ use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
 use rns_runtime::config::Config;
 use rns_runtime::lifecycle::ShutdownSignal;
-use rns_runtime::link_client::{LinkClient, LinkClientError};
+use rns_runtime::link_client::{LinkClient, LinkClientError, RequestFailure};
 use rns_runtime::platform::resolve_config_dir;
 use rns_runtime::reticulum::{
     InitOptions, InstanceMode, ReticulumConfig, ReticulumHandle, SharedInstanceRpcEndpoint, init,
@@ -26,7 +26,7 @@ use rns_runtime::reticulum::{
 };
 use rns_runtime::rpc::{self, RpcRequest, RpcResponse};
 use rns_tools::RS_RETICULUM_VERSION;
-use rns_tools::format::pretty_hex_rep;
+use rns_tools::format::{PyNum, pretty_cost, pretty_hex_rep, prettytime, py_float_repr, py_round};
 use rns_transport::constants::PATH_REQUEST_TIMEOUT;
 use rns_transport::messages::PathRequestOptions;
 
@@ -486,7 +486,10 @@ fn blackhole_lines(
         let identity = pretty_hex_rep(&entry.identity);
         let until = match entry.until {
             Some(until) if until != 0.0 => {
-                format!("for {}", py_prettytime((until - now).max(0.0), false))
+                format!(
+                    "for {}",
+                    prettytime(PyNum::Float((until - now).max(0.0)), false)
+                )
             }
             _ => "indefinitely".to_string(),
         };
@@ -670,7 +673,7 @@ fn path_table_line(entry: &rpc::PathTableEntry, now: f64) -> String {
         entry.hops,
         pretty_hex_rep(entry.via.as_deref().unwrap_or_default()),
         entry.interface,
-        py_prettytime(entry.expires - now, true),
+        prettytime(PyNum::Float(entry.expires - now), true),
         cost_suffix(entry.value, entry.lr_cost)
     )
 }
@@ -683,14 +686,6 @@ fn sort_by_usage(entries: &mut [rpc::PathTableEntry]) {
 /// The `(dv:<value>/lc:<lr_cost>)` tail of an rnpath 1.6.0 table line (rnpath.py:302).
 fn cost_suffix(value: Option<f64>, lr_cost: Option<f64>) -> String {
     format!("(dv:{}/lc:{})", pretty_cost(value), pretty_cost(lr_cost))
-}
-
-/// `RNS.prettycost`: the quantized cost to three decimals, `n` when absent.
-fn pretty_cost(value: Option<f64>) -> String {
-    match value.map(rns_identity::stamps::quantize_cost) {
-        Some(Ok(cost)) => format!("{cost:.3}"),
-        _ => "n".to_string(),
-    }
 }
 
 /// `json.dumps` of the path table rows with bytes as hex (rnpath.py:276-282).
@@ -1165,7 +1160,7 @@ async fn remote_query(
     print!("{OUTPUT_RST}Sending request... ");
     flush();
     let client = LinkClient::new(handle.transport_tx.clone(), identity);
-    client
+    match client
         .query(
             transport_hash,
             app,
@@ -1175,14 +1170,18 @@ async fn remote_query(
             REMOTE_LINK_TIMEOUT,
         )
         .await
-        .map_err(|e| {
+    {
+        // A timed-out receipt has no response; callers report it as a failed request.
+        Err(LinkClientError::RequestFailed(RequestFailure::TimedOut)) => Ok(Vec::new()),
+        result => result.map_err(|e| {
             print!("{OUTPUT_RST}");
             match e {
                 LinkClientError::Timeout(_) => println!("The link timed out, exiting now"),
                 _ => println!("Link closed unexpectedly, exiting now"),
             }
             ExitCode::from(10)
-        })
+        }),
+    }
 }
 
 /// rnpath.py:146-206: `-p` fetches `/list` from the transport whose identity
@@ -1366,53 +1365,6 @@ fn remote_request_failed() -> ExitCode {
     ExitCode::from(10)
 }
 
-/// `RNS.prettytime` (RNS/__init__.py:239-290), not verbose.
-fn py_prettytime(time: f64, compact: bool) -> String {
-    let neg = time < 0.0;
-    let mut time = time.abs();
-    let days = (time / 86400.0).floor();
-    time %= 86400.0;
-    let hours = (time / 3600.0).floor();
-    time %= 3600.0;
-    let minutes = (time / 60.0).floor();
-    time %= 60.0;
-    let seconds = if compact {
-        time.trunc()
-    } else {
-        py_round(time, 2)
-    };
-
-    let mut components = Vec::new();
-    for (value, unit) in [(days, "d"), (hours, "h"), (minutes, "m")] {
-        if value > 0.0 && (!compact || components.len() < 2) {
-            components.push(format!("{}{unit}", value as i64));
-        }
-    }
-    if seconds > 0.0 && (!compact || components.len() < 2) {
-        let seconds = if compact {
-            format!("{}", seconds as i64)
-        } else {
-            py_float_repr(seconds)
-        };
-        components.push(format!("{seconds}s"));
-    }
-    let mut out = String::new();
-    let count = components.len();
-    for (i, c) in components.iter().enumerate() {
-        if i > 0 {
-            out.push_str(if i + 1 < count { ", " } else { " and " });
-        }
-        out.push_str(c);
-    }
-    if out.is_empty() {
-        "0s".to_string()
-    } else if neg {
-        format!("-{out}")
-    } else {
-        out
-    }
-}
-
 /// rnpath.py:542-561 for an integer timestamp, from `datetime` differences.
 fn pretty_date(time: f64, now: f64) -> String {
     let diff = now - time;
@@ -1446,38 +1398,6 @@ fn pretty_date(time: f64, now: f64) -> String {
         return format!("{} months", day_diff / 30);
     }
     format!("{} years", day_diff / 365)
-}
-
-/// Python `round(x, n)` for a float.
-fn py_round(value: f64, digits: usize) -> f64 {
-    format!("{value:.digits$}").parse().unwrap_or(value)
-}
-
-/// Python `repr(float)`: shortest round-trip digits, scientific notation
-/// outside `1e-4 <= |x| < 1e16`.
-fn py_float_repr(value: f64) -> String {
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value > 0.0 { "inf" } else { "-inf" }.to_string();
-    }
-    let sci = format!("{value:e}");
-    let (mantissa, exponent) = sci
-        .split_once('e')
-        .expect("scientific format has an exponent");
-    let exponent: i32 = exponent.parse().expect("integer exponent");
-    if value == 0.0 || (-4..16).contains(&exponent) {
-        let fixed = format!("{value}");
-        if fixed.contains('.') {
-            fixed
-        } else {
-            format!("{fixed}.0")
-        }
-    } else {
-        let sign = if exponent < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exponent.abs())
-    }
 }
 
 /// A `json.dumps` string with the default `ensure_ascii`.
@@ -1524,11 +1444,19 @@ mod tests {
     fn formatting_matches_upstream_helpers() {
         for case in cases("prettytime_compact") {
             let t = case[0].as_f64().unwrap();
-            assert_eq!(py_prettytime(t, true), case[1].as_str().unwrap(), "{t}");
+            assert_eq!(
+                prettytime(PyNum::Float(t), true),
+                case[1].as_str().unwrap(),
+                "{t}"
+            );
         }
         for case in cases("prettytime") {
             let t = case[0].as_f64().unwrap();
-            assert_eq!(py_prettytime(t, false), case[1].as_str().unwrap(), "{t}");
+            assert_eq!(
+                prettytime(PyNum::Float(t), false),
+                case[1].as_str().unwrap(),
+                "{t}"
+            );
         }
         let now = fixture()["pretty_date_now"].as_f64().unwrap();
         for case in cases("pretty_date") {

@@ -16,7 +16,7 @@ use rns_identity::destination::{
 };
 use rns_runtime::reticulum::{InstanceMode, ReticulumHandle};
 use rns_tools::RS_RETICULUM_VERSION;
-use rns_tools::format::pretty_hex_rep;
+use rns_tools::format::{pretty_hex_rep, py_float_repr, py_round};
 use rns_transport::link_messages::{DestinationEvent, PacketMetrics};
 use rns_transport::messages::{
     OutboundRequest, PathRequestOptions, TransportMessage, TransportQuery, TransportQueryResponse,
@@ -650,38 +650,6 @@ fn passed(deadline: Option<Instant>) -> bool {
 
 fn flush() {
     let _ = std::io::stdout().flush();
-}
-
-/// Python `round(x, n)` for a float.
-fn py_round(value: f64, digits: usize) -> f64 {
-    format!("{value:.digits$}").parse().unwrap_or(value)
-}
-
-/// Python `repr(float)`: shortest round-trip digits, scientific notation
-/// outside `1e-4 <= |x| < 1e16`.
-fn py_float_repr(value: f64) -> String {
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value > 0.0 { "inf" } else { "-inf" }.to_string();
-    }
-    let sci = format!("{value:e}");
-    let (mantissa, exponent) = sci
-        .split_once('e')
-        .expect("scientific format has an exponent");
-    let exponent: i32 = exponent.parse().expect("integer exponent");
-    if value == 0.0 || (-4..16).contains(&exponent) {
-        let fixed = format!("{value}");
-        if fixed.contains('.') {
-            fixed
-        } else {
-            format!("{fixed}.0")
-        }
-    } else {
-        let sign = if exponent < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exponent.abs())
-    }
 }
 
 struct JsonOk<'a> {
