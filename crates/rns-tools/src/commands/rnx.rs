@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -517,7 +517,6 @@ impl Client<'_> {
             ..LinkConnectOptions::default()
         };
         let msg = format!("Establishing link with <{}>", hex::encode(hash));
-        let started = Instant::now();
         let connected = spin(
             &msg,
             handle.connect_link(hash, self.identity.clone(), options),
@@ -525,7 +524,7 @@ impl Client<'_> {
         .await;
         match connected {
             Ok(mut session) => {
-                let rtt = started.elapsed().as_secs_f64();
+                let rtt = session.handle.rtt();
                 let events = std::mem::replace(&mut session.events, mpsc::channel(1).1);
                 tokio::spawn(drain(events));
                 Some((session, rtt))
@@ -570,25 +569,32 @@ impl Client<'_> {
             }
         }
         let (session, rtt) = self.session.as_ref().expect("connected above");
+        let (link, rtt) = (session.handle.clone(), *rtt);
         let data = rns_tools::rnx::request_value(command, timeout, args.stdout, args.stderr, stdin);
         let request_size = packed_request_size(&data);
         let rexec_timeout = timeout.seconds() + rtt * 4.0 + REMOTE_EXEC_GRACE;
-        let request = session.handle.request_with_options(
+        let (progress_tx, mut progress_rx) = tokio::sync::watch::channel(0.0);
+        let request = link.request_with_options(
             COMMAND_PATH,
             data,
             RequestOptions {
                 timeout: Some(secs(rexec_timeout)),
+                progress: Some(progress_tx),
                 ..RequestOptions::default()
             },
         );
+        tokio::pin!(request);
+        // `-W` bounds only the result transfer; when it passes, the receipt
+        // still holds no response (rnx.py:425-430, 443, 527-532).
         let result = match args.result_timeout {
-            Some(w) => tokio::time::timeout(secs(rexec_timeout + w), request)
-                .await
-                .ok(),
+            Some(w) => tokio::select! {
+                r = &mut request => Some(r),
+                _ = progress_rx.changed() => tokio::time::timeout(secs(w), &mut request).await.ok(),
+            },
             None => Some(request.await),
         };
         let response = match result {
-            None => return fail("Receiving result failed", 246),
+            None => return fail("No response", 249),
             Some(Ok(response)) => response,
             Some(Err(LinkSessionError::SessionClosed | LinkSessionError::LinkNotActive)) => {
                 self.session = None;

@@ -21,10 +21,14 @@ use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
 use rns_runtime::lifecycle::ShutdownSignal;
 use rns_runtime::link_client::{LinkClient, LinkClientError, RequestFailure};
+use rns_runtime::link_session::{
+    LinkSession, LinkSessionCloseReason, LinkSessionError, LinkSessionEvent, RequestOptions,
+};
 use rns_runtime::platform::{StoragePaths, resolve_config_dir};
+use rns_runtime::prelude::CloseReason;
 use rns_runtime::reticulum::{
-    InitOptions, InstanceMode, ReticulumConfig, ReticulumHandle, SharedInstanceRpcEndpoint,
-    init_with_options,
+    InitOptions, InstanceMode, LinkConnectError, LinkConnectOptions, ReticulumConfig,
+    ReticulumHandle, SharedInstanceRpcEndpoint, init_with_options,
 };
 use rns_runtime::rpc::{self, ManageOperation, RpcRequest};
 use rns_tools::RS_RETICULUM_VERSION;
@@ -324,6 +328,21 @@ struct Session {
     handle: ReticulumHandle,
     rpc_key: Vec<u8>,
     first_remote_request: std::sync::atomic::AtomicBool,
+    /// Monitor mode's remote link, reused while it stays up (rnstatus.py:139-146).
+    remote_link: tokio::sync::Mutex<Option<RemoteLink>>,
+}
+
+struct RemoteLink {
+    session: LinkSession,
+    closed: tokio::sync::watch::Receiver<Option<LinkSessionCloseReason>>,
+}
+
+/// How a remote `/status` query ended without a response.
+enum RemoteFailure {
+    /// The request failed; carries the link-closed line printed before it.
+    Unanswered(Option<&'static str>),
+    LinkTimeout,
+    LinkLost,
 }
 
 impl Session {
@@ -353,10 +372,14 @@ impl Session {
             handle,
             rpc_key,
             first_remote_request: AtomicBool::new(true),
+            remote_link: tokio::sync::Mutex::new(None),
         })
     }
 
     async fn close(self) {
+        if let Some(link) = self.remote_link.lock().await.take() {
+            link.session.handle.close().await;
+        }
         rns_tools::shut_down(&self.handle).await;
     }
 
@@ -612,32 +635,22 @@ impl Session {
         } else {
             Value::Array(vec![Value::Boolean(args.link_stats)])
         };
-        let mut payload = Vec::new();
-        let _ = rmpv::encode::write_value(&mut payload, &request);
-        let client = LinkClient::new(self.handle.transport_tx.clone(), identity);
-        let answer = client
-            .query(
-                identity_hash,
-                MGMT_APP,
-                "/status",
-                payload,
-                REMOTE_HOPS,
-                REMOTE_LINK_TIMEOUT,
-            )
-            .await;
+        let answer = if args.monitor {
+            self.monitor_query(identity_hash, identity, request).await
+        } else {
+            one_shot_query(&self.handle, identity_hash, identity, &request).await
+        };
         let bytes = match answer {
             Ok(bytes) => bytes,
             // No response to the identified request, or the link closed while
             // it was pending. Upstream's link-closed callback prints its line but
             // its exit() runs off the main thread, so the request failure follows.
-            Err(e) if request_went_unanswered(&e) => {
+            Err(RemoteFailure::Unanswered(closed_text)) => {
                 if !no_output {
                     if first {
                         outp!(out, "{CLR}Sending request... ");
                     }
-                    if let LinkClientError::RequestFailed(RequestFailure::LinkClosed(reason)) = &e
-                        && let Some(text) = link_closed_text(*reason)
-                    {
+                    if let Some(text) = closed_text {
                         outp!(out, "{CLR}");
                         outln!(out, "{text}");
                     }
@@ -649,15 +662,14 @@ impl Session {
                 }
                 return Ok(None);
             }
-            Err(LinkClientError::Timeout(_)) => {
+            Err(RemoteFailure::LinkTimeout) => {
                 if !no_output {
                     outp!(out, "{CLR}");
                     outln!(out, "The link timed out, exiting now");
                 }
                 return Err(10);
             }
-            Err(e) => {
-                tracing::debug!("remote status query failed: {e}");
+            Err(RemoteFailure::LinkLost) => {
                 if !no_output {
                     outp!(out, "{CLR}");
                     outln!(out, "Link closed unexpectedly, exiting now");
@@ -745,20 +757,131 @@ impl Session {
     }
 }
 
-fn request_went_unanswered(error: &LinkClientError) -> bool {
-    matches!(error, LinkClientError::RequestFailed(_))
+/// One `/status` request on a fresh link, torn down afterwards.
+async fn one_shot_query(
+    handle: &ReticulumHandle,
+    identity_hash: [u8; 16],
+    identity: Identity,
+    request: &Value,
+) -> Result<Vec<u8>, RemoteFailure> {
+    let mut payload = Vec::new();
+    let _ = rmpv::encode::write_value(&mut payload, request);
+    let client = LinkClient::new(handle.transport_tx.clone(), identity);
+    client
+        .query(
+            identity_hash,
+            MGMT_APP,
+            "/status",
+            payload,
+            REMOTE_HOPS,
+            REMOTE_LINK_TIMEOUT,
+        )
+        .await
+        .map_err(|e| match e {
+            LinkClientError::RequestFailed(RequestFailure::LinkClosed(reason)) => {
+                RemoteFailure::Unanswered(rns_tools::link_closed_text(reason))
+            }
+            LinkClientError::RequestFailed(RequestFailure::TimedOut) => {
+                RemoteFailure::Unanswered(None)
+            }
+            LinkClientError::Timeout(_) => RemoteFailure::LinkTimeout,
+            e => {
+                tracing::debug!("remote status query failed: {e}");
+                RemoteFailure::LinkLost
+            }
+        })
 }
 
-/// rnstatus.py:87-100: the line for each `teardown_reason`, none for a local close.
-fn link_closed_text(reason: Option<rns_runtime::prelude::CloseReason>) -> Option<&'static str> {
-    use rns_runtime::prelude::CloseReason;
-    match reason {
-        Some(CloseReason::InitiatorClosed) => None,
-        Some(CloseReason::Timeout) => Some("The link timed out, exiting now"),
-        Some(CloseReason::DestinationClosed) => {
-            Some("The link was closed by the server, exiting now")
+impl Session {
+    /// Monitor mode: request on the remote link while it is active, else open
+    /// a new one (rnstatus.py:139-146).
+    async fn monitor_query(
+        &self,
+        identity_hash: [u8; 16],
+        identity: Identity,
+        request: Value,
+    ) -> Result<Vec<u8>, RemoteFailure> {
+        let mut cached = self.remote_link.lock().await;
+        if cached
+            .as_ref()
+            .is_some_and(|link| link.closed.borrow().is_some())
+        {
+            *cached = None;
         }
-        _ => Some("Link closed unexpectedly, exiting now"),
+        if cached.is_none() {
+            *cached = Some(self.open_remote_link(identity_hash, identity).await?);
+        }
+        let link = cached.as_mut().expect("opened above");
+        let result = link
+            .session
+            .handle
+            .request_with_options("/status", request, RequestOptions::default())
+            .await;
+        match result {
+            Ok(response) => {
+                let mut bytes = Vec::new();
+                let _ = rmpv::encode::write_value(&mut bytes, &response.value);
+                Ok(bytes)
+            }
+            Err(LinkSessionError::Timeout(_)) => Err(RemoteFailure::Unanswered(None)),
+            Err(_) => {
+                // The session reports its close reason just after failing the request.
+                let mut closed = link.closed.clone();
+                let reason =
+                    tokio::time::timeout(Duration::from_secs(1), closed.wait_for(Option::is_some))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok().and_then(|reason| *reason));
+                *cached = None;
+                let reason = match reason {
+                    Some(LinkSessionCloseReason::Local) => Some(CloseReason::InitiatorClosed),
+                    Some(LinkSessionCloseReason::Remote) => Some(CloseReason::DestinationClosed),
+                    Some(LinkSessionCloseReason::Timeout) => Some(CloseReason::Timeout),
+                    _ => None,
+                };
+                Err(RemoteFailure::Unanswered(rns_tools::link_closed_text(
+                    reason,
+                )))
+            }
+        }
+    }
+
+    async fn open_remote_link(
+        &self,
+        identity_hash: [u8; 16],
+        identity: Identity,
+    ) -> Result<RemoteLink, RemoteFailure> {
+        let destination = Destination::hash_from_name_and_identity(MGMT_APP, Some(&identity_hash));
+        let options = LinkConnectOptions {
+            client_label: "rnstatus".to_string(),
+            identify: true,
+            ..LinkConnectOptions::default()
+        };
+        let connected = tokio::time::timeout(
+            REMOTE_LINK_TIMEOUT,
+            self.handle.connect_link(destination, identity, options),
+        )
+        .await;
+        let mut session = match connected {
+            Ok(Ok(session)) => session,
+            Err(_) | Ok(Err(LinkConnectError::Session(LinkSessionError::Timeout(_)))) => {
+                return Err(RemoteFailure::LinkTimeout);
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("remote link failed: {e}");
+                return Err(RemoteFailure::LinkLost);
+            }
+        };
+        let (closed_tx, closed) = tokio::sync::watch::channel(None);
+        let mut events = std::mem::replace(&mut session.events, tokio::sync::mpsc::channel(1).1);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if let LinkSessionEvent::Closed { reason } = event {
+                    closed_tx.send_replace(Some(reason));
+                }
+            }
+        });
+        Ok(RemoteLink { session, closed })
     }
 }
 

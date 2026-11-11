@@ -42,7 +42,8 @@ use rns_runtime::platform::StoragePaths;
 use rns_runtime::reticulum::ReticulumHandle;
 use rns_runtime::rncp::{
     DEFAULT_RNCP_APP_NAME, RncpError, RncpEvent, RncpFetchRequest, RncpListenerConfig,
-    RncpSendRequest, default_rncp_app_name, rncp_fetch_file, rncp_send_file, spawn_rncp_listener,
+    RncpProgress, RncpSendRequest, default_rncp_app_name, rncp_fetch_file, rncp_send_file,
+    spawn_rncp_listener,
 };
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
@@ -291,28 +292,36 @@ struct UiState {
     total_size: Option<f64>,
     started: Option<Instant>,
     progress: f64,
-    stats: VecDeque<(Instant, f64)>,
+    stats: VecDeque<(Instant, f64, f64)>,
     speed: f64,
+    /// `-P`: append the physical-layer rate to the progress line.
+    phy_rates: bool,
+    phy_speed: f64,
 }
 
 impl UiState {
     /// rncp.py:323-356 (`sender_progress`): speed over the last 32 updates.
-    fn update(&mut self, progress: f64) {
+    fn update(&mut self, progress: f64, phy_got: f64) {
         let now = Instant::now();
         self.started.get_or_insert(now);
         self.progress = progress;
         let got = progress * self.total_size.unwrap_or(0.0);
-        self.stats.push_back((now, got));
+        self.stats.push_back((now, got, phy_got));
         while self.stats.len() > 32 {
             self.stats.pop_front();
         }
-        let (first_at, first_got) = self.stats[0];
+        let (first_at, first_got, first_phy) = self.stats[0];
         let span = now.duration_since(first_at).as_secs_f64();
-        self.speed = if span == 0.0 {
-            0.0
+        if span == 0.0 {
+            self.speed = 0.0;
+            self.phy_speed = 0.0;
         } else {
-            (got - first_got) / span
-        };
+            self.speed = (got - first_got) / span;
+            // Segment progress restarts per segment, so only a gain moves the rate.
+            if phy_got - first_phy > 0.0 {
+                self.phy_speed = (phy_got - first_phy) / span;
+            }
+        }
     }
 
     fn stat_str(&self, elapsed: Option<f64>) -> String {
@@ -323,9 +332,18 @@ impl UiState {
         let cs = size_str((self.progress * total).trunc(), 'B');
         let ts = size_str(total, 'B');
         let ss = size_str(self.speed, 'b');
+        // rncp.py:577-579, 753-755.
+        let phy_str = if self.phy_rates {
+            format!(" ({}ps at physical layer)", size_str(self.phy_speed, 'b'))
+        } else {
+            String::new()
+        };
         match elapsed {
-            Some(dt) => format!("{percent}% - {cs} of {ts} in {} - {ss}ps", prettytime(dt)),
-            None => format!("{percent}% - {cs} of {ts} - {ss}ps"),
+            Some(dt) => format!(
+                "{percent}% - {cs} of {ts} in {} - {ss}ps{phy_str}",
+                prettytime(dt)
+            ),
+            None => format!("{percent}% - {cs} of {ts} - {ss}ps{phy_str}"),
         }
     }
 }
@@ -352,6 +370,8 @@ impl Ui {
                 progress: 0.0,
                 stats: VecDeque::new(),
                 speed: 0.0,
+                phy_rates: false,
+                phy_speed: 0.0,
             })),
         };
         if !silent {
@@ -425,8 +445,13 @@ impl Ui {
         self.lock().total_size = Some(total);
     }
 
-    fn progress(&self, progress: f32) {
-        self.lock().update(f64::from(progress));
+    fn progress(&self, update: RncpProgress) {
+        self.lock()
+            .update(f64::from(update.progress), update.phy_bytes);
+    }
+
+    fn show_phy_rates(&self, on: bool) {
+        self.lock().phy_rates = on;
     }
 }
 
@@ -446,11 +471,6 @@ pub(crate) async fn main() {
         true,
         std::io::stderr,
     );
-    if args.phy_rates {
-        tracing::debug!(
-            "Physical layer rates are not available, -P adds nothing to the progress line"
-        );
-    }
 
     // rncp.py:824-880.
     let positionals = args.file.is_some() && args.destination.is_some();
@@ -564,6 +584,7 @@ async fn run_fetch(args: Args) -> ! {
         prepare_identity(&handle, args.identity_path.as_deref(), &paths.identity_dir).await;
 
     let ui = Ui::new(args.silent, true);
+    ui.show_phy_rates(args.phy_rates);
     let h = pretty_hex_rep(&dest_hash);
     let link_wait = wait_for_path(&handle, dest_hash, args.timeout, &ui, &interrupt, "  ").await;
 
@@ -584,7 +605,7 @@ async fn run_fetch(args: Args) -> ! {
         }
     };
 
-    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f32>(32);
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<RncpProgress>(32);
     let progress_task = {
         let ui = ui.clone();
         let show_requesting = show_requesting.clone();
@@ -746,6 +767,7 @@ async fn run_send(args: Args) -> ! {
         prepare_identity(&handle, args.identity_path.as_deref(), &paths.identity_dir).await;
 
     let ui = Ui::new(args.silent, false);
+    ui.show_phy_rates(args.phy_rates);
     let h = pretty_hex_rep(&dest_hash);
     let link_wait = wait_for_path(&handle, dest_hash, args.timeout, &ui, &interrupt, " ").await;
 
@@ -778,7 +800,7 @@ async fn run_send(args: Args) -> ! {
             }
         }
     };
-    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f32>(32);
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<RncpProgress>(32);
     let progress_task = {
         let ui = ui.clone();
         let show_transferring = show_transferring.clone();
@@ -824,6 +846,8 @@ async fn run_send(args: Args) -> ! {
                 let mut st = ui.lock();
                 st.tick = Tick::Off;
                 st.progress = 1.0;
+                // The send's final line drops the physical rate once the resource is done (rncp.py:753).
+                st.phy_rates = false;
                 let total = st.total_size.unwrap_or(0.0);
                 let dt = st.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
                 st.speed = if dt > 0.0 { total / dt } else { 0.0 };

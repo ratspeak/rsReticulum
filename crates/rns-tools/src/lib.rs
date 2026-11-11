@@ -188,6 +188,20 @@ where
     };
 }
 
+/// The line rnstatus and rnpath print for a remote link's `teardown_reason`,
+/// none for a local close (rnstatus.py:87-100, rnpath.py:62-76).
+pub fn link_closed_text(reason: Option<rns_runtime::prelude::CloseReason>) -> Option<&'static str> {
+    use rns_runtime::prelude::CloseReason;
+    match reason {
+        Some(CloseReason::InitiatorClosed) => None,
+        Some(CloseReason::Timeout) => Some("The link timed out, exiting now"),
+        Some(CloseReason::DestinationClosed) => {
+            Some("The link was closed by the server, exiting now")
+        }
+        _ => Some("Link closed unexpectedly, exiting now"),
+    }
+}
+
 /// Longest a tool waits for its runtime to shut down before exiting.
 const EXIT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 

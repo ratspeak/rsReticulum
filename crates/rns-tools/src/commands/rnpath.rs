@@ -1176,16 +1176,7 @@ async fn remote_query(
         // Upstream's link-closed callback prints, but its exit() runs off the
         // main thread, so the pending request still fails (rnpath.py:61-76).
         Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed(reason))) => {
-            use rns_runtime::prelude::CloseReason;
-            let text = match reason {
-                Some(CloseReason::InitiatorClosed) => None,
-                Some(CloseReason::Timeout) => Some("The link timed out, exiting now"),
-                Some(CloseReason::DestinationClosed) => {
-                    Some("The link was closed by the server, exiting now")
-                }
-                _ => Some("Link closed unexpectedly, exiting now"),
-            };
-            if let Some(text) = text {
+            if let Some(text) = rns_tools::link_closed_text(reason) {
                 println!("{OUTPUT_RST}{text}");
             }
             Ok(Vec::new())

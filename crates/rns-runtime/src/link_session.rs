@@ -1003,6 +1003,7 @@ impl LinkSessionChannelHandle {
 pub struct LinkSessionHandle {
     link_id: [u8; 16],
     mdu: usize,
+    rtt: f64,
     command_tx: mpsc::Sender<LinkSessionCommand>,
     phy_stats_rx: watch::Receiver<LinkPhyStats>,
 }
@@ -1014,6 +1015,11 @@ impl LinkSessionHandle {
 
     pub fn mdu(&self) -> usize {
         self.mdu
+    }
+
+    /// Round-trip time in seconds measured when the link proof arrived.
+    pub fn rtt(&self) -> f64 {
+        self.rtt
     }
 
     /// Latest physical-layer measurements observed for this Link.
@@ -1337,6 +1343,7 @@ impl LinkSession {
         let handle = LinkSessionHandle {
             link_id,
             mdu: link.mdu,
+            rtt: link.rtt_secs(),
             command_tx: command_tx.clone(),
             phy_stats_rx,
         };
@@ -5830,6 +5837,7 @@ mod tests {
         let handle = LinkSessionHandle {
             link_id,
             mdu,
+            rtt: 0.0,
             command_tx: command_tx.clone(),
             phy_stats_rx,
         };

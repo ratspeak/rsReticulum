@@ -130,9 +130,18 @@ pub struct RncpSendRequest<'a> {
     /// ends at the later of this and the link establishment timeout; the
     /// transfer itself has no deadline.
     pub path_timeout: Duration,
-    pub progress_tx: Option<mpsc::Sender<f32>>,
+    pub progress_tx: Option<mpsc::Sender<RncpProgress>>,
     /// Stops the transfer and closes the link, as rncp does on SIGINT.
     pub shutdown: Option<ShutdownSignal>,
+}
+
+/// One transfer progress update: the logical fraction, and the bytes of the
+/// current segment moved on the link, `get_segment_progress() *
+/// get_transfer_size()` as rncp's `-P` rate reads them (rncp.py:330-331).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RncpProgress {
+    pub progress: f32,
+    pub phy_bytes: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -765,7 +774,7 @@ async fn send_segments(
     transport_tx: &mpsc::Sender<TransportMessage>,
     rl: &mut RncpLink,
     mut prepared: PreparedResourceSource,
-    progress_tx: Option<mpsc::Sender<f32>>,
+    progress_tx: Option<mpsc::Sender<RncpProgress>>,
 ) -> Result<usize, RncpError> {
     let keys = rl
         .link
@@ -1060,7 +1069,7 @@ struct OutboundDrive<'a> {
     endpoint_lifecycle_rx: &'a mut mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     attached_interface: InterfaceId,
     interface_owner: Option<rns_transport::messages::InterfaceOwnerId>,
-    progress_tx: Option<mpsc::Sender<f32>>,
+    progress_tx: Option<mpsc::Sender<RncpProgress>>,
     progress_base: f32,
     progress_span: f32,
 }
@@ -1083,10 +1092,13 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
     transfer.advertisement_mdu = link.mdu;
     let total = transfer.resource.parts.len();
     if let Some(ref tx) = progress_tx {
-        let _ = tx.try_send(if total == 0 {
-            progress_base + progress_span
-        } else {
-            progress_base
+        let _ = tx.try_send(RncpProgress {
+            progress: if total == 0 {
+                progress_base + progress_span
+            } else {
+                progress_base
+            },
+            phy_bytes: 0.0,
         });
     }
 
@@ -1159,7 +1171,10 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
                     } else {
                         confirmed_count as f32 / total as f32
                     };
-                    let _ = tx.try_send(progress_base + (progress_span * frac));
+                    let _ = tx.try_send(RncpProgress {
+                        progress: progress_base + (progress_span * frac),
+                        phy_bytes: transfer.progress() * transfer.resource.total_size as f64,
+                    });
                 }
             }
             rns_wire::context::PacketContext::ResourcePrf => {
@@ -1171,7 +1186,10 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
                     return Err(RncpError::ResourceFailed("proof mismatch".into()));
                 }
                 if let Some(ref tx) = progress_tx {
-                    let _ = tx.try_send(progress_base + progress_span);
+                    let _ = tx.try_send(RncpProgress {
+                        progress: progress_base + progress_span,
+                        phy_bytes: transfer.resource.total_size as f64,
+                    });
                 }
                 return Ok(());
             }
@@ -1457,7 +1475,7 @@ pub struct RncpFetchRequest<'a> {
     /// ends at the later of this and the link establishment timeout; the
     /// request uses the Link's default timeout and the transfer has no deadline.
     pub path_timeout: Duration,
-    pub progress_tx: Option<mpsc::Sender<f32>>,
+    pub progress_tx: Option<mpsc::Sender<RncpProgress>>,
     /// Stops the fetch and closes the link, as rncp does on SIGINT.
     pub shutdown: Option<ShutdownSignal>,
 }
@@ -1535,6 +1553,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
 
     let link_rtt = link.rtt.unwrap_or(Duration::from_millis(500));
     let mut ack_seen = false;
+    let mut last_phy_bytes = 0.0_f64;
     let mut transfers: std::collections::HashMap<[u8; 32], InboundTransfer> =
         std::collections::HashMap::new();
     let mut split_resources: std::collections::HashMap<[u8; 32], MultiSegmentInbound> =
@@ -1721,8 +1740,12 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                     let mut completed_rh = None;
                     for (rh, t) in &mut transfers {
                         let action = t.receive_part(body.to_vec());
+                        last_phy_bytes = t.resource.progress() * t.resource.total_size as f64;
                         if let Some(ref tx) = progress_tx {
-                            let _ = tx.try_send(t.resource.progress() as f32);
+                            let _ = tx.try_send(RncpProgress {
+                                progress: t.resource.progress() as f32,
+                                phy_bytes: last_phy_bytes,
+                            });
                         }
                         match action {
                             TransferAction::SendHmu(_) | TransferAction::SendRequest(_) => {
@@ -1807,7 +1830,10 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                             }
                             if !coord.is_complete() {
                                 if let Some(ref tx) = progress_tx {
-                                    let _ = tx.try_send(coord.progress() as f32);
+                                    let _ = tx.try_send(RncpProgress {
+                                        progress: coord.progress() as f32,
+                                        phy_bytes: last_phy_bytes,
+                                    });
                                 }
                                 continue;
                             }
@@ -1828,7 +1854,10 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                             };
                             split_resources.remove(&original_hash);
                             if let Some(ref tx) = progress_tx {
-                                let _ = tx.try_send(1.0);
+                                let _ = tx.try_send(RncpProgress {
+                                    progress: 1.0,
+                                    phy_bytes: last_phy_bytes,
+                                });
                             }
                             break Ok((file_name, payload));
                         }
@@ -1837,7 +1866,10 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                             break Err(RncpError::ResourceFailed("invalid data received".into()));
                         };
                         if let Some(ref tx) = progress_tx {
-                            let _ = tx.try_send(1.0);
+                            let _ = tx.try_send(RncpProgress {
+                                progress: 1.0,
+                                phy_bytes: last_phy_bytes,
+                            });
                         }
                         break Ok((file_name, payload));
                     }
