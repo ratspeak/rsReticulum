@@ -378,7 +378,7 @@ pub(crate) async fn spawn_authenticated_client(
                 repeat: false,
             },
             bitrate: 1_000_000_000,
-            mtu: rns_interface::traits::optimise_mtu(1_000_000_000).unwrap_or(262_144),
+            mtu: 262_144,
             online,
             rxb: Some(rxb),
             txb: Some(txb),
