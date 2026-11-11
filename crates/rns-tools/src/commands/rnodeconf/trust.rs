@@ -152,7 +152,7 @@ pub fn signing_key_path(root: &Path) -> PathBuf {
 }
 
 pub fn device_key_path(root: &Path) -> PathBuf {
-    root.join(DEVICE_KEY_FILENAME)
+    root.join("firmware").join(DEVICE_KEY_FILENAME)
 }
 
 pub fn load_device_identity(path: &Path) -> Result<Identity, String> {
@@ -183,6 +183,19 @@ mod tests {
         assert_eq!(
             trusted_key_filename(der),
             format!("{}.pubkey", hex::encode(rns_crypto::sha::sha256(der)))
+        );
+    }
+
+    #[test]
+    fn signing_keys_live_in_the_firmware_dir() {
+        let root = Path::new("/home/u/.config/rnodeconf");
+        assert_eq!(
+            signing_key_path(root),
+            root.join("firmware").join("signing.key")
+        );
+        assert_eq!(
+            device_key_path(root),
+            root.join("firmware").join("device.key")
         );
     }
 

@@ -112,6 +112,8 @@ fn plan_nrf52(fw_filename: &str, ctx: &FlashContext) -> FlashPlan {
 }
 
 fn plan_esp32(fw_filename: &str, ctx: &FlashContext) -> Option<FlashPlan> {
+    // Upstream parses the version before choosing a board and fails on a non-number.
+    let version = ctx.selected_version.parse::<f64>().ok()?;
     if fw_filename == "extracted_rnode_firmware.zip" {
         return Some(FlashPlan {
             program: ctx.python.clone(),
@@ -153,7 +155,11 @@ fn plan_esp32(fw_filename: &str, ctx: &FlashContext) -> Option<FlashPlan> {
 
     let spec = esp32_spec(fw_filename)?;
     let version_dir = ctx.update_dir.join(&ctx.selected_version);
-    let stem = fw_filename.strip_suffix(".zip")?;
+    let console = spec.console_from.is_none_or(|min| version >= min);
+    let stem = match spec.legacy_stem {
+        Some(legacy) if !console => legacy,
+        _ => fw_filename.strip_suffix(".zip")?,
+    };
     let mut images = vec![
         ("0xe000", version_dir.join(format!("{stem}.boot_app0"))),
         (
@@ -162,7 +168,7 @@ fn plan_esp32(fw_filename: &str, ctx: &FlashContext) -> Option<FlashPlan> {
         ),
         ("0x10000", version_dir.join(format!("{stem}.bin"))),
     ];
-    if spec.include_console || version_at_least(&ctx.selected_version, 1.55) {
+    if console {
         images.push(("0x210000", version_dir.join("console_image.bin")));
     }
     images.push(("0x8000", version_dir.join(format!("{stem}.partitions"))));
@@ -185,7 +191,10 @@ struct Esp32Spec {
     chip: &'static str,
     flash_size: &'static str,
     bootloader_offset: &'static str,
-    include_console: bool,
+    /// Version from which the console image is written; `None` means always.
+    console_from: Option<f64>,
+    /// Images flashed instead of the board's own below `console_from`.
+    legacy_stem: Option<&'static str>,
 }
 
 fn esp32_spec(fw_filename: &str) -> Option<Esp32Spec> {
@@ -193,7 +202,15 @@ fn esp32_spec(fw_filename: &str) -> Option<Esp32Spec> {
         chip: "esp32s3",
         flash_size: "4MB",
         bootloader_offset: "0x0",
-        include_console: true,
+        console_from: None,
+        legacy_stem: None,
+    };
+    let esp32 = Esp32Spec {
+        chip: "esp32",
+        flash_size: "4MB",
+        bootloader_offset: "0x1000",
+        console_from: Some(1.55),
+        legacy_stem: None,
     };
     Some(match fw_filename {
         "rnode_firmware_t3s3.zip"
@@ -208,31 +225,37 @@ fn esp32_spec(fw_filename: &str) -> Option<Esp32Spec> {
         "rnode_firmware_heltec32v4pa.zip" => Esp32Spec {
             chip: "esp32-s3",
             flash_size: "16MB",
-            bootloader_offset: "0x0",
-            include_console: true,
+            ..s3
         },
         "rnode_firmware_heltec32v3.zip" => Esp32Spec {
-            chip: "esp32s3",
+            chip: "esp32-s3",
             flash_size: "8MB",
-            bootloader_offset: "0x0",
-            include_console: true,
+            ..s3
+        },
+        "rnode_firmware_heltec32v2.zip" => Esp32Spec {
+            flash_size: "8MB",
+            ..esp32
+        },
+        "rnode_firmware_tbeam_sx1262.zip" => Esp32Spec {
+            legacy_stem: Some("rnode_firmware_tbeam"),
+            ..esp32
+        },
+        "rnode_firmware_lora32v10.zip" => Esp32Spec {
+            console_from: Some(1.59),
+            legacy_stem: Some("rnode_firmware_lora32v20"),
+            ..esp32
+        },
+        "rnode_firmware_lora32v21_tcxo.zip" => Esp32Spec {
+            console_from: None,
+            ..esp32
         },
         "rnode_firmware_tbeam.zip"
-        | "rnode_firmware_tbeam_sx1262.zip"
-        | "rnode_firmware_lora32v10.zip"
         | "rnode_firmware_lora32v20.zip"
         | "rnode_firmware_lora32v21.zip"
-        | "rnode_firmware_lora32v21_tcxo.zip"
-        | "rnode_firmware_heltec32v2.zip"
         | "rnode_firmware_featheresp32.zip"
         | "rnode_firmware_esp32_generic.zip"
         | "rnode_firmware_ng20.zip"
-        | "rnode_firmware_ng21.zip" => Esp32Spec {
-            chip: "esp32",
-            flash_size: "4MB",
-            bootloader_offset: "0x1000",
-            include_console: false,
-        },
+        | "rnode_firmware_ng21.zip" => esp32,
         _ => return None,
     })
 }
@@ -273,10 +296,6 @@ fn esp32_args(
     args
 }
 
-fn version_at_least(version: &str, min: f64) -> bool {
-    version.parse::<f64>().map(|v| v >= min).unwrap_or(false)
-}
-
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -298,6 +317,41 @@ mod tests {
 
     fn update_version_file(filename: &str) -> String {
         path_string(&PathBuf::from("/cache/update").join("1.74").join(filename))
+    }
+
+    #[test]
+    fn flasher_plans_match_upstream_get_flasher_call() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/rnodeconf_flasher_plan/vectors.json"
+        );
+        let g: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let c = &g["ctx"];
+        let field = |k: &str| c[k].as_str().unwrap().to_string();
+        let mut mismatches = Vec::new();
+        for case in g["cases"].as_array().unwrap() {
+            let ctx = FlashContext {
+                python: field("python"),
+                port: field("port"),
+                baud_flash: field("baud_flash"),
+                update_dir: PathBuf::from(field("update_dir")),
+                extracted_dir: PathBuf::from(field("extracted_dir")),
+                selected_version: case["version"].as_str().unwrap().to_string(),
+            };
+            let fw = case["fw"].as_str().unwrap();
+            let platform = case["platform"].as_u64().unwrap() as u8;
+            let expected: Option<Vec<String>> =
+                serde_json::from_value(case["argv"].clone()).unwrap();
+            let got = plan_flasher(platform, fw, &ctx).map(|plan| plan.argv());
+            if got != expected {
+                mismatches.push(format!(
+                    "{fw} @ {}\n  upstream {expected:?}\n  rust     {got:?}",
+                    ctx.selected_version
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 
     #[test]
