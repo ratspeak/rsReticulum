@@ -953,6 +953,8 @@ pub struct LinkManager {
     /// Largest advertised total size of an inbound Resource this manager
     /// reassembles in memory; `None` accepts any size.
     inbound_reassembly_limit: Option<usize>,
+    /// Python `Link.last_resource_window` / `last_resource_eifr`, per Link.
+    last_inbound_resource: HashMap<[u8; 16], (usize, Option<f64>)>,
     deferred_request_notify: Arc<tokio::sync::Notify>,
     pending_deferred_requests: Vec<PendingDeferredRequest>,
     deferred_resource_leases: Vec<DeferredResourceLease>,
@@ -1086,6 +1088,7 @@ impl LinkManager {
             request_handler: None,
             max_request_size: None,
             inbound_reassembly_limit: Some(DEFAULT_INBOUND_REASSEMBLY_LIMIT),
+            last_inbound_resource: HashMap::new(),
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
             pending_deferred_requests: Vec::new(),
             deferred_resource_leases: Vec::new(),
@@ -1190,6 +1193,7 @@ impl LinkManager {
             request_handler: None,
             max_request_size: None,
             inbound_reassembly_limit: Some(DEFAULT_INBOUND_REASSEMBLY_LIMIT),
+            last_inbound_resource: HashMap::new(),
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
             pending_deferred_requests: Vec::new(),
             deferred_resource_leases: Vec::new(),
@@ -4113,7 +4117,8 @@ impl LinkManager {
                             let mut rh = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
                             let copy_len = adv.random_hash.len().min(rh.len());
                             rh[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
-                            let mut transfer = match InboundTransfer::from_advertisement(
+                            let previous = self.last_inbound_resource.get(&link_id).copied();
+                            let mut transfer = match InboundTransfer::from_advertisement_with_link(
                                 adv.num_parts,
                                 adv.transfer_size,
                                 adv.data_size,
@@ -4121,7 +4126,12 @@ impl LinkManager {
                                 adv.resource_hash,
                                 transfer_flags,
                                 map_hashes,
-                                rtt,
+                                rns_protocol::resource::InboundLinkFacts {
+                                    rtt,
+                                    establishment_cost: active.link.establishment_cost,
+                                    previous_window: previous.map(|(window, _)| window),
+                                    previous_eifr: previous.and_then(|(_, eifr)| eifr),
+                                },
                             ) {
                                 Ok(transfer) => transfer,
                                 Err(error) => {
@@ -4310,6 +4320,7 @@ impl LinkManager {
             rns_wire::context::PacketContext::Resource => {
                 // Python encrypts payload ONCE before chunking (Resource.py:424);
                 // chunks ride raw. Decrypt happens in InboundTransfer::complete.
+                let mut teardown_corrupt = false;
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
@@ -4392,6 +4403,14 @@ impl LinkManager {
                                 .inbound_resources
                                 .get_mut(&rh)
                                 .map(|transfer| transfer.complete(Some(&decrypt_fn)));
+                            if let Some(transfer) = active.inbound_resources.get(&rh) {
+                                Self::inbound_resource_concluded(
+                                    &mut self.last_inbound_resource,
+                                    &mut active.link,
+                                    link_id,
+                                    transfer,
+                                );
+                            }
                             let resource_id = Self::inbound_resource_identity(active, &rh).0;
                             match completion {
                                 Some(Ok((assembled_data, proof))) => {
@@ -4644,17 +4663,26 @@ impl LinkManager {
                                     }
                                 }
                                 Some(Err(error)) => {
-                                    let _ = Self::send_resource_action(
-                                        &self.transport_tx,
-                                        &mut self.pending_link_control,
-                                        &mut self.pending_endpoint_sends,
-                                        active,
-                                        &link_id,
-                                        TransferAction::SendCancel(
-                                            rns_protocol::resource::CancelType::Rcl,
-                                            rh,
-                                        ),
-                                    );
+                                    // Only a decompression overflow is rejected and tears
+                                    // the Link down; a corrupt assembly sends nothing
+                                    // (Resource.py:703-709, 732-738).
+                                    if matches!(
+                                        error,
+                                        rns_protocol::resource::ResourceError::DecompressedTooLarge
+                                    ) {
+                                        let _ = Self::send_resource_action(
+                                            &self.transport_tx,
+                                            &mut self.pending_link_control,
+                                            &mut self.pending_endpoint_sends,
+                                            active,
+                                            &link_id,
+                                            TransferAction::SendCancel(
+                                                rns_protocol::resource::CancelType::Rcl,
+                                                rh,
+                                            ),
+                                        );
+                                        teardown_corrupt = true;
+                                    }
                                     Self::conclude_inbound_failure(
                                         active,
                                         &mut self.active_inbound_lifecycles,
@@ -4676,6 +4704,15 @@ impl LinkManager {
                             }
                         }
                     }
+                }
+                if teardown_corrupt
+                    && let Some(role) = self.active_links.get(&link_id).map(|a| a.link.role())
+                {
+                    let reason = match role {
+                        LinkRole::Initiator => CloseReason::InitiatorClosed,
+                        LinkRole::Responder => CloseReason::DestinationClosed,
+                    };
+                    self.close_active_link(link_id, reason, true);
                 }
             }
             rns_wire::context::PacketContext::ResourceReq => {
@@ -4767,8 +4804,19 @@ impl LinkManager {
                                     .then_some(rh)
                             });
                         if let Some(resource_id) = resource_id {
-                            if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
-                                transfer.handle_cancel();
+                            // Link.py:1199-1206 runs Resource.cancel(), which answers with RCL.
+                            if let Some(action) =
+                                active.inbound_resources.get_mut(&rh).map(|t| t.cancel())
+                                && active.link.state == LinkState::Active
+                            {
+                                Self::send_resource_action(
+                                    &self.transport_tx,
+                                    &mut self.pending_link_control,
+                                    &mut self.pending_endpoint_sends,
+                                    active,
+                                    &link_id,
+                                    action,
+                                );
                             }
                             tracing::debug!(
                                 link_id = hex::encode(link_id),
@@ -5157,6 +5205,24 @@ impl LinkManager {
                 if !active.inbound_resources.contains_key(&resource_hash) {
                     continue;
                 }
+                let action = match action {
+                    TransferAction::SendCancel(cancel_type, hash) => {
+                        // Resource.cancel(): RCL only while the Link is active (Resource.py:1133-1139).
+                        if active.link.state == LinkState::Active {
+                            Self::send_resource_action(
+                                &self.transport_tx,
+                                &mut self.pending_link_control,
+                                &mut self.pending_endpoint_sends,
+                                active,
+                                link_id,
+                                TransferAction::SendCancel(cancel_type, hash),
+                            );
+                        }
+                        // Removed before resource_concluded, so no carryover (Resource.py:1137-1142).
+                        TransferAction::Failed("resource transfer timed out".to_string())
+                    }
+                    action => action,
+                };
                 match action {
                     TransferAction::Failed(reason) => {
                         let resource_id = Self::inbound_resource_identity(active, &resource_hash).0;
@@ -5241,6 +5307,30 @@ impl LinkManager {
                 })
                 .collect();
             for (resource_hash, action) in outbound_watchdog_actions {
+                let action = match action {
+                    TransferAction::SendCancel(cancel_type, hash) => {
+                        // Resource.cancel(): ICL only while the Link is active (Resource.py:1124-1132).
+                        if active.link.state == LinkState::Active {
+                            Self::send_resource_action(
+                                &self.transport_tx,
+                                &mut self.pending_link_control,
+                                &mut self.pending_endpoint_sends,
+                                active,
+                                link_id,
+                                TransferAction::SendCancel(cancel_type, hash),
+                            );
+                        }
+                        TransferAction::Failed(
+                            active
+                                .outbound_resources
+                                .get(&resource_hash)
+                                .and_then(|transfer| transfer.failure_reason())
+                                .unwrap_or("resource transfer failed")
+                                .to_string(),
+                        )
+                    }
+                    action => action,
+                };
                 match action {
                     TransferAction::Failed(reason) => {
                         if let Some(transfer) = active.outbound_resources.remove(&resource_hash) {
@@ -5437,6 +5527,7 @@ impl LinkManager {
         self.deferred_resource_leases
             .retain(|pending| pending.link_id != link_id);
         self.active_endpoint_generations.remove(&link_id);
+        self.last_inbound_resource.remove(&link_id);
         self.endpoint_dispatch_tokens.remove(&link_id);
         self.pending_packet_dispatches
             .retain(|pending| pending.receipt.link_id != link_id);
@@ -5970,6 +6061,23 @@ impl LinkManager {
     ) -> Option<InboundResourceLifecycle> {
         pending_inbound_request_resources.remove(&(link_id, resource_id));
         active_inbound_lifecycles.remove(&(link_id, resource_id))
+    }
+
+    /// Python `Link.resource_concluded` for an incoming resource: keep its
+    /// window and EIFR for the next one and refresh `expected_rate`
+    /// (Link.py:1344-1350).
+    fn inbound_resource_concluded(
+        last_inbound_resource: &mut HashMap<[u8; 16], (usize, Option<f64>)>,
+        link: &mut Link,
+        link_id: [u8; 16],
+        transfer: &InboundTransfer,
+    ) {
+        last_inbound_resource.insert(link_id, (transfer.resource.window.window, transfer.eifr));
+        link.resource_concluded(
+            transfer.resource.total_size,
+            transfer.started_at.elapsed().as_secs_f64(),
+            true,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

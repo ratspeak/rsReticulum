@@ -60,8 +60,8 @@ pub const PER_RETRY_DELAY: f64 = 0.5;
 /// HMU-wait multiplier in the watchdog timeout (Python `Resource.HMU_WAIT_FACTOR`).
 /// Applied only when mid-HMU-wait or with no outstanding parts.
 pub const HMU_WAIT_FACTOR: f64 = 3.5;
-/// Cold-start byte count for the first `update_eifr` call (≈one link handshake);
-/// drops out once a real `req_data_rtt_rate` sample arrives.
+/// Establishment cost assumed by [`InboundTransfer::from_advertisement`] when
+/// the owner does not pass the Link's real `establishment_cost`.
 pub const EIFR_COLD_START_BYTES: usize = 600;
 pub const WATCHDOG_MAX_SLEEP: f64 = 1.0;
 pub const HASHMAP_IS_NOT_EXHAUSTED: u8 = 0x00;
@@ -200,54 +200,61 @@ impl WindowState {
         }
     }
 
-    /// Grow the window after a received batch, before calculating the next
-    /// request size. The minimum follows a growing window; sustained fast rounds
-    /// promote its ceiling, while sustained very-slow rounds lower and clamp it.
-    pub fn grow(&mut self, rate: usize) {
+    /// Grow the window after a drained request round; the minimum follows a
+    /// growing window (Resource.py:917-920).
+    pub fn grow(&mut self) {
         if self.window < self.window_max {
             self.window += 1;
-            // saturating: a very-slow demotion can clamp `window` below `window_min` (Python's
-            // signed comparison is false there; a plain sub underflows).
+            // saturating: a carried-over window can sit below `window_min`.
             if self.window.saturating_sub(self.window_min) > (WINDOW_FLEXIBILITY - 1) {
                 self.window_min += 1;
             }
         }
+    }
 
-        // Only a run of consecutive fast/very-slow rounds promotes the
-        // ceiling, so one lucky RTT cannot stretch the window irrevocably.
-        if rate > RATE_FAST {
-            self.fast_rate_rounds += 1;
-            self.very_slow_rate_rounds = 0;
-            if self.fast_rate_rounds >= FAST_RATE_THRESHOLD {
-                self.window_max = WINDOW_MAX_FAST;
-            }
-        } else if rate < RATE_VERY_SLOW {
+    /// Count a fast round from the first part's request/response rate
+    /// (Resource.py:866-875). Fast rounds are never reset.
+    pub fn on_first_part(&mut self, req_resp_rate: f64) {
+        self.count_fast(req_resp_rate);
+    }
+
+    /// Count fast and very-slow rounds from a drained window's data rate
+    /// (Resource.py:930-940). Very-slow rounds count only before any fast
+    /// round, and demotion leaves the current window unclamped.
+    pub fn on_window_drained(&mut self, req_data_rate: f64) {
+        self.count_fast(req_data_rate);
+        if self.fast_rate_rounds == 0
+            && req_data_rate < RATE_VERY_SLOW as f64
+            && self.very_slow_rate_rounds < VERY_SLOW_RATE_THRESHOLD
+        {
             self.very_slow_rate_rounds += 1;
-            self.fast_rate_rounds = 0;
-            if self.very_slow_rate_rounds >= VERY_SLOW_RATE_THRESHOLD {
+            if self.very_slow_rate_rounds == VERY_SLOW_RATE_THRESHOLD {
                 self.window_max = WINDOW_MAX_VERY_SLOW;
-                if self.window > self.window_max {
-                    self.window = self.window_max;
-                }
             }
-        } else {
-            self.fast_rate_rounds = 0;
-            self.very_slow_rate_rounds = 0;
         }
     }
 
-    /// Shrink the window and ceiling toward their minimum after a timeout.
-    /// If the ceiling remains more than `WINDOW_FLEXIBILITY - 1` above the
-    /// window, lower it once more; one call need not close a larger gap.
+    fn count_fast(&mut self, rate: f64) {
+        if rate > RATE_FAST as f64 && self.fast_rate_rounds < FAST_RATE_THRESHOLD {
+            self.fast_rate_rounds += 1;
+            if self.fast_rate_rounds == FAST_RATE_THRESHOLD {
+                self.window_max = WINDOW_MAX_FAST;
+            }
+        }
+    }
+
+    /// Shrink after a part timeout. Nothing changes at the window minimum;
+    /// otherwise the ceiling follows, closing a gap wider than the
+    /// flexibility by one more step (Resource.py:633-638).
     pub fn shrink(&mut self) {
         if self.window > self.window_min {
             self.window -= 1;
-        }
-        if self.window_max > self.window_min {
-            self.window_max -= 1;
-        }
-        if self.window_max.saturating_sub(self.window) > WINDOW_FLEXIBILITY - 1 {
-            self.window_max -= 1;
+            if self.window_max > self.window_min {
+                self.window_max -= 1;
+                if self.window_max.saturating_sub(self.window) > WINDOW_FLEXIBILITY - 1 {
+                    self.window_max -= 1;
+                }
+            }
         }
     }
 }
@@ -519,7 +526,6 @@ impl OutboundResource {
 
         if exhausted {
             self.state = ResourceState::AwaitingProof;
-            self.window.grow(0);
             return Vec::new();
         }
 
@@ -733,8 +739,18 @@ impl InboundResource {
         let data = &stream[RANDOM_HASH_SIZE..];
 
         let final_data = if self.flags.compressed {
-            compression::bz2_decompress(data, MAX_EFFICIENT_SIZE)
-                .map_err(|_| ResourceError::DecompressionFailed)?
+            match compression::bz2_decompress(data, MAX_EFFICIENT_SIZE) {
+                Ok(decompressed) => decompressed,
+                Err(error) => {
+                    self.state = ResourceState::Corrupt;
+                    return Err(match error {
+                        compression::CompressionError::DecompressedTooLarge => {
+                            ResourceError::DecompressedTooLarge
+                        }
+                        _ => ResourceError::DecompressionFailed,
+                    });
+                }
+            }
         } else {
             data.to_vec()
         };
@@ -819,6 +835,10 @@ pub enum ResourceError {
     HashMismatch,
     #[error("decompression failed")]
     DecompressionFailed,
+    /// Upstream rejects this with RESOURCE_RCL and tears the Link down
+    /// (Resource.py:703-709); every other assembly error sends nothing.
+    #[error("decompressed resource exceeds the size limit")]
+    DecompressedTooLarge,
     #[error("invalid metadata prefix: declared {declared} bytes, available {available} bytes")]
     InvalidMetadata { declared: usize, available: usize },
     #[error("resource control {context:?} requires {encoded_len} packet bytes, MTU is {mtu}")]
@@ -1504,10 +1524,11 @@ pub struct OutboundTransfer {
     pub sent_parts: usize,
     sent_part_indices: HashSet<usize>,
     req_hashlist: HashSet<[u8; 32]>,
-    // Only newly requested parts advance this clock. Link keepalives, duplicate
-    // requests and local polling are not Resource progress.
+    // Python `last_activity`: every part or HMU sent restarts the sender wait.
     last_progress: Instant,
-    last_request_parts: usize,
+    // Python sets the sender's `rtt` once, from advertisement to first request.
+    rtt_sampled: bool,
+    failure_reason: Option<String>,
     /// Proof-cache queries left before the sender gives up (Resource.py:1106).
     proof_queries_left: usize,
     /// Advertisement wait per attempt before PROCESSING_GRACE; `None` uses
@@ -1575,7 +1596,8 @@ impl OutboundTransfer {
             sent_part_indices: HashSet::new(),
             req_hashlist: HashSet::new(),
             last_progress: Instant::now(),
-            last_request_parts: 0,
+            rtt_sampled: false,
+            failure_reason: None,
             proof_queries_left: PROOF_CACHE_QUERIES,
             advertisement_timeout: None,
             advertisement_mdu: rns_wire::constants::LINK_MDU,
@@ -1602,7 +1624,7 @@ impl OutboundTransfer {
             self.resource.state,
             ResourceState::Failed | ResourceState::Rejected | ResourceState::Corrupt
         ) {
-            return TransferAction::Failed("transfer failed".to_string());
+            return self.check_timeout();
         }
 
         if !self.advertised {
@@ -1640,15 +1662,18 @@ impl OutboundTransfer {
             // Some owners send a request-handler's cancel action first and
             // conclude on their next poll. Do not leave that failed owner
             // dormant merely because it is no longer Advertised.
-            return TransferAction::Failed("transfer failed".to_string());
+            return TransferAction::Failed(
+                self.failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "transfer failed".to_string()),
+            );
         }
         if self.resource.state == ResourceState::AwaitingProof {
             return self.check_proof_timeout();
         }
         if self.resource.state == ResourceState::Transferring {
             if self.last_progress.elapsed() > self.progress_timeout() {
-                self.resource.state = ResourceState::Failed;
-                return TransferAction::Failed("resource part requests timed out".to_string());
+                return self.cancel("resource part requests timed out");
             }
             return TransferAction::None;
         }
@@ -1672,9 +1697,22 @@ impl OutboundTransfer {
                 }
             }
         } else {
-            self.resource.state = ResourceState::Failed;
-            TransferAction::Failed("resource advertisement timed out".to_string())
+            self.cancel("resource advertisement timed out")
         }
+    }
+
+    /// Python `Resource.cancel()` on the initiator: fail and send ICL
+    /// (Resource.py:1124-1132). The owner sends it only while the Link is
+    /// active, then concludes; the next poll returns `Failed(reason)`.
+    pub fn cancel(&mut self, reason: &str) -> TransferAction {
+        self.resource.state = ResourceState::Failed;
+        self.failure_reason = Some(reason.to_string());
+        TransferAction::SendCancel(CancelType::Icl, self.resource.resource_hash)
+    }
+
+    /// Why a failed transfer failed, when it failed locally.
+    pub fn failure_reason(&self) -> Option<&str> {
+        self.failure_reason.as_deref()
     }
 
     /// Exact finite wait owned by this sender, as `(started_at, timeout)`.
@@ -1714,8 +1752,7 @@ impl OutboundTransfer {
             return TransferAction::None;
         }
         if self.proof_queries_left == 0 {
-            self.resource.state = ResourceState::Failed;
-            return TransferAction::Failed("resource proof timed out".to_string());
+            return self.cancel("resource proof timed out");
         }
         self.proof_queries_left -= 1;
         self.last_part_sent = Some(Instant::now());
@@ -1823,15 +1860,7 @@ impl OutboundTransfer {
             self.window_cursor = self.cursor;
             self.awaiting_hmu = false;
 
-            // Grow window on successful delivery
             if newly_confirmed > 0 {
-                let elapsed = self.started_at.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 {
-                    (newly_confirmed * SDU) as f64 / elapsed
-                } else {
-                    0.0
-                };
-                self.resource.window.grow(rate as usize);
                 self.retries = 0;
             }
         } else {
@@ -1844,7 +1873,6 @@ impl OutboundTransfer {
             self.awaiting_hmu = false;
 
             self.enter_awaiting_proof();
-            self.resource.window.grow(0);
         }
     }
 
@@ -2019,24 +2047,30 @@ impl OutboundTransfer {
             }
         }
 
+        // Resource.request (Resource.py:1009-1106).
+        let now = Instant::now();
+        if !self.rtt_sampled {
+            self.rtt_sampled = true;
+            self.rtt = now.duration_since(self.started_at);
+        }
+        if self.resource.state == ResourceState::Advertised {
+            self.resource.state = ResourceState::Transferring;
+        }
         if sent_count > 0 {
-            let now = Instant::now();
-            if self.resource.state == ResourceState::Advertised && self.rtt == Duration::ZERO {
-                // A later window's request is not a new handshake sample, and
-                // must not collapse a known slow-Link RTT to a local tick.
-                self.rtt = now.duration_since(self.started_at);
-            }
             self.last_part_sent = Some(now);
+            self.last_progress = now;
             if self.sent_parts > previously_sent {
-                self.last_progress = now;
-                self.last_request_parts = sent_count;
                 self.retries = 0;
             }
-            if self.sent_parts == self.resource.num_parts() {
-                self.enter_awaiting_proof();
-            } else {
-                self.resource.state = ResourceState::Transferring;
-            }
+        }
+        if actions
+            .iter()
+            .any(|action| matches!(action, TransferAction::SendHmu(_)))
+        {
+            self.last_progress = now;
+        }
+        if self.sent_parts == self.resource.num_parts() {
+            self.enter_awaiting_proof();
         }
 
         actions
@@ -2067,19 +2101,12 @@ impl OutboundTransfer {
     }
 
     fn progress_timeout(&self) -> Duration {
-        // Preserve the receiver's retry budget (including its increasing
-        // per-retry delay), and allow a whole requested window to traverse the
-        // slow link. No fixed 30-second cap: an individual LoRa packet can
-        // legitimately take longer than that. Only new parts restart this
-        // envelope, so repeated requests cannot keep a dead transfer alive.
+        // rtt * timeout_factor * max_retries + sender_grace_time + the
+        // receiver's summed per-retry delays (Resource.py:647-649).
         let retry_wait = PER_RETRY_DELAY * (MAX_RETRIES * (MAX_RETRIES + 1) / 2) as f64;
-        let request_count = MAX_RETRIES
-            .saturating_add(self.last_request_parts)
-            .try_into()
-            .unwrap_or(u32::MAX);
         self.rtt
-            .saturating_mul(PART_TIMEOUT_FACTOR as u32)
-            .saturating_mul(request_count)
+            .saturating_mul(rns_link::constants::TRAFFIC_TIMEOUT_FACTOR as u32)
+            .saturating_mul(MAX_RETRIES as u32)
             .saturating_add(Duration::from_secs_f64(SENDER_GRACE_TIME + retry_wait))
     }
 
@@ -2175,9 +2202,27 @@ pub struct InboundTransfer {
     /// Most recent effective inflight rate, in bits/sec. Python `eifr`.
     /// `None` until `update_eifr()` runs at least once.
     pub eifr: Option<f64>,
-    /// Previous non-zero EIFR sample — seeded from the link's history on
-    /// link-level ports, or left `None` on fresh receivers. Python
+    /// EIFR the previous incoming resource on this Link ended with. Python
     /// `previous_eifr`.
+    pub previous_eifr: Option<f64>,
+    /// Bytes/sec of the first part after a request, request bytes included.
+    /// Python `req_resp_rtt_rate`; set once and never reset.
+    pub req_resp_rtt_rate: f64,
+    /// Raw packet length of the last RESOURCE_REQ. Python `req_sent_bytes`.
+    pub req_sent_bytes: usize,
+    /// Link establishment cost in bytes, the cold-start EIFR basis.
+    pub establishment_cost: usize,
+    rtt_seeded: bool,
+}
+
+/// Link facts an incoming resource starts from (Resource.py:215-224, 565-575).
+#[derive(Debug, Clone, Copy)]
+pub struct InboundLinkFacts {
+    pub rtt: Duration,
+    pub establishment_cost: usize,
+    /// `Link.get_last_resource_window()`.
+    pub previous_window: Option<usize>,
+    /// `Link.get_last_resource_eifr()`.
     pub previous_eifr: Option<f64>,
 }
 
@@ -2196,8 +2241,38 @@ impl InboundTransfer {
         map_hashes: Vec<[u8; MAPHASH_LEN]>,
         rtt: Duration,
     ) -> Result<Self, ResourceError> {
+        Self::from_advertisement_with_link(
+            total_parts,
+            total_size,
+            data_size,
+            random_hash,
+            resource_hash,
+            flags,
+            map_hashes,
+            InboundLinkFacts {
+                rtt,
+                establishment_cost: EIFR_COLD_START_BYTES,
+                previous_window: None,
+                previous_eifr: None,
+            },
+        )
+    }
+
+    /// Create from a received advertisement, starting from the owning Link's
+    /// RTT, establishment cost and the previous resource's window and EIFR.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_advertisement_with_link(
+        total_parts: usize,
+        total_size: usize,
+        data_size: usize,
+        random_hash: [u8; RANDOM_HASH_SIZE],
+        resource_hash: [u8; 32],
+        flags: ResourceFlags,
+        map_hashes: Vec<[u8; MAPHASH_LEN]>,
+        link: InboundLinkFacts,
+    ) -> Result<Self, ResourceError> {
         let hashmap_height = map_hashes.len();
-        let resource = InboundResource::new(
+        let mut resource = InboundResource::new(
             total_parts,
             total_size,
             data_size,
@@ -2206,6 +2281,9 @@ impl InboundTransfer {
             flags,
             map_hashes,
         )?;
+        if let Some(window) = link.previous_window.filter(|window| *window > 0) {
+            resource.window.window = window;
+        }
 
         let now = Instant::now();
         Ok(Self {
@@ -2213,7 +2291,7 @@ impl InboundTransfer {
             parts_since_hmu: 0,
             started_at: now,
             accepted: true,
-            rtt,
+            rtt: link.rtt,
             outstanding_parts: 0,
             last_activity: now,
             req_sent: None,
@@ -2226,7 +2304,11 @@ impl InboundTransfer {
             rtt_rxd_bytes_at_part_req: 0,
             req_data_rtt_rate: 0.0,
             eifr: None,
-            previous_eifr: None,
+            previous_eifr: link.previous_eifr.filter(|eifr| *eifr > 0.0),
+            req_resp_rtt_rate: 0.0,
+            req_sent_bytes: 0,
+            establishment_cost: link.establishment_cost,
+            rtt_seeded: false,
         })
     }
 
@@ -2240,28 +2322,19 @@ impl InboundTransfer {
         }
     }
 
-    /// Refresh `self.eifr` in bits/sec, preferring the last measured
-    /// `req_data_rtt_rate` (bytes/sec → bits/sec), falling back to the
-    /// last `previous_eifr`, and finally to a cold-start estimate
-    /// `EIFR_COLD_START_BYTES * 8 / rtt`.
+    /// Refresh `self.eifr` in bits/sec: the last window's data rate, else
+    /// the previous resource's EIFR, else `establishment_cost * 8 / rtt`
+    /// (Resource.py:565-575).
     pub fn update_eifr(&mut self) {
         let rtt_secs = self.rtt.as_secs_f64().max(0.001);
-
-        let rate = if self.req_data_rtt_rate > 0.0 {
+        let rate = if self.req_data_rtt_rate != 0.0 {
             self.req_data_rtt_rate * 8.0
         } else if let Some(prev) = self.previous_eifr {
             prev
         } else {
-            (EIFR_COLD_START_BYTES as f64 * 8.0) / rtt_secs
+            (self.establishment_cost as f64 * 8.0) / rtt_secs
         };
-
         self.eifr = Some(rate);
-        // Keep `previous_eifr` warm with the most recent non-zero rate so
-        // a later transfer on the same link can seed from it (Python's
-        // `link.expected_rate = self.eifr` maps here).
-        if rate > 0.0 {
-            self.previous_eifr = Some(rate);
-        }
     }
 
     /// Accept a data part and decide what to send next.
@@ -2283,27 +2356,38 @@ impl InboundTransfer {
             return TransferAction::None;
         }
         let payload_len = data.len();
-        if !self.resource.receive_part(data) {
-            // Malformed, irrelevant and duplicate parts are not progress and
-            // must not refill the receiver's retry budget.
-            return TransferAction::None;
-        }
+        // Every part, duplicates included, is activity (Resource.py:850-852).
         self.last_activity = Instant::now();
         self.retries_left = MAX_RETRIES;
 
-        // The first reply after a request gives us an RTT sample; once we
-        // have it we can relax the initial timeout multiplier.
         if self.req_resp.is_none() {
             self.req_resp = Some(self.last_activity);
+            self.part_timeout_factor = PART_TIMEOUT_FACTOR_AFTER_RTT;
             if let Some(sent) = self.req_sent {
-                let rtt = self.last_activity.duration_since(sent);
-                self.rtt = rtt;
-                self.part_timeout_factor = PART_TIMEOUT_FACTOR_AFTER_RTT;
+                let sample = self.last_activity.duration_since(sent);
+                if !self.rtt_seeded {
+                    // The first sample keeps the Link RTT (Resource.py:859-860).
+                    self.rtt_seeded = true;
+                } else if sample < self.rtt {
+                    self.rtt = self.rtt.mul_f64(0.95).max(sample);
+                } else if sample > self.rtt {
+                    self.rtt = self.rtt.mul_f64(1.05).min(sample);
+                }
+                let sample_secs = sample.as_secs_f64();
+                if sample_secs > 0.0 {
+                    let cost =
+                        rns_wire::constants::HEADER_MINSIZE + payload_len + self.req_sent_bytes;
+                    self.req_resp_rtt_rate = cost as f64 / sample_secs;
+                    self.resource.window.on_first_part(self.req_resp_rtt_rate);
+                }
             }
         }
 
+        if !self.resource.receive_part(data) {
+            return TransferAction::None;
+        }
+
         self.parts_since_hmu += 1;
-        // Count accepted bytes only when measuring a completed window.
         self.rtt_rxd_bytes = self.rtt_rxd_bytes.saturating_add(payload_len);
 
         if self.outstanding_parts > 0 {
@@ -2316,30 +2400,22 @@ impl InboundTransfer {
         }
 
         if self.outstanding_parts == 0 {
-            // Window drained — compute req_data_rtt_rate from the byte
-            // delta since last request, refresh EIFR, then grow the
-            // window. Mirrors Python Resource.py:896-903.
+            // Resource.py:914-942.
+            self.resource.window.grow();
             if let Some(sent_at) = self.req_sent {
                 let rtt = self.last_activity.duration_since(sent_at).as_secs_f64();
-                if rtt > 0.0 {
+                if rtt != 0.0 {
                     let req_transferred = self
                         .rtt_rxd_bytes
                         .saturating_sub(self.rtt_rxd_bytes_at_part_req);
                     self.req_data_rtt_rate = req_transferred as f64 / rtt;
                     self.update_eifr();
                     self.rtt_rxd_bytes_at_part_req = self.rtt_rxd_bytes;
+                    self.resource
+                        .window
+                        .on_window_drained(self.req_data_rtt_rate);
                 }
             }
-
-            let elapsed = self.started_at.elapsed().as_secs_f64();
-            let received = self.resource.received_count();
-            let rate = if elapsed > 0.0 {
-                (received * SDU) as f64 / elapsed
-            } else {
-                0.0
-            };
-            self.resource.window.grow(rate as usize);
-
             return self.request_next();
         }
         TransferAction::None
@@ -2414,6 +2490,8 @@ impl InboundTransfer {
 
         self.last_activity = Instant::now();
         self.req_sent = Some(self.last_activity);
+        self.req_sent_bytes = crate::resource_control::encrypted_len(request_data.len())
+            .map_or(0, |len| rns_wire::constants::HEADER_MINSIZE + len);
         self.req_resp = None;
         // Snapshot the byte counter so the next round's completion can
         // compute the delta over this window. Python Resource.py:964.
@@ -2435,11 +2513,14 @@ impl InboundTransfer {
     ///     (only when `waiting_for_hmu || outstanding_parts == 0`)
     ///   `extra_wait               = retries_used * PER_RETRY_DELAY`
     ///
-    /// The pre-RTT-sample branch (`req_data_rtt_rate == 0`) uses the
-    /// cold-start form `part_timeout_factor * (3*sdu / eifr) + grace`,
-    /// which lengthens the window on slow links where we haven't measured
-    /// a rate yet.
+    /// Before the first part of any request arrived (`req_resp_rtt_rate == 0`)
+    /// the cold-start form `part_timeout_factor * (3*sdu / eifr) + grace`
+    /// applies. When retries run out the receiver cancels with RCL.
     pub fn check_timeout(&mut self) -> TransferAction {
+        if self.resource.state == ResourceState::Failed {
+            // Owners that only send the cancel conclude on the next poll.
+            return TransferAction::Failed("resource transfer failed".to_string());
+        }
         if self.resource.state != ResourceState::Transferring {
             return TransferAction::None;
         }
@@ -2468,7 +2549,7 @@ impl InboundTransfer {
         };
         let expected_tof_remaining = (self.outstanding_parts as f64 * sdu_f * 8.0) / eifr;
 
-        let timeout = if self.req_data_rtt_rate > 0.0 {
+        let timeout = if self.req_resp_rtt_rate != 0.0 {
             self.part_timeout_factor * expected_tof_remaining
                 + expected_hmu_wait_remaining
                 + RETRY_GRACE_TIME
@@ -2487,8 +2568,8 @@ impl InboundTransfer {
                 self.waiting_for_hmu = false;
                 return self.request_next();
             } else {
-                self.resource.state = ResourceState::Failed;
-                return TransferAction::Failed("resource transfer timed out".to_string());
+                // Resource.cancel() on the receiver sends RCL (Resource.py:644-646, 1133-1139).
+                return self.cancel();
             }
         }
 
@@ -2899,7 +2980,7 @@ mod tests {
         let mut ws = WindowState::new();
         let initial = ws.window;
 
-        ws.grow(RATE_FAST + 1);
+        ws.grow();
         assert_eq!(ws.window, initial + 1);
 
         ws.shrink();
@@ -3002,7 +3083,7 @@ mod tests {
         let mut ws = WindowState::new();
         let initial_window = ws.window;
 
-        ws.grow(RATE_FAST + 1);
+        ws.grow();
         assert_eq!(ws.window, initial_window + 1);
 
         let request_window = ws.window;
@@ -3016,36 +3097,34 @@ mod tests {
 
         for _ in 0..(WINDOW_FLEXIBILITY + 2) {
             ws.window_max = WINDOW_MAX_FAST;
-            ws.grow(RATE_FAST + 1);
+            ws.grow();
         }
 
         // Once the window outgrows its flexibility band, `window_min` slides up.
         assert!(ws.window_min > initial_min);
     }
 
-    // Regression: a very-slow demotion can clamp `window` below an already-raised `window_min`;
-    // the next promoted grow must not underflow `window - window_min` (Python's signed comparison
-    // is simply false there).
+    // A very-slow demotion lowers the ceiling but never clamps the current window,
+    // and fast rounds are only counted, never reset (Resource.py:930-940).
     #[test]
-    fn window_grow_survives_demote_then_promote() {
+    fn very_slow_demotion_keeps_window_and_counters_are_sticky() {
         let mut w = WindowState::new();
         for _ in 0..6 {
-            w.grow(1000);
+            w.grow();
         }
         assert_eq!((w.window, w.window_min, w.window_max), (10, 7, 10));
         for _ in 0..VERY_SLOW_RATE_THRESHOLD {
-            w.grow(RATE_VERY_SLOW - 1);
+            w.on_window_drained((RATE_VERY_SLOW - 1) as f64);
         }
-        assert_eq!(
-            (w.window, w.window_min, w.window_max),
-            (WINDOW_MAX_VERY_SLOW, 7, WINDOW_MAX_VERY_SLOW)
-        );
-        for _ in 0..FAST_RATE_THRESHOLD + 1 {
-            w.grow(RATE_FAST + 1);
+        assert_eq!((w.window, w.window_max), (10, WINDOW_MAX_VERY_SLOW));
+        w.on_window_drained(0.0);
+        assert_eq!(w.very_slow_rate_rounds, VERY_SLOW_RATE_THRESHOLD);
+        for _ in 0..FAST_RATE_THRESHOLD {
+            w.on_first_part((RATE_FAST + 1) as f64);
         }
         assert_eq!(w.window_max, WINDOW_MAX_FAST);
-        assert_eq!(w.window, 5);
-        assert_eq!(w.window_min, 7); // unchanged: window has not outgrown the band
+        w.on_window_drained(1000.0);
+        assert_eq!(w.fast_rate_rounds, FAST_RATE_THRESHOLD);
     }
 
     #[test]
@@ -3235,11 +3314,15 @@ mod tests {
         transfer.retries = MAX_ADV_RETRIES;
         transfer.started_at = ago_or_skip!(Duration::from_secs(60));
 
-        assert!(matches!(
+        assert_eq!(
             transfer.check_timeout(),
-            TransferAction::Failed(_)
-        ));
+            TransferAction::SendCancel(CancelType::Icl, transfer.resource.resource_hash)
+        );
         assert_eq!(transfer.resource.state, ResourceState::Failed);
+        assert_eq!(
+            transfer.check_timeout(),
+            TransferAction::Failed("resource advertisement timed out".to_string())
+        );
     }
 
     #[test]
@@ -3707,13 +3790,15 @@ mod tests {
         };
         assert!(!sender.handle_request(&request).is_empty());
         assert_eq!(sender.resource.state, ResourceState::Transferring);
-        let progress_at = sender.last_progress;
-        // Repeating a valid request can recover loss but is not new progress.
-        for _ in 0..20 {
-            sender.handle_request(&request);
-        }
-        assert_eq!(sender.last_progress, progress_at);
+        // Every part sent in answer to a request restarts the sender wait.
+        sender.last_progress = ago_or_skip!(Duration::from_secs(5));
+        sender.handle_request(&request);
+        assert!(sender.last_progress.elapsed() < Duration::from_secs(5));
         sender.last_progress = ago_or_skip!(sender.progress_timeout() + Duration::from_secs(1));
+        assert_eq!(
+            sender.tick(),
+            TransferAction::SendCancel(CancelType::Icl, sender.resource.resource_hash)
+        );
         assert_eq!(
             sender.tick(),
             TransferAction::Failed("resource part requests timed out".to_string())
@@ -3728,10 +3813,10 @@ mod tests {
             ));
         }
         receiver.last_activity = ago_or_skip!(Duration::from_secs(600));
-        assert!(matches!(
+        assert_eq!(
             receiver.check_timeout(),
-            TransferAction::Failed(_)
-        ));
+            TransferAction::SendCancel(CancelType::Rcl, receiver.resource.resource_hash)
+        );
         assert_eq!(
             receiver.receive_part(sender.resource.parts[0].clone()),
             TransferAction::None
@@ -3761,6 +3846,10 @@ mod tests {
         sender.last_part_sent = Some(ago_or_skip!(sender.proof_wait() + Duration::from_secs(1)));
         assert_eq!(
             sender.tick(),
+            TransferAction::SendCancel(CancelType::Icl, sender.resource.resource_hash)
+        );
+        assert_eq!(
+            sender.tick(),
             TransferAction::Failed("resource proof timed out".to_string())
         );
         assert!(!sender.handle_proof(&proof));
@@ -3773,16 +3862,16 @@ mod tests {
 
     #[test]
     fn resource_loss_slow_window_progress_can_exceed_three_minutes() {
-        let (_, mut sender, mut receiver) = loss_test_pair(100_000, Duration::from_secs(30));
+        let (_, mut sender, mut receiver) = loss_test_pair(100_000, Duration::from_millis(500));
         let TransferAction::SendRequest(request) = receiver.request_next() else {
             panic!()
         };
+        // The sender RTT is the advertisement-to-first-request time, set once
+        // (Resource.py:1009-1013).
+        sender.started_at = ago_or_skip!(Duration::from_secs(30));
         sender.handle_request(&request);
-        assert_eq!(
-            sender.rtt,
-            Duration::from_secs(30),
-            "do not replace the slow RTT with local scheduling time"
-        );
+        assert!(sender.rtt >= Duration::from_secs(30));
+        let sampled = sender.rtt;
         assert!(sender.progress_timeout() > Duration::from_secs(180));
         sender.last_progress = ago_or_skip!(Duration::from_secs(180));
         assert_eq!(sender.check_timeout(), TransferAction::None);
@@ -3793,12 +3882,13 @@ mod tests {
         next.extend_from_slice(&sender.resource.map_hashes[4]);
         sender.started_at = ago_or_skip!(Duration::from_secs(3600));
         sender.handle_request(&next);
+        assert_eq!(sender.rtt, sampled);
         assert!(sender.last_progress.elapsed() < Duration::from_secs(1));
         assert_eq!(sender.check_timeout(), TransferAction::None);
     }
 
     #[test]
-    fn resource_loss_invalid_or_duplicate_input_does_not_rearm_liveness() {
+    fn resource_loss_invalid_request_is_ignored_and_any_part_rearms_receiver() {
         let (_, mut sender, mut receiver) = loss_test_pair(8192, Duration::from_secs(2));
         let TransferAction::SendRequest(mut request) = receiver.request_next() else {
             panic!()
@@ -3811,12 +3901,14 @@ mod tests {
         assert!(sender.handle_request(&request).is_empty());
         assert_eq!(sender.resource.state, ResourceState::Advertised);
         receiver.receive_part(sender.resource.parts[0].clone());
-        let progress_at = receiver.last_activity;
+        // Resource.receive_part refreshes activity and retries for every part,
+        // duplicates included (Resource.py:850-852).
         receiver.retries_left = 3;
         receiver.receive_part(sender.resource.parts[0].clone());
+        assert_eq!(receiver.retries_left, MAX_RETRIES);
+        receiver.retries_left = 3;
         receiver.receive_part(vec![0; 5]);
-        assert_eq!(receiver.last_activity, progress_at);
-        assert_eq!(receiver.retries_left, 3);
+        assert_eq!(receiver.retries_left, MAX_RETRIES);
         sender.handle_cancel();
         let mut proof = sender.resource.resource_hash.to_vec();
         proof.extend_from_slice(&sender.resource.expected_proof);
@@ -3832,8 +3924,8 @@ mod tests {
             panic!()
         };
         sender.handle_request(&request);
-        assert_eq!(sender.progress_timeout(), Duration::MAX);
-        assert_eq!(sender.timeout_window().unwrap().1, Duration::MAX);
+        // The first request replaces the Link RTT with the advertisement-to-request time.
+        assert!(sender.rtt < Duration::from_secs(60));
         assert_eq!(sender.check_timeout(), TransferAction::None);
         assert_eq!(sender.tick(), TransferAction::None);
     }
@@ -5016,9 +5108,12 @@ mod tests {
         inbound.retries_left = 0;
         inbound.last_activity = ago_or_skip!(Duration::from_secs(60));
 
-        let action = inbound.check_timeout();
-        assert!(matches!(action, TransferAction::Failed(_)));
+        assert_eq!(
+            inbound.check_timeout(),
+            TransferAction::SendCancel(CancelType::Rcl, outbound.resource_hash)
+        );
         assert_eq!(inbound.resource.state, ResourceState::Failed);
+        assert!(matches!(inbound.check_timeout(), TransferAction::Failed(_)));
     }
 
     #[test]
@@ -5421,8 +5516,8 @@ mod tests {
             "measured rate should win: expected 4000.0 bits/sec, got {}",
             eifr
         );
-        // Non-zero sample must warm previous_eifr.
-        assert_eq!(inbound.previous_eifr, Some(4_000.0));
+        // previous_eifr is only seeded from the Link, never rewritten here.
+        assert_eq!(inbound.previous_eifr, Some(1_000.0));
     }
 
     #[test]

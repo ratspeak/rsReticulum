@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use rns_crypto::ed25519::Ed25519PublicKey;
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
-use rns_link::link::{CloseReason, Link};
+use rns_link::link::{CloseReason, Link, LinkState};
 use rns_protocol::resource::{InboundTransfer, TransferAction};
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
@@ -710,6 +710,18 @@ async fn poll_response_resources(
                     link_id,
                     rns_wire::context::PacketContext::ResourceHmu,
                     &hmu,
+                    true,
+                )
+                .await?;
+            }
+            // Out of retries: Resource.cancel() sends RCL (Resource.py:1133-1139).
+            TransferAction::SendCancel(_, resource_hash) if link.state == LinkState::Active => {
+                send_link_data(
+                    transport_tx,
+                    link,
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceRcl,
+                    &resource_hash,
                     true,
                 )
                 .await?;

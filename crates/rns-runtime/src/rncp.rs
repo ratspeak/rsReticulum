@@ -1560,6 +1560,18 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                         }
                     }
                     TransferAction::Failed(reason) => failed = Some(reason),
+                    // Out of retries: Resource.cancel() sends RCL (Resource.py:1133-1139).
+                    TransferAction::SendCancel(_, resource_hash) => {
+                        if let Ok(encrypted) = link.encrypt(&resource_hash) {
+                            let raw = build_data_packet(
+                                link_id,
+                                rns_wire::context::PacketContext::ResourceRcl,
+                                &encrypted,
+                            );
+                            send_endpoint_packet(&transport_tx, link_id, raw).await?;
+                        }
+                        failed = Some("resource transfer timed out".to_string());
+                    }
                     _ => {}
                 }
             }

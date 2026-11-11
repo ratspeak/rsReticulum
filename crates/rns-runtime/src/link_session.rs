@@ -826,6 +826,8 @@ struct SessionResources {
     rejected_inbound: HashMap<[u8; 32], Instant>,
     resource_dir: Option<PathBuf>,
     inbound_reassembly_limit: Option<usize>,
+    /// Python `Link.last_resource_window` / `last_resource_eifr`.
+    last_inbound: Option<(usize, Option<f64>)>,
 }
 
 struct SessionActorState {
@@ -2259,7 +2261,28 @@ async fn poll_outbound_resource(
             );
             activate_next_queued(transport_tx, attached_interface, link, resources, event_tx).await
         }
-        retry => match send_resource_action(transport_tx, attached_interface, link, retry).await {
+        retry => match send_resource_action(transport_tx, attached_interface, link, retry.clone())
+            .await
+        {
+            Ok(()) if matches!(retry, TransferAction::SendCancel(_, _)) => {
+                let outbound = resources
+                    .outbound
+                    .take()
+                    .expect("watchdog action requires an outbound resource");
+                link.untrack_resource(&outbound.transfer.resource.resource_hash);
+                let reason = outbound
+                    .transfer
+                    .failure_reason()
+                    .unwrap_or("resource transfer failed")
+                    .to_string();
+                conclude_outbound_resource(
+                    outbound,
+                    event_tx,
+                    Err(LinkSessionResourceError::Failed(reason)),
+                );
+                activate_next_queued(transport_tx, attached_interface, link, resources, event_tx)
+                    .await
+            }
             Ok(()) => false,
             Err(error) => {
                 let transport_failed =
@@ -2316,6 +2339,10 @@ async fn send_resource_action(
             rns_wire::flags::PacketType::Data,
         ),
         TransferAction::SendCancel(cancel_type, resource_hash) => {
+            // Resource.cancel() sends ICL/RCL only on an active Link (Resource.py:1126, 1134).
+            if link.state != LinkState::Active {
+                return Ok(());
+            }
             let context = match cancel_type {
                 CancelType::Icl => rns_wire::context::PacketContext::ResourceIcl,
                 CancelType::Rcl => rns_wire::context::PacketContext::ResourceRcl,
@@ -2589,8 +2616,10 @@ fn validate_inbound_advertisement(
 
 fn inbound_transfer_from_advertisement(
     advertisement: &ResourceAdvertisement,
-    rtt: Duration,
+    link: &Link,
+    previous: Option<(usize, Option<f64>)>,
 ) -> Result<InboundTransfer, LinkSessionResourceError> {
+    let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
     validate_inbound_advertisement(advertisement)?;
     let mut random_hash = [0u8; RANDOM_HASH_SIZE];
     let random = advertisement
@@ -2606,7 +2635,7 @@ fn inbound_transfer_from_advertisement(
     if advertisement.total_segments > 1 && advertisement.segment_index > 1 {
         flags.has_metadata = false;
     }
-    InboundTransfer::from_advertisement(
+    InboundTransfer::from_advertisement_with_link(
         advertisement.num_parts,
         advertisement.transfer_size,
         advertisement.data_size,
@@ -2614,7 +2643,12 @@ fn inbound_transfer_from_advertisement(
         advertisement.resource_hash,
         flags,
         advertisement.get_map_hashes(),
-        rtt,
+        rns_protocol::resource::InboundLinkFacts {
+            rtt,
+            establishment_cost: link.establishment_cost,
+            previous_window: previous.map(|(window, _)| window),
+            previous_eifr: previous.and_then(|(_, eifr)| eifr),
+        },
     )
     .map_err(|error| LinkSessionResourceError::InvalidAdvertisement(error.to_string()))
 }
@@ -2638,8 +2672,8 @@ async fn accept_inbound_offer(
         return Err(LinkSessionResourceError::OfferExpired);
     }
 
-    let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
-    let mut transfer = inbound_transfer_from_advertisement(&advertisement, rtt)?;
+    let mut transfer =
+        inbound_transfer_from_advertisement(&advertisement, link, resources.last_inbound)?;
     let request = match transfer.request_next() {
         TransferAction::SendRequest(request) => request,
         _ => {
@@ -2840,8 +2874,8 @@ async fn accept_followup_inbound_segment(
         });
     }
 
-    let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
-    let mut transfer = inbound_transfer_from_advertisement(&advertisement, rtt)?;
+    let mut transfer =
+        inbound_transfer_from_advertisement(&advertisement, link, resources.last_inbound)?;
     let request = match transfer.request_next() {
         TransferAction::SendRequest(request) => request,
         _ => {
@@ -2904,8 +2938,7 @@ async fn process_inbound_resource_advertisement(
             Err(LinkSessionResourceError::TransportUnavailable)
         );
     }
-    let rtt = Duration::from_secs_f64(link.rtt_secs().max(0.001));
-    if inbound_transfer_from_advertisement(&advertisement, rtt).is_err() {
+    if inbound_transfer_from_advertisement(&advertisement, link, None).is_err() {
         return matches!(
             send_resource_action(
                 transport_tx,
@@ -3266,19 +3299,37 @@ async fn complete_inbound_segment(
         rns_link::encryption::link_decrypt(&keys, ciphertext)
             .map_err(|_| rns_protocol::resource::ResourceError::DecryptFailed)
     };
-    let (data, proof) = match inbound.transfer.complete(Some(&decrypt)) {
+    let completion = inbound.transfer.complete(Some(&decrypt));
+    // Link.resource_concluded (Link.py:1344-1350).
+    resources.last_inbound = Some((
+        inbound.transfer.resource.window.window,
+        inbound.transfer.eifr,
+    ));
+    link.resource_concluded(
+        inbound.transfer.resource.total_size,
+        inbound.transfer.started_at.elapsed().as_secs_f64(),
+        true,
+    );
+    let (data, proof) = match completion {
         Ok(completed) => completed,
         Err(error) => {
-            let transport_failed = matches!(
-                send_resource_action(
-                    transport_tx,
-                    attached_interface,
-                    link,
-                    TransferAction::SendCancel(CancelType::Rcl, segment_hash),
-                )
-                .await,
-                Err(LinkSessionResourceError::TransportUnavailable)
+            // Only a decompression overflow is rejected and tears the Link
+            // down; a corrupt assembly sends nothing (Resource.py:703-709, 732-738).
+            let reject = matches!(
+                error,
+                rns_protocol::resource::ResourceError::DecompressedTooLarge
             );
+            let transport_failed = reject
+                && matches!(
+                    send_resource_action(
+                        transport_tx,
+                        attached_interface,
+                        link,
+                        TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+                    )
+                    .await,
+                    Err(LinkSessionResourceError::TransportUnavailable)
+                );
             fail_inbound_logical(
                 link,
                 resources,
@@ -3286,6 +3337,10 @@ async fn complete_inbound_segment(
                 resource_id,
                 LinkSessionResourceError::Failed(error.to_string()),
             );
+            if reject {
+                send_local_teardown(transport_tx, attached_interface, link).await;
+                return true;
+            }
             return transport_failed;
         }
     };
@@ -3588,7 +3643,9 @@ async fn handle_inbound_resource_hmu(
     false
 }
 
-fn handle_inbound_resource_cancel(
+async fn handle_inbound_resource_cancel(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    attached_interface: InterfaceId,
     link: &mut Link,
     resources: &mut SessionResources,
     event_tx: &mpsc::Sender<LinkSessionEvent>,
@@ -3605,8 +3662,10 @@ fn handle_inbound_resource_cancel(
     let Some(inbound) = resources.inbound.get_mut(&segment) else {
         return;
     };
-    inbound.transfer.handle_cancel();
+    // Link.py:1199-1206 runs Resource.cancel(), which answers with RCL.
+    let action = inbound.transfer.cancel();
     let resource_id = inbound.resource_id;
+    let _ = send_resource_action(transport_tx, attached_interface, link, action).await;
     remove_inbound_segments(link, resources, resource_id);
     conclude_inbound_resource(
         resources,
@@ -4581,7 +4640,15 @@ async fn process_destination_event(
                 rns_wire::context::PacketContext::ResourceIcl => {
                     link.record_inbound();
                     link.record_rx(body.len());
-                    handle_inbound_resource_cancel(link, &mut state.resources, event_tx, body);
+                    handle_inbound_resource_cancel(
+                        transport_tx,
+                        attached_interface,
+                        link,
+                        &mut state.resources,
+                        event_tx,
+                        body,
+                    )
+                    .await;
                 }
                 rns_wire::context::PacketContext::ResourceRcl => {
                     link.record_inbound();
