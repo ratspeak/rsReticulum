@@ -592,7 +592,7 @@ impl Channel {
         types
     }
 
-    /// Match Python RNS 1.4.2's receive guard: future sequence numbers are
+    /// Match Python RNS's receive guard: future sequence numbers are
     /// accepted only through `WINDOW_MAX`, while old sequence numbers are
     /// accepted only when the current receive window wraps past zero.
     fn is_acceptable_sequence(&self, seq: u16) -> bool {

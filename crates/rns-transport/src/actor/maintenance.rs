@@ -62,7 +62,7 @@ impl TransportActor {
 
             // Failed link establishment can mean either a stale path or a
             // topology change. Queue rediscovery so automated path requests
-            // are bounded and throttled like upstream Reticulum 1.2.5.
+            // are bounded and throttled like upstream Reticulum.
             let (_, expired_links) = self.link_table.cull_stale(LINK_TIMEOUT);
             let mut queued_dests = HashSet::new();
             for expired_link in expired_links {
