@@ -11,13 +11,23 @@ autobins = false
 [dependencies]
 rns-tools = { path = "../rns-tools" }
 rns-identity = { workspace = true }
+rns-runtime = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+nix = { workspace = true }
 rmpv = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [[bin]]
 name = "rngcs-rs"
 path = "src/bin/rngcs-rs.rs"
+
+[[bin]]
+name = "rngit-rs"
+path = "src/bin/rngit-rs.rs"

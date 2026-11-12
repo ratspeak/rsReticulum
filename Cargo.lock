@@ -1650,11 +1650,17 @@ name = "rns-git"
 version = "1.4.0"
 dependencies = [
  "base64",
+ "clap",
  "hex",
+ "nix 0.29.0",
  "rmpv",
  "rns-identity",
+ "rns-runtime",
  "rns-tools",
  "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
