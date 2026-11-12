@@ -7,14 +7,22 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use rns_git::client::forks::{ClientArgs, Operation};
 use rns_git::server::config::{
     NodeConfig, load_or_create_identity, read_or_create_config, resolve_config_dir,
+};
+use rns_git::server::forks::{
+    SYNC_CHECK_INTERVAL, handle_fork, handle_mirror, handle_sync, sync_mirrors,
 };
 use rns_git::server::handlers::{
     Reply, handle_create, handle_delete, handle_fetch, handle_list, handle_push,
 };
 use rns_git::server::layout::{Repositories, git_available};
-use rns_git::server::{APP_NAME, PATH_CREATE, PATH_DELETE, PATH_FETCH, PATH_LIST, PATH_PUSH};
+use rns_git::server::stats::{STATS_JOB_INTERVAL, Stats};
+use rns_git::server::{
+    APP_NAME, PATH_CREATE, PATH_DELETE, PATH_FETCH, PATH_FORK, PATH_LIST, PATH_MIRROR, PATH_PUSH,
+    PATH_SYNC,
+};
 use rns_identity::destination::{AllowPolicy, Destination};
 use rns_identity::identity::Identity;
 use rns_runtime::config::ConfigError;
@@ -49,17 +57,20 @@ fn admission() -> DeferredAdmission {
 /// Bundle directories kept until their Link closes (`link.temporary_directories`).
 type LinkTempDirs = Arc<Mutex<HashMap<[u8; 16], Vec<tempfile::TempDir>>>>;
 
-type Handler = fn(&RwLock<Repositories>, Option<&[u8; 16]>, &rmpv::Value) -> Option<Reply>;
+type Handler = Box<
+    dyn Fn(&RwLock<Repositories>, Option<&[u8; 16]>, &rmpv::Value) -> Option<Reply> + Send + Sync,
+>;
 
 /// Run a git handler on the blocking pool and answer through the responder.
 fn deferred(
     repositories: Arc<RwLock<Repositories>>,
     tempdirs: LinkTempDirs,
-    handler: Handler,
+    handler: Arc<Handler>,
 ) -> impl Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static {
     move |request, responder| {
         let repositories = repositories.clone();
         let tempdirs = tempdirs.clone();
+        let handler = Arc::clone(&handler);
         tokio::task::spawn_blocking(move || {
             let hash = request.remote_identity.as_ref().map(|id| id.hash);
             let (outcome, tmpdir) = match handler(&repositories, hash.as_ref(), &request.value) {
@@ -146,6 +157,130 @@ struct CreateArgs {
     quiet: u8,
     #[arg(long)]
     version: bool,
+}
+
+#[derive(Parser)]
+#[command(
+    name = "rngit-rs fork",
+    about = "Reticulum Git Repository Forker",
+    disable_version_flag = true
+)]
+struct ForkArgs {
+    /// path to alternative config directory
+    #[arg(long)]
+    config: Option<String>,
+    /// path to alternative Reticulum config directory
+    #[arg(long)]
+    rnsconfig: Option<String>,
+    /// path to identity
+    #[arg(short = 'i', long, value_name = "PATH")]
+    identity: Option<String>,
+    /// URL of source repository
+    source: String,
+    /// URL of target repository
+    target: String,
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    #[arg(short = 'q', long, action = clap::ArgAction::Count)]
+    quiet: u8,
+    #[arg(long)]
+    version: bool,
+}
+
+#[derive(Parser)]
+#[command(
+    name = "rngit-rs mirror",
+    about = "Reticulum Git Mirror Management",
+    disable_version_flag = true
+)]
+struct MirrorArgs {
+    /// path to alternative config directory
+    #[arg(long)]
+    config: Option<String>,
+    /// path to alternative Reticulum config directory
+    #[arg(long)]
+    rnsconfig: Option<String>,
+    /// path to identity
+    #[arg(short = 'i', long, value_name = "PATH")]
+    identity: Option<String>,
+    /// document scope: active, completed or all
+    #[arg(long, default_value = "active")]
+    scope: String,
+    /// URL of source repository
+    source: String,
+    /// URL of target repository
+    target: String,
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    #[arg(short = 'q', long, action = clap::ArgAction::Count)]
+    quiet: u8,
+    #[arg(long)]
+    version: bool,
+}
+
+#[derive(Parser)]
+#[command(
+    name = "rngit-rs sync",
+    about = "Reticulum Git Repository Syncer",
+    disable_version_flag = true
+)]
+struct SyncArgs {
+    /// path to alternative config directory
+    #[arg(long)]
+    config: Option<String>,
+    /// path to alternative Reticulum config directory
+    #[arg(long)]
+    rnsconfig: Option<String>,
+    /// path to identity
+    #[arg(short = 'i', long, value_name = "PATH")]
+    identity: Option<String>,
+    /// URL of repository
+    repository: String,
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    #[arg(short = 'q', long, action = clap::ArgAction::Count)]
+    quiet: u8,
+    #[arg(long)]
+    version: bool,
+}
+
+/// `rngit fork`, `rngit mirror` and `rngit sync` (`server.py:193-215`, `262-275`).
+async fn clone_subcommand(op: Operation, argv: Vec<String>) {
+    // (version, config, rnsconfig, identity, source, target, verbose, quiet)
+    let parsed = match op {
+        Operation::Sync => {
+            let a = SyncArgs::parse_from(argv);
+            let (c, r, i, t) = (a.config, a.rnsconfig, a.identity, a.repository);
+            (a.version, c, r, i, None, t, a.verbose, a.quiet)
+        }
+        Operation::Fork => {
+            let a = ForkArgs::parse_from(argv);
+            let (c, r, i, s, t) = (a.config, a.rnsconfig, a.identity, a.source, a.target);
+            (a.version, c, r, i, Some(s), t, a.verbose, a.quiet)
+        }
+        Operation::Mirror => {
+            // Upstream parses --scope for mirror and never reads it.
+            let a = MirrorArgs::parse_from(argv);
+            let _ = a.scope;
+            let (c, r, i, s, t) = (a.config, a.rnsconfig, a.identity, a.source, a.target);
+            (a.version, c, r, i, Some(s), t, a.verbose, a.quiet)
+        }
+    };
+    let (version, config, rnsconfig, identity, source, target, verbose, quiet) = parsed;
+    if version {
+        println!("rngit-rs {RS_RETICULUM_VERSION}");
+        return;
+    }
+    let args = ClientArgs {
+        config,
+        rnsconfig,
+        identity,
+        source,
+        target,
+        verbose,
+        quiet,
+    };
+    rns_git::client::forks::run(op, args).await
 }
 
 /// `ReticulumGitClient.abort` (`server.py:402-403`).
@@ -362,6 +497,17 @@ async fn main() {
         create(args).await;
         return;
     }
+    let op = match argv.get(1).map(String::as_str) {
+        Some("fork") => Some(Operation::Fork),
+        Some("mirror") => Some(Operation::Mirror),
+        Some("sync") => Some(Operation::Sync),
+        _ => None,
+    };
+    if let Some(op) = op {
+        argv.remove(1);
+        clone_subcommand(op, argv).await;
+        return;
+    }
     let args = Args::parse_from(argv);
     if args.version {
         println!("rngit-rs {RS_RETICULUM_VERSION}");
@@ -529,16 +675,36 @@ async fn main() {
         tracing::error!("Could not register the {PATH_LIST} handler");
         rns_tools::exit(&handle, 1).await;
     }
+    let stats = Arc::new(Stats::load(
+        configdir.join("stats"),
+        config.record_stats,
+        config.stats_ignored.clone(),
+    ));
     let tempdirs: LinkTempDirs = Arc::default();
-    let fetch: Handler = handle_fetch;
-    let push: Handler = |r, i, d| handle_push(r, i, d).map(Reply::Bytes);
-    let delete: Handler = |r, i, d| handle_delete(r, i, d).map(Reply::Bytes);
-    let create: Handler = |r, i, d| handle_create(r, i, d).map(Reply::Bytes);
+    let fetch: Handler = {
+        let stats = stats.clone();
+        Box::new(move |r, i, d| handle_fetch(r, &stats, i, d))
+    };
+    let push: Handler = {
+        let stats = stats.clone();
+        Box::new(move |r, i, d| handle_push(r, &stats, i, d).map(Reply::Bytes))
+    };
+    let delete: Handler = {
+        let stats = stats.clone();
+        Box::new(move |r, i, d| handle_delete(r, &stats, i, d).map(Reply::Bytes))
+    };
+    let create: Handler = Box::new(|r, i, d| handle_create(r, i, d).map(Reply::Bytes));
+    let fork: Handler = Box::new(|r, i, d| handle_fork(r, i, d).map(Reply::Bytes));
+    let mirror: Handler = Box::new(|r, i, d| handle_mirror(r, i, d).map(Reply::Bytes));
+    let sync: Handler = Box::new(|r, i, d| handle_sync(r, i, d).map(Reply::Bytes));
     for (path, handler) in [
         (PATH_FETCH, fetch),
         (PATH_PUSH, push),
         (PATH_CREATE, create),
         (PATH_DELETE, delete),
+        (PATH_FORK, fork),
+        (PATH_MIRROR, mirror),
+        (PATH_SYNC, sync),
     ] {
         let ok = registered
             .handle
@@ -548,7 +714,7 @@ async fn main() {
                 Vec::new(),
                 true,
                 admission(),
-                deferred(repositories.clone(), tempdirs.clone(), handler),
+                deferred(repositories.clone(), tempdirs.clone(), Arc::new(handler)),
             )
             .await;
         if !matches!(ok, Ok(true)) {
@@ -565,6 +731,10 @@ async fn main() {
     // The jobs loop (server.py:2656-2661): the first tick announces when an interval is set.
     let announce_interval = config.announce_interval;
     let mut last_announce: Option<Instant> = None;
+    let mut last_persist = Instant::now();
+    let mirror_interval = config.mirror_interval;
+    let sync_lock = std::sync::Arc::new(Mutex::new(()));
+    let mut last_sync_check = Instant::now();
     loop {
         tokio::select! {
             _ = interrupt.wait() => break,
@@ -592,6 +762,19 @@ async fn main() {
                 tracing::warn!("Could not announce: {e}");
             }
             last_announce = Some(Instant::now());
+        }
+        if last_persist.elapsed() >= Duration::from_secs(STATS_JOB_INTERVAL) {
+            let stats = stats.clone();
+            tokio::task::spawn_blocking(move || stats.persist());
+            last_persist = Instant::now();
+        }
+        if mirror_interval > 0
+            && last_sync_check.elapsed() >= Duration::from_secs(SYNC_CHECK_INTERVAL)
+        {
+            let repos = repositories.clone();
+            let lock = sync_lock.clone();
+            tokio::task::spawn_blocking(move || sync_mirrors(&repos, mirror_interval, &lock));
+            last_sync_check = Instant::now();
         }
     }
     println!();

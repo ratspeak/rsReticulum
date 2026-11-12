@@ -6,16 +6,17 @@ use rmpv::Value;
 
 use super::layout::{Repositories, parse_repository_path};
 use super::perms::Perm;
+use super::stats::Stats;
 use super::{IDX_REPOSITORY, RES_DISALLOWED, RES_INVALID_REQ, RES_NOT_FOUND, RES_REMOTE_FAIL};
 
-fn status(code: u8, message: &str) -> Vec<u8> {
+pub(super) fn status(code: u8, message: &str) -> Vec<u8> {
     let mut reply = vec![code];
     reply.extend_from_slice(message.as_bytes());
     reply
 }
 
 /// Python truthiness of an unpacked request value.
-fn truthy(value: &Value) -> bool {
+pub(super) fn truthy(value: &Value) -> bool {
     match value {
         Value::Nil => false,
         Value::Boolean(b) => *b,
@@ -31,7 +32,7 @@ fn truthy(value: &Value) -> bool {
 }
 
 /// `data.get(key)` for an integer or string key.
-fn get<'a>(map: &'a [(Value, Value)], key: &Value) -> Option<&'a Value> {
+pub(super) fn get<'a>(map: &'a [(Value, Value)], key: &Value) -> Option<&'a Value> {
     map.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
@@ -241,6 +242,7 @@ fn writable_repository(
 /// `handle_fetch` (`server.py:2931-3004`). `None` sends no response.
 pub fn handle_fetch(
     repos: &std::sync::RwLock<Repositories>,
+    stats: &Stats,
     identity: Option<&[u8; 16]>,
     data: &Value,
 ) -> Option<Reply> {
@@ -267,7 +269,7 @@ pub fn handle_fetch(
     if !truthy(refs) {
         return Some(Reply::Bytes(status(RES_INVALID_REQ, "No refs specified")));
     }
-    match fetch_bundle(map, refs, &repository_path, group, repo) {
+    match fetch_bundle(map, refs, &repository_path, group, repo, stats, identity) {
         Ok(reply) => Some(reply),
         Err(Raised) => {
             tracing::error!("Error while handling fetch request for {group}/{repo}");
@@ -282,6 +284,8 @@ fn fetch_bundle(
     repository_path: &std::path::Path,
     group: &str,
     repo: &str,
+    stats: &Stats,
+    identity: Option<&[u8; 16]>,
 ) -> Result<Reply, Raised> {
     let Value::Array(refs) = refs else {
         return Err(Raised);
@@ -348,7 +352,7 @@ fn fetch_bundle(
             "Could not fetch refs",
         )));
     }
-    fetch_succeeded(group, repo);
+    stats.fetch_succeeded(group, repo, identity);
     let file = std::fs::File::open(&bundle_path).map_err(|_| Raised)?;
     // {IDX_RESULT_CODE: RES_OK}
     let metadata = vec![0x81, super::IDX_RESULT_CODE, super::RES_OK];
@@ -362,6 +366,7 @@ fn fetch_bundle(
 /// `handle_push` (`server.py:3006-3100`). `None` sends no response.
 pub fn handle_push(
     repos: &std::sync::RwLock<Repositories>,
+    stats: &Stats,
     identity: Option<&[u8; 16]>,
     data: &Value,
 ) -> Option<Vec<u8>> {
@@ -405,6 +410,7 @@ pub fn handle_push(
                 &repository_path,
                 group,
                 repo,
+                stats,
             )
             .unwrap_or_else(|Raised| {
                 tracing::error!("Error while handling push request for {group}/{repo}");
@@ -419,13 +425,16 @@ pub fn handle_push(
         return Some(status(RES_INVALID_REQ, "Invalid data for operations"));
     };
     Some(
-        push_operations(operations, &repository_path, group, repo).unwrap_or_else(|Raised| {
-            tracing::error!("Error while handling push operations for {group}/{repo}");
-            status(RES_REMOTE_FAIL, "Remote error")
-        }),
+        push_operations(operations, &repository_path, group, repo, stats).unwrap_or_else(
+            |Raised| {
+                tracing::error!("Error while handling push operations for {group}/{repo}");
+                status(RES_REMOTE_FAIL, "Remote error")
+            },
+        ),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_bundle(
     bundle: &Value,
     local_ref: &str,
@@ -434,6 +443,7 @@ fn push_bundle(
     repository_path: &std::path::Path,
     group: &str,
     repo: &str,
+    stats: &Stats,
 ) -> Result<Vec<u8>, Raised> {
     let tmpdir = tempfile::TempDir::new().map_err(|_| Raised)?;
     let bundle_path = tmpdir.path().join("push.bundle");
@@ -465,7 +475,7 @@ fn push_bundle(
     if !result.status.success() {
         return Ok(failed(&result.stderr));
     }
-    push_succeeded(group, repo);
+    stats.push_succeeded(group, repo);
     Ok(vec![super::RES_OK])
 }
 
@@ -474,6 +484,7 @@ fn push_operations(
     repository_path: &std::path::Path,
     group: &str,
     repo: &str,
+    stats: &Stats,
 ) -> Result<Vec<u8>, Raised> {
     let empty = Value::from("");
     for op in operations {
@@ -525,19 +536,14 @@ fn push_operations(
             return Ok(status(RES_REMOTE_FAIL, "Could not update refs"));
         }
     }
-    push_succeeded(group, repo);
+    stats.push_succeeded(group, repo);
     Ok(vec![super::RES_OK])
 }
-
-/// `fetch_succeeded` (`server.py:4770-4773`): statistics, not recorded yet.
-fn fetch_succeeded(_group: &str, _repo: &str) {}
-
-/// `push_succeeded` (`server.py:4775-4777`): statistics, not recorded yet.
-fn push_succeeded(_group: &str, _repo: &str) {}
 
 /// `handle_delete` (`server.py:3102-3134`). `None` sends no response.
 pub fn handle_delete(
     repos: &std::sync::RwLock<Repositories>,
+    stats: &Stats,
     identity: Option<&[u8; 16]>,
     data: &Value,
 ) -> Option<Vec<u8>> {
@@ -567,7 +573,7 @@ pub fn handle_delete(
     tracing::debug!("Deleting ref {reference} in {group}/{repo}");
     match run_git(&repository_path, &["update-ref", "-d", &reference]) {
         Ok(result) if result.status.success() => {
-            push_succeeded(group, repo);
+            stats.push_succeeded(group, repo);
             Some(vec![super::RES_OK])
         }
         Ok(result) => {
@@ -585,7 +591,7 @@ pub fn handle_delete(
 }
 
 /// `REPO_CREATE_PERMS_TEMPLATE` (`server.py:5090`).
-const REPO_CREATE_PERMS_TEMPLATE: &str = "adm:{IDENTITY_HASH}";
+pub(super) const REPO_CREATE_PERMS_TEMPLATE: &str = "adm:{IDENTITY_HASH}";
 
 /// `handle_create` (`server.py:3141-3211`). `None` sends no response.
 /// Group permissions are checked without the blocklist, as upstream does.
