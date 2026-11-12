@@ -1,5 +1,5 @@
 //! Repository groups and repositories on disk (`load_repository_group`,
-//! `update_group_permissions`, `load_repository`, `server.py:2528-2645@1.6.0`).
+//! `update_group_permissions`, `load_repository`, `server.py`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,7 +54,7 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// `_ensure_git` (`server.py:2709-2712`).
+/// `_ensure_git` (`server.py`).
 pub fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
@@ -65,7 +65,7 @@ pub fn git_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// `__is_fork` / `__is_mirror` (`server.py:2734-2760`).
+/// `__is_fork` / `__is_mirror` (`server.py`).
 fn upstream_source(path: &Path, kind: &str) -> Option<String> {
     if git_stdout(path, &["config", "repository.rngit.type"])? != kind {
         return None;
@@ -95,7 +95,7 @@ impl Repositories {
         Ok(repos)
     }
 
-    /// `load_repository_group` (`server.py:2528-2546`).
+    /// `load_repository_group` (`server.py`).
     pub fn load_group(
         &mut self,
         name: &str,
@@ -128,7 +128,7 @@ impl Repositories {
         Ok(())
     }
 
-    /// `update_group_permissions` (`server.py:2548-2602`): the group's
+    /// `update_group_permissions` (`server.py`): the group's
     /// `.allowed` file first, then its `[access]` statements appended.
     pub fn update_group_permissions(&mut self, name: &str, config: &NodeConfig) {
         let aliases = self.aliases.clone();
@@ -160,7 +160,7 @@ impl Repositories {
         group.permissions = permissions;
     }
 
-    /// `load_repository` (`server.py:2621-2645`). A repository `.allowed`
+    /// `load_repository` (`server.py`). A repository `.allowed`
     /// file that cannot be read is an error, as upstream lets it raise.
     pub fn load_repository(&mut self, group_name: &str, path: &Path) -> Result<bool, AllowedError> {
         let Some(group) = self.groups.get_mut(group_name) else {
@@ -199,7 +199,7 @@ impl Repositories {
         Ok(true)
     }
 
-    /// `resolve_permission` (`server.py:2311-2369`), the only resolver that
+    /// `resolve_permission` (`server.py`), the only resolver that
     /// checks the blocklist.
     pub fn resolve_permission(
         &self,
@@ -220,7 +220,7 @@ impl Repositories {
         super::perms::resolve_repository(&g.permissions, &r.permissions, hash, perm)
     }
 
-    /// `resolve_group_permission` (`server.py:2371-2396`).
+    /// `resolve_group_permission` (`server.py`).
     pub fn resolve_group_permission(&self, hash: &[u8; 16], group: &str, perm: Perm) -> bool {
         self.groups
             .get(group)
@@ -232,7 +232,7 @@ impl Repositories {
     }
 }
 
-/// `parse_request_repository_path` (`server.py:2292-2300`).
+/// `parse_request_repository_path` (`server.py`).
 pub fn parse_repository_path(path: &str) -> Option<(&str, &str)> {
     let mut parts = path.split('/');
     let (Some(group), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
@@ -241,7 +241,7 @@ pub fn parse_repository_path(path: &str) -> Option<(&str, &str)> {
     (super::py_len(group) <= 256 && super::py_len(repo) <= 256).then_some((group, repo))
 }
 
-/// `parse_request_group_path` (`server.py:2302-2309`).
+/// `parse_request_group_path` (`server.py`).
 pub fn parse_group_path(path: &str) -> Option<&str> {
     (!path.contains('/') && super::py_len(path) <= 256).then_some(path)
 }

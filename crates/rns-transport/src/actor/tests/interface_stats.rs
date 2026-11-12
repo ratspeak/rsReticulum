@@ -1,6 +1,6 @@
 //! Python 1.5.5 per-interface counters in interface stats: announce and path
 //! request counts, protocol and IFAC violations, packet filter hits and
-//! dropped transmit bytes (Interface.py:303-338, Reticulum.py:1640-1663).
+//! dropped transmit bytes (Interface.py, Reticulum.py).
 use super::*;
 use rns_wire::context::PacketContext;
 use rns_wire::flags::{DestinationType, HeaderType, PacketFlags, PacketType, TransportType};
@@ -83,7 +83,7 @@ fn packet(
 }
 
 /// `rest` follows the destination: a tag, or a requestor transport id and a
-/// tag (Transport.py:1832-1835).
+/// tag (Transport.py).
 fn path_request(destination: [u8; 16], rest: &[u8]) -> Bytes {
     let pr_destination = rns_identity::destination::Destination::hash_from_name_and_identity(
         "rnstransport.path.request",
@@ -305,7 +305,7 @@ fn a_full_transmit_queue_counts_dropped_bytes() {
 }
 
 /// Python counts a path request once its destination and tag pass the
-/// duplicate gate (Transport.py:1847-1858), so a repeat sent through another
+/// duplicate gate (Transport.py), so a repeat sent through another
 /// requestor neither counts nor brings the ingress limit closer.
 #[test]
 fn a_repeated_path_request_tag_is_not_counted() {
@@ -385,7 +385,7 @@ fn totals(actor: &mut TransportActor) -> crate::messages::TrafficTotalsRpcEntry 
 }
 
 /// Spawned children add their announce bytes and samples, not counts, to the
-/// parent (Interface.py:307-311, TCPInterface.py:655-658).
+/// parent (Interface.py, TCPInterface.py).
 #[test]
 fn a_parent_takes_its_childrens_announce_bytes_but_not_their_counts() {
     let mut actor = hub();
@@ -408,7 +408,7 @@ fn a_parent_takes_its_childrens_announce_bytes_but_not_their_counts() {
 }
 
 /// Totals sum top-level interfaces other than the shared-instance server and
-/// keep what they counted when an interface leaves (Transport.py:736-814).
+/// keep what they counted when an interface leaves (Transport.py).
 #[test]
 fn traffic_totals_are_cumulative_over_top_level_interfaces() {
     let mut actor = hub();
@@ -443,7 +443,7 @@ fn traffic_totals_are_cumulative_over_top_level_interfaces() {
 }
 
 /// `unupcount` counts paths never used and `actpcount` the rest
-/// (Transport.py:3564-3569, Reticulum.py:1848-1850).
+/// (Transport.py, Reticulum.py).
 #[test]
 fn traffic_totals_count_never_used_paths() {
     let mut actor = hub();

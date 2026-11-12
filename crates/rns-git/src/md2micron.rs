@@ -1,12 +1,12 @@
 //! Markdown to Micron conversion: a port of `MarkdownToMicron` and
-//! `convert_markdown_to_micron` from `RNS/Utilities/rngit/util.py@1.6.0`
+//! `convert_markdown_to_micron` from `RNS/Utilities/rngit/util.py`
 //! (`:79-816`).
 //!
 //! Upstream's regular expressions are matched by hand with the same Python
 //! `re` semantics: `\s` is Python's Unicode whitespace, `\d` any Unicode
 //! decimal digit. Display width is the character count, which is what
 //! upstream uses when the optional `wcwidth` module is absent
-//! (`util.py:150-156`). Input lines never contain `\n`: `format_block`
+//! (`util.py`). Input lines never contain `\n`: `format_block`
 //! splits on it first, as upstream does.
 
 use std::convert::Infallible;
@@ -44,7 +44,7 @@ pub enum Align {
     Right,
 }
 
-/// Python `MarkdownToMicron` (`util.py:79-811`).
+/// Python `MarkdownToMicron` (`util.py`).
 #[derive(Debug, Clone)]
 pub struct MarkdownToMicron {
     pub max_width: usize,
@@ -62,7 +62,7 @@ impl Default for MarkdownToMicron {
     }
 }
 
-/// Python `convert_markdown_to_micron` (`util.py:814-816`).
+/// Python `convert_markdown_to_micron` (`util.py`).
 pub fn convert_markdown_to_micron(text: &str) -> Result<String, MarkdownError> {
     MarkdownToMicron::default().format_block(text)
 }
@@ -95,7 +95,7 @@ impl MarkdownToMicron {
     pub const TABLE_MIN_COL_WIDTH: usize = 3;
 
     /// An empty or absent `url_scope` selects `:/page/`, as upstream's
-    /// `url_scope or ":/page/"` does (`util.py:130-145`).
+    /// `url_scope or ":/page/"` does (`util.py`).
     pub fn new(
         max_width: usize,
         syntax_highlighter: Option<SyntaxHighlighter>,
@@ -120,7 +120,7 @@ impl MarkdownToMicron {
         self.local_url_scope = url_scope.to_string();
     }
 
-    /// Back to the scope given at construction (`util.py:148`).
+    /// Back to the scope given at construction (`util.py`).
     pub fn restore_url_scope(&mut self) {
         self.local_url_scope = self.initial_url_scope.clone();
     }
@@ -129,7 +129,7 @@ impl MarkdownToMicron {
         text.len()
     }
 
-    /// Python `format_block` (`util.py:158-302`).
+    /// Python `format_block` (`util.py`).
     pub fn format_block(&self, text: &str) -> Result<String, MarkdownError> {
         let mut st = BlockState::default();
         for line in text.split('\n') {
@@ -193,7 +193,7 @@ impl MarkdownToMicron {
         Ok(st.out.join("\n"))
     }
 
-    /// Python `format_line(line)` (`util.py:304-322`).
+    /// Python `format_line(line)` (`util.py`).
     pub fn format_line(&self, line: &str) -> Result<String, MarkdownError> {
         let mut line = line.replace('\\', "\\\\");
         if line.starts_with('-') && !line.starts_with("---") && !line.starts_with("- ") {
@@ -226,12 +226,12 @@ impl MarkdownToMicron {
         self.format_inline(&line)
     }
 
-    /// Python `format_line(line, mode="codeblock")` (`util.py:305`).
+    /// Python `format_line(line, mode="codeblock")` (`util.py`).
     pub fn format_codeblock_line(&self, line: &str) -> String {
         escape_literals(line)
     }
 
-    /// Python `_format_inline` (`util.py:324-371`).
+    /// Python `_format_inline` (`util.py`).
     pub fn format_inline(&self, text: &str) -> Result<String, MarkdownError> {
         let mut links: Vec<(String, String)> = Vec::new();
         let mut codes: Vec<String> = Vec::new();
@@ -283,12 +283,12 @@ impl MarkdownToMicron {
         }
     }
 
-    /// Python `format_table` (`util.py:423-528`); `align` empty means none.
+    /// Python `format_table` (`util.py`); `align` empty means none.
     pub fn format_table(&self, rows: &[String], align: &str) -> Result<Vec<String>, MarkdownError> {
         self.table(rows, align, false, |cell| self.format_inline(cell))
     }
 
-    /// Python `format_table_raw` (`util.py:530-631`): cells are not formatted
+    /// Python `format_table_raw` (`util.py`): cells are not formatted
     /// and the header row is not escaped.
     pub fn format_table_raw(&self, rows: &[String], align: &str) -> Vec<String> {
         let Ok(lines) = self.table(rows, align, true, |cell| {
@@ -390,7 +390,7 @@ impl MarkdownToMicron {
         Ok(result)
     }
 
-    /// Python `_visible_width` (`util.py:667-674`): the six tag patterns are
+    /// Python `_visible_width` (`util.py`): the six tag patterns are
     /// removed one pass each, in upstream's order.
     fn visible_width(&self, text: &[char]) -> usize {
         let hex = |c: &[char], from: usize, n: usize| {
@@ -419,7 +419,7 @@ impl MarkdownToMicron {
         self.display_width(&s)
     }
 
-    /// Python `_pad_cell` (`util.py:676-688`).
+    /// Python `_pad_cell` (`util.py`).
     fn pad_cell(&self, text: &str, width: usize, align: Align) -> String {
         let text = self.truncate_cell(text, width);
         let c: Vec<char> = text.chars().collect();
@@ -434,7 +434,7 @@ impl MarkdownToMicron {
         }
     }
 
-    /// Python `_truncate_cell` (`util.py:690-746`). Upstream appends the open
+    /// Python `_truncate_cell` (`util.py`). Upstream appends the open
     /// toggle closers in `set` order, which varies per process; this emits
     /// them in `!*_=` order, one of upstream's possible outputs.
     fn truncate_cell(&self, text: &str, width: usize) -> String {
@@ -503,7 +503,7 @@ impl MarkdownToMicron {
         out
     }
 
-    /// Python `_wrap_text` (`util.py:748-811`).
+    /// Python `_wrap_text` (`util.py`).
     fn wrap_text(&self, text: &str, width: usize) -> Vec<String> {
         if text.is_empty() {
             return vec![String::new()];
@@ -614,7 +614,7 @@ impl BlockState {
         Ok(())
     }
 
-    /// Upstream's `except Exception` fallback (`util.py:218-224`) has no
+    /// Upstream's `except Exception` fallback (`util.py`) has no
     /// counterpart: the highlighter here cannot fail.
     fn flush_code(&mut self, m: &MarkdownToMicron) {
         if self.code_buffer.is_empty() {
@@ -742,7 +742,7 @@ fn table_row_group(c: &[char]) -> Option<&[char]> {
     None
 }
 
-/// Python `_is_table_row` (`util.py:408-413`).
+/// Python `_is_table_row` (`util.py`).
 fn is_table_row(line: &str) -> bool {
     if !line.contains('|') {
         return false;
@@ -784,7 +784,7 @@ fn is_table_separator(line: &str) -> bool {
     c[j..].iter().all(|x| py_space(*x))
 }
 
-/// Python `_parse_table_row` (`util.py:633-654`).
+/// Python `_parse_table_row` (`util.py`).
 fn parse_table_row(line: &str) -> Vec<String> {
     let line = py_strip(line);
     let line = line.strip_prefix('|').unwrap_or(line);
@@ -809,7 +809,7 @@ fn parse_table_row(line: &str) -> Vec<String> {
     cells
 }
 
-/// Python `_parse_table_alignments` (`util.py:656-665`).
+/// Python `_parse_table_alignments` (`util.py`).
 fn parse_table_alignments(line: &str) -> Vec<Align> {
     parse_table_row(line)
         .iter()

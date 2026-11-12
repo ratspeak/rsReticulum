@@ -350,7 +350,7 @@ impl crate::serial_io::SerialGeneration for KissGeneration {
                     match crate::serial_io::blocking_write_all(port_w, framed).await {
                         Ok(p) => {
                             port_w = p;
-                            // Python counts the unframed payload here (KISSInterface.py:275).
+                            // Python counts the unframed payload here (KISSInterface.py).
                             txb.fetch_add(data.len() as u64, Ordering::Relaxed);
                         }
                         Err(e) => return GenerationEnd::WriteFailed(e),
@@ -426,7 +426,7 @@ mod tests {
         assert!(cfg.id_interval.is_none() && cfg.id_callsign.is_none());
     }
 
-    /// Python KISSInterface.py:350-353 — beacon payload is the callsign
+    /// Python KISSInterface.py — beacon payload is the callsign
     /// zero-padded to 15 bytes; longer callsigns pass through unchanged.
     #[test]
     fn test_beacon_frame_payload_padding() {

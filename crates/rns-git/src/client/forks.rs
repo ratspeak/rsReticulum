@@ -1,6 +1,6 @@
 //! `rngit fork`, `rngit mirror` and `rngit sync` (`fork_repository`,
 //! `mirror_repository`, `_remote_clone_operation`, `sync_repository`,
-//! `server.py:606-716@1.6.0`).
+//! `server.py`).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -60,7 +60,7 @@ fn reply_text(response: &[u8], fallback: &str) -> String {
 }
 
 /// What `_remote_clone_operation` and `sync_repository` print for a reply
-/// (`server.py:646-667`, `694-711`): `Ok` on success, `Err` for the abort text.
+/// (`server.py`): `Ok` on success, `Err` for the abort text.
 pub fn outcome(op: Operation, repo_path: &str, response: Option<&[u8]>) -> Result<String, String> {
     let Some(response) = response.filter(|r| !r.is_empty()) else {
         return Err("No response from remote".into());
@@ -84,7 +84,7 @@ fn prettyhex(hash: &[u8]) -> String {
     format!("<{}>", hex::encode(hash))
 }
 
-/// `ReticulumGitClient.abort` (`server.py:433-434`).
+/// `ReticulumGitClient.abort` (`server.py`).
 async fn abort(handle: &ReticulumHandle, message: &str) -> ! {
     println!("{message}");
     rns_tools::exit(handle, 1).await
@@ -152,7 +152,7 @@ pub async fn run(op: Operation, args: ClientArgs) -> ! {
         }
     };
 
-    // fork_repository / mirror_repository, then _resolve_aliased_url (server.py:610-626).
+    // fork_repository / mirror_repository, then _resolve_aliased_url (server.py).
     let mut source = None;
     if op != Operation::Sync {
         let Some(src) = non_empty(args.source) else {
@@ -177,7 +177,7 @@ pub async fn run(op: Operation, args: ClientArgs) -> ! {
         abort(&handle, "No remote specified").await;
     }
 
-    // connect_remote (server.py:466-483).
+    // connect_remote (server.py).
     let remote = args.target;
     let destination = match config.parse_remote_destination_url(&remote) {
         Ok(hash) => hash,

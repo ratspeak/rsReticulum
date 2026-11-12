@@ -143,7 +143,7 @@ struct Args {
     destination: Option<String>,
 }
 
-// rncp.py:376-385 and :615-624 share this text for send and fetch.
+// rncp.py and :615-624 share this text for send and fetch.
 fn parse_dest_hash(hex_str: &str) -> Result<[u8; 16], String> {
     if hex_str.chars().count() != 32 {
         return Err(
@@ -160,7 +160,7 @@ fn parse_dest_hash(hex_str: &str) -> Result<[u8; 16], String> {
 const ERASE: &str = "\x1b[2K\r";
 const SYMS: [char; 7] = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
 
-/// rncp.py:54-68 (`prepare_identity`): `-i` is used as given, and an identity
+/// rncp.py (`prepare_identity`): `-i` is used as given, and an identity
 /// that cannot be saved is still used for this run.
 async fn prepare_identity(
     handle: &ReticulumHandle,
@@ -192,7 +192,7 @@ async fn prepare_identity(
     id
 }
 
-/// rncp.py:891-908 (`size_str`).
+/// rncp.py (`size_str`).
 fn size_str(num: f64, suffix: char) -> String {
     let mut num = if suffix == 'b' { num * 8.0 } else { num };
     for unit in ["", "K", "M", "G", "T", "P", "E", "Z"] {
@@ -208,7 +208,7 @@ fn size_str(num: f64, suffix: char) -> String {
     format!("{num:.2}Y{suffix}")
 }
 
-/// `RNS.prettytime` (RNS/__init__.py:239-290) for the float durations rncp prints.
+/// `RNS.prettytime` (RNS/__init__.py) for the float durations rncp prints.
 fn prettytime(time: f64) -> String {
     let neg = time < 0.0;
     let mut time = time.abs();
@@ -262,13 +262,13 @@ fn python_float(v: f64) -> String {
     }
 }
 
-/// `str(round(prg * 100.0, 1))` (rncp.py:582, :746).
+/// `str(round(prg * 100.0, 1))` (rncp.py).
 fn percent_str(progress: f64) -> String {
     python_float(format!("{:.1}", progress * 100.0).parse().unwrap_or(0.0))
 }
 
 /// Resource `total_size`: data plus the 3-byte length and msgpack of
-/// `{"name": <basename>}` (Resource.py:263-271, rncp.py:629).
+/// `{"name": <basename>}` (Resource.py, rncp.py).
 fn resource_total_size(data_size: u64, file_name: &str) -> f64 {
     let meta = rmpv::Value::Map(vec![(
         rmpv::Value::String("name".into()),
@@ -300,7 +300,7 @@ struct UiState {
 }
 
 impl UiState {
-    /// rncp.py:323-356 (`sender_progress`): speed over the last 32 updates.
+    /// rncp.py (`sender_progress`): speed over the last 32 updates.
     fn update(&mut self, progress: f64, phy_got: f64) {
         let now = Instant::now();
         self.started.get_or_insert(now);
@@ -332,7 +332,7 @@ impl UiState {
         let cs = size_str((self.progress * total).trunc(), 'B');
         let ts = size_str(total, 'B');
         let ss = size_str(self.speed, 'b');
-        // rncp.py:577-579, 753-755.
+        // rncp.py.
         let phy_str = if self.phy_rates {
             format!(" ({}ps at physical layer)", size_str(self.phy_speed, 'b'))
         } else {
@@ -431,7 +431,7 @@ impl Ui {
         }
     }
 
-    /// rncp.py:576-577: the erase before the fetch progress, without a line under `-S`.
+    /// rncp.py: the erase before the fetch progress, without a line under `-S`.
     fn transfer_started(&self) {
         let mut st = self.lock();
         if !self.silent {
@@ -472,7 +472,7 @@ pub(crate) async fn main() {
         std::io::stderr,
     );
 
-    // rncp.py:824-880.
+    // rncp.py.
     let positionals = args.file.is_some() && args.destination.is_some();
     if args.listen || args.print_identity {
         run_listen(args).await;
@@ -489,7 +489,7 @@ pub(crate) async fn main() {
     }
 }
 
-/// rncp.py:394-430 / :640-676: request a path unless one is known, wait
+/// rncp.py / :640-676: request a path unless one is known, wait
 /// `max(-w, medium path timeout)` for it, and return the time left for the
 /// link, which rncp waits for until the later of that deadline and the link
 /// establishment timeout.
@@ -546,7 +546,7 @@ async fn run_fetch(args: Args) -> ! {
         process::exit(0);
     };
 
-    // rncp.py:364-374: the save directory is checked before the hash.
+    // rncp.py: the save directory is checked before the hash.
     let save_dir = match args.save.as_deref() {
         Some(p) => {
             let path = expand_tilde(p);
@@ -643,7 +643,7 @@ async fn run_fetch(args: Args) -> ! {
         fail("The transfer failed");
     };
 
-    // rncp.py:543-567: every answered request failure exits 0.
+    // rncp.py: every answered request failure exits 0.
     match result {
         Err(RncpError::Interrupted) => {
             println!();
@@ -846,7 +846,7 @@ async fn run_send(args: Args) -> ! {
                 let mut st = ui.lock();
                 st.tick = Tick::Off;
                 st.progress = 1.0;
-                // The send's final line drops the physical rate once the resource is done (rncp.py:753).
+                // The send's final line drops the physical rate once the resource is done (rncp.py).
                 st.phy_rates = false;
                 let total = st.total_size.unwrap_or(0.0);
                 let dt = st.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
@@ -952,7 +952,7 @@ async fn run_listen(args: Args) -> ! {
         process::exit(0);
     }
 
-    // rncp.py:118-170: -n skips the allowed_identities file and -a entirely.
+    // rncp.py: -n skips the allowed_identities file and -a entirely.
     let allow_all = args.no_auth;
     let allowed = if allow_all {
         Vec::new()
@@ -1076,7 +1076,7 @@ fn spawn_listen_announcer(
 
         loop {
             send_rncp_announce(&transport_tx, &mut destination, &identity, destination_hash).await;
-            // rncp.py:86-87, 222-230: -1 and 0 both announce once.
+            // rncp.py: -1 and 0 both announce once.
             if interval_seconds <= 0 {
                 break;
             }
@@ -1122,7 +1122,7 @@ async fn send_rncp_announce(
 }
 
 /// The `-a` values plus the first existing allowed_identities file, each
-/// validated as a 16-byte hex hash (rncp.py:121-167).
+/// validated as a 16-byte hex hash (rncp.py).
 fn allowed_identities(cli: &[String], candidates: &[PathBuf]) -> Result<Vec<[u8; 16]>, String> {
     let mut entries: Vec<String> = cli.to_vec();
     if let Some(path) = candidates.iter().find(|p| p.is_file()) {
@@ -1188,7 +1188,7 @@ async fn start_interruptible(
     }
 }
 
-/// `max(-w, reticulum.get_medium_path_timeout())` (rncp.py:405, 662).
+/// `max(-w, reticulum.get_medium_path_timeout())` (rncp.py).
 async fn path_timeout(handle: &ReticulumHandle, timeout: f64) -> Duration {
     let medium = rns_tools::medium_path_timeout(handle).await;
     let secs = if timeout.is_finite() {

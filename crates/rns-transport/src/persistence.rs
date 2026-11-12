@@ -185,7 +185,7 @@ pub fn interface_hash_from_name(name: &str) -> [u8; 32] {
 /// Save the Python-compatible nine-field destination rows. Entries without a
 /// supplied interface name or cached announce hash are skipped; expired entries
 /// are retained. Rows carry every in-memory random blob, as Python does. The
-/// ninth field is the path's last use (Transport.py:4345-4357@1.6.0).
+/// ninth field is the path's last use (Transport.py).
 pub fn save_python_destination_table(
     table: &PathTable,
     interface_names: &HashMap<u64, String>,
@@ -388,7 +388,7 @@ pub fn load_python_cached_announce(
 /// Save Python-compatible tunnel rows, retaining expired tunnels and paths.
 /// Nested paths without a cached announce hash are omitted; each saved path
 /// keeps at most the last 32 random blobs and, as its ninth field, the path's
-/// last use (Transport.py:4419-4441@1.6.0). An unknown interface has no hash.
+/// last use (Transport.py). An unknown interface has no hash.
 pub fn save_python_tunnel_table(
     table: &crate::tunnel::TunnelTable,
     interface_names: &HashMap<u64, String>,
@@ -842,7 +842,7 @@ pub fn save_python_blackhole_files(
 }
 
 /// Write `blackhole_dir/local` with the local entries, as upstream
-/// `Transport.persist_blackhole` does (Transport.py:4598-4616).
+/// `Transport.persist_blackhole` does (Transport.py).
 pub fn save_local_blackhole_file(
     table: &crate::blackhole::BlackholeTable,
     local_identity_hash: [u8; 16],
@@ -868,7 +868,7 @@ pub fn save_local_blackhole_file(
 }
 
 /// Store a publisher's fetched `/list` reply as `blackhole_dir/<publisher>`,
-/// unchanged, as upstream's updater does (Discovery.py:938-943).
+/// unchanged, as upstream's updater does (Discovery.py).
 pub fn save_blackhole_source_file(
     publisher: [u8; 16],
     payload: &[u8],
@@ -946,7 +946,7 @@ pub fn load_python_blackhole_dir(
             let Some(identity_hash) = value_bin_array::<16>(&identity_value) else {
                 continue;
             };
-            // Transport.py:4550-4552: a non-map entry reloads as permanent.
+            // Transport.py: a non-map entry reloads as permanent.
             let entry_map = match entry_value {
                 Value::Map(entry_map) => entry_map,
                 _ => Vec::new(),
@@ -1442,7 +1442,7 @@ mod announce_sweep_tests {
     }
 
     /// Decision-table parity with Python `Transport.clean_announce_cache`
-    /// (upstream Transport.py:2521): referenced → keep, unreferenced → remove,
+    /// (upstream Transport.py): referenced → keep, unreferenced → remove,
     /// non-hex name → remove. Grace column is the deliberate Rust extension.
     #[test]
     fn sweep_matrix_matches_python_semantics() {
@@ -1668,10 +1668,10 @@ mod tests {
             interface_hash_from_name("Interface[Test]")
         );
         assert_eq!(loaded[0].packet_hash, packet_hash);
-        // Transport.py:4345-4357@1.6.0: the ninth field is the path's use.
+        // Transport.py: the ninth field is the path's use.
         assert_eq!(loaded[0].used, Some(4321.5));
 
-        // A legacy eight-field row has no use (Transport.py:557@1.6.0).
+        // A legacy eight-field row has no use (Transport.py).
         let mut legacy = Vec::new();
         let rmpv::Value::Array(mut rows) = rmpv::decode::read_value(&mut std::io::Cursor::new(
             std::fs::read(&destination_table_path).unwrap(),

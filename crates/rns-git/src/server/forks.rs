@@ -1,5 +1,5 @@
 //! `/git/fork`, `/git/mirror`, `/git/sync` and the periodic mirror job
-//! (`server.py:2098-2172`, `2762-2836`, `3213-3362@1.6.0`).
+//! (`server.py`).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -18,13 +18,13 @@ use super::{
     IDX_REPOSITORY, RES_DISALLOWED, RES_INVALID_REQ, RES_NOT_FOUND, RES_OK, RES_REMOTE_FAIL,
 };
 
-/// `CLONE_PROTOS` (`server.py:1978`).
+/// `CLONE_PROTOS` (`server.py`).
 pub const CLONE_PROTOS: [&str; 4] = ["rns", "http", "https", "ssh"];
 
-/// `sync_check_interval` (`server.py:1998`): seconds between mirror job runs.
+/// `sync_check_interval` (`server.py`): seconds between mirror job runs.
 pub const SYNC_CHECK_INTERVAL: u64 = 15 * 60;
 
-/// `ls-remote` is the only git call upstream bounds (`server.py:2790-2791`).
+/// `ls-remote` is the only git call upstream bounds (`server.py`).
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a clone handler makes: a fork or a mirror.
@@ -125,7 +125,7 @@ fn now_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// `__mirror_synced` (`server.py:2762-2769`): 0 when unset or unreadable.
+/// `__mirror_synced` (`server.py`): 0 when unset or unreadable.
 pub fn mirror_synced(path: &Path) -> i64 {
     match git(Some(path), &["config", "repository.rngit.upstream.sync"]) {
         Ok(out) if out.status.success() => py_int(&lossy(&out.stdout)).unwrap_or(0),
@@ -133,7 +133,7 @@ pub fn mirror_synced(path: &Path) -> i64 {
     }
 }
 
-/// `__set_mirror_synced` (`server.py:2771-2779`).
+/// `__set_mirror_synced` (`server.py`).
 pub fn set_mirror_synced(path: &Path) -> bool {
     let now = now_secs().to_string();
     git(
@@ -143,7 +143,7 @@ pub fn set_mirror_synced(path: &Path) -> bool {
     .is_ok_and(|out| out.status.success())
 }
 
-/// `__update_head_to_source_default` (`server.py:2785-2836`): point HEAD at
+/// `__update_head_to_source_default` (`server.py`): point HEAD at
 /// the source's default branch, else at the first local branch.
 pub fn update_head_to_source_default(repo_path: &Path, source_url: &str) -> bool {
     tracing::debug!(
@@ -225,7 +225,7 @@ pub fn update_head_to_source_default(repo_path: &Path, source_url: &str) -> bool
     }
 }
 
-/// `__sync_mirror` / `__sync_fork` (`server.py:2110-2172`): fetch every ref
+/// `__sync_mirror` / `__sync_fork` (`server.py`): fetch every ref
 /// from the source; a mirror also follows the source's HEAD.
 fn sync_upstream(kind: RepoType, label: &str, path: &Path, source: &str) -> bool {
     let what = match kind {
@@ -275,7 +275,7 @@ fn capitalise(word: &str) -> String {
         .unwrap_or_default()
 }
 
-/// `__sync_mirrors` (`server.py:2098-2108`): every mirror whose last sync is
+/// `__sync_mirrors` (`server.py`): every mirror whose last sync is
 /// older than `mirror_interval` seconds. Forks are never synced here. Returns
 /// at once when a run is already in progress.
 pub fn sync_mirrors(repos: &RwLock<Repositories>, mirror_interval: i64, sync_lock: &Mutex<()>) {
@@ -332,7 +332,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `handle_fork` (`server.py:3213-3215`). `None` sends no response.
+/// `handle_fork` (`server.py`). `None` sends no response.
 pub fn handle_fork(
     repos: &RwLock<Repositories>,
     identity: Option<&[u8; 16]>,
@@ -346,7 +346,7 @@ pub fn handle_fork(
     handle_remote_clone(repos, identity, data, RepoType::Fork)
 }
 
-/// `handle_mirror` (`server.py:3217-3219`). `None` sends no response.
+/// `handle_mirror` (`server.py`). `None` sends no response.
 pub fn handle_mirror(
     repos: &RwLock<Repositories>,
     identity: Option<&[u8; 16]>,
@@ -360,7 +360,7 @@ pub fn handle_mirror(
     handle_remote_clone(repos, identity, data, RepoType::Mirror)
 }
 
-/// `_handle_remote_clone` (`server.py:3221-3330`). An identified link and a
+/// `_handle_remote_clone` (`server.py`). An identified link and a
 /// remote identity are the same condition here: both come from LINKIDENTIFY.
 fn handle_remote_clone(
     repos: &RwLock<Repositories>,
@@ -438,7 +438,7 @@ fn handle_remote_clone(
     }))
 }
 
-/// The `try` body of `_handle_remote_clone` (`server.py:3248-3324`).
+/// The `try` body of `_handle_remote_clone` (`server.py`).
 fn clone_into(
     repos: &RwLock<Repositories>,
     hash: &[u8; 16],
@@ -562,7 +562,7 @@ fn clone_into(
     }
 }
 
-/// `handle_sync` (`server.py:3332-3362`). `None` sends no response.
+/// `handle_sync` (`server.py`). `None` sends no response.
 pub fn handle_sync(
     repos: &RwLock<Repositories>,
     identity: Option<&[u8; 16]>,

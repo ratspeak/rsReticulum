@@ -38,7 +38,7 @@ impl LinkMtu {
     /// Qualified base used for legacy and current host endpoint traffic.
     pub const BASE: Self = Self(BASE_LINK_MTU);
     /// Validate protocol domain without truncation or saturation. Any nonzero
-    /// 21-bit value is adopted, as `Link.mtu_from_lr_packet` (Link.py:155-158@1.6.0).
+    /// 21-bit value is adopted, as `Link.mtu_from_lr_packet` (Link.py).
     pub fn try_from_signal(signal: Option<u32>) -> Result<Self, LinkSignallingError> {
         match signal {
             None | Some(0) => Ok(Self::BASE),

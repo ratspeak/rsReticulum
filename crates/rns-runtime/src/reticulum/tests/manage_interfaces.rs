@@ -1,6 +1,6 @@
 //! Attaching, detaching and reloading configured interfaces at run time, as
 //! Python's `Reticulum._attach_interface`, `_detach_interface` and
-//! `_reload_interface` do (Reticulum.py:850-920).
+//! `_reload_interface` do (Reticulum.py).
 use super::*;
 
 fn config_dir(config: &str) -> PathBuf {

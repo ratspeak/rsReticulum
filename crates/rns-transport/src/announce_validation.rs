@@ -1,4 +1,4 @@
-//! The announce validation caches (Identity.py:676-790).
+//! The announce validation caches (Identity.py).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -61,7 +61,7 @@ impl AnnounceValidationCache {
         Self::default()
     }
 
-    /// Identity.py:750-790.
+    /// Identity.py.
     pub fn lookup(
         &self,
         packet_hash: &[u8; 32],
@@ -98,7 +98,7 @@ impl AnnounceValidationCache {
         CachedAnnounce::Miss
     }
 
-    /// Identity.py:686-700: keeps the first result and clears any invalidation.
+    /// Identity.py: keeps the first result and clears any invalidation.
     pub fn insert_valid(&mut self, packet_hash: [u8; 32], result: ValidatedAnnounce) {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.valid.entry(packet_hash) {
             entry.insert(result);
@@ -115,7 +115,7 @@ impl AnnounceValidationCache {
         }
     }
 
-    /// Identity.py:704-713: a newer invalidation replaces the old one in place.
+    /// Identity.py: a newer invalidation replaces the old one in place.
     pub fn insert_invalid(&mut self, packet_hash: [u8; 32], reason: InvalidAnnounce) {
         if self.invalid.insert(packet_hash, reason).is_none() {
             self.invalid_order.push_back(packet_hash);
@@ -128,7 +128,7 @@ impl AnnounceValidationCache {
         }
     }
 
-    /// Identity.py:678-680, called whenever the blackhole set changes.
+    /// Identity.py, called whenever the blackhole set changes.
     pub fn reset(&mut self) {
         self.valid.clear();
         self.valid_order.clear();

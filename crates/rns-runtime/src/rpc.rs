@@ -195,7 +195,7 @@ pub struct PathTableEntry {
     pub hops: u8,
     pub expires: f64,
     /// Destination stamp value: `None` when the destination is unknown, 0 when
-    /// known but unstamped (Reticulum.py:1884-1885).
+    /// known but unstamped (Reticulum.py).
     #[serde(default)]
     pub value: Option<f64>,
     /// Last use in Unix seconds; 0 when never used.
@@ -326,7 +326,7 @@ pub struct InterfaceStatEntry {
 }
 
 /// What a transport instance adds to its interface stats
-/// (Reticulum.py:1700-1705).
+/// (Reticulum.py).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TransportStats {
     pub(crate) transport_id: [u8; 16],
@@ -336,7 +336,7 @@ pub(crate) struct TransportStats {
 }
 
 /// Python's top-level traffic, packet, link and path counters
-/// (Reticulum.py:1806-1852).
+/// (Reticulum.py).
 pub(crate) type TrafficTotals = rns_transport::messages::TrafficTotalsRpcEntry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -785,7 +785,7 @@ pub(crate) fn encode_optional_bool(value: Option<bool>) -> Result<Vec<u8>, RpcEr
     encode_umsgpack(&value.map(PyValue::Bool).unwrap_or(PyValue::None))
 }
 
-/// A float, or integer 0 when the timeout is unknown (Transport.py:3552).
+/// A float, or integer 0 when the timeout is unknown (Transport.py).
 pub(crate) fn encode_medium_path_timeout(seconds: Option<f64>) -> Result<Vec<u8>, RpcError> {
     encode_umsgpack(&seconds.map(PyValue::Float).unwrap_or(PyValue::Int(0)))
 }
@@ -896,7 +896,7 @@ pub(crate) fn encode_interface_stats(
 }
 
 /// Remote management's `/status` answer: `[stats]`, then the link count and
-/// nil profiling results when asked for, in that order (Transport.py:3325-3337).
+/// nil profiling results when asked for, in that order (Transport.py).
 pub(crate) fn encode_remote_status(
     entries: &[InterfaceStatEntry],
     transport: Option<&TransportStats>,
@@ -915,7 +915,7 @@ pub(crate) fn encode_remote_status(
     encode_umsgpack(&PyValue::List(response))
 }
 
-/// The inbound queue keys of `get_interface_stats()` (Reticulum.py:1829-1843@1.6.0).
+/// The inbound queue keys of `get_interface_stats()` (Reticulum.py).
 fn queue_stats(q: &InboundQueueSnapshot) -> Vec<(&'static str, PyValue)> {
     let int = |n: u64| PyValue::Int(i128::from(n));
     let height = |n: usize| int(n as u64);
@@ -949,7 +949,7 @@ fn queue_stats(q: &InboundQueueSnapshot) -> Vec<(&'static str, PyValue)> {
     ]
 }
 
-/// `Reticulum.get_interface_stats()` (Reticulum.py:1619-1852@1.6.0) for the
+/// `Reticulum.get_interface_stats()` (Reticulum.py) for the
 /// control port and remote management alike.
 fn interface_stats_value(
     entries: &[InterfaceStatEntry],
@@ -965,7 +965,7 @@ fn interface_stats_value(
         Some(t) => {
             let int = |value: u64| PyValue::Int(i128::from(value));
             // Python's speeds become floats once an interface is measured, and
-            // its frequency sums once a frequency is (Transport.py:746-813).
+            // its frequency sums once a frequency is (Transport.py).
             let speed = |value: f64| {
                 if t.measured {
                     PyValue::Float(value)
@@ -1065,7 +1065,7 @@ fn interface_stat_value(e: &InterfaceStatEntry) -> PyValue {
     let int = |value: u64| PyValue::Int(i128::from(value));
     let optional = |value: Option<PyValue>| value.unwrap_or(PyValue::None);
     // Python's `current_*_speed` are unset (reported as 0) until the first
-    // traffic count, and floats after it (Reticulum.py:1696-1724).
+    // traffic count, and floats after it (Reticulum.py).
     let speed = |index: usize, fallback: u64| match e.speeds {
         Some(speeds) => PyValue::Float(speeds[index]),
         None => int(fallback),
@@ -1698,7 +1698,7 @@ fn i64_from_i128(v: i128) -> Result<i64, RpcError> {
     i64::try_from(v).map_err(|_| RpcError::Deserialize(format!("integer out of range: {v}")))
 }
 
-/// Python `Interface.MODE_*` (Interface.py:45-51) for a Debug-formatted mode.
+/// Python `Interface.MODE_*` (Interface.py) for a Debug-formatted mode.
 fn python_interface_mode(mode: &str) -> u8 {
     match mode {
         "Full" => 0x01,
@@ -2318,7 +2318,7 @@ pub async fn connect_unix_and_request_bytes(
 }
 
 /// Python's top-level byte totals and packet rates in an `interface_stats`
-/// answer (Reticulum.py:1806-1825).
+/// answer (Reticulum.py).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InterfaceStatsTotals {
     pub rxb: u64,
@@ -2466,7 +2466,7 @@ pub enum RpcError {
 }
 
 /// Keys Python 1.5.5 `get_interface_stats()` gives every interface
-/// (Reticulum.py:1501-1663); `rnstatus` indexes most of them unguarded.
+/// (Reticulum.py); `rnstatus` indexes most of them unguarded.
 #[cfg(test)]
 pub(crate) const PYTHON_INTERFACE_KEYS: &[&str] = &[
     "clients",
@@ -2523,7 +2523,7 @@ pub(crate) const PYTHON_INTERFACE_KEYS: &[&str] = &[
     "packet_filter_hits",
 ];
 
-/// Totals in every Python 1.5.5 stats dict (Reticulum.py:1673-1714).
+/// Totals in every Python 1.5.5 stats dict (Reticulum.py).
 #[cfg(test)]
 pub(crate) const PYTHON_TOTAL_KEYS: &[&str] = &[
     "interfaces",
@@ -2564,7 +2564,7 @@ pub(crate) const PYTHON_TOTAL_KEYS: &[&str] = &[
     "rss",
 ];
 
-/// Added only by a transport instance (Reticulum.py:1700-1705).
+/// Added only by a transport instance (Reticulum.py).
 #[cfg(test)]
 pub(crate) const PYTHON_TRANSPORT_KEYS: &[&str] = &[
     "transport_id",
@@ -3218,7 +3218,7 @@ mod tests {
     const FX_REQ_DESTINATION_DATA_USED: &str = "82b064657374696e6174696f6e5f64617461a475736564b064657374696e6174696f6e5f68617368c410cccccccccccccccccccccccccccccccc";
     const FX_REQ_IDENTITY_DATA_RETAIN: &str = "82ad6964656e746974795f64617461a672657461696ead6964656e746974795f68617368c410dddddddddddddddddddddddddddddddd";
     // Path-table replies: RNS 1.6.0 umsgpack over the dict get_path_table builds
-    // (Reticulum.py:1887-1891), unknown and stamped destinations.
+    // (Reticulum.py), unknown and stamped destinations.
     const FX_RESP_PATH_TABLE: &str = "9189a468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a576616c7565c0a47573656400a76c725f636f7374c0a9696e74657266616365b2544350496e746572666163655b746573745d";
     const FX_RESP_PATH_TABLE_STAMPED: &str = "9189a468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a576616c7565cb4018500000000000a475736564cb41d26580cfe00000a76c725f636f7374cb400a000000000000a9696e74657266616365b2544350496e746572666163655b746573745d";
     const FX_RESP_BLACKHOLE_DICT: &str = "81c4104242424242424242424242424242424283a6736f75726365c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5756e74696ccb4093480000000000a6726561736f6ea6706172697479";

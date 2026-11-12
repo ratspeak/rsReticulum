@@ -577,7 +577,7 @@ impl Shared {
     }
 
     /// Open the discovery and data sockets of one NIC, adopt it and start its
-    /// tasks (AutoInterface.py:253-312, :337-347).
+    /// tasks (AutoInterface.py).
     fn start_nic(self: &Arc<Self>, nic: &NicAddrs) -> Result<NicHandle, NicError> {
         let (unicast, mcast, beacon) = self.discovery_sockets(nic).map_err(NicError::Discovery)?;
         let scope = nic.scope_id;
@@ -719,7 +719,7 @@ impl Shared {
         self.beacon_interval() * 3.25
     }
 
-    /// `announce_handler` / `peer_announce` (AutoInterface.py:485-520).
+    /// `announce_handler` / `peer_announce` (AutoInterface.py).
     async fn beacon_loop(self: Arc<Self>, sock: UdpSocket, link_local: Ipv6Addr, scope: u32) {
         let token = discovery_token(&self.group_id, &link_local);
         let dest = SocketAddrV6::new(self.mcast_group, self.discovery_port, 0, scope);
@@ -736,7 +736,7 @@ impl Shared {
         }
     }
 
-    /// `discovery_handler` (AutoInterface.py:358-374).
+    /// `discovery_handler` (AutoInterface.py).
     async fn discovery_loop(self: Arc<Self>, sock: UdpSocket, ifname: String, scope: u32) {
         let mut buf = [0u8; DISCOVERY_BUFFER];
         loop {
@@ -774,7 +774,7 @@ impl Shared {
         self.add_peer(src, ifname, scope).await;
     }
 
-    /// `add_peer` (AutoInterface.py:526-607).
+    /// `add_peer` (AutoInterface.py).
     async fn add_peer(self: &Arc<Self>, addr: Ipv6Addr, ifname: &str, scope: u32) {
         let outcome = self.core().discovered(addr, ifname, scope, Instant::now());
         match outcome {
@@ -851,7 +851,7 @@ impl Shared {
             online: online.clone(),
             rxb: Some(rxb.clone()),
             txb: Some(txb),
-            // AutoInterfacePeer never sets `name` (AutoInterface.py:636-650).
+            // AutoInterfacePeer never sets `name` (AutoInterface.py).
             inspection: Some(InterfaceInspectionSource::identified(
                 InterfaceIdentity::new(name, "None", "AutoInterfacePeer"),
             )),
@@ -869,7 +869,7 @@ impl Shared {
         )
     }
 
-    /// The data listener's `process_incoming` (AutoInterface.py:613-615).
+    /// The data listener's `process_incoming` (AutoInterface.py).
     async fn data_loop(self: Arc<Self>, sock: UdpSocket) {
         let mut buf = vec![0u8; DATA_BUFFER];
         loop {
@@ -902,7 +902,7 @@ impl Shared {
         }
     }
 
-    /// `peer_jobs` (AutoInterface.py:376-483).
+    /// `peer_jobs` (AutoInterface.py).
     async fn run_jobs(self: Arc<Self>) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs_f64(PEER_JOB_INTERVAL)).await;
@@ -1042,7 +1042,7 @@ struct ChildTask {
 }
 
 /// `AutoInterfacePeer.process_incoming` / `process_outgoing`
-/// (AutoInterface.py:652-681). Ends, and deregisters the child, once the
+/// (AutoInterface.py). Ends, and deregisters the child, once the
 /// parent drops the peer or transport drops the child.
 async fn child_task(mut task: ChildTask) {
     loop {
@@ -1088,7 +1088,7 @@ async fn child_task(mut task: ChildTask) {
         .await;
 }
 
-/// `detach` (AutoInterface.py:619-632): closes every socket, stops every
+/// `detach` (AutoInterface.py): closes every socket, stops every
 /// task and takes the spawned peers down with the parent.
 struct Teardown {
     shared: Arc<Shared>,
@@ -1200,7 +1200,7 @@ pub async fn spawn_auto_interface(
     })
 }
 
-/// `peers` and the `AutoInterface[name]` identity for interface stats (Reticulum.py:1726-1728).
+/// `peers` and the `AutoInterface[name]` identity for interface stats (Reticulum.py).
 fn auto_inspection(shared: &Arc<Shared>) -> InterfaceInspectionSource {
     let shared = Arc::downgrade(shared);
     let last = Arc::new(AtomicU64::new(0));

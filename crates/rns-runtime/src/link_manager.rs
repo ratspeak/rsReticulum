@@ -1360,7 +1360,7 @@ impl LinkManager {
 
     /// Tear down, with LINKCLOSE, every active Link whose `no_data_for` exceeds
     /// `timeout`, as LXMRouter.clean_links does for propagation links
-    /// (LXMRouter.py:1072-1080). Keepalives do not count as data.
+    /// (LXMRouter.py). Keepalives do not count as data.
     pub fn set_data_inactivity_timeout(&mut self, timeout: Option<std::time::Duration>) {
         self.data_inactivity_timeout = timeout;
     }
@@ -1977,7 +1977,7 @@ impl LinkManager {
     }
 
     /// Ask transport whether a verified LINKIDENTIFY came from a blackholed
-    /// identity before accepting it (Link.py:1067-1070).
+    /// identity before accepting it (Link.py).
     fn check_identity_blackhole(&mut self, link_id: [u8; 16], remote_pub: [u8; 64]) {
         let (response_tx, result_rx) = oneshot::channel();
         let staged = Self::stage_required_link_control(
@@ -3333,7 +3333,7 @@ impl LinkManager {
         }
         let request_data = &raw[data_offset..];
 
-        // Link.py:214 reads packet.hops after Transport.py:2028 increments it;
+        // Link.py reads packet.hops after Transport.py increments it;
         // the delivered raw is unadjusted.
         let hops = header.hops.saturating_add(1);
 
@@ -3344,7 +3344,7 @@ impl LinkManager {
             return;
         }
 
-        // Link.validate_request (Link.py:193-195@1.6.0): the cost is read now, so
+        // Link.validate_request (Link.py): the cost is read now, so
         // a changed set_link_cost applies to the next request.
         let policy = crate::destination_stamper::policy();
         if policy.lr_stamps_enforced {
@@ -3662,7 +3662,7 @@ impl LinkManager {
                         match active.link.receive_rtt_packet(data) {
                             Ok(()) => {
                                 // +1 mirrors Python's increment-on-receive
-                                // (Transport.py:1491) before Link.py:525 reads
+                                // (Transport.py) before Link.py reads
                                 // packet.hops; the delivered raw is unadjusted.
                                 active.link.expected_hops = Some(header.hops.saturating_add(1));
                                 tracing::info!(
@@ -3682,7 +3682,7 @@ impl LinkManager {
                                 }
                             }
                             Err(rns_link::handshake::HandshakeError::MalformedRtt) => {
-                                // Link.py:622-624 tears the link down.
+                                // Link.py tears the link down.
                                 tracing::warn!(
                                     link_id = hex::encode(link_id),
                                     "malformed LRRTT, tearing down link"
@@ -3739,7 +3739,7 @@ impl LinkManager {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
 
-                    // Keepalives are NOT encrypted (Packet.py:205-208).
+                    // Keepalives are NOT encrypted (Packet.py).
                     if data.first() == Some(&rns_link::constants::KEEPALIVE_REQUEST) {
                         // Only the responder replies.
                         if active.link.is_initiator {
@@ -3856,7 +3856,7 @@ impl LinkManager {
                             &proof_data,
                             rns_wire::context::PacketContext::None,
                         ) {
-                            // Proofs to a link count into txbytes (Link.py:388, Packet.py:291).
+                            // Proofs to a link count into txbytes (Link.py, Packet.py).
                             active.link.record_tx(proof_data.len());
                             tracing::debug!(
                                 link_id = hex::encode(link_id),
@@ -4415,7 +4415,7 @@ impl LinkManager {
                 }
             }
             rns_wire::context::PacketContext::Resource => {
-                // Python encrypts payload ONCE before chunking (Resource.py:424);
+                // Python encrypts payload ONCE before chunking (Resource.py);
                 // chunks ride raw. Decrypt happens in InboundTransfer::complete.
                 let mut teardown_corrupt = false;
                 if let Some(active) = self.active_links.get_mut(&link_id) {
@@ -4486,7 +4486,7 @@ impl LinkManager {
                         }
 
                         if let Some(rh) = completed_rh {
-                            // Reverses pre-chunk encryption (Resource.py:424).
+                            // Reverses pre-chunk encryption (Resource.py).
                             let decrypt_fn = |data: &[u8]| -> Result<
                                 Vec<u8>,
                                 rns_protocol::resource::ResourceError,
@@ -4559,7 +4559,7 @@ impl LinkManager {
                                         break 'resource_part;
                                     }
                                     // PROOF+RESOURCE_PRF = plaintext, PacketType::Proof
-                                    // (Packet.py:195-197). Each split segment still needs its
+                                    // (Packet.py). Each split segment still needs its
                                     // own proof or the sender retries.
                                     if !Self::send_resource_action(
                                         &self.transport_tx,
@@ -4762,7 +4762,7 @@ impl LinkManager {
                                 Some(Err(error)) => {
                                     // Only a decompression overflow is rejected and tears
                                     // the Link down; a corrupt assembly sends nothing
-                                    // (Resource.py:703-709, 732-738).
+                                    // (Resource.py).
                                     if matches!(
                                         error,
                                         rns_protocol::resource::ResourceError::DecompressedTooLarge
@@ -4813,7 +4813,7 @@ impl LinkManager {
                 }
             }
             rns_wire::context::PacketContext::ResourceReq => {
-                // Receiver's HMU for outbound transfer (Link.py:1104-1124).
+                // Receiver's HMU for outbound transfer (Link.py).
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
@@ -4882,7 +4882,7 @@ impl LinkManager {
                 }
             }
             rns_wire::context::PacketContext::ResourceIcl => {
-                // Sender-initiated cancel of an inbound transfer (Link.py:1135-1142).
+                // Sender-initiated cancel of an inbound transfer (Link.py).
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
@@ -4901,7 +4901,7 @@ impl LinkManager {
                                     .then_some(rh)
                             });
                         if let Some(resource_id) = resource_id {
-                            // Link.py:1199-1206 runs Resource.cancel(), which answers with RCL.
+                            // Link.py runs Resource.cancel(), which answers with RCL.
                             if let Some(action) =
                                 active.inbound_resources.get_mut(&rh).map(|t| t.cancel())
                                 && active.link.state == LinkState::Active
@@ -4934,7 +4934,7 @@ impl LinkManager {
                 }
             }
             rns_wire::context::PacketContext::ResourceRcl => {
-                // Receiver-initiated reject of an outbound transfer (Link.py:1144-1151).
+                // Receiver-initiated reject of an outbound transfer (Link.py).
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
@@ -5019,7 +5019,7 @@ impl LinkManager {
             rns_wire::context::PacketContext::ResourcePrf => {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
-                    // RESOURCE_PRF proofs route through Link.receive (Transport.py:2268).
+                    // RESOURCE_PRF proofs route through Link.receive (Transport.py).
                     active.link.record_rx(data.len());
                     if data.len() >= 64 {
                         let mut rh = [0u8; 32];
@@ -5304,7 +5304,7 @@ impl LinkManager {
                 }
                 let action = match action {
                     TransferAction::SendCancel(cancel_type, hash) => {
-                        // Resource.cancel(): RCL only while the Link is active (Resource.py:1133-1139).
+                        // Resource.cancel(): RCL only while the Link is active (Resource.py).
                         if active.link.state == LinkState::Active {
                             Self::send_resource_action(
                                 &self.transport_tx,
@@ -5315,7 +5315,7 @@ impl LinkManager {
                                 TransferAction::SendCancel(cancel_type, hash),
                             );
                         }
-                        // Removed before resource_concluded, so no carryover (Resource.py:1137-1142).
+                        // Removed before resource_concluded, so no carryover (Resource.py).
                         TransferAction::Failed("resource transfer timed out".to_string())
                     }
                     action => action,
@@ -5406,7 +5406,7 @@ impl LinkManager {
             for (resource_hash, action) in outbound_watchdog_actions {
                 let action = match action {
                     TransferAction::SendCancel(cancel_type, hash) => {
-                        // Resource.cancel(): ICL only while the Link is active (Resource.py:1124-1132).
+                        // Resource.cancel(): ICL only while the Link is active (Resource.py).
                         if active.link.state == LinkState::Active {
                             Self::send_resource_action(
                                 &self.transport_tx,
@@ -5568,7 +5568,7 @@ impl LinkManager {
                 .map(|(link_id, active)| (*link_id, active.link.role()))
                 .collect();
             for (link_id, role) in idle {
-                // Link.teardown records the reason from the local role (Link.py:756-757).
+                // Link.teardown records the reason from the local role (Link.py).
                 let reason = match role {
                     LinkRole::Initiator => CloseReason::InitiatorClosed,
                     LinkRole::Responder => CloseReason::DestinationClosed,
@@ -6162,7 +6162,7 @@ impl LinkManager {
 
     /// Python `Link.resource_concluded` for an incoming resource: keep its
     /// window and EIFR for the next one and refresh `expected_rate`
-    /// (Link.py:1344-1350).
+    /// (Link.py).
     fn inbound_resource_concluded(
         last_inbound_resource: &mut HashMap<[u8; 16], (usize, Option<f64>)>,
         link: &mut Link,
@@ -7713,7 +7713,7 @@ impl LinkManager {
             .active_links
             .get(link_id)
             .ok_or(LinkSendError::LinkNotFound)?;
-        // Python refuses outbound only on CLOSED links (Packet.py:286); Stale
+        // Python refuses outbound only on CLOSED links (Packet.py); Stale
         // links stay sendable so peers can probe and recover them.
         if !matches!(active.link.state, LinkState::Active | LinkState::Stale) {
             return Err(LinkSendError::LinkNotActive);
@@ -8114,7 +8114,7 @@ impl LinkManager {
             }
         }
 
-        // Destination.py:730-749: another writer may have rotated the ring file.
+        // Destination.py: another writer may have rotated the ring file.
         let mut ratchets = self
             .destination_ratchets
             .write()
@@ -8130,7 +8130,7 @@ impl LinkManager {
             ring.reload(identity)
         });
         if let Err(error) = reloaded {
-            // Destination.py:559-568: an unreadable ring file disables ratchets.
+            // Destination.py: an unreadable ring file disables ratchets.
             tracing::error!(
                 path = %ring.path().display(),
                 %error,
@@ -9066,7 +9066,7 @@ mod tests {
         };
         let idle = std::time::Duration::from_secs(181);
 
-        // A keepalive does not refresh the data clock (Link.py:1030).
+        // A keepalive does not refresh the data clock (Link.py).
         lm.active_links
             .get_mut(&link_id)
             .unwrap()
@@ -9882,8 +9882,8 @@ mod tests {
     }
 
     /// Destination side learns expected_hops from the LRRTT packet at
-    /// activation (Link.py:525); +1 mirrors Python's increment-on-receive.
-    /// The initiator keeps its construction-time value (Link.py:282).
+    /// activation (Link.py); +1 mirrors Python's increment-on-receive.
+    /// The initiator keeps its construction-time value (Link.py).
     #[test]
     fn lrrtt_activation_sets_expected_hops_on_destination_side() {
         let dest_hash = [0x37; 16];
@@ -12484,8 +12484,8 @@ mod tests {
         ));
     }
 
-    /// 1.3.8 stats parity (Packet.py:291): tx counts the link payload after
-    /// the context byte — the same unit rx counts (Link.py:929) — so a channel
+    /// 1.3.8 stats parity (Packet.py): tx counts the link payload after
+    /// the context byte — the same unit rx counts (Link.py) — so a channel
     /// echo round-trip yields matching data counters on both peers.
     #[test]
     fn channel_echo_round_trip_counts_matching_tx_rx_bytes() {

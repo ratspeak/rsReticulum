@@ -1,6 +1,6 @@
 //! `/mgmt/work`: work documents on the server
-//! (`handle_work` and `resolve_doc_permission`, `server.py:2398-2468`,
-//! `3789-4441@1.6.0`).
+//! (`handle_work` and `resolve_doc_permission`, `server.py`,
+//! `3789-4441`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use super::{
     IDX_REPOSITORY, RES_DISALLOWED, RES_INVALID_REQ, RES_NOT_FOUND, RES_OK, RES_REMOTE_FAIL,
 };
 
-/// `WORK_DOC_LIMIT` (`server.py:1976`), counted in code points.
+/// `WORK_DOC_LIMIT` (`server.py`), counted in code points.
 pub const WORK_DOC_LIMIT: usize = 256 * 1024;
 
 /// Upstream raised inside its `try`, replying "Remote error".
@@ -147,7 +147,7 @@ fn allowed_path(work_path: &Path, doc_id: i128) -> PathBuf {
     PathBuf::from(format!("{}/{doc_id}.allowed", work_path.display()))
 }
 
-/// `resolve_doc_permission` (`server.py:2398-2468`): the document's
+/// `resolve_doc_permission` (`server.py`): the document's
 /// `.allowed` file decides first, then the repository and group as
 /// `resolve_permission` does, without the blocklist.
 pub fn resolve_doc_permission(
@@ -213,7 +213,7 @@ pub(crate) fn load_document(path: &Path) -> Option<Value> {
     rmpv::decode::read_value(&mut &bytes[..]).ok()
 }
 
-/// `_work_save_document` (`server.py:3888-3900`).
+/// `_work_save_document` (`server.py`).
 fn save_document(path: &Path, document: &Value) -> bool {
     let saved = (|| -> std::io::Result<()> {
         let dir = path.parent().unwrap_or(Path::new("."));
@@ -382,7 +382,7 @@ fn check_signature(
     Ok((!valid).then(|| status(RES_INVALID_REQ, "Invalid signature")))
 }
 
-/// `_work_list` (`server.py:3902-3936`).
+/// `_work_list` (`server.py`).
 fn work_list(
     work_path: &Path,
     data: &Request,
@@ -454,7 +454,7 @@ fn work_list(
     ok_with(map(result))
 }
 
-/// `_work_view` (`server.py:3938-3996`).
+/// `_work_view` (`server.py`).
 fn work_view(work_path: &Path, data: &Request) -> Vec<u8> {
     if !valid_scope(&data.name("scope", "all")) {
         return status(RES_INVALID_REQ, "Invalid request");
@@ -517,7 +517,7 @@ fn work_view(work_path: &Path, data: &Request) -> Vec<u8> {
     ]))
 }
 
-/// `_work_create` and `_work_propose` (`server.py:3998-4085`), which differ
+/// `_work_create` and `_work_propose` (`server.py`), which differ
 /// in the scope they store under and the ownership file propose writes.
 fn work_new(
     work_path: &Path,
@@ -586,7 +586,7 @@ fn work_new(
     ])))
 }
 
-/// `_work_edit` (`server.py:4087-4147`).
+/// `_work_edit` (`server.py`).
 fn work_edit(work_path: &Path, data: &Request, identity: &Identity) -> Result<Vec<u8>, Raised> {
     let scope = data.name("scope", "active");
     let content = data.text("content")?;
@@ -667,7 +667,7 @@ fn work_edit(work_path: &Path, data: &Request, identity: &Identity) -> Result<Ve
     Ok(vec![RES_OK])
 }
 
-/// `_work_delete` (`server.py:4149-4197`).
+/// `_work_delete` (`server.py`).
 fn work_delete(
     work_path: &Path,
     data: &Request,
@@ -708,7 +708,7 @@ fn work_delete(
     Ok(vec![RES_OK])
 }
 
-/// `_work_comment` (`server.py:4199-4248`).
+/// `_work_comment` (`server.py`).
 fn work_comment(work_path: &Path, data: &Request, identity: &Identity) -> Result<Vec<u8>, Raised> {
     let scope = data.name("scope", "active");
     let content = py_strip(&data.text("content")?).to_string();
@@ -774,7 +774,7 @@ fn move_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::rename(src, &dst)
 }
 
-/// `_work_complete` and `_work_activate` (`server.py:4250-4318`).
+/// `_work_complete` and `_work_activate` (`server.py`).
 fn work_move(
     work_path: &Path,
     data: &Request,
@@ -811,7 +811,7 @@ fn work_move(
     ]))
 }
 
-/// `_work_perms` and its get/set steps (`server.py:4320-4440`).
+/// `_work_perms` and its get/set steps (`server.py`).
 fn work_perms(
     work_path: &Path,
     data: &Request,
@@ -881,7 +881,7 @@ fn work_perms(
     Ok(vec![RES_OK])
 }
 
-/// `handle_work` (`server.py:3789-3862`). `None` sends no response.
+/// `handle_work` (`server.py`). `None` sends no response.
 pub fn handle_work(
     repos: &RwLock<Repositories>,
     identity: Option<&Identity>,

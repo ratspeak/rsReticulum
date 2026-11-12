@@ -209,7 +209,7 @@ impl PathTable {
         count
     }
 
-    /// Python `mark_path_responsive` (Transport.py:3632-3648@1.6.0): only a
+    /// Python `mark_path_responsive` (Transport.py): only a
     /// cryptographic liveness proof renews a path. `mode` is the mode of the
     /// interface the path was learned on. Returns whether a path existed.
     pub fn mark_responsive(&mut self, dest_hash: &[u8; 16], mode: InterfaceMode) -> bool {
@@ -225,7 +225,7 @@ impl PathTable {
         true
     }
 
-    /// Python's path-table cull (Transport.py:1118-1160@1.6.0): drop expired
+    /// Python's path-table cull (Transport.py): drop expired
     /// paths, paths on a missing interface and never-used paths older than
     /// `linger` (x10 on slow interfaces). With `check_unused`, never-used
     /// paths beyond `PATH_POOL_UNUSED_TARGET` are dropped too, fast-interface

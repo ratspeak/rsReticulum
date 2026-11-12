@@ -1,4 +1,4 @@
-//! Stamped link requests for initiators (RNS/Link.py:300-395@1.6.0): the cost
+//! Stamped link requests for initiators (RNS/Link.py): the cost
 //! is the one the destination announced, recalled from Transport, and keys are
 //! ground off the async runtime under `lr_stamp_timeout`.
 
@@ -80,7 +80,7 @@ pub fn link_mtu_discovery() -> bool {
     crate::reticulum::get_instance().is_none_or(|handle| handle.link_mtu_discovery())
 }
 
-/// The MTU a new link request to `destination_hash` signals (Link.py:392-397@1.6.0):
+/// The MTU a new link request to `destination_hash` signals (Link.py):
 /// the next-hop interface's hardware MTU when discovery is on and that interface
 /// autoconfigures or fixes its MTU, otherwise the base MTU.
 pub async fn signalled_link_mtu(
@@ -116,7 +116,7 @@ pub async fn signalled_link_mtu(
 }
 
 /// The request keys upstream would use for a link to `destination_hash`:
-/// stamped at the destination's announced cost (Link.py:310-316@1.6.0), with
+/// stamped at the destination's announced cost (Link.py), with
 /// the grind on the blocking pool. Synchronous owners hand the result to
 /// their `provide_link_request_keys`. Dropping the future cancels the grind.
 pub async fn link_request_keys(

@@ -8,11 +8,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rmpv::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Destination aspects `rnx.execute` (rnx.py:70).
+/// Destination aspects `rnx.execute` (rnx.py).
 pub const APP_NAME: &str = "rnx.execute";
-/// Request handler path (rnx.py:115-122).
+/// Request handler path (rnx.py).
 pub const COMMAND_PATH: &str = "command";
-/// `remote_exec_grace` (rnx.py:325).
+/// `remote_exec_grace` (rnx.py).
 pub const REMOTE_EXEC_GRACE: f64 = 2.0;
 /// `RNS.Transport.PATH_REQUEST_TIMEOUT`, the default `-w`, sent as an integer.
 pub const DEFAULT_TIMEOUT: i64 = 15;
@@ -40,7 +40,7 @@ impl Timeout {
     }
 }
 
-/// `request_data` as `execute` builds it (rnx.py:379-385).
+/// `request_data` as `execute` builds it (rnx.py).
 pub fn request_value(
     command: &str,
     timeout: Timeout,
@@ -58,7 +58,7 @@ pub fn request_value(
     ])
 }
 
-/// A decoded request as `execute_received_command` reads it (rnx.py:156-160).
+/// A decoded request as `execute_received_command` reads it (rnx.py).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandRequest {
     pub command: String,
@@ -107,7 +107,7 @@ impl CommandRequest {
     }
 }
 
-/// The result array (rnx.py:170-179).
+/// The result array (rnx.py).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandResult {
     pub executed: bool,
@@ -164,7 +164,7 @@ fn now() -> f64 {
 }
 
 /// `out[0:limit]` with Python slice semantics, applied only when
-/// `len(out) > limit` (rnx.py:225-238).
+/// `len(out) > limit` (rnx.py).
 pub fn truncate(out: &[u8], limit: Option<i64>) -> Vec<u8> {
     let len = out.len() as i64;
     match limit {
@@ -180,7 +180,7 @@ pub fn truncate(out: &[u8], limit: Option<i64>) -> Vec<u8> {
     }
 }
 
-/// `execute_received_command` (rnx.py:155-252): run the command without a
+/// `execute_received_command` (rnx.py): run the command without a
 /// shell, feed stdin, SIGTERM it once the timeout passes, truncate output.
 pub async fn execute(request: &CommandRequest) -> CommandResult {
     let started = now();
@@ -268,7 +268,7 @@ pub async fn execute(request: &CommandRequest) -> CommandResult {
     }
 }
 
-/// A response as the client indexes it (rnx.py:438-452).
+/// A response as the client indexes it (rnx.py).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Response {
     pub executed: bool,
@@ -351,7 +351,7 @@ pub struct TransferStats {
     pub elapsed: f64,
 }
 
-/// Text the client writes for an executed result (rnx.py:461-520).
+/// Text the client writes for an executed result (rnx.py).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Rendered {
     pub stdout: Vec<u8>,
@@ -451,7 +451,7 @@ pub fn render(
     r
 }
 
-/// The process status for `-m` (rnx.py:536-540): the remote code as Python's
+/// The process status for `-m` (rnx.py): the remote code as Python's
 /// `exit()` passes it to the OS, or 240 without one.
 pub fn mirrored_exit_code(retcode: Option<i64>) -> i32 {
     retcode.map_or(240, |code| (code & 0xff) as i32)
@@ -471,7 +471,7 @@ pub fn py_float(x: f64) -> String {
     }
 }
 
-/// `size_str` (rnx.py:680-697).
+/// `size_str` (rnx.py).
 pub fn size_str(num: f64, suffix: char) -> String {
     let mut num = if suffix == 'b' { num * 8.0 } else { num };
     for unit in ["", "K", "M", "G", "T", "P", "E", "Z"] {
@@ -487,7 +487,7 @@ pub fn size_str(num: f64, suffix: char) -> String {
     format!("{num:.2}Y{suffix}")
 }
 
-/// `pretty_time` without `verbose` (rnx.py:699-739).
+/// `pretty_time` without `verbose` (rnx.py).
 pub fn pretty_time(time: f64) -> String {
     let days = (time / 86400.0).floor() as i64;
     let time = time.rem_euclid(86400.0);
@@ -520,7 +520,7 @@ pub fn pretty_time(time: f64) -> String {
 }
 
 /// The allowed-identities files the listener reads, first existing wins
-/// (rnx.py:94-101).
+/// (rnx.py).
 pub fn allowed_identity_files(home: Option<&Path>) -> Vec<PathBuf> {
     let mut files = vec![PathBuf::from("/etc/rnx/allowed_identities")];
     if let Some(home) = home {
@@ -531,7 +531,7 @@ pub fn allowed_identity_files(home: Option<&Path>) -> Vec<PathBuf> {
 }
 
 /// Parse an allowed-identities file: only lines of exactly 32 characters
-/// count, and one that is not hex fails (rnx.py:102-108).
+/// count, and one that is not hex fails (rnx.py).
 pub fn parse_allowed_identities(text: &str) -> Result<Vec<[u8; 16]>, String> {
     let mut allowed = Vec::new();
     for line in text.replace('\r', "").split('\n') {
@@ -552,7 +552,7 @@ pub fn parse_allowed_identities(text: &str) -> Result<Vec<[u8; 16]>, String> {
 }
 
 /// Validate a 32-character hash argument with upstream's messages
-/// (rnx.py:80-93, 328-336).
+/// (rnx.py).
 pub fn parse_hash_arg(value: &str) -> Result<[u8; 16], String> {
     if value.chars().count() != 32 {
         return Err(
@@ -567,7 +567,7 @@ pub fn parse_hash_arg(value: &str) -> Result<[u8; 16], String> {
 }
 
 /// A one-shot client's output and exit code for a received response value
-/// (rnx.py:437-549).
+/// (rnx.py).
 pub fn client_result(
     value: &Value,
     detailed: bool,

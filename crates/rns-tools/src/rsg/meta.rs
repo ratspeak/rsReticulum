@@ -1,7 +1,7 @@
 //! RSM metadata loading for `rnid -S -E`: a port of `rsg_meta_from_file`
-//! (`RNS/Utilities/rnid.py:566-575@1.6.0`) over the vendored ConfigObj
-//! (`RNS/vendor/configobj.py@1.6.0`: parse, `%(name)s` interpolation,
-//! validate, dict) and Validator (`RNS/vendor/validate.py@1.6.0`). Error
+//! (`RNS/Utilities/rnid.py`) over the vendored ConfigObj
+//! (`RNS/vendor/configobj.py`: parse, `%(name)s` interpolation,
+//! validate, dict) and Validator (`RNS/vendor/validate.py`). Error
 //! strings are the text of the Python exception rnid prints.
 
 use std::path::Path;

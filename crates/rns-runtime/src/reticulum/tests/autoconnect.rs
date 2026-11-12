@@ -1,5 +1,5 @@
 //! Auto-connecting discovered interfaces as Python's `InterfaceDiscovery`
-//! does (Discovery.py:747-870).
+//! does (Discovery.py).
 use super::*;
 use rns_transport::discovery::app_data::DiscoveryInfo;
 
@@ -69,7 +69,7 @@ fn hub_config(uplink_port: u16) -> String {
 }
 
 /// Python never auto-connects to an onion address, nor to the literal
-/// addresses 127.0.0.1 and 0.0.0.0 (Discovery.py:814-825, :982).
+/// addresses 127.0.0.1 and 0.0.0.0 (Discovery.py).
 #[tokio::test]
 async fn autoconnect_refuses_onion_and_local_addresses() {
     let port = unused_port().await;
@@ -98,7 +98,7 @@ async fn autoconnect_refuses_onion_and_local_addresses() {
 }
 
 /// Python connects once per endpoint, and never beside a client interface
-/// already aimed at it (`interface_exists`, Discovery.py:747-770), however
+/// already aimed at it (`interface_exists`, Discovery.py), however
 /// many announcers name the endpoint.
 #[tokio::test]
 async fn autoconnect_connects_once_per_endpoint() {
@@ -123,8 +123,8 @@ async fn autoconnect_connects_once_per_endpoint() {
 }
 
 /// Python names the network that announced an auto-connected interface in
-/// its stats, as the announcer's identity hash in hex (Discovery.py:865,
-/// Reticulum.py:1611-1612), and `rnstatus` prints it (rnstatus.py:525-526).
+/// its stats, as the announcer's identity hash in hex (Discovery.py,
+/// Reticulum.py), and `rnstatus` prints it (rnstatus.py).
 #[tokio::test]
 async fn an_autoconnected_interface_names_its_source() {
     let (uplink_port, port) = (unused_port().await, unused_port().await);
@@ -289,7 +289,7 @@ async fn wait_names(
 /// Python's monitor keeps bootstrap interfaces while no auto-connected
 /// interface is online, detaches one that stays down for 12 s, and
 /// re-enables bootstrap interfaces once none is attached
-/// (Discovery.py:659-718).
+/// (Discovery.py).
 #[tokio::test(flavor = "multi_thread")]
 async fn autoconnect_monitor_detaches_dead_interfaces_and_restores_bootstrap() {
     let bootstrap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -343,7 +343,7 @@ async fn autoconnect_monitor_detaches_dead_interfaces_and_restores_bootstrap() {
 
 /// Python tears bootstrap interfaces down only once the target number of
 /// auto-connected interfaces is online, and gives them `configured_bitrate`
-/// 5 Mbit/s (Discovery.py:695-699, :884).
+/// 5 Mbit/s (Discovery.py).
 #[tokio::test(flavor = "multi_thread")]
 async fn bootstrap_interfaces_yield_to_an_online_autoconnected_interface() {
     let listeners = [
@@ -394,7 +394,7 @@ async fn bootstrap_interfaces_yield_to_an_online_autoconnected_interface() {
 }
 
 /// Python makes a non-transport instance with a discoverable interface keep
-/// a static transport identity (Reticulum.py:1078-1083).
+/// a static transport identity (Reticulum.py).
 #[test]
 fn a_discoverable_interface_makes_the_transport_identity_static() {
     let parse =
@@ -413,7 +413,7 @@ fn a_discoverable_interface_makes_the_transport_identity_static() {
 
 /// Python runs an executable `reachable_on` and announces its output only
 /// when it is an address or hostname; otherwise the announce is skipped
-/// (Discovery.py:183-207).
+/// (Discovery.py).
 #[cfg(unix)]
 #[tokio::test]
 async fn an_executable_reachable_on_is_evaluated_and_validated() {

@@ -36,7 +36,7 @@ pub const BITRATE_GUESS: u64 = 10_000_000;
 /// Python `Interface.DEFAULT_IFAC_SIZE` for TCP, the IFAC size when none is configured.
 pub const DEFAULT_IFAC_SIZE: usize = 16;
 
-/// The hardware MTU after `optimise_mtu()` (Interface.py:255-267@1.6.0), or a
+/// The hardware MTU after `optimise_mtu()` (Interface.py), or a
 /// fixed MTU. Upstream leaves `HW_MTU = None` below 62.5 kbps; that is the base MTU here.
 pub(crate) fn hardware_mtu(bitrate: u64, fixed_mtu: Option<u32>) -> u32 {
     fixed_mtu
@@ -45,7 +45,7 @@ pub(crate) fn hardware_mtu(bitrate: u64, fixed_mtu: Option<u32>) -> u32 {
 }
 
 /// Reported MTU and packet capacity: packets up to the hardware MTU, frames up
-/// to the hardware MTU plus the IFAC size (TCPInterface.py:338-341@1.6.0).
+/// to the hardware MTU plus the IFAC size (TCPInterface.py).
 pub(crate) fn hardware_capacity(
     bitrate: u64,
     fixed_mtu: Option<u32>,
@@ -62,7 +62,7 @@ pub const TCP_KEEPIDLE: u32 = 5;
 pub const TCP_KEEPINTVL: u32 = 2;
 pub const TCP_KEEPCNT: u32 = 12;
 
-/// Python's per-platform TCP timeouts (TCPInterface.py:181-207): the full
+/// Python's per-platform TCP timeouts (TCPInterface.py): the full
 /// set on Linux (and Android), keepalive with the idle time on Apple
 /// platforms, nothing elsewhere. `i2p_tunneled` selects the longer I2P values.
 pub(crate) fn set_tcp_keepalive_tuned(stream: &TcpStream, i2p_tunneled: bool) {
@@ -108,7 +108,7 @@ pub(crate) fn set_tcp_keepalive_tuned(stream: &TcpStream, i2p_tunneled: bool) {
 }
 
 /// Python `get_address_for_if` / `get_address_for_host` of the TCP and
-/// Backbone listeners (TCPInterface.py:469-504): `device` wins over
+/// Backbone listeners (TCPInterface.py): `device` wins over
 /// `listen_ip`, neither is an error, and nothing falls back to a wildcard.
 pub async fn resolve_bind_address(
     listen_ip: Option<&str>,
@@ -185,7 +185,7 @@ pub struct TcpClientConfig {
     /// Use the longer socket timeouts for a TCP connection tunneled over I2P.
     pub i2p_tunneled: bool,
     /// Parsed like Python, which stores it but connects with
-    /// [`INITIAL_CONNECT_TIMEOUT`] (TCPInterface.py:241).
+    /// [`INITIAL_CONNECT_TIMEOUT`] (TCPInterface.py).
     pub connect_timeout_secs: u64,
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
@@ -218,7 +218,7 @@ impl TcpClientConfig {
         }
     }
 
-    /// Python `str(TCPClientInterface)` (TCPInterface.py:457-461).
+    /// Python `str(TCPClientInterface)` (TCPInterface.py).
     pub fn python_name(&self) -> String {
         format!(
             "TCPInterface[{}/{}:{}]",
@@ -232,7 +232,7 @@ impl TcpClientConfig {
 #[derive(Debug, Clone)]
 pub struct TcpServerConfig {
     pub name: String,
-    /// Host to bind; required unless `device` is set (TCPInterface.py:550).
+    /// Host to bind; required unless `device` is set (TCPInterface.py).
     pub listen_ip: Option<String>,
     pub listen_port: u16,
     pub kiss_framing: bool,
@@ -241,7 +241,7 @@ pub struct TcpServerConfig {
     /// Bind to this network device's address instead of `listen_ip`
     /// (Python `device =` option).
     pub device: Option<String>,
-    /// Accepted clients take the I2P socket timeouts (TCPInterface.py:589).
+    /// Accepted clients take the I2P socket timeouts (TCPInterface.py).
     pub i2p_tunneled: bool,
     /// Bitrate the hardware MTU is optimised for; accepted clients inherit it.
     pub bitrate: u64,
@@ -458,7 +458,7 @@ async fn tcp_write_loop(
     state.online.store(false, Ordering::SeqCst);
 }
 
-/// Python's initiator `teardown()` (TCPInterface.py:437-455): the interface
+/// Python's initiator `teardown()` (TCPInterface.py): the interface
 /// stays registered and offline, and queued outbound packets are discarded
 /// until the runtime stops it.
 pub(crate) async fn hold_torn_down(
@@ -545,7 +545,7 @@ pub async fn spawn_tcp_client_observed(
     let identity = InterfaceIdentity::new(&python_name, &config.name, "TCPClientInterface");
     let (teardown_tx, teardown) = ClientTeardown::channel();
     // Python connects once, synchronously, before the interface is handed to
-    // transport (TCPInterface.py:162-163, :241).
+    // transport (TCPInterface.py).
     let mut initial_attempt = Some(
         tokio::time::timeout(
             std::time::Duration::from_secs(INITIAL_CONNECT_TIMEOUT),
@@ -561,7 +561,7 @@ pub async fn spawn_tcp_client_observed(
         let addr = format!("{}:{}", config.target_host, config.target_port);
         // Every attempt after the first follows a failure or an outage.
         let mut attempted = false;
-        // Retries within the current outage (TCPInterface.py:271-290).
+        // Retries within the current outage (TCPInterface.py).
         let mut attempts: usize = 0;
 
         loop {
@@ -607,7 +607,7 @@ pub async fn spawn_tcp_client_observed(
             state.online.store(true, Ordering::SeqCst);
             attempts = 0;
             // Python synthesizes on every non-KISS connection
-            // (TCPInterface.py:178-179, :298-299).
+            // (TCPInterface.py).
             let synthesis = config
                 .tunnel_identity
                 .as_ref()
@@ -1009,7 +1009,7 @@ mod tests {
     }
 
     /// Python's initiator teardown keeps the interface registered and
-    /// offline after the retry budget is spent (TCPInterface.py:437-455).
+    /// offline after the retry budget is spent (TCPInterface.py).
     #[tokio::test]
     async fn give_up_keeps_interface_registered_and_offline() {
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(8);

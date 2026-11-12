@@ -1,6 +1,6 @@
 //! Held and cached announces re-enter inbound processing as Python
 //! re-injects them: past IFAC, without counting their bytes again
-//! (Interface.py:296, Transport.py:3107-3119).
+//! (Interface.py, Transport.py).
 use super::*;
 use crate::ingress::HeldAnnounce;
 
@@ -125,7 +125,7 @@ fn a_wire_announce_without_valid_ifac_is_dropped_and_never_held() {
     assert!(!actor.path_table.has_path(&unsigned_destination));
 }
 
-/// Python's 5 s interface job re-evaluates the limiter (Transport.py:1329-1337),
+/// Python's 5 s interface job re-evaluates the limiter (Transport.py),
 /// so a burst clears on a quiet interface without another announce.
 #[test]
 fn interface_job_clears_a_burst_on_a_quiet_interface() {

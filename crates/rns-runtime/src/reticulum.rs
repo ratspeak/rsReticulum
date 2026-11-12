@@ -76,9 +76,9 @@ struct InterfaceControlMetadata {
     /// `target_ip`, `target_port`), which auto-connect checks.
     client_target: Option<(String, u16)>,
     /// The network identity, in hex, that announced an auto-connected
-    /// interface (Python `autoconnect_source`, Discovery.py:865).
+    /// interface (Python `autoconnect_source`, Discovery.py).
     autoconnect_source: Option<String>,
-    // Per-interface stamp costs, copied raw to spawned children (TCPInterface.py:608-609).
+    // Per-interface stamp costs, copied raw to spawned children (TCPInterface.py).
     destination_cost: Option<f64>,
     pr_cost: Option<f64>,
     /// What a connection this interface accepts takes from it.
@@ -86,7 +86,7 @@ struct InterfaceControlMetadata {
 }
 
 /// The listener settings Python copies to each accepted connection
-/// (TCPInterface.py:588-646, BackboneInterface.py:706-757, I2PInterface.py:861-912).
+/// (TCPInterface.py, BackboneInterface.py, I2PInterface.py).
 #[derive(Clone)]
 struct SpawnInheritance {
     mode: rns_interface::traits::InterfaceMode,
@@ -171,7 +171,7 @@ struct TransportCompletion {
 const RUNTIME_INTERFACE_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Python `Transport.application_identity.hash`: one random requester per
-/// process for destination type requests (Transport.py:449).
+/// process for destination type requests (Transport.py).
 fn application_requester() -> [u8; 16] {
     static REQUESTER: OnceLock<[u8; 16]> = OnceLock::new();
     *REQUESTER.get_or_init(|| Identity::new().hash)
@@ -269,7 +269,7 @@ impl RuntimeShutdownCoordinator {
     }
 
     /// Python's exit handler deregisters this process's destination types
-    /// from the shared instance first (Reticulum.py:189).
+    /// from the shared instance first (Reticulum.py).
     fn install_exit_unwants(&self, target: SharedRpcTarget) {
         *self
             .inner
@@ -1285,14 +1285,14 @@ pub struct DiscoveryRuntime {
     announcer_started: Mutex<bool>,
     subscriber_started: Mutex<bool>,
     local_interfaces: Mutex<Vec<LocalDiscoveryInterface>>,
-    /// Any configured section is discoverable, enabled or not (Reticulum.py:1074-1080).
+    /// Any configured section is discoverable, enabled or not (Reticulum.py).
     announcer_configured: AtomicBool,
     autoconnected: Mutex<HashMap<[u8; 32], AutoconnectedInterface>>,
     bootstrap_interfaces: Mutex<Vec<u64>>,
     /// Configs of `bootstrap_only` interfaces, re-spawned when no
-    /// auto-connected interface is online (Reticulum.py:1275).
+    /// auto-connected interface is online (Reticulum.py).
     bootstrap_configs: Mutex<Vec<BootstrapConfig>>,
-    /// A bootstrap-only I2P interface stays attached (Reticulum.py:888), so
+    /// A bootstrap-only I2P interface stays attached (Reticulum.py), so
     /// Python never re-enables bootstrap interfaces beside it.
     i2p_bootstrap: AtomicBool,
     autoconnect_lock: Mutex<()>,
@@ -1300,7 +1300,7 @@ pub struct DiscoveryRuntime {
     initial_autoconnect_ran: AtomicBool,
 }
 
-/// An auto-connected interface under the monitor (Discovery.py:651-718).
+/// An auto-connected interface under the monitor (Discovery.py).
 struct AutoconnectedInterface {
     /// `None` while the interface is still being spawned.
     id: Option<u64>,
@@ -1341,7 +1341,7 @@ struct LocalDiscoveryInterface {
     online: Option<Arc<AtomicBool>>,
     /// Overrides `config.reachable_on` once the interface learns its address.
     reachable_on: Option<tokio::sync::watch::Receiver<Option<String>>>,
-    /// Python `location_cmd` (Reticulum.py:1096).
+    /// Python `location_cmd` (Reticulum.py).
     location_cmd: Option<String>,
 }
 
@@ -1775,7 +1775,7 @@ impl ReticulumHandle {
     }
 
     async fn default_packet_receipt_timeout(&self, destination_hash: [u8; 16]) -> Duration {
-        // Reticulum.py:1985-1987 and Transport.py:3488@1.6.0 fallbacks.
+        // Reticulum.py and Transport.py fallbacks.
         let first_hop =
             self.first_hop_timeout(destination_hash)
                 .await
@@ -2025,8 +2025,8 @@ impl ReticulumHandle {
     }
 
     /// Return the next-hop interface MTU in bytes, when available. A Client's
-    /// next hop is its own local shared-instance interface (Transport.py:3508,
-    /// 3517-3524@1.6.0). This interface value is not a negotiated Link payload
+    /// next hop is its own local shared-instance interface (Transport.py,
+    /// 3517-3524). This interface value is not a negotiated Link payload
     /// budget or the MTU of every hop on the path.
     pub async fn next_hop_hardware_mtu(
         &self,
@@ -2303,7 +2303,7 @@ impl ReticulumHandle {
 
     /// A destination type request: registered locally, and on a shared-instance
     /// client also with the shared instance, whose answer is returned. A failed
-    /// RPC answers false (Reticulum.py:2224-2267).
+    /// RPC answers false (Reticulum.py).
     async fn destination_type_request(
         &self,
         local: TransportQuery,
@@ -2335,7 +2335,7 @@ impl ReticulumHandle {
     /// Python `Reticulum.attach_interface`: brings up a configured interface
     /// that is not running, even one disabled in its section. True, false, or
     /// `None` when the configuration has no such section. A shared-instance
-    /// client forwards the call to the instance (Reticulum.py:850-875, 2141-2148).
+    /// client forwards the call to the instance (Reticulum.py).
     pub async fn attach_interface(&self, name: &str) -> Result<Option<bool>, ControlError> {
         if self.instance_mode == InstanceMode::Client {
             return self
@@ -2350,7 +2350,7 @@ impl ReticulumHandle {
 
     /// Python `Reticulum.detach_interface`: stops and removes a running
     /// interface and the connections it spawned. `None` when no interface has
-    /// that name (Reticulum.py:877-904, 2150-2157).
+    /// that name (Reticulum.py).
     pub async fn detach_interface(&self, name: &str) -> Result<Option<bool>, ControlError> {
         if self.instance_mode == InstanceMode::Client {
             return self
@@ -2364,7 +2364,7 @@ impl ReticulumHandle {
     }
 
     /// Python `Reticulum.reload_interface`: detaches a running interface and
-    /// attaches it again from the current configuration (Reticulum.py:906-920).
+    /// attaches it again from the current configuration (Reticulum.py).
     pub async fn reload_interface(&self, name: &str) -> Result<Option<bool>, ControlError> {
         if self.instance_mode == InstanceMode::Client {
             return self
@@ -2528,7 +2528,7 @@ impl ReticulumHandle {
     }
 
     /// Python `Reticulum.required_announces_only`: only shared-instance
-    /// clients may restrict their own announce ingress (Reticulum.py:2216-2222).
+    /// clients may restrict their own announce ingress (Reticulum.py).
     pub async fn required_announces_only(&self, enabled: bool) -> bool {
         if self.instance_mode != InstanceMode::Client {
             return false;
@@ -2666,7 +2666,7 @@ impl ReticulumHandle {
     }
 
     /// Blackholed identity hashes, which listing discovered interfaces culls
-    /// (Discovery.py:528, :554-555); empty when the query fails.
+    /// (Discovery.py); empty when the query fails.
     async fn blackholed_identity_set(&self) -> std::collections::HashSet<[u8; 16]> {
         match self
             .query_control_result(TransportQuery::GetBlackholedIdentities)
@@ -2755,7 +2755,7 @@ fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::
         },
         TransportQuery::GetBlackholedIdentities => RpcRequest::GetBlackholedIdentities,
         // Python 1.3.8 is_blackholed() proxies to the shared instance
-        // (Reticulum.py:1655-1659).
+        // (Reticulum.py).
         TransportQuery::IsBlackholed { hash } => RpcRequest::IsBlackholed {
             identity_hash: hash.to_vec(),
         },
@@ -2774,7 +2774,7 @@ fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::
         } => RpcRequest::BlackholeIdentity {
             identity_hash: hash.to_vec(),
             until: ttl.map(|ttl| unix_now() + ttl),
-            // Reticulum.py:2196@1.6.0 forwards the caller's reason, None when unlabelled.
+            // Reticulum.py forwards the caller's reason, None when unlabelled.
             reason: reason_label.clone().or_else(|| {
                 (*reason != rns_transport::blackhole::BlackholeReason::Manual)
                     .then(|| reason.as_str().to_string())
@@ -2980,7 +2980,7 @@ impl SharedInstanceType {
     }
 
     /// Python forces TCP wherever `platformutils.use_af_unix()` is false
-    /// (Reticulum.py:815-820): only Linux and Android have abstract sockets.
+    /// (Reticulum.py): only Linux and Android have abstract sockets.
     fn on_this_platform(self) -> Self {
         if cfg!(target_os = "linux") || rns_interface::local::is_android() {
             self
@@ -3006,7 +3006,7 @@ pub struct InitOptions {
     pub enforce_stamps: bool,
     /// Embedder choice: an interface that fails to build or start is recorded
     /// in [`ReticulumHandle::startup_interface_failures`] and the rest start.
-    /// Off, startup stops as upstream does (Reticulum.py:1306-1311).
+    /// Off, startup stops as upstream does (Reticulum.py).
     pub keep_starting_after_interface_failure: bool,
 }
 
@@ -3075,7 +3075,7 @@ async fn detect_shared_tcp_server(port: u16) -> bool {
     .is_ok_and(|r| r.is_ok())
 }
 
-/// Binds without listening; upstream learns the same by binding its server (Reticulum.py:414-426).
+/// Binds without listening; upstream learns the same by binding its server (Reticulum.py).
 fn shared_tcp_port_is_free(port: u16) -> bool {
     let Ok(socket) = tokio::net::TcpSocket::new_v4() else {
         return false;
@@ -3088,7 +3088,7 @@ fn shared_tcp_port_is_free(port: u16) -> bool {
         .is_ok()
 }
 
-/// Reticulum.py:458-463: an unreachable shared instance leaves this process standalone.
+/// Reticulum.py: an unreachable shared instance leaves this process standalone.
 fn shared_instance_unreachable(error: &dyn std::fmt::Display) -> InstanceMode {
     tracing::error!("Local shared instance appears to be running, but it could not be connected");
     tracing::error!("The contained exception was: {error}");
@@ -3435,7 +3435,7 @@ fn warn_deprecated_alias(alias: &str, key: &str) {
 }
 
 /// The aliases Python accepts for `autoconnect_interface_mode`; any other
-/// value is ignored (Reticulum.py:715-728).
+/// value is ignored (Reticulum.py).
 fn parse_autoconnect_interface_mode(value: &str) -> Option<rns_interface::traits::InterfaceMode> {
     use rns_interface::traits::InterfaceMode;
     match value.to_lowercase().as_str() {
@@ -3635,7 +3635,7 @@ impl ReticulumConfig {
                     "required_discovery_value",
                 );
             }
-            // Reticulum.py:674-677 keeps only a positive value; Discovery.py:495 defaults the rest.
+            // Reticulum.py keeps only a positive value; Discovery.py defaults the rest.
             if let Some(v) = config_float("reticulum", sec, "required_discovery_value")?.or(
                 config_float("reticulum", sec, "discover_interfaces_required_value")?,
             ) {
@@ -3656,7 +3656,7 @@ impl ReticulumConfig {
             if let Some(list) = sec.get_list("blackhole_sources") {
                 rc.blackhole_sources = parse_hash16_list("blackhole_sources", Some(list))?;
             }
-            // Reticulum.py:593-596: float minutes, clamped to min 2, stored ×60.
+            // Reticulum.py: float minutes, clamped to min 2, stored ×60.
             if let Some(v) = config_float("reticulum", sec, "blackhole_update_interval")? {
                 rc.blackhole_update_interval = v.max(2.0) * 60.0;
             }
@@ -3666,7 +3666,7 @@ impl ReticulumConfig {
         }
 
         // Python promotes the identity while synthesizing a discoverable
-        // interface (Reticulum.py:1078-1083).
+        // interface (Reticulum.py).
         if !rc.enable_transport
             && !rc.static_transport_identity
             && config
@@ -3693,7 +3693,7 @@ impl ReticulumConfig {
     }
 
     /// Apply constructor overrides after the configuration file, in Python's
-    /// order (Reticulum.py:349-362).
+    /// order (Reticulum.py).
     pub fn apply_init_options(&mut self, options: &InitOptions) {
         if options.enable_stamping {
             tracing::debug!("Network stamp generation activated");
@@ -3715,14 +3715,14 @@ impl ReticulumConfig {
     }
 }
 
-/// Python 1.3.8 Transport.py:234-238: the wire-facing transport identity is
+/// Python 1.3.8 Transport.py: the wire-facing transport identity is
 /// ephemeral per boot exactly when transport is disabled and
 /// `static_transport_identity` is unset.
 fn uses_ephemeral_transport_identity(rc: &ReticulumConfig) -> bool {
     !rc.enable_transport && !rc.static_transport_identity
 }
 
-/// Python 1.3.8 Transport.py:240: per-boot random hop delta,
+/// Python 1.3.8 Transport.py: per-boot random hop delta,
 /// `(ord(os.urandom(1)) % 6) + 2` = 2..=7.
 fn generate_local_hops_delta() -> u8 {
     (rns_crypto::random::random_bytes(1)[0] % 6) + 2
@@ -3850,12 +3850,12 @@ pub async fn init_with_policy(
     let announce_dispatch = actor.announce_dispatch_handle();
     actor.is_foreground = is_foreground.clone();
     actor.initialize_storage(paths.storage_dir.clone());
-    // Python 1.3.8 Transport.py:234-238: non-transport nodes get a fresh
+    // Python 1.3.8 Transport.py: non-transport nodes get a fresh
     // per-boot wire-facing transport identity unless static_transport_identity
     // is set. Pre-seed the actor's hash so runtime-side wire consumers
     // (discovery announcer, blackhole publisher/subscriber) share the value.
     actor.static_transport_identity = rc.static_transport_identity;
-    // Python 1.3.8 Transport.py:240: one random 2..=7 delta per boot;
+    // Python 1.3.8 Transport.py: one random 2..=7 delta per boot;
     // should_apply_delta gates actual application.
     if rc.local_hops_delta {
         actor.local_hops_delta = generate_local_hops_delta();
@@ -3943,7 +3943,7 @@ pub async fn init_with_policy(
     });
 
     // Python defaults the local shared-instance RPC key to a hash of the
-    // PERSISTENT transport identity (internal_identity(), Reticulum.py:352),
+    // PERSISTENT transport identity (internal_identity(), Reticulum.py),
     // so RPC auth stays stable across the per-boot ephemeral rotation.
     if rc.rpc_key.is_none()
         && let Some(private_key) = transport_identity.get_private_key()
@@ -4342,7 +4342,7 @@ pub async fn init_with_policy(
         .into());
     }
 
-    // Reticulum.py:423-426, 465-466: only becoming the shared instance fails the requirement.
+    // Reticulum.py: only becoming the shared instance fails the requirement.
     if options.require_shared_instance
         && (would_own_shared_instance || instance_mode == InstanceMode::Shared)
     {
@@ -4573,7 +4573,7 @@ pub async fn init_with_policy(
                                 }
                             }
                             // Python announces an I2P interface itself, never its
-                            // peers (Discovery.py:112); without a server the
+                            // peers (Discovery.py); without a server the
                             // first peer stands in.
                             let announced = match iface_config {
                                 interface_factory::InterfaceConfig::I2P(_) => {
@@ -4598,7 +4598,7 @@ pub async fn init_with_policy(
                                     );
                                 }
                                 // Python never detaches an I2PInterface
-                                // (Reticulum.py:809).
+                                // (Reticulum.py).
                                 if bootstrap_only
                                     && !matches!(
                                         iface_config,
@@ -4780,7 +4780,7 @@ pub async fn init_with_policy(
         }
 
         // Python serves remote management on Transport.identity
-        // (Transport.py:367-368), the hash `rnstatus -R` and `rnpath -R` take.
+        // (Transport.py), the hash `rnstatus -R` and `rnpath -R` take.
         match crate::remote_management::start_remote_management_with_stats(
             transport_tx.clone(),
             &handle.transport_identity,
@@ -4812,7 +4812,7 @@ pub async fn init_with_policy(
         management_announces.extend(start_network_destinations(&transport_tx, network_identity));
     }
 
-    // Transport.py:534,645-650@1.6.0: only a transport instance has a probe destination,
+    // Transport.py: only a transport instance has a probe destination,
     // and it is built on Transport.identity.
     if instance_mode != InstanceMode::Client && rc.enable_transport && rc.respond_to_probes {
         match crate::probe::spawn_announced_probe_responder(
@@ -4873,7 +4873,7 @@ async fn run_accepted_child_registration_pump(
         };
         let (role, ingress_overrides, ifac_key, ifac_size) =
             child_registration_from_parent(&interface_controls, sub_handle.parent_id);
-        // LocalInterface.py:429,455@1.6.0: a spawned client copies the bitrate, not the MTU.
+        // LocalInterface.py: a spawned client copies the bitrate, not the MTU.
         if role == rns_transport::messages::InterfaceRole::LocalClient
             && let Some(bitrate) = forced_shared_bitrate.filter(|bitrate| *bitrate > 0)
         {
@@ -5043,9 +5043,9 @@ enum InterfaceFailureWatch {
     RNode(rns_interface::rnode::RNodeDriverSubscription),
     #[cfg(feature = "serial")]
     RNodeMulti(rns_interface::rnode_multi::RNodeMultiFailures),
-    /// TCP or Backbone client teardown (TCPInterface.py:437-442).
+    /// TCP or Backbone client teardown (TCPInterface.py).
     ClientTeardown(rns_interface::tcp::ClientTeardown),
-    /// Serial, KISS or AX.25 KISS runtime port error (SerialInterface.py:203-210).
+    /// Serial, KISS or AX.25 KISS runtime port error (SerialInterface.py).
     #[cfg(feature = "serial")]
     Serial(rns_interface::serial::SerialFailures),
 }
@@ -5235,7 +5235,7 @@ fn apply_forced_shared_instance_bitrate(
     handle.bitrate = bitrate;
     handle.mtu =
         rns_interface::traits::optimise_mtu(bitrate).unwrap_or(rns_wire::constants::MTU as u32);
-    // HDLC.py ReceiveBuffer and Transport.py:2014@1.6.0 bound frames by the optimised HW_MTU.
+    // HDLC.py ReceiveBuffer and Transport.py bound frames by the optimised HW_MTU.
     handle.packet_capacity = rns_transport::messages::InterfacePacketCapacity::new(
         handle.mtu,
         handle.mtu,
@@ -5273,7 +5273,7 @@ async fn adopt_shared_instance_client(
             role: rns_transport::messages::InterfaceRole::SharedInstancePeer,
             ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
             ifac_key: None,
-            // LocalInterface.py:66@1.6.0 bounds frames at HW_MTU + DEFAULT_IFAC_SIZE.
+            // LocalInterface.py bounds frames at HW_MTU + DEFAULT_IFAC_SIZE.
             ifac_size: rns_interface::tcp::DEFAULT_IFAC_SIZE,
             kind: InterfaceKind::Standard,
             multipoint: false,
@@ -5945,14 +5945,14 @@ async fn register_owned_interface_with_post_init(
     .map(|_| ())
 }
 
-/// Python's configured `bitrate`, which counts from `MINIMUM_BITRATE` (Reticulum.py:1018-1020).
+/// Python's configured `bitrate`, which counts from `MINIMUM_BITRATE` (Reticulum.py).
 fn configured_bitrate(post_init: &interface_factory::InterfacePostInit) -> Option<u64> {
     post_init
         .bitrate
         .filter(|bitrate| *bitrate >= MINIMUM_BITRATE)
 }
 
-/// Python's post-init `optimise_mtu` after a configured bitrate (Reticulum.py:1127-1128),
+/// Python's post-init `optimise_mtu` after a configured bitrate (Reticulum.py),
 /// for the interface classes with `AUTOCONFIGURE_MTU`.
 fn apply_configured_bitrate_mtu(
     iface_config: &interface_factory::InterfaceConfig,
@@ -6000,7 +6000,7 @@ fn clone_interface_post_init(
 }
 
 /// Python's I2P key file for an interface: the old name when that file
-/// exists, else one bound to the transport identity (I2PInterface.py:229-238).
+/// exists, else one bound to the transport identity (I2PInterface.py).
 fn i2p_key_path(storage_dir: &Path, name: &str, transport_identity_hash: &[u8; 16]) -> PathBuf {
     let dir = storage_dir.join("i2p");
     let name_hash = rns_crypto::sha::sha256(name.as_bytes());
@@ -7142,7 +7142,7 @@ fn interface_config_mode_mut(
     }
 }
 
-/// Python Reticulum.py:841-848: a `discoverable` interface must run in
+/// Python Reticulum.py: a `discoverable` interface must run in
 /// Gateway, Internal, or Access Point mode for discovery to be useful, so
 /// other modes are auto-corrected (AP for RNode radios, Gateway otherwise)
 /// with a notice.
@@ -7228,7 +7228,7 @@ fn discovery_config_for_interface(
     };
     let iface_name = interface_config_name(iface_config);
     // Upstream parses these only for a discoverable interface, and a bad value
-    // stops startup (Reticulum.py:1077-1106@1.6.0).
+    // stops startup (Reticulum.py).
     let key_error = |key: &str, what: &str| {
         invalid_config_value(&format!("interfaces.{iface_name}"), key, what)
     };
@@ -7265,12 +7265,12 @@ fn discovery_config_for_interface(
                 None,
             ),
             // Python announces a KISS-framed TCP client as a KISS interface
-            // (Discovery.py:230-234).
+            // (Discovery.py).
             interface_factory::InterfaceConfig::TcpClient(c) if c.kiss_framing => {
                 ("KISSInterface", None, None, None, None, None, None)
             }
             // A target host makes a BackboneClientInterface, which Python never
-            // announces (Reticulum.py:1120-1122, BackboneInterface.py:154).
+            // announces (Reticulum.py, BackboneInterface.py).
             interface_factory::InterfaceConfig::Backbone(c) if c.target_host.is_some() => {
                 return Ok(None);
             }
@@ -7287,7 +7287,7 @@ fn discovery_config_for_interface(
                 None,
             ),
             // The server announces its own b32 once SAM assigns it
-            // (Discovery.py:215-216).
+            // (Discovery.py).
             interface_factory::InterfaceConfig::I2P(_) => {
                 ("I2PInterface", None, None, None, None, None, None)
             }
@@ -7333,7 +7333,7 @@ fn discovery_config_for_interface(
         }
         address
     });
-    // Only KISS announces the discovery_* radio keys; RNode sends its own (Discovery.py:216-232).
+    // Only KISS announces the discovery_* radio keys; RNode sends its own (Discovery.py).
     let discovery_frequency = uint_key("discovery_frequency")?;
     let discovery_bandwidth = uint_key("discovery_bandwidth")?;
     let (frequency, bandwidth) = if interface_type == "KISSInterface" {
@@ -7380,7 +7380,7 @@ fn discovery_config_for_interface(
     }))
 }
 
-/// Upstream's announcer `sanitize`: drop CR and LF, then strip (Discovery.py:123-128).
+/// Upstream's announcer `sanitize`: drop CR and LF, then strip (Discovery.py).
 fn sanitize_discovery_value(value: &str) -> String {
     value.replace(['\n', '\r'], "").trim().to_string()
 }
@@ -7394,7 +7394,7 @@ fn hex_to_16(hex: &str) -> Option<[u8; 16]> {
 }
 
 /// Python reads `discovery_stamp_value` with `as_float` and generates at 16
-/// when it is unset or 0 (Reticulum.py:1090, Discovery.py:134).
+/// when it is unset or 0 (Reticulum.py, Discovery.py).
 fn discovery_stamp_value(
     float_key: &dyn Fn(&str) -> Result<Option<f64>, ConfigError>,
 ) -> Result<f64, ConfigError> {
@@ -7409,7 +7409,7 @@ fn discovery_stamp_value(
 }
 
 /// Upstream announces only an IP address or hostname and logs an error for
-/// anything else (Discovery.py:203-206@1.6.0).
+/// anything else (Discovery.py).
 fn configured_reachable_on(section: &ConfigSection) -> Option<String> {
     let reachable_on = sanitize_discovery_value(section.get("reachable_on")?);
     if rns_transport::discovery::address::is_valid_address(&reachable_on) == Some(true) {
@@ -7424,7 +7424,7 @@ fn configured_reachable_on(section: &ConfigSection) -> Option<String> {
 }
 
 /// Python announces a server only with a configured `reachable_on`, and logs
-/// an error at each announce it skips (Discovery.py:120, :186-188).
+/// an error at each announce it skips (Discovery.py).
 fn server_reachable_on(
     section: &ConfigSection,
     iface_config: &interface_factory::InterfaceConfig,
@@ -7449,7 +7449,7 @@ fn discovery_announce_interval_secs(
     if let Some(minutes) = section.get_float("discovery_announce_interval") {
         return Ok((minutes.max(0.0) * 60.0).round().max(1.0) as u64);
     }
-    // Upstream: whole minutes, at least five, six hours when unset (Reticulum.py:1085-1089).
+    // Upstream: whole minutes, at least five, six hours when unset (Reticulum.py).
     match section.get("announce_interval") {
         None => Ok(6 * 60 * 60),
         Some(value) => value
@@ -7665,7 +7665,7 @@ async fn run_discovery_publisher(
     crate::destination_stamper::load_stored_stamp(&mut discovery_destination, announce_identity);
     let mut discovery_stamps = crate::destination_stamper::DestinationStamps::<()>::new();
     let mut registered: HashMap<u64, Option<String>> = HashMap::new();
-    // Python's last_discovery_announce and job sleep (Discovery.py:103-119).
+    // Python's last_discovery_announce and job sleep (Discovery.py).
     let mut last_announce: HashMap<u64, tokio::time::Instant> = HashMap::new();
     let mut next_prepare = tokio::time::Instant::now()
         + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
@@ -7679,7 +7679,7 @@ async fn run_discovery_publisher(
             _ = handle.transport_tx.closed() => break,
             _ = tick.tick() => {}
         }
-        // Python walks the live interface list on every pass (Discovery.py:108).
+        // Python walks the live interface list on every pass (Discovery.py).
         let locals = handle.discovery.local_interfaces.lock().await.clone();
         publications.retain(|id, _| locals.iter().any(|local| local.id == *id));
         if let Some(announcer) = announcer.as_mut() {
@@ -7944,7 +7944,7 @@ async fn run_discovery_publisher(
 
 /// Evaluate executable `reachable_on` and `location_cmd` values and validate
 /// the address before an announce, as Python does; `None` aborts this
-/// announce (Discovery.py:136-207).
+/// announce (Discovery.py).
 async fn resolve_discovery_inputs(
     mut config: DiscoveryInterfaceConfig,
     location_cmd: Option<&str>,
@@ -8005,7 +8005,7 @@ async fn resolve_discovery_inputs(
 }
 
 /// Python's `lat,lon,height` checks for `location_cmd` output
-/// (Discovery.py:146-155).
+/// (Discovery.py).
 // Plain comparisons let NaN through, as upstream's do.
 #[allow(clippy::manual_range_contains)]
 fn parse_discovery_location(output: &str) -> Result<(f64, f64, f64), String> {
@@ -8051,12 +8051,12 @@ async fn run_discovery_command(path: &Path) -> Result<String, String> {
     Ok(stdout)
 }
 
-/// Python's `is_ip_address` (Discovery.py:982-986).
+/// Python's `is_ip_address` (Discovery.py).
 fn is_ip_address(value: &str) -> bool {
     value.parse::<std::net::IpAddr>().is_ok()
 }
 
-/// Python's `is_hostname` (Discovery.py:1001-1007).
+/// Python's `is_hostname` (Discovery.py).
 fn is_hostname(hostname: &str) -> bool {
     let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
     if hostname.len() > 253 {
@@ -8076,7 +8076,7 @@ fn is_hostname(hostname: &str) -> bool {
     })
 }
 
-/// Python's `connect_discovered` (Discovery.py:732-743): one pass over the
+/// Python's `connect_discovered` (Discovery.py): one pass over the
 /// stored transport records, then each new discovery.
 async fn run_discovery_autoconnect(
     handle: ReticulumHandle,
@@ -8154,7 +8154,7 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
     if discovered_endpoint_exists(handle, &host, port).await {
         return;
     }
-    // Python's `endpoint_hash` (Discovery.py:747-752).
+    // Python's `endpoint_hash` (Discovery.py).
     let key = rns_crypto::sha::sha256(format!("{host}:{port}").as_bytes());
     {
         let mut connected = handle.discovery.autoconnected.lock().await;
@@ -8200,7 +8200,7 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
 
 /// Python auto-connects only Backbone interfaces of a transport node running
 /// a trusted stack and release, unless unverified stacks are allowed; the
-/// transport requirement holds either way (Discovery.py:780-802).
+/// transport requirement holds either way (Discovery.py).
 fn autoconnect_admits(record: &DiscoveredInterface, config: &ReticulumConfig) -> bool {
     let admitted = rns_transport::discovery::autoconnect::qualifies(
         &record.info,
@@ -8227,7 +8227,7 @@ fn discovered_ifac_value(value: &Option<String>) -> Option<String> {
 }
 
 /// Python refuses an interface whose advertised costs exceed the stamp values
-/// this node generates (Discovery.py:804-813).
+/// this node generates (Discovery.py).
 fn autoconnect_costs_acceptable(
     record: &DiscoveredInterface,
     stamps: &rns_transport::stamps::StampPolicy,
@@ -8252,7 +8252,7 @@ fn autoconnect_costs_acceptable(
     dst_cost <= dst_value && pr_cost <= pr_value
 }
 
-/// Python's `autoconnect_interface_name` (Discovery.py:771-779).
+/// Python's `autoconnect_interface_name` (Discovery.py).
 async fn autoconnect_interface_name(handle: &ReticulumHandle, name: &str) -> String {
     let names: std::collections::HashSet<String> = match handle
         .query_transport(TransportQuery::GetInterfaceStats)
@@ -8294,7 +8294,7 @@ async fn spawn_discovered_backbone_client(
     config.tunnel_identity = Some(rns_interface::traits::TunnelIdentity(
         handle.transport_identity.clone(),
     ));
-    // Discovery.py:884 adds the interface with configured_bitrate=5E6.
+    // Discovery.py adds the interface with configured_bitrate=5E6.
     config.bitrate = 5_000_000;
     let spawned = rns_interface::backbone::spawn_backbone_client_observed(
         config,
@@ -8311,11 +8311,11 @@ async fn spawn_discovered_backbone_client(
             .expect("empty interface defaults are valid")
             .with_default_ifac_size(16);
     finalize_post_init(&mut post_init, &handle.config);
-    // Python's `configured_bitrate=5E6` (Discovery.py:884).
+    // Python's `configured_bitrate=5E6` (Discovery.py).
     post_init.bitrate = Some(5_000_000);
-    // Discovery.py:881: autoconnect_interface_gravity, else AC_GRAVITY (0).
+    // Discovery.py: autoconnect_interface_gravity, else AC_GRAVITY (0).
     post_init.gravity = Some(handle.config.autoconnect_interface_gravity.unwrap_or(0));
-    // Discovery.py:880: True when configured, otherwise None.
+    // Discovery.py: True when configured, otherwise None.
     post_init.announces_to_internal = handle.config.autoconnect_announces_to_internal;
     post_init.ifac_network_name = discovered_ifac_value(&record.info.ifac_netname);
     post_init.ifac_passphrase =
@@ -8342,7 +8342,7 @@ async fn spawn_discovered_backbone_client(
     Ok((id, online))
 }
 
-/// Python's `__monitor_job` (Discovery.py:659-718): detach interfaces that
+/// Python's `__monitor_job` (Discovery.py): detach interfaces that
 /// stay down, forget ones detached elsewhere, trade bootstrap interfaces for
 /// online auto-connected ones and refill free slots.
 async fn run_autoconnect_monitor(handle: ReticulumHandle) {
@@ -8360,7 +8360,7 @@ async fn run_autoconnect_monitor(handle: ReticulumHandle) {
 }
 
 async fn autoconnect_monitor_tick(handle: &ReticulumHandle) {
-    // Upstream DETACH_THRESHOLD is in seconds (Discovery.py:476, :684).
+    // Upstream DETACH_THRESHOLD is in seconds (Discovery.py).
     let threshold = Duration::from_secs(rns_transport::discovery::DETACH_THRESHOLD_TICKS);
     let limit = handle.config.autoconnect_discovered_interfaces;
     let registered: std::collections::HashSet<u64> = handle
@@ -8489,7 +8489,7 @@ fn autoconnect_from_monitor(
 }
 
 /// Python re-synthesizes every bootstrap-only interface config once no
-/// auto-connected interface is online (Discovery.py:701-705).
+/// auto-connected interface is online (Discovery.py).
 async fn respawn_bootstrap_interfaces(handle: &ReticulumHandle) {
     let configs: Vec<(
         interface_factory::InterfaceConfig,
@@ -8660,7 +8660,7 @@ async fn attach_interface_section(
             );
     }
     let ids: Vec<u64> = spawned.into_iter().map(|(id, _, _)| id).collect();
-    // Python never detaches an I2PInterface (Reticulum.py:888).
+    // Python never detaches an I2PInterface (Reticulum.py).
     if interface_bootstrap_only(config, &iface_config)
         && !matches!(iface_config, interface_factory::InterfaceConfig::I2P(_))
     {
@@ -8674,7 +8674,7 @@ async fn attach_interface_section(
     Ok(ids)
 }
 
-/// Python's `interface_exists` (Discovery.py:754-770): a client interface
+/// Python's `interface_exists` (Discovery.py): a client interface
 /// already aimed at this host and port, or an I2P interface at this address.
 async fn discovered_endpoint_exists(handle: &ReticulumHandle, host: &str, port: u16) -> bool {
     let aimed = handle
@@ -8702,7 +8702,7 @@ async fn discovered_endpoint_exists(handle: &ReticulumHandle, host: &str, port: 
 }
 
 /// Python never auto-connects to an onion address, nor to the literal
-/// addresses 127.0.0.1 and 0.0.0.0 (Discovery.py:814-825, :978-985).
+/// addresses 127.0.0.1 and 0.0.0.0 (Discovery.py).
 fn refused_autoconnect_host(host: &str) -> bool {
     host.to_lowercase().ends_with(".onion") || ["127.0.0.1", "0.0.0.0"].contains(&host)
 }
@@ -8795,7 +8795,7 @@ async fn start_blackhole_publisher(
         }
     });
 
-    // Transport.py:495@1.6.0.
+    // Transport.py
     if let Some(destination) = lm.destination_mut() {
         destination.set_link_cost(BLACKHOLE_LINK_COST);
     }
@@ -8812,10 +8812,10 @@ async fn start_blackhole_publisher(
     Ok((dest_hash, announce))
 }
 
-/// Interval between management announces (Transport.py:359@1.6.0).
+/// Interval between management announces (Transport.py).
 const MGMT_ANNOUNCE_INTERVAL: Duration =
     Duration::from_secs(rns_transport::constants::MGMT_ANNOUNCE_INTERVAL as u64);
-/// Delay before the first management announce (Transport.py:522-523@1.6.0).
+/// Delay before the first management announce (Transport.py).
 const MGMT_ANNOUNCE_FIRST_DELAY: Duration = Duration::from_secs(15);
 
 /// Asks one of the transport's management destinations to announce itself.
@@ -8873,7 +8873,7 @@ pub(crate) fn register_management_destination(
 }
 
 /// The `rnstransport.network.instance.<hash>` and `rnstransport.network`
-/// destinations on the network identity (Transport.py:501-507@1.6.0).
+/// destinations on the network identity (Transport.py).
 fn start_network_destinations(
     transport_tx: &mpsc::Sender<TransportMessage>,
     network_identity: &Identity,
@@ -8904,7 +8904,7 @@ fn start_network_destinations(
 }
 
 /// Announce every management destination 15 s after start and then every
-/// two hours (Transport.py:1359-1368@1.6.0).
+/// two hours (Transport.py).
 async fn run_management_announcer(destinations: Vec<ManagementAnnounce>, shutdown: ShutdownSignal) {
     let mut wait = MGMT_ANNOUNCE_FIRST_DELAY;
     loop {
@@ -8926,7 +8926,7 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
     }
     *started = true;
     drop(started);
-    // BlackholeUpdater.start registers its announce type (Discovery.py:908).
+    // BlackholeUpdater.start registers its announce type (Discovery.py).
     handle
         .wants_destination_type("rnstransport.info.blackhole")
         .await;
@@ -8966,7 +8966,7 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
                         rns_transport::discovery::BLACKHOLE_ASPECT_FILTER,
                         Some(&source_hash),
                     );
-                // Discovery.py:964-971: without a path, retry on the next job
+                // Discovery.py: without a path, retry on the next job
                 // run; once a path exists the source waits a full interval.
                 if handle
                     .await_path(
@@ -9075,7 +9075,7 @@ fn ensure_runtime_interface_admission(
         .map_err(|_| "runtime is shutting down; interface spawn rejected".to_string())
 }
 
-/// Any initiator that gives up panics the instance (TCPInterface.py:435-442).
+/// Any initiator that gives up panics the instance (TCPInterface.py).
 fn watch_runtime_client_teardown(
     handle: &ReticulumHandle,
     name: &str,
@@ -10540,7 +10540,7 @@ async fn spawn_interface_with_rnode_startup_options(
                 ));
             }
             // Python runs the server and one peer interface per configured
-            // peer, each named "<name> to <peer>" (I2PInterface.py:793-819).
+            // peer, each named "<name> to <peer>" (I2PInterface.py).
             let mut handles = Vec::new();
             let mut next = Some(id);
             if c.connectable {
@@ -10797,7 +10797,7 @@ fn load_or_create_network_identity(path: &Path) -> Result<Arc<Identity>, Reticul
 }
 
 /// A section that fails to build stops startup whatever
-/// `panic_on_interface_error` says (Reticulum.py:1307-1311); an unknown type
+/// `panic_on_interface_error` says (Reticulum.py); an unknown type
 /// is only logged, as upstream does for a missing external module. With
 /// `failures`, a failed section is recorded there and the rest are built.
 fn synthesize_interfaces(
@@ -13081,7 +13081,7 @@ loglevel = 7
         assert_eq!(rc.shared_instance_type, SharedInstanceType::Tcp);
     }
 
-    /// Python Reticulum.py:815-820: Unix sockets serve the shared instance
+    /// Python Reticulum.py: Unix sockets serve the shared instance
     /// only where `platformutils.use_af_unix()` holds, whatever was requested.
     fn python_unix_request() -> SharedInstanceType {
         if cfg!(target_os = "linux") || rns_interface::local::is_android() {
@@ -14545,7 +14545,7 @@ loglevel = 7
     }
 
     /// An interface announces the address it learns at runtime
-    /// (Discovery.py:215-216); a later change waits for the interval instead
+    /// (Discovery.py); a later change waits for the interval instead
     /// of announcing at once, so a flapping address cannot flood announces.
     #[tokio::test(start_paused = true)]
     async fn discovery_publisher_announces_a_learned_address_on_its_interval() {
@@ -15008,9 +15008,9 @@ loglevel = 7
         }
     }
 
-    /// Python reads only `reachable_on` (Reticulum.py:999), and a Backbone
+    /// Python reads only `reachable_on` (Reticulum.py), and a Backbone
     /// client is a `BackboneClientInterface`, which never supports discovery
-    /// (Reticulum.py:1120-1122, Discovery.py:77-78, BackboneInterface.py:154).
+    /// (Reticulum.py, Discovery.py, BackboneInterface.py).
     #[test]
     fn network_discovery_uses_the_configured_reachable_on() {
         let discovery = |endpoint: &str, key: &str| {
@@ -15076,7 +15076,7 @@ loglevel = 7
 
     /// Upstream sends a nil name without `discovery_name`, announces only a
     /// valid `reachable_on`, and fails startup on a discovery key it cannot
-    /// parse (Reticulum.py:1077-1106, Discovery.py:173, :203-206@1.6.0).
+    /// parse (Reticulum.py, Discovery.py).
     #[test]
     fn discovery_keys_parse_like_upstream() {
         let discovery = |extra: &str| {
@@ -15125,7 +15125,7 @@ loglevel = 7
     }
 
     /// Python announces a KISS-framed TCP client as a KISS interface with its
-    /// discovery radio parameters and no address (Discovery.py:182-185, :230-234).
+    /// discovery radio parameters and no address (Discovery.py).
     #[test]
     fn a_kiss_framed_tcp_client_is_discovered_as_a_kiss_interface() {
         let config = Config::parse("[interfaces]\n[[kiss tnc]]\ntype = TCPClientInterface\nenabled = yes\nkiss_framing = yes\ntarget_host = 10.0.0.2\ntarget_port = 8001\ndiscoverable = yes\ndiscovery_frequency = 433775000\ndiscovery_modulation = 2\ndiscovery_spreading_factor = 7\ndiscovery_coding_rate = 5\ndiscovery_channel = 3\nreachable_on = 10.0.0.2\n").unwrap();
@@ -15157,7 +15157,7 @@ loglevel = 7
         );
     }
 
-    /// Serial KISS/AX.25 never announce; RNode announces its own radio, no address (Interface.py:118).
+    /// Serial KISS/AX.25 never announce; RNode announces its own radio, no address (Interface.py).
     #[cfg(feature = "serial")]
     #[test]
     fn only_upstream_discoverable_radio_types_announce() {
@@ -15238,7 +15238,7 @@ loglevel = 7
         assert_eq!(h.blackhole_sources()[0], [0xAA; 16]);
     }
 
-    /// Python's `autoconnect_unverified_implementations` (Reticulum.py:632-634).
+    /// Python's `autoconnect_unverified_implementations` (Reticulum.py).
     #[test]
     fn autoconnect_unverified_implementations_is_parsed_and_off_by_default() {
         assert!(!ReticulumConfig::default().autoconnect_unverified_implementations);
@@ -15249,7 +15249,7 @@ loglevel = 7
     }
 
     /// Only Backbone interfaces from Python 1.5.7 or later, unless unverified
-    /// stacks are allowed (Discovery.py:782-798).
+    /// stacks are allowed (Discovery.py).
     #[test]
     fn discovered_interfaces_auto_connect_like_python() {
         let record = |interface_type: &str, impl_name: Option<&str>, version: Option<&str>| {
@@ -15381,7 +15381,7 @@ loglevel = 7
         assert_eq!(rc.ingress_overrides.held_release_interval, Some(3.5));
     }
 
-    /// Python Reticulum.py:841-848 parity: discoverable interfaces are
+    /// Python Reticulum.py parity: discoverable interfaces are
     /// auto-corrected to Gateway/AP mode unless already Internal or
     /// `ignore_config_warnings` is enabled.
     #[test]
@@ -15488,7 +15488,7 @@ egress_control = Yes
         assert!(rc.static_transport_identity);
         assert!(!uses_ephemeral_transport_identity(&rc));
 
-        // Python Transport.py:234-238: transport nodes never rotate.
+        // Python Transport.py: transport nodes never rotate.
         let rc = ReticulumConfig::from_config(
             &Config::parse("[reticulum]\nenable_transport = yes\n").unwrap(),
         );
@@ -15516,7 +15516,7 @@ egress_control = Yes
 
     #[test]
     fn local_hops_delta_value_stays_in_python_range() {
-        // Python Transport.py:240: (rand_byte % 6) + 2 = 2..=7.
+        // Python Transport.py: (rand_byte % 6) + 2 = 2..=7.
         for _ in 0..256 {
             let delta = generate_local_hops_delta();
             assert!((2..=7).contains(&delta), "delta {delta} out of range");
@@ -15528,7 +15528,7 @@ egress_control = Yes
         let rc = ReticulumConfig::from_config(&Config::parse("[reticulum]\n").unwrap());
         assert_eq!(rc.blackhole_update_interval, 3600.0);
 
-        // Reticulum.py:593-596: minutes ×60 into seconds.
+        // Reticulum.py: minutes ×60 into seconds.
         let rc = ReticulumConfig::from_config(
             &Config::parse("[reticulum]\nblackhole_update_interval = 30\n").unwrap(),
         );
@@ -15583,7 +15583,7 @@ egress_control = Yes
 
     #[test]
     fn internal_interface_mode_parses_and_discovery_autocorrects() {
-        // Python 1.3.8 Reticulum.py:721,737-738: mode = internal → MODE_INTERNAL.
+        // Python 1.3.8 Reticulum.py: mode = internal → MODE_INTERNAL.
         let base = "[interfaces]\n\n[[Test TCP]]\ntype = TCPClientInterface\nenabled = yes\n\
                     target_host = 127.0.0.1\ntarget_port = 4242\nmode = internal\n";
         let config = Config::parse(base).unwrap();
@@ -15593,7 +15593,7 @@ egress_control = Yes
             rns_interface::traits::InterfaceMode::Internal
         );
 
-        // Reticulum.py:856-863 in RNS 1.4.0: Internal is a supported
+        // Reticulum.py in RNS 1.4.0: Internal is a supported
         // discovery mode and must not be auto-corrected.
         let config = Config::parse(&format!("{base}discoverable = yes\n")).unwrap();
         let mut interfaces = synthesize_interfaces(&config, None).unwrap();
@@ -17835,7 +17835,7 @@ txpower = 17
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// TCPInterface.py:437-442: a client that spends its retry budget panics
+    /// TCPInterface.py: a client that spends its retry budget panics
     /// the instance when `panic_on_interface_error` is set.
     #[tokio::test]
     async fn tcp_client_teardown_stops_the_runtime_when_panic_on_interface_error_is_set() {
@@ -17870,7 +17870,7 @@ txpower = 17
         assert_eq!(handle.interface_panic(), Some("Unreachable"));
     }
 
-    /// TCPInterface.py:435-442 / BackboneInterface.py:1088-1091: a client
+    /// TCPInterface.py / BackboneInterface.py: a client
     /// added at runtime that gives up also panics the instance.
     #[tokio::test]
     async fn runtime_backbone_client_teardown_stops_the_runtime_when_panic_on_interface_error_is_set()
@@ -18007,7 +18007,7 @@ txpower = 17
         (result, dir)
     }
 
-    // Reticulum.py:435-466: neither bindable nor connectable means standalone, required or not.
+    // Reticulum.py: neither bindable nor connectable means standalone, required or not.
     #[tokio::test]
     async fn required_shared_instance_falls_back_to_standalone_when_unreachable() {
         let holder = tokio::net::TcpSocket::new_v4().unwrap();
@@ -18030,7 +18030,7 @@ txpower = 17
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Reticulum.py:468-472: without sharing there is no shared instance to require.
+    // Reticulum.py: without sharing there is no shared instance to require.
     #[tokio::test]
     async fn required_shared_instance_is_not_enforced_without_sharing() {
         let (result, dir) = init_requiring_shared_instance(

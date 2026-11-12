@@ -37,9 +37,9 @@ const REMOTE_HOPS: u8 = 8;
 const MGMT_APP: &str = "rnstransport.remote.management";
 const BLACKHOLE_APP: &str = "rnstransport.info.blackhole";
 const SPINNER: [char; 7] = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
-/// rnpath.py:42.
+/// rnpath.py.
 const OUTPUT_RST: &str = "\r                                                          \r";
-/// rnpath.py:478,489.
+/// rnpath.py.
 const LOOKUP_RST: &str = "\r                                                       \r";
 const DEST_LENGTH_INVALID: &str =
     "Destination length is invalid, must be 32 hexadecimal characters (16 bytes).";
@@ -166,7 +166,7 @@ pub(crate) async fn main() -> ExitCode {
     );
 
     let destination = args.destination.as_deref().filter(|d| !d.is_empty());
-    // rnpath.py:525-528.
+    // rnpath.py.
     if !(args.drop_announces
         || args.table
         || args.rates
@@ -197,7 +197,7 @@ pub(crate) async fn main() -> ExitCode {
         Ok(ctx) => ctx,
         Err(code) => return code,
     };
-    // rnpath.py:108-110
+    // rnpath.py
     let registration = rns_tools::RpcRegistration::want(
         ctx.endpoint.clone(),
         ctx.rpc_key.clone(),
@@ -211,7 +211,7 @@ pub(crate) async fn main() -> ExitCode {
 }
 
 async fn dispatch_local(args: &Args, ctx: &ClientCtx, destination: Option<&str>) -> ExitCode {
-    // Dispatch order of rnpath.py:132-490.
+    // Dispatch order of rnpath.py.
     if args.blackholed {
         return show_blackholed(ctx, destination).await;
     }
@@ -239,12 +239,12 @@ async fn dispatch_local(args: &Args, ctx: &ClientCtx, destination: Option<&str>)
     query_path(ctx, destination, args.timeout).await
 }
 
-/// rnpath.py:249-255 and its copies: a 32-character hex destination.
+/// rnpath.py and its copies: a 32-character hex destination.
 fn parse_destination(input: Option<&str>) -> Result<[u8; 16], &'static str> {
     parse_hex16(input, DEST_LENGTH_INVALID, DEST_INVALID)
 }
 
-/// rnpath.py:94-100.
+/// rnpath.py.
 fn parse_hash(input: Option<&str>) -> Result<[u8; 16], &'static str> {
     parse_hex16(input, HASH_LENGTH_INVALID, HASH_INVALID)
 }
@@ -311,7 +311,7 @@ impl ClientCtx {
     }
 
     /// `RNS.Transport.identity` of a shared-instance client: ephemeral unless
-    /// `static_transport_identity` is set (Transport.py:440-445).
+    /// `static_transport_identity` is set (Transport.py).
     fn local_transport_identity(&self) -> Option<[u8; 16]> {
         if !self.static_transport_identity {
             return None;
@@ -420,7 +420,7 @@ fn local_rpc_failure_message(
     }
 }
 
-/// rnpath.py:132-206: `-b` lists the shared instance's blackhole list.
+/// rnpath.py: `-b` lists the shared instance's blackhole list.
 async fn show_blackholed(ctx: &ClientCtx, filter: Option<&str>) -> ExitCode {
     let entries = match request(ctx, &RpcRequest::GetBlackholedIdentities).await {
         Ok(RpcResponse::BlackholeList(entries)) => entries,
@@ -458,7 +458,7 @@ struct BlackholeLine {
     source: Option<Vec<u8>>,
 }
 
-/// rnpath.py:176-206, shared by `-b` and `-p`.
+/// rnpath.py, shared by `-b` and `-p`.
 fn print_blackhole_list(
     entries: &[BlackholeLine],
     filter: Option<&str>,
@@ -513,7 +513,7 @@ fn blackhole_lines(
     lines
 }
 
-/// rnpath.py:181-184: at most 64 characters, the last one an ellipsis.
+/// rnpath.py: at most 64 characters, the last one an ellipsis.
 fn truncate_reason(reason: &str) -> String {
     const RMLEN: usize = 64;
     if reason.chars().count() <= RMLEN {
@@ -525,7 +525,7 @@ fn truncate_reason(reason: &str) -> String {
     }
 }
 
-/// rnpath.py:208-225.
+/// rnpath.py.
 async fn do_blackhole(
     ctx: &ClientCtx,
     destination: Option<&str>,
@@ -567,7 +567,7 @@ async fn do_blackhole(
     ExitCode::SUCCESS
 }
 
-/// rnpath.py:227-243.
+/// rnpath.py.
 async fn do_unblackhole(ctx: &ClientCtx, destination: Option<&str>) -> ExitCode {
     let id = match parse_hash(destination) {
         Ok(id) => id,
@@ -612,7 +612,7 @@ fn table_filter(destination: Option<&str>) -> Result<Option<[u8; 16]>, ExitCode>
     }
 }
 
-/// rnpath.py:245-306, local shared instance.
+/// rnpath.py, local shared instance.
 async fn show_path_table(
     ctx: &ClientCtx,
     destination: Option<&str>,
@@ -643,7 +643,7 @@ fn print_path_table(
     usage: bool,
     now: f64,
 ) -> ExitCode {
-    // rnpath.py:276-283 dumps the whole table, filter or not.
+    // rnpath.py dumps the whole table, filter or not.
     if json {
         println!("{}", path_table_json(&table));
         return ExitCode::SUCCESS;
@@ -665,7 +665,7 @@ fn print_path_table(
     ExitCode::SUCCESS
 }
 
-/// rnpath.py:302.
+/// rnpath.py.
 fn path_table_line(entry: &rpc::PathTableEntry, now: f64) -> String {
     format!(
         "{} {:>3}h via {} on {} expires in {} {}",
@@ -678,17 +678,17 @@ fn path_table_line(entry: &rpc::PathTableEntry, now: f64) -> String {
     )
 }
 
-/// rnpath.py:287-288: most recently used first.
+/// rnpath.py: most recently used first.
 fn sort_by_usage(entries: &mut [rpc::PathTableEntry]) {
     entries.sort_by(|a, b| b.used.total_cmp(&a.used));
 }
 
-/// The `(dv:<value>/lc:<lr_cost>)` tail of an rnpath 1.6.0 table line (rnpath.py:302).
+/// The `(dv:<value>/lc:<lr_cost>)` tail of an rnpath 1.6.0 table line (rnpath.py).
 fn cost_suffix(value: Option<f64>, lr_cost: Option<f64>) -> String {
     format!("(dv:{}/lc:{})", pretty_cost(value), pretty_cost(lr_cost))
 }
 
-/// `json.dumps` of the path table rows with bytes as hex (rnpath.py:276-282).
+/// `json.dumps` of the path table rows with bytes as hex (rnpath.py).
 /// Upstream sends `value` and `used` as int 0 when unset, and floats otherwise.
 fn path_table_json(entries: &[rpc::PathTableEntry]) -> String {
     let rows: Vec<String> = entries
@@ -723,7 +723,7 @@ fn py_int_or_float(value: f64) -> String {
     }
 }
 
-/// rnpath.py:308-390, local shared instance.
+/// rnpath.py, local shared instance.
 async fn show_rate_table(ctx: &ClientCtx, destination: Option<&str>, json: bool) -> ExitCode {
     let filter = match table_filter(destination) {
         Ok(filter) => filter,
@@ -768,7 +768,7 @@ fn print_rate_table(
     ExitCode::SUCCESS
 }
 
-/// rnpath.py:355-386.
+/// rnpath.py.
 fn rate_table_lines(entry: &rpc::RateTableEntry, now: f64) -> Vec<String> {
     let hash = pretty_hex_rep(&entry.hash);
     let Some(&start_ts) = entry.timestamps.first() else {
@@ -805,8 +805,8 @@ fn rate_table_lines(entry: &rpc::RateTableEntry, now: f64) -> Vec<String> {
     )]
 }
 
-/// `json.dumps` of the rate table rows, in upstream key order (Storage.py:162-163,
-/// Reticulum.py:1911).
+/// `json.dumps` of the rate table rows, in upstream key order (Storage.py,
+/// Reticulum.py).
 fn rate_table_json(entries: &[rpc::RateTableEntry]) -> String {
     let rows: Vec<String> = entries
         .iter()
@@ -825,7 +825,7 @@ fn rate_table_json(entries: &[rpc::RateTableEntry]) -> String {
     format!("[{}]", rows.join(", "))
 }
 
-/// rnpath.py:392-400.
+/// rnpath.py.
 async fn drop_announces(ctx: &ClientCtx) -> ExitCode {
     println!("Dropping announce queues on all interfaces...");
     match request(ctx, &RpcRequest::DropAnnounceQueues).await {
@@ -838,7 +838,7 @@ async fn drop_announces(ctx: &ClientCtx) -> ExitCode {
     }
 }
 
-/// rnpath.py:402-421.
+/// rnpath.py.
 async fn drop_path(ctx: &ClientCtx, destination: Option<&str>) -> ExitCode {
     let dest = match parse_destination(destination) {
         Ok(dest) => dest,
@@ -867,7 +867,7 @@ async fn drop_path(ctx: &ClientCtx, destination: Option<&str>) -> ExitCode {
     }
 }
 
-/// rnpath.py:423-442.
+/// rnpath.py.
 async fn drop_all_via(ctx: &ClientCtx, destination: Option<&str>) -> ExitCode {
     let via = match parse_destination(destination) {
         Ok(via) => via,
@@ -896,7 +896,7 @@ async fn drop_all_via(ctx: &ClientCtx, destination: Option<&str>) -> ExitCode {
     }
 }
 
-/// rnpath.py:444-490: request a path through the shared instance and wait
+/// rnpath.py: request a path through the shared instance and wait
 /// `max(-w, medium_path_timeout)` with the spinner.
 async fn query_path(ctx: &ClientCtx, destination: Option<&str>, timeout: f64) -> ExitCode {
     let dest = match parse_destination(destination) {
@@ -982,7 +982,7 @@ async fn query_path_attached(
 }
 
 /// Print one spinner frame every 100 ms until `done` or the deadline
-/// (rnpath.py:465-472, rnprobe.py:85-91). Returns whether `done` held.
+/// (rnpath.py, rnprobe.py). Returns whether `done` held.
 async fn spin_until<F, Fut>(deadline: Option<Instant>, mut done: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -1072,7 +1072,7 @@ fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Start the runtime used for `-R` and `-p`, as rnpath.py:108 does.
+/// Start the runtime used for `-R` and `-p`, as rnpath.py does.
 async fn start_runtime(args: &Args) -> Result<ReticulumHandle, ExitCode> {
     let handle = init(
         args.config.as_deref(),
@@ -1085,7 +1085,7 @@ async fn start_runtime(args: &Args) -> Result<ReticulumHandle, ExitCode> {
         eprintln!("rnpath-rs: failed to initialize Reticulum runtime: {e:?}");
         ExitCode::from(1)
     })?;
-    // rnpath.py:108-110
+    // rnpath.py
     handle.wants_destination_type(MGMT_APP).await;
     handle.wants_destination_type(BLACKHOLE_APP).await;
     Ok(handle)
@@ -1097,7 +1097,7 @@ async fn stop_runtime(handle: ReticulumHandle, code: ExitCode) -> ExitCode {
     code
 }
 
-/// rnpath.py:43-58: wait for a path to the remote destination, printing the
+/// rnpath.py: wait for a path to the remote destination, printing the
 /// request line when one is needed. Exit 12 on timeout.
 async fn await_remote_path(
     handle: &ReticulumHandle,
@@ -1138,14 +1138,14 @@ async fn await_remote_path(
     }
 }
 
-/// `Transport.medium_path_timeout()` (Transport.py:3550-3553).
+/// `Transport.medium_path_timeout()` (Transport.py).
 fn medium_path_timeout_for_bitrate(lowest_bitrate: u64) -> f64 {
     let bits = (rns_wire::constants::MTU * 8) as f64;
     2.0 * (bits / lowest_bitrate.max(rns_runtime::constants::MINIMUM_BITRATE) as f64)
         + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
 }
 
-/// rnpath.py:59-92 and the request: one link query, with upstream's
+/// rnpath.py and the request: one link query, with upstream's
 /// progress lines and link failure messages (exit 10).
 async fn remote_query(
     handle: &ReticulumHandle,
@@ -1174,7 +1174,7 @@ async fn remote_query(
         // A timed-out receipt has no response; callers report it as a failed request.
         Err(LinkClientError::RequestFailed(RequestFailure::TimedOut)) => Ok(Vec::new()),
         // Upstream's link-closed callback prints, but its exit() runs off the
-        // main thread, so the pending request still fails (rnpath.py:61-76).
+        // main thread, so the pending request still fails (rnpath.py).
         Err(LinkClientError::RequestFailed(RequestFailure::LinkClosed(reason))) => {
             if let Some(text) = rns_tools::link_closed_text(reason) {
                 println!("{OUTPUT_RST}{text}");
@@ -1192,7 +1192,7 @@ async fn remote_query(
     }
 }
 
-/// rnpath.py:146-206: `-p` fetches `/list` from the transport whose identity
+/// rnpath.py: `-p` fetches `/list` from the transport whose identity
 /// hash is the destination argument, filtered by `list_filter`.
 async fn run_remote_blackhole_list(args: &Args) -> ExitCode {
     let identity_hash = match parse_hash(args.destination.as_deref()) {
@@ -1254,7 +1254,7 @@ async fn remote_blackhole_list(
     )
 }
 
-/// rnpath.py:111-130 and the remote branches: `-t` and `-r` over
+/// rnpath.py and the remote branches: `-t` and `-r` over
 /// `rnstransport.remote.management`; other actions are not implemented upstream.
 async fn run_remote(args: &Args, remote: &str) -> ExitCode {
     let remote_hash = match parse_destination(Some(remote)) {
@@ -1298,7 +1298,7 @@ async fn run_remote(args: &Args, remote: &str) -> ExitCode {
     stop_runtime(handle, code).await
 }
 
-/// The remote branches that print "not implemented" and exit 255 (rnpath.py:135-449).
+/// The remote branches that print "not implemented" and exit 255 (rnpath.py).
 fn remote_unimplemented(args: &Args) -> Option<&'static str> {
     if args.blackholed {
         Some("Listing blackholed identities on remote instances not yet implemented")
@@ -1329,7 +1329,7 @@ async fn remote_management(
     let dest_value = filter
         .map(|f| rmpv::Value::Binary(f.to_vec()))
         .unwrap_or(rmpv::Value::Nil);
-    // rnpath.py:263,326.
+    // rnpath.py.
     let request = if args.table {
         let max = args.max.map(rmpv::Value::from).unwrap_or(rmpv::Value::Nil);
         vec![rmpv::Value::from("table"), dest_value, max]
@@ -1347,7 +1347,7 @@ async fn remote_management(
         Err(code) => return code,
     };
     let now = now_epoch();
-    // A falsy reply, including an empty table, is reported as a failure (rnpath.py:266-273).
+    // A falsy reply, including an empty table, is reported as a failure (rnpath.py).
     if args.table {
         match rpc::decode_response_for_request(&bytes, &RpcRequest::GetPathTable { max_hops: None })
         {
@@ -1373,7 +1373,7 @@ fn remote_request_failed() -> ExitCode {
     ExitCode::from(10)
 }
 
-/// rnpath.py:542-561 for an integer timestamp, from `datetime` differences.
+/// rnpath.py for an integer timestamp, from `datetime` differences.
 fn pretty_date(time: f64, now: f64) -> String {
     let diff = now - time;
     let day_diff = (diff / 86400.0).floor() as i64;
@@ -1525,7 +1525,7 @@ mod tests {
         assert_eq!(order, [4, 2, 1, 3]);
     }
 
-    /// rnpath.py:181-202: reason truncation, the `by` suffix and the filter string.
+    /// rnpath.py: reason truncation, the `by` suffix and the filter string.
     #[test]
     fn blackhole_lines_truncate_reason_and_filter_on_rendered_text() {
         let own = [0xdd; 16];

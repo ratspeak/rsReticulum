@@ -1,4 +1,4 @@
-//! `rngit` client subcommands (`ReticulumGitClient`, `server.py:281-1830@1.6.0`).
+//! `rngit` client subcommands (`ReticulumGitClient`, `server.py`).
 
 pub mod forks;
 pub mod perms;

@@ -727,7 +727,7 @@ pub(crate) async fn main() {
                 );
             }
             tracing::info!("reticulum started in {:?} mode", handle.instance_mode);
-            // Python's discovery stamps come from RNS itself (Discovery.py:87,266).
+            // Python's discovery stamps come from RNS itself (Discovery.py).
             handle
                 .enable_on_network_discovery(std::sync::Arc::new(
                     rns_transport::discovery::RnsDiscoveryStamper,

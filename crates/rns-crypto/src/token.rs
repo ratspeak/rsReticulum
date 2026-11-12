@@ -250,7 +250,7 @@ mod tests {
         assert_ne!(t1, t2);
     }
 
-    /// Legacy AES-128 round-trip via 32-byte key (Python `Token.py:62-65`).
+    /// Legacy AES-128 round-trip via 32-byte key (Python `Token.py`).
     #[test]
     fn test_encrypt_decrypt_roundtrip_aes128() {
         let key = [0x42u8; 32];

@@ -450,8 +450,8 @@ async fn run_local_client_connection(
 ) -> LocalClientConnectionEnd {
     let interface_id = io.interface_id;
     let mut buf = [0u8; 8192];
-    // LocalInterface.py:81-82@1.6.0: the receive buffer follows HW_MTU, which a
-    // forced bitrate re-optimises (Reticulum.py:443-448@1.6.0).
+    // LocalInterface.py: the receive buffer follows HW_MTU, which a
+    // forced bitrate re-optimises (Reticulum.py).
     let hw_mtu = io
         .force_bitrate
         .filter(|bitrate| *bitrate > 0)
@@ -661,7 +661,7 @@ pub async fn spawn_local_server(
     let label = endpoint.python_label();
     let unix_path =
         (!matches!(endpoint, LocalEndpoint::Tcp(_))).then(|| config.socket_path.clone());
-    // LocalInterface.py:372, :485-487.
+    // LocalInterface.py.
     let server_identity = InterfaceIdentity::new(
         format!("Shared Instance[{label}]"),
         "Reticulum",
@@ -681,7 +681,7 @@ pub async fn spawn_local_server(
                     let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
                     let client_name = format!("{}/client_{}", config.name, client_id);
                     tracing::debug!(name = %client_name, %peer, "local client connected");
-                    // LocalInterface.py:351-353, :420-424 and :443.
+                    // LocalInterface.py and :443.
                     let identity = match &unix_path {
                         Some(path) => InterfaceIdentity::new(
                             format!("LocalInterface[{label}]"),
@@ -763,7 +763,7 @@ pub async fn spawn_local_client(
     let transport_tx = InterfaceTransportSender::new(id, transport_tx);
     let owner = transport_tx.owner();
     let endpoint = LocalEndpoint::parse(&config.socket_path);
-    // Reticulum.py:437-441: named "Local shared instance".
+    // Reticulum.py: named "Local shared instance".
     let identity = InterfaceIdentity::new(
         format!("LocalInterface[{}]", endpoint.python_label()),
         "Local shared instance",
@@ -901,7 +901,7 @@ mod tests {
 
     #[test]
     fn forced_bitrate_delay_is_payload_airtime() {
-        // Upstream sleeps len / bitrate * 8 (LocalInterface.py:228-236).
+        // Upstream sleeps len / bitrate * 8 (LocalInterface.py).
         assert_eq!(forced_bitrate_delay(400, 1000), Duration::from_millis(3200));
     }
 
@@ -1259,7 +1259,7 @@ mod tests {
     }
 
     /// Python's `LocalClientInterface` drops outgoing traffic while offline
-    /// (LocalInterface.py:218), so nothing queued during an outage reaches
+    /// (LocalInterface.py), so nothing queued during an outage reaches
     /// the restarted shared instance.
     #[cfg(unix)]
     #[tokio::test]

@@ -1,16 +1,16 @@
-//! The `rngit create` client side (`ReticulumGitClient`, `server.py:281-604@1.6.0`).
+//! The `rngit create` client side (`ReticulumGitClient`, `server.py`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rns_tools::rsg::pyfmt::py_fromhex;
 
-/// `__default_rngit_config__` (`client.py:681-718`) as ConfigObj writes it.
+/// `__default_rngit_config__` (`client.py`) as ConfigObj writes it.
 pub const DEFAULT_CLIENT_CONFIG: &str = include_str!("default_client_config.txt");
 
 const PROTO_SPEC: &str = "rns://";
 
-/// `ReticulumGitClient.__init__` config directory (`server.py:336-339`),
+/// `ReticulumGitClient.__init__` config directory (`server.py`),
 /// including upstream's `~/.rngit/reticulum` when `~/.config/rngit/config` exists.
 pub fn client_config_dir(configdir: Option<&Path>) -> PathBuf {
     if let Some(dir) = configdir {
@@ -25,7 +25,7 @@ pub fn client_config_dir(configdir: Option<&Path>) -> PathBuf {
 }
 
 /// The `[logging] loglevel` and `[aliases]` that `__apply_config` reads
-/// (`server.py:368-382`). A missing file is created from the default.
+/// (`server.py`). A missing file is created from the default.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     pub loglevel: Option<i64>,
@@ -70,7 +70,7 @@ impl ClientConfig {
         Ok(out)
     }
 
-    /// `__resolve_destination_alias` (`server.py:384-393`).
+    /// `__resolve_destination_alias` (`server.py`).
     fn resolve(&self, alias: &str) -> String {
         let is_hash = alias.chars().count() == 32 && py_fromhex(alias).is_ok_and(|h| !h.is_empty());
         if is_hash {
@@ -106,13 +106,13 @@ impl ClientConfig {
         py_fromhex(&hexhash).map_err(|e| format!("Invalid destination hash: {e}"))
     }
 
-    /// `parse_remote_destination_url` (`server.py:425-433`): the abort text on error.
+    /// `parse_remote_destination_url` (`server.py`): the abort text on error.
     pub fn parse_remote_destination_url(&self, remote: &str) -> Result<Vec<u8>, String> {
         let (hexhash, _) = self.destination(remote)?;
         Self::decode(&hexhash)
     }
 
-    /// `parse_remote_group_url` (`server.py:446-454`): hash and group.
+    /// `parse_remote_group_url` (`server.py`): hash and group.
     pub fn parse_remote_group_url(&self, remote: &str) -> Result<(Vec<u8>, String), String> {
         let (hexhash, components) = self.destination(remote)?;
         if components.len() != 2 {
@@ -122,7 +122,7 @@ impl ClientConfig {
         Ok((hash, components[1].clone()))
     }
 
-    /// `parse_remote_url` (`server.py:405-413`): hash, group and repository.
+    /// `parse_remote_url` (`server.py`): hash, group and repository.
     pub fn parse_remote_url(&self, remote: &str) -> Result<(Vec<u8>, String, String), String> {
         let (hexhash, components) = self.destination(remote)?;
         if components.len() != 3 {
@@ -134,7 +134,7 @@ impl ClientConfig {
 }
 
 /// What `create_repository` prints for a `/git/create` reply
-/// (`server.py:588-600`): `Ok` on success, `Err` for the abort text.
+/// (`server.py`): `Ok` on success, `Err` for the abort text.
 pub fn create_outcome(repo_path: &str, response: Option<&[u8]>) -> Result<String, String> {
     let Some(response) = response.filter(|r| !r.is_empty()) else {
         return Err("No response from remote".into());

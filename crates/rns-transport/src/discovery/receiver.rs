@@ -329,7 +329,7 @@ impl ReceiverConfig {
         let Some(raw) = event.app_data.as_ref() else {
             return Outcome::Rejected(Reason::MissingAppData);
         };
-        // Upstream ignores discovery from beyond the hop limit (Discovery.py:296-298).
+        // Upstream ignores discovery from beyond the hop limit (Discovery.py).
         if event.hops > crate::constants::PATHFINDER_M - 1 {
             return Outcome::Rejected(Reason::HopLimit);
         }
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     /// Python validates TCPClientInterface announces but neither stores nor
-    /// reports them (Discovery.py:354, :596).
+    /// reports them (Discovery.py).
     #[test]
     fn client_interfaces_are_validated_but_not_stored() {
         let dir = tmpdir("client");

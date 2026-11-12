@@ -1,5 +1,5 @@
 //! Permission statements, `.allowed` files and the permission decision
-//! (`server.py:2251-2526@1.6.0`).
+//! (`server.py`).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,7 +20,7 @@ pub enum Perm {
 }
 
 impl Perm {
-    /// The wire value (`PERM_*`, `server.py:1927-1935`).
+    /// The wire value (`PERM_*`, `server.py`).
     pub fn code(self) -> u8 {
         match self {
             Perm::Read => 0x01,
@@ -67,7 +67,7 @@ impl Perm {
     }
 }
 
-/// One of the eight stored lists (`ALL_PERMS`, `server.py:1945`).
+/// One of the eight stored lists (`ALL_PERMS`, `server.py`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PermList {
     Read,
@@ -116,7 +116,7 @@ pub enum Target {
 }
 
 impl Target {
-    /// The wire value (`TGT_NONE`/`TGT_ALL`, `server.py:1947-1948`).
+    /// The wire value (`TGT_NONE`/`TGT_ALL`, `server.py`).
     pub fn code(&self) -> Option<u8> {
         match self {
             Target::None => Some(0x01),
@@ -130,7 +130,7 @@ pub const TGT_NONE_SMPHR: [&str; 3] = ["n", "none", "nobody"];
 pub const TGT_ALL_SMPHR: [&str; 3] = ["a", "all", "everyone"];
 pub const ALL_TGTS: [&str; 6] = ["n", "none", "nobody", "a", "all", "everyone"];
 
-/// `__resolve_identity_alias` (`server.py:2251-2261`).
+/// `__resolve_identity_alias` (`server.py`).
 pub fn resolve_identity_alias(alias: &str, aliases: &BTreeMap<String, String>) -> String {
     if ALL_TGTS.contains(&alias.to_lowercase().as_str()) {
         return alias.to_string();
@@ -146,7 +146,7 @@ pub fn resolve_identity_alias(alias: &str, aliases: &BTreeMap<String, String>) -
         .unwrap_or_else(|| alias.to_string())
 }
 
-/// `parse_permission` (`server.py:2263-2290`): either half is `None` when
+/// `parse_permission` (`server.py`): either half is `None` when
 /// it does not parse.
 pub fn parse_permission(
     statement: &str,
@@ -208,7 +208,7 @@ impl Permissions {
         }
     }
 
-    /// `permissions_from_allowed_input` (`server.py:2470-2510`).
+    /// `permissions_from_allowed_input` (`server.py`).
     pub fn from_allowed_input(input: &str, aliases: &BTreeMap<String, String>) -> Self {
         let mut perms = Permissions::default();
         for line in py_splitlines(input) {
@@ -256,7 +256,7 @@ pub enum AllowedError {
     NotUtf8,
 }
 
-/// `load_allowed_permissions` (`server.py:2512-2526`): an executable file is
+/// `load_allowed_permissions` (`server.py`): an executable file is
 /// run with no arguments and its stdout parsed (the exit status is
 /// ignored); the flag says whether it was run.
 pub fn load_allowed_permissions(
@@ -293,7 +293,7 @@ fn decide(list: &[Target], admins: &[Target], hash: &[u8; 16]) -> Option<bool> {
 }
 
 /// `resolve_permission`'s decision once group and repository are known
-/// (`server.py:2311-2369`); the blocklist is checked by the caller.
+/// (`server.py`); the blocklist is checked by the caller.
 pub fn resolve_repository(
     group: &Permissions,
     repository: &Permissions,
@@ -313,7 +313,7 @@ pub fn resolve_repository(
     decide(group.get(list), group.get(PermList::Admin), hash).unwrap_or(false)
 }
 
-/// `resolve_group_permission`'s decision (`server.py:2371-2396`); upstream
+/// `resolve_group_permission`'s decision (`server.py`); upstream
 /// does not check the blocklist here.
 pub fn resolve_group(group: &Permissions, hash: &[u8; 16], perm: Perm) -> bool {
     let Some(list) = perm.list() else {

@@ -3,7 +3,7 @@ use crate::announce_validation::{CachedAnnounce, InvalidAnnounce, ValidatedAnnou
 use crate::now_f64;
 
 /// Where an inbound packet comes from. Python re-injects held announces and
-/// cached packets with `ifac_handled=True` (Interface.py:296, Transport.py:3460),
+/// cached packets with `ifac_handled=True` (Interface.py, Transport.py),
 /// and its byte counters live in the interface drivers, so neither passes
 /// IFAC or counts as received traffic again.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -14,7 +14,7 @@ enum InboundOrigin {
 }
 
 /// A transit link proof's verdict; only a bad signature is a protocol
-/// violation (Transport.py:2668).
+/// violation (Transport.py).
 #[derive(PartialEq, Eq)]
 enum TransitProof {
     Valid,
@@ -24,7 +24,7 @@ enum TransitProof {
 
 /// The app_data upstream remembers: `b""` for a ratchet announce with nothing
 /// after the signature, since its `None` threshold ignores the ratchet
-/// (Identity.py:815-834), and `None` once a valid stamp strip leaves nothing (:867).
+/// (Identity.py), and `None` once a valid stamp strip leaves nothing.
 pub(super) fn remembered_app_data(
     announce: &rns_identity::announce::AnnounceData,
     stamp: &rns_identity::announce::AnnounceStampCheck,
@@ -47,7 +47,7 @@ impl TransportActor {
     }
 
     /// An announce the ingress controller held, released for processing; it
-    /// can be held again (Interface.py:278-297).
+    /// can be held again (Interface.py).
     pub(super) fn on_released_announce(&mut self, announce: crate::ingress::HeldAnnounce) {
         self.on_inbound_inner(
             crate::messages::InboundPacket {
@@ -62,7 +62,7 @@ impl TransportActor {
     }
 
     /// Python `Interface.protocol_violation`, `ifac_violation` and
-    /// `packet_filter_hit` (Interface.py:327-338).
+    /// `packet_filter_hit` (Interface.py).
     pub(super) fn protocol_violation(&mut self, interface_id: InterfaceId) {
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
             entry.protocol_violations = entry.protocol_violations.saturating_add(1);
@@ -70,7 +70,7 @@ impl TransportActor {
     }
 
     /// Upstream drops stamp and blackhole rejections silently; anything else
-    /// is a protocol violation (Transport.py:2046-2051, :2450-2451).
+    /// is a protocol violation (Transport.py).
     fn reject_announce(
         &mut self,
         header: &rns_wire::header::PacketHeader,
@@ -146,13 +146,13 @@ impl TransportActor {
                 .record_rx(packet.interface_id, packet.raw.len() as u64);
         }
 
-        // Transport.py:1990-2010: frames of two bytes or less are protocol
+        // Transport.py: frames of two bytes or less are protocol
         // violations before any IFAC handling.
         if packet.raw.len() <= 2 {
             self.protocol_violation(packet.interface_id);
             return;
         }
-        // Upstream bounds the frame only after IFAC (Transport.py:2014,
+        // Upstream bounds the frame only after IFAC (Transport.py,
         // HW_MTU + ifac_size, the default IFAC size without IFAC).
         let clear_limit = if origin == InboundOrigin::CachedPacket {
             500
@@ -230,7 +230,7 @@ impl TransportActor {
             }
         };
 
-        // Python 1.3.8 Packet.py:247-248: unpack() rejects on-wire hop counts
+        // Python 1.3.8 Packet.py: unpack() rejects on-wire hop counts
         // >= PATHFINDER_M for every packet type. Checked on the RAW hops byte,
         // before the inbound hop adjustment; kept at the inbound boundary so
         // locally built packets and vector tooling are unaffected.
@@ -244,7 +244,7 @@ impl TransportActor {
             return;
         }
 
-        // Packet.unpack rejects a zero-length data field (Packet.py:275).
+        // Packet.unpack rejects a zero-length data field (Packet.py).
         if data_offset >= raw.len() {
             debug!(
                 interface_id = packet.interface_id,
@@ -254,7 +254,7 @@ impl TransportActor {
             return;
         }
 
-        // Transport.HOP_LIMITER, on wire hops (Transport.py:2022).
+        // Transport.HOP_LIMITER, on wire hops (Transport.py).
         if parsed.hops >= self.hop_limiter {
             trace!(
                 hops = parsed.hops,
@@ -288,7 +288,7 @@ impl TransportActor {
 
         // A handful of contexts legitimately repeat (keepalives, resource
         // transfer frames, channel traffic): they bypass Python's packet
-        // filter and the hashlist (Transport.py:1635-1640).
+        // filter and the hashlist (Transport.py).
         let skip_hashlist = matches!(
             parsed.context,
             rns_wire::context::PacketContext::Keepalive
@@ -300,9 +300,9 @@ impl TransportActor {
         );
 
         // PLAIN and GROUP packets travel one hop at most and are never
-        // announced (Transport.py:1642-1666). Checked on wire hops before
+        // announced (Transport.py). Checked on wire hops before
         // the hashlist, so a dropped copy reserves no hash; the shared
-        // owner already filtered its ingress (:1627).
+        // owner already filtered its ingress.
         if !skip_hashlist
             && !from_shared_owner
             && matches!(
@@ -333,7 +333,7 @@ impl TransportActor {
             let Some(ingress) = self.interfaces.get(&packet.interface_id) else {
                 return;
             };
-            // A relay has no capacity refusal (Transport.py:2331-2375).
+            // A relay has no capacity refusal (Transport.py).
             if self.local_destinations.contains(&parsed.destination_hash)
                 && ingress
                     .packet_capacity
@@ -388,13 +388,13 @@ impl TransportActor {
         }
 
         // Destination-type filtering runs after the packet filter and before
-        // the hash is remembered (Transport.py:2030-2041, :2235).
+        // the hash is remembered (Transport.py).
         if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
             && !self.admit_announce_type(&raw[data_offset..], parsed.hops, packet.interface_id)
         {
             return;
         }
-        // Transport.py:2044: announce frames above the base MTU.
+        // Transport.py: announce frames above the base MTU.
         if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
             && raw.len() > rns_wire::constants::MTU
         {
@@ -405,7 +405,7 @@ impl TransportActor {
         if check_hashlist {
             self.packet_hashlist.insert(pkt_hash);
         }
-        // Python records PHY stats in `_inbound`, after the packet filter (Transport.py:2192-2209).
+        // Python records PHY stats in `_inbound`, after the packet filter (Transport.py).
         self.record_packet_metrics(pkt_hash, packet_metrics);
 
         parsed.hops = self.adjusted_inbound_hops(parsed.hops, packet.interface_id);
@@ -512,7 +512,7 @@ impl TransportActor {
             }
         };
 
-        // Identity.validate_announce (Identity.py:749-889): the cache, then
+        // Identity.validate_announce (Identity.py): the cache, then
         // the stamp, then the blackhole check, then the signature.
         let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
         let stamps_enabled = self.stamp_policy.stamps_enabled;
@@ -688,7 +688,7 @@ impl TransportActor {
         // Python remembers every freshly validated announce, replays included,
         // before it decides whether the path changes; a validation-cache hit
         // only re-remembers a destination that was forgotten
-        // (Identity.py:109-126, :717-727).
+        // (Identity.py).
         match self.recent_announces.entry(header.destination_hash) {
             std::collections::hash_map::Entry::Occupied(mut o) if !cache_hit => {
                 let e = o.get_mut();
@@ -726,7 +726,7 @@ impl TransportActor {
             }
         }
 
-        // Own announces are validated and remembered but route nothing (Transport.py:2453-2454).
+        // Own announces are validated and remembered but route nothing (Transport.py).
         if self.local_destinations.contains(&header.destination_hash) {
             debug!("not routing own announce");
             return;
@@ -749,7 +749,7 @@ impl TransportActor {
         // Same-hop neighbor rebroadcast counts toward the local cap;
         // strict hops+1 forward drops our queued copy outright.
         // Only HEADER_2 copies come from a rebroadcasting transport node
-        // (Transport.py:2454); copies heard before our first send count too.
+        // (Transport.py); copies heard before our first send count too.
         if self.is_transport_enabled
             && header.transport_id.is_some()
             && let Some(existing) = self.announce_table.get(&header.destination_hash)
@@ -800,7 +800,7 @@ impl TransportActor {
                 } else if announce_emitted != path_timebase {
                     false
                 } else {
-                    // Transport.py:2522-2532: the same emission heard on a
+                    // Transport.py: the same emission heard on a
                     // higher-gravity interface replaces the path.
                     let gravity = |id| self.interfaces.get(&id).map(|entry| entry.gravity);
                     matches!(
@@ -822,7 +822,7 @@ impl TransportActor {
 
         if should_add {
             // Only path-updating announces on interfaces with a rate target
-            // touch the rate table (Transport.py:2578-2591).
+            // touch the rate table (Transport.py).
             let rate_limit = (header.context != rns_wire::context::PacketContext::PathResponse)
                 .then(|| self.interfaces.get(&interface_id))
                 .flatten()
@@ -899,7 +899,7 @@ impl TransportActor {
                 interface_id,
                 iface_mode,
             );
-            // Transport.py:2510,2726@1.6.0: a replacement keeps the path's use.
+            // Transport.py: a replacement keeps the path's use.
             entry.used = self
                 .path_table
                 .get(&header.destination_hash)
@@ -917,7 +917,7 @@ impl TransportActor {
             entry.packet_hash = Some(announce_packet_hash);
             if rate_blocked {
                 // Rate-blocked announces update routing fields only, never
-                // liveness, and create no entry (Transport.py:2712-2724).
+                // liveness, and create no entry (Transport.py).
                 if let Some(existing) = self.path_table.get_mut(&header.destination_hash) {
                     existing.next_hop = entry.next_hop;
                     existing.hops = entry.hops;
@@ -953,7 +953,7 @@ impl TransportActor {
             }
             // Wake any callers waiting on a path for this destination.
             self.fire_path_waiters(&header.destination_hash);
-            // Transport.py:2751-2754@1.6.0.
+            // Transport.py
             self.inflight_path_requests.remove(&header.destination_hash);
 
             if self
@@ -1008,7 +1008,7 @@ impl TransportActor {
         let app_data_for_handlers = announce_app_data;
 
         // The desiring interface is unused: the response rebroadcasts once
-        // everywhere through the announce table (Transport.py:2626-2648).
+        // everywhere through the announce table (Transport.py).
         if is_from_local_client
             && header.context == rns_wire::context::PacketContext::PathResponse
             && self
@@ -1133,7 +1133,7 @@ impl TransportActor {
             .path_table
             .get_live(&header.destination_hash)
             .is_some_and(|path| self.is_local_client_interface(path.interface_id));
-        // Python 1.3.8 Transport.py:1550-1551: to_local_client also covers
+        // Python 1.3.8 Transport.py: to_local_client also covers
         // proofs whose reverse entry came in from a local client.
         let proof_for_local_client = self
             .reverse_table
@@ -1172,7 +1172,7 @@ impl TransportActor {
         }
 
         // Tunnel synthesis: install the tunnel, and replay its cached paths,
-        // once the signature verifies (Transport.py:2788-2805).
+        // once the signature verifies (Transport.py).
         if header.destination_hash == tunnel_synth_dest {
             if let Some(payload_start) = self.data_payload_offset(raw, header) {
                 match crate::tunnel::TunnelSynthesisData::unpack(&raw[payload_start..])
@@ -1193,7 +1193,7 @@ impl TransportActor {
                         self.restore_tunnel_paths(&tunnel_id, interface_id);
                     }
                     // Wrong length or a bad signature is a silent drop
-                    // (Transport.py:3067-3084).
+                    // (Transport.py).
                     None => debug!(interface_id, "invalid tunnel synthesis"),
                 }
             }
@@ -1220,7 +1220,7 @@ impl TransportActor {
         );
         if self.local_destinations.contains(&header.destination_hash) {
             if self.link_packet_on_unbound_interface(header, interface_id) {
-                // Transport.py:2858-2866: un-claim the hash so the copy arriving
+                // Transport.py: un-claim the hash so the copy arriving
                 // over the Link's attached interface is still accepted.
                 self.packet_hashlist
                     .remove(&rns_wire::hash::packet_hash(raw, header.flags.header_type));
@@ -1365,7 +1365,7 @@ impl TransportActor {
                 ) {
                     Ok(attenuated) => attenuated,
                     // Python cannot re-encode a clamped MTU for a disabled
-                    // mode and counts it (Transport.py:2354-2361).
+                    // mode and counts it (Transport.py).
                     Err(crate::link_transit::LinkTransitError::UnsupportedTransitModeTransform) => {
                         self.protocol_violation(interface_id);
                         return;
@@ -1470,7 +1470,7 @@ impl TransportActor {
         // next-hop address, not interface inequality, prevent packet loops.
         let mut forwarded =
             self.rewrite_forwarded_transport_packet(raw, header, path, to_local_client)?;
-        // Python 1.3.8 Transport.py:1687: substitute the delta for
+        // Python 1.3.8 Transport.py: substitute the delta for
         // local-client-originated packets leaving the shared instance.
         if self.local_hops_delta != 0 && from_local_client && !to_local_client {
             forwarded[1] = self.local_hops_delta;
@@ -1510,7 +1510,7 @@ impl TransportActor {
                 && self.local_hops_delta != 0
                 && header.flags.header_type == rns_wire::flags::HeaderType::Header2)
         {
-            // Python 1.3.8 Transport.py:1613-1619: with the delta active,
+            // Python 1.3.8 Transport.py: with the delta active,
             // HEADER_2 frames delivered to local shared clients get their
             // transport headers stripped, same as the one-hop case.
             let mut flags = header.flags;
@@ -1708,7 +1708,7 @@ impl TransportActor {
                     return;
                 }
                 // Python re-balances the path from a validly signed proof that
-                // took a different number of hops (Transport.py:2886-2912).
+                // took a different number of hops (Transport.py).
                 if header.hops != link_entry.remaining_hops
                     && _interface_id == link_entry.interface_id
                     && !link_entry.validated
@@ -1735,7 +1735,7 @@ impl TransportActor {
                 let outbound_interface = link_entry.interface_id;
                 let target_interface = link_entry.receiving_interface;
                 let destination_hash = link_entry.destination_hash;
-                // Python 1.3.8 Transport.py:1552/2222: instance-local
+                // Python 1.3.8 Transport.py/2222: instance-local
                 // links are exempt from delta mangling (1.3.7 eacff56f).
                 let instance_local_link = self.is_local_client_interface(link_entry.interface_id)
                     && self.is_local_client_interface(link_entry.receiving_interface);
@@ -1847,7 +1847,7 @@ impl TransportActor {
         // match — a proof on the wrong interface means a routing change or
         // a spoof. Older entries without that field route unconditionally.
         if self.is_transport_enabled || from_local_client || proof_for_local_client {
-            // Python 1.3.8 Transport.py:2287: delta for local-client-origin
+            // Python 1.3.8 Transport.py: delta for local-client-origin
             // proofs; proofs headed to local clients exempt (1.3.7 eacff56f).
             let proof_hops =
                 if !from_local_client || proof_for_local_client || self.local_hops_delta == 0 {
@@ -1930,7 +1930,7 @@ impl TransportActor {
         };
 
         let from_local_client = self.is_local_client_interface(interface_id);
-        // Python 1.3.8 Transport.py:1548-1553 (the 1.3.7 eacff56f fix): links
+        // Python 1.3.8 Transport.py (the 1.3.7 eacff56f fix): links
         // between two local clients of this shared instance are exempt from
         // delta mangling.
         let instance_local_link = self.is_local_client_interface(entry.interface_id)
@@ -1941,7 +1941,7 @@ impl TransportActor {
         if !self.is_transport_enabled && !shared_client_path {
             return false;
         }
-        // Transport.py:2396-2402: nothing but the proof may cross before validation.
+        // Transport.py: nothing but the proof may cross before validation.
         if !entry.validated {
             debug!(
                 link_id = hex::encode(header.destination_hash),
@@ -2006,7 +2006,7 @@ impl TransportActor {
 
         let mut forwarded = raw.to_vec();
         if forwarded.len() >= 2 {
-            // Python 1.3.8 Transport.py:1731: delta for local-client link
+            // Python 1.3.8 Transport.py: delta for local-client link
             // traffic leaving the instance; instance-local links exempt.
             forwarded[1] =
                 if !from_local_client || instance_local_link || self.local_hops_delta == 0 {
@@ -2038,7 +2038,7 @@ impl TransportActor {
             entry.timestamp = now_f64();
         }
         self.send_to_interface(target_interface, &forwarded);
-        // Transport.py:2438-2440@1.6.0.
+        // Transport.py
         if let Some(path) = self.path_table.get_mut(&entry.destination_hash) {
             path.mark_used();
         }
@@ -2124,12 +2124,12 @@ impl TransportActor {
         }
     }
 
-    /// Python's terminus re-balance (Transport.py:2954-2984): the first validly
+    /// Python's terminus re-balance (Transport.py): the first validly
     /// signed proof for a pending local Link ends its pending state and, when
     /// its hops differ from the path hops at request time, rewrites the path
     /// hops and marks the path responsive.
     /// Returns whether the proof goes on to the Link: only with the expected
-    /// hops, after any re-balance (Transport.py:2988-2992).
+    /// hops, after any re-balance (Transport.py).
     fn rebalance_at_link_terminus(
         &mut self,
         raw: &[u8],
@@ -2148,7 +2148,7 @@ impl TransportActor {
         {
             return expected_hops == Some(header.hops);
         }
-        // A valid proof ends the pending state, so a replay cannot re-balance (Transport.py:2954).
+        // A valid proof ends the pending state, so a replay cannot re-balance (Transport.py).
         self.pending_local_link_hops
             .remove(&header.destination_hash);
         if expected_hops == Some(header.hops) {

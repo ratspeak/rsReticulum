@@ -4,15 +4,15 @@ use crate::now_f64;
 /// Bound on the in-memory resource proof cache; Python keeps one file per proof.
 const PROOF_CACHE_MAX_ENTRIES: usize = 1024;
 
-/// Path-request lengths (Transport.py:3975-3980).
+/// Path-request lengths (Transport.py).
 pub(super) const PR_LEGACY_LENGTH: usize = 32;
 pub(super) const PR_LENGTH: usize = 48;
 pub(super) const PR_STAMPED_LENGTH: usize = 64;
 pub(super) const PR_EXT_HEADER_LENGTH: usize = 2;
 pub(super) const PR_EXT_PAYLOAD_LENGTH: usize = 16;
 
-/// Transport.validate_pr_stamp (Transport.py:4011-4016): material `dst || tag`.
-/// `0xC1 0x00` followed by the stamp (Transport.py:3720, :4049).
+/// Transport.validate_pr_stamp (Transport.py): material `dst || tag`.
+/// `0xC1 0x00` followed by the stamp (Transport.py).
 fn stamped_path_request_ext(
     stamp: &crate::pr_stamper::PathRequestStamp,
 ) -> [u8; PR_EXT_PAYLOAD_LENGTH] {
@@ -22,7 +22,7 @@ fn stamped_path_request_ext(
     ext
 }
 
-/// Transport.py:3930-3936: marks a relayed unstamped request from a stamping node.
+/// Transport.py: marks a relayed unstamped request from a stamping node.
 const LENIENT_PATH_REQUEST_EXT: [u8; PR_EXT_PAYLOAD_LENGTH] = {
     let mut ext = [0u8; PR_EXT_PAYLOAD_LENGTH];
     ext[0] = rns_identity::announce::ANNOUNCE_EXT_MARKER;
@@ -219,11 +219,11 @@ impl TransportActor {
                         "outbound: routed via path"
                     );
 
-                    // Python 1.3.8 Transport.py:1153/1186: local_hops_delta
+                    // Python 1.3.8 Transport.py/1186: local_hops_delta
                     // replaces the zero hops byte on the way out.
                     let apply_delta = self.should_apply_delta(&parsed, target_interface);
 
-                    // Transport.py:1625-1654: wrap beyond one hop, or at one hop
+                    // Transport.py: wrap beyond one hop, or at one hop
                     // when this node sits behind a shared instance.
                     let wrap = path_hops > 1 || (path_hops == 1 && self.is_shared_instance);
                     let sent = if let Some(next_hop) = path_next_hop.filter(|_| wrap) {
@@ -256,7 +256,7 @@ impl TransportActor {
                             );
                             self.send_to_interface(target_interface, &new_raw)
                         } else {
-                            // Transport.py:1626,1646: an already-wrapped packet is not sent.
+                            // Transport.py: an already-wrapped packet is not sent.
                             false
                         }
                     } else if apply_delta {
@@ -266,7 +266,7 @@ impl TransportActor {
                         self.send_to_interface(target_interface, &request.raw)
                     };
 
-                    // Transport.py:1618@1.6.0: traffic marks use, never liveness.
+                    // Transport.py: traffic marks use, never liveness.
                     if let Some(path) = self.path_table.get_live_mut(&request.destination_hash) {
                         path.mark_used();
                     }
@@ -300,7 +300,7 @@ impl TransportActor {
                 false
             }
         };
-        // Packet.py:309-311: a packet that went nowhere keeps no receipt.
+        // Packet.py: a packet that went nowhere keeps no receipt.
         if !sent && let Some(hash) = new_receipt {
             self.receipt_table.remove(&hash);
         }
@@ -317,7 +317,7 @@ impl TransportActor {
         if let Some(sent) = self.dispatch_local_link_attached(&request, interface_id) {
             return sent;
         }
-        // Transport.py:1672-1676: an attached interface is used only while online.
+        // Transport.py: an attached interface is used only while online.
         if self
             .interfaces
             .get(&interface_id)
@@ -358,7 +358,7 @@ impl TransportActor {
             let pkt_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
             self.packet_hashlist.insert(pkt_hash);
             // Python's outbound applies should_apply_delta on attached-
-            // interface sends too (Transport.py:1342-1345).
+            // interface sends too (Transport.py).
             if self.should_apply_delta(&parsed, interface_id) {
                 let transport_insert = parsed.flags.packet_type
                     == rns_wire::flags::PacketType::Announce
@@ -498,7 +498,7 @@ impl TransportActor {
     }
 
     /// Python's packet cache holds only the resource proofs this instance
-    /// sent; files expire after `PATH_TIMEOUT` (Reticulum.py:1438-1446).
+    /// sent; files expire after `PATH_TIMEOUT` (Reticulum.py).
     pub(super) fn cache_proof(&mut self, packet_hash: [u8; 32], raw: Bytes) {
         if self
             .proof_cache
@@ -514,7 +514,7 @@ impl TransportActor {
         }
     }
 
-    /// Python `Transport.get_cached_packet(packet_hash)` (Transport.py:3398-3437).
+    /// Python `Transport.get_cached_packet(packet_hash)` (Transport.py).
     fn cached_proof(&self, packet_hash: &[u8; 32]) -> Option<Bytes> {
         self.proof_cache
             .get(packet_hash)
@@ -531,9 +531,9 @@ impl TransportActor {
 
     /// A CACHE_REQUEST for one of our established Links is answered by
     /// re-sending the cached packet's data on that Link, and dropped on a
-    /// miss (Transport.py:2845-2855). Any other request replays a cache hit
+    /// miss (Transport.py). Any other request replays a cache hit
     /// through inbound when transport handling applies, and otherwise returns
-    /// false so normal processing continues (Transport.py:2271-2287, :3439-3452).
+    /// false so normal processing continues (Transport.py).
     pub(super) fn handle_cache_request(
         &mut self,
         raw: &[u8],
@@ -588,7 +588,7 @@ impl TransportActor {
     }
 
     /// Python `Transport.cache_request`: replay a local hit, otherwise send
-    /// a CACHE_REQUEST to the destination (Transport.py:3455-3464).
+    /// a CACHE_REQUEST to the destination (Transport.py).
     pub(super) fn send_cache_request(&mut self, packet_hash: [u8; 32], destination_hash: [u8; 16]) {
         if let Some(cached) = self.cached_proof(&packet_hash) {
             self.replay_cached_packet(cached);
@@ -653,7 +653,7 @@ impl TransportActor {
 
         let is_from_local_client = self.is_local_client_interface(interface_id);
 
-        // Transport.py:2071-2086 and parse_path_request (:3982-4005).
+        // Transport.py and parse_path_request.
         if data.len() > PR_STAMPED_LENGTH {
             self.protocol_violation(interface_id);
             return;
@@ -693,7 +693,7 @@ impl TransportActor {
             trace!(dest = %hex::encode(requested_dest), "ignoring duplicate path request");
             return;
         }
-        // Transport.py:2099-2129: the flags byte is not consulted, so the
+        // Transport.py: the flags byte is not consulted, so the
         // lenient 0xC1 0xFF marker fails like any invalid stamp.
         if self.stamp_policy.stamps_enabled {
             let required_value = self.interface_pr_cost(interface_id);
@@ -722,11 +722,11 @@ impl TransportActor {
             }
         }
         // Python counts a path request once its tag and stamp pass these gates
-        // (Transport.py:2088-2131).
+        // (Transport.py).
         self.record_interface_event(interface_id, InterfaceEvent::ReceivedPathRequest, raw_len);
         self.count_transport_event(InterfaceEvent::ReceivedPathRequest);
 
-        // Transport.py:2136-2158@1.6.0: a request for a destination already
+        // Transport.py: a request for a destination already
         // in flight joins the waiting requesters instead of being processed.
         if self.inflight_path_requests.contains_key(&requested_dest) {
             // A leaf answers batched requesters only for its local clients;
@@ -795,7 +795,7 @@ impl TransportActor {
                 && path.interface_id == interface_id;
 
             if requestor_is_next_hop || same_roaming_interface {
-                // Transport.py:3962-3969@1.6.0: answered, even when declined.
+                // Transport.py: answered, even when declined.
                 self.inflight_path_requests.remove(&requested_dest);
             }
             if requestor_is_next_hop {
@@ -818,7 +818,7 @@ impl TransportActor {
                 .and_then(|hash| self.cached_announce_raw(&hash))
                 .map(|raw| (path.hops, raw));
             if let Some((hops, raw)) = cached_raw {
-                // Python 1.3.8 Transport.py:2984: unparseable cached announce
+                // Python 1.3.8 Transport.py: unparseable cached announce
                 // aborts the answer entirely (no fall-through to discovery).
                 let Some(response) =
                     self.path_response_from_cached_announce(&raw, requested_dest, hops)
@@ -872,7 +872,7 @@ impl TransportActor {
             }
         }
 
-        // Python 1.3.8 Transport.py:2946-2947: recursive_prs forces discovery
+        // Python 1.3.8 Transport.py: recursive_prs forces discovery
         // independent of interface mode (flag checked first).
         let search = self
             .interfaces
@@ -908,7 +908,7 @@ impl TransportActor {
                 return;
             }
 
-            // Transport.py:3893-3897: never reached while enforcement drops
+            // Transport.py: never reached while enforcement drops
             // unstamped requests above.
             if ext.is_none() && self.stamp_policy.stamps_enforced {
                 tracing::error!(
@@ -952,7 +952,7 @@ impl TransportActor {
         }
     }
 
-    /// Transport.py:3930-3936, :3955-3956: a stamping node relays someone
+    /// Transport.py: a stamping node relays someone
     /// else's unstamped request with the lenient marker instead of a stamp.
     fn lenient_relay_ext(
         &self,
@@ -964,7 +964,7 @@ impl TransportActor {
         }
     }
 
-    /// Transport.py:3699-3704: destination, transport id, tag, then any
+    /// Transport.py: destination, transport id, tag, then any
     /// received extension unchanged.
     fn build_path_request_packet(
         &self,
@@ -1020,7 +1020,7 @@ impl TransportActor {
         self.send_path_request_ext(destination_hash, interface_id, tag, None, recursive);
     }
 
-    /// Python `request_path` on one interface (Transport.py:3685-3745): a
+    /// Python `request_path` on one interface (Transport.py): a
     /// supplied extension is sent unchanged; otherwise, under `stamp_prs`, a
     /// cached stamp is appended or generation is queued and nothing is sent yet.
     pub(super) fn send_path_request_ext(
@@ -1045,7 +1045,7 @@ impl TransportActor {
     }
 
     /// Resolve the request tag and extension. `None` means the request waits
-    /// for the stamper (Transport.py:3707-3720).
+    /// for the stamper (Transport.py).
     #[allow(clippy::type_complexity)]
     fn stamp_path_request_or_queue(
         &mut self,
@@ -1086,7 +1086,7 @@ impl TransportActor {
         None
     }
 
-    /// Python `stamp_path_request` after generation (Transport.py:4038-4051).
+    /// Python `stamp_path_request` after generation (Transport.py).
     pub(super) fn on_path_request_stamp_ready(
         &mut self,
         result: crate::pr_stamper::PathRequestStampResult,
@@ -1132,7 +1132,7 @@ impl TransportActor {
     }
 
     /// One request, stamped once, offered on every outbound interface but
-    /// `except`, limited to `modes` when given (Transport.py:3936-3947@1.6.0).
+    /// `except`, limited to `modes` when given (Transport.py).
     pub(super) fn forward_path_request_ext(
         &mut self,
         destination_hash: [u8; 16],
@@ -1276,7 +1276,7 @@ impl TransportActor {
             }
 
             if should_add {
-                // Transport.py:3115-3127@1.6.0 keeps the saved timestamp and use.
+                // Transport.py keeps the saved timestamp and use.
                 let entry = crate::path_table::PathEntry {
                     timestamp: tunnel_path.timestamp,
                     next_hop: tunnel_path.next_hop,
@@ -1316,7 +1316,7 @@ impl TransportActor {
     }
 }
 
-/// The header Python's `RNS.Packet(link, ...)` packs (Packet.py:180-190).
+/// The header Python's `RNS.Packet(link, ...)` packs (Packet.py).
 fn link_packet_header(
     link_id: [u8; 16],
     packet_type: rns_wire::flags::PacketType,
@@ -1347,7 +1347,7 @@ mod cache_miss_tests {
     #[test]
     fn live_path_without_cached_announce_uses_normal_discovery_gates() {
         // A Boundary requester searches only Boundary and Gateway interfaces
-        // (Transport.py:3781-3783@1.6.0), so the Full route gets no request.
+        // (Transport.py), so the Full route gets no request.
         for (mode, discovers, sent) in [
             (InterfaceMode::Gateway, true, true),
             (InterfaceMode::Boundary, true, false),

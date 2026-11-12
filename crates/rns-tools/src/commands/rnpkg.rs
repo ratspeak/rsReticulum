@@ -5,7 +5,7 @@ use clap::Parser;
 use rns_runtime::lifecycle::ShutdownSignal;
 use rns_tools::RS_RETICULUM_VERSION;
 
-/// `__example_rnpkg_config__` (rnpkg.py:76-77).
+/// `__example_rnpkg_config__` (rnpkg.py).
 const EXAMPLE_CONFIG: &str = "# This is an example package manager configuration file.\n";
 
 #[derive(Parser)]

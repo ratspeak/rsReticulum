@@ -1,4 +1,4 @@
-//! The `/page/*.mu` handlers (`pages.py:366-1748@1.6.0`).
+//! The `/page/*.mu` handlers (`pages.py`).
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -31,7 +31,7 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// `format_diff` (`pages.py:2653-2674`).
+/// `format_diff` (`pages.py`).
 fn format_diff(diff: &str) -> String {
     let doubled = diff.replace('\\', "\\\\");
     let mut lines = Vec::new();
@@ -66,7 +66,7 @@ fn format_diff(diff: &str) -> String {
     lines.join("\n")
 }
 
-/// `format_commit` (`pages.py:2676-2684`).
+/// `format_commit` (`pages.py`).
 fn format_commit(message: &str) -> String {
     message
         .replace('\\', "\\\\")

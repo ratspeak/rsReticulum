@@ -19,7 +19,7 @@ pub fn qualifies(info: &DiscoveryInfo, allow_unverified: bool) -> bool {
     if !AUTOCONNECT_INTERFACE_TYPES.contains(&info.interface_type.as_str()) {
         return false;
     }
-    // Upstream checks transport before the unverified bypass (Discovery.py:781).
+    // Upstream checks transport before the unverified bypass (Discovery.py).
     if !info.transport_enabled {
         return false;
     }
@@ -41,7 +41,7 @@ pub fn qualifies(info: &DiscoveryInfo, allow_unverified: bool) -> bool {
 }
 
 /// Python's `version_tuple`: the leading digits of each dot-separated
-/// component, up to the first without any (Discovery.py:995-1005).
+/// component, up to the first without any (Discovery.py).
 fn version_tuple(version: &str) -> Option<Vec<u64>> {
     let components: Vec<u64> = version
         .trim()
@@ -71,7 +71,7 @@ mod tests {
     }
 
     /// Python 1.6.0 auto-connects only to "RNS" 1.5.7 or later
-    /// (Discovery.py:486, :782-790).
+    /// (Discovery.py).
     #[test]
     fn python_backbones_qualify_from_1_5_7() {
         assert!(qualifies(&backbone(Some("RNS"), Some("1.5.7")), false));
@@ -102,7 +102,7 @@ mod tests {
     }
 
     /// The transport requirement holds even with the unverified opt-in
-    /// (Discovery.py:781).
+    /// (Discovery.py).
     #[test]
     fn non_transport_interfaces_never_qualify() {
         let mut info = backbone(Some("RNS"), Some("1.6.0"));
@@ -111,7 +111,7 @@ mod tests {
         assert!(!qualifies(&info, true));
     }
 
-    /// Python auto-connects only Backbone interfaces (Discovery.py:483, :798).
+    /// Python auto-connects only Backbone interfaces (Discovery.py).
     #[test]
     fn only_backbone_interfaces_are_auto_connected() {
         assert_eq!(AUTOCONNECT_INTERFACE_TYPES, &["BackboneInterface"]);

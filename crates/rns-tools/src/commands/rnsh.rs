@@ -367,7 +367,7 @@ async fn run_initiator(args: Args, config_dir: PathBuf) -> ExitCode {
         progress_tx: Some(progress_tx),
     };
 
-    // initiator.py:156
+    // initiator.py
     handle.wants_destination_type(APP_NAME).await;
     let result = rnsh_client_execute(handle.transport_tx.clone(), cfg).await;
     terminate_task.abort();

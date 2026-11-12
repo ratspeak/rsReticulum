@@ -1,4 +1,4 @@
-//! `rngit-rs`: the Reticulum Git repository node (`RNS/Utilities/rngit/server.py@1.6.0`).
+//! `rngit-rs`: the Reticulum Git repository node (`RNS/Utilities/rngit/server.py`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -202,7 +202,7 @@ fn deferred_page(
     }
 }
 
-/// The `nomadnetwork.node` destination (`pages.py:179-183`): app data is the node name.
+/// The `nomadnetwork.node` destination (`pages.py`): app data is the node name.
 async fn start_page_node(
     handle: &rns_runtime::reticulum::ReticulumHandle,
     identity: Identity,
@@ -394,7 +394,7 @@ struct SyncArgs {
     version: bool,
 }
 
-/// `rngit fork`, `rngit mirror` and `rngit sync` (`server.py:193-215`, `262-275`).
+/// `rngit fork`, `rngit mirror` and `rngit sync` (`server.py`).
 async fn clone_subcommand(op: Operation, argv: Vec<String>) {
     // (version, config, rnsconfig, identity, source, target, verbose, quiet)
     let parsed = match op {
@@ -496,7 +496,7 @@ struct PermsCliArgs {
     version: bool,
 }
 
-/// `rngit work` (`server.py:182-191`, `255-260`, `106-122`).
+/// `rngit work` (`server.py`).
 async fn work_subcommand(argv: Vec<String>) {
     use rns_git::client::work::{CommonArgs, WorkArgs, run_client, run_work};
     let args = WorkCliArgs::parse_from(argv);
@@ -540,7 +540,7 @@ async fn work_subcommand(argv: Vec<String>) {
     .await
 }
 
-/// `rngit perms` (`server.py:175-180`, `245-253`, `100-104`).
+/// `rngit perms` (`server.py`).
 async fn perms_subcommand(argv: Vec<String>) {
     use rns_git::client::perms::{perms_target, run_perms};
     use rns_git::client::work::{CommonArgs, run_client};
@@ -613,13 +613,13 @@ struct ReleaseArgs {
     version: bool,
 }
 
-/// `ReticulumGitClient.abort` (`server.py:402-403`).
+/// `ReticulumGitClient.abort` (`server.py`).
 async fn abort(handle: &rns_runtime::reticulum::ReticulumHandle, message: &str) -> ! {
     println!("{message}");
     rns_tools::exit(handle, 1).await
 }
 
-/// `rngit create` (`server.py:85-87`, `create_repository` `server.py:569-604`).
+/// `rngit create` (`server.py`, `create_repository` `server.py`).
 async fn create(args: CreateArgs) {
     use rns_git::server::client::{ClientConfig, client_config_dir, create_outcome};
     use rns_git::server::{IDX_REPOSITORY, PATH_CREATE};
@@ -809,7 +809,7 @@ impl ReleaseRemote for LinkRemote {
     }
 }
 
-/// `rngit release` (`server.py:84-99`, `715-1239`).
+/// `rngit release` (`server.py`).
 async fn release(args: ReleaseArgs) {
     use rns_git::client::releases::{Fail, ReleaseOp};
     use rns_git::server::client::{ClientConfig, client_config_dir};
@@ -1004,7 +1004,7 @@ async fn release(args: ReleaseArgs) {
     }
 }
 
-/// `RNS.LOG_MAXSIZE` (`RNS/__init__.py:74`).
+/// `RNS.LOG_MAXSIZE` (`RNS/__init__.py`).
 const LOG_MAXSIZE: u64 = 5 * 1024 * 1024;
 
 /// The `-s` log file: appended per line and rotated to `.1` past
@@ -1372,7 +1372,7 @@ async fn main() {
     }
     let mut last_page_announce: Option<Instant> = None;
 
-    // The jobs loop (server.py:2656-2661): the first tick announces when an interval is set.
+    // The jobs loop (server.py): the first tick announces when an interval is set.
     let announce_interval = config.announce_interval;
     let mut last_announce: Option<Instant> = None;
     let mut last_persist = Instant::now();
@@ -1407,7 +1407,7 @@ async fn main() {
             }
             last_announce = Some(Instant::now());
         }
-        // The page node's own jobs loop (pages.py:218-228) announces on the same interval.
+        // The page node's own jobs loop (pages.py) announces on the same interval.
         if let Some(pages) = &pages
             && announce_interval != 0
             && last_page_announce

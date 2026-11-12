@@ -203,7 +203,7 @@ fn decode_entry_map(v: Value) -> Result<BlackholeManifestEntry, ManifestError> {
 }
 
 /// Decode a `/list` reply from `publisher` the way upstream's updater takes
-/// it (`Discovery.py:920-933`): any map is accepted and each entry is taken
+/// it (`Discovery.py`): any map is accepted and each entry is taken
 /// as given. Keys that are not 16-byte hashes are skipped, since they can
 /// never match an identity. A missing or malformed field reads as nil, and an
 /// entry that is not a map is a permanent entry without a reason; a missing

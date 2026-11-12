@@ -191,7 +191,7 @@ impl DiscoveryStore {
     }
 
     /// Read and maintain the store as upstream's `list_discovered_interfaces`
-    /// does (RNS/Discovery.py:524-581@1.6.0), returning records sorted
+    /// does (RNS/Discovery.py), returning records sorted
     /// descending by `(status_code, stamp_value, last_heard)`.
     ///
     /// A record is deleted when it is older than seven days, lacks a transport
@@ -224,7 +224,7 @@ impl DiscoveryStore {
             if path.extension().is_some() {
                 continue;
             }
-            // Upstream logs and keeps a record it cannot read (Discovery.py:578-581).
+            // Upstream logs and keeps a record it cannot read (Discovery.py).
             let corrupt = |path: &Path| {
                 tracing::warn!(path = %path.display(), "discovered interface data file may be corrupt");
             };
@@ -417,7 +417,7 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
     decode_lookup(bytes).map(|lookup| record_from_lookup(&lookup))
 }
 
-/// Upstream treats a missing or empty ID as absent (RNS/Discovery.py:549-550).
+/// Upstream treats a missing or empty ID as absent (RNS/Discovery.py).
 fn id_present(lookup: &HashMap<String, Value>, k: &str) -> bool {
     match lookup.get(k) {
         None | Some(Value::Nil) => false,
@@ -499,7 +499,7 @@ fn record_from_lookup(lookup: &HashMap<String, Value>) -> DiscoveredInterface {
 }
 
 /// The configuration snippet upstream stores with each record and
-/// `rnstatus -D` prints (RNS/Discovery.py:380-455@1.6.0).
+/// `rnstatus -D` prints (RNS/Discovery.py).
 pub fn config_entry(rec: &DiscoveredInterface) -> Option<String> {
     let i = &rec.info;
     let opt = |v: Option<String>| v.unwrap_or_else(|| "None".to_string());
@@ -842,7 +842,7 @@ mod tests {
     }
 
     /// Python stores the announcer's stack as `impl_name` and `version`
-    /// (Discovery.py:364-365).
+    /// (Discovery.py).
     #[test]
     fn records_keep_the_announcing_implementation() {
         let dir = tmpdir("implementation");
@@ -870,7 +870,7 @@ mod tests {
     }
 
     /// Python lists only `InterfaceDiscovery.DISCOVERABLE_TYPES` and removes
-    /// other records, such as a KISS TCP client's (Discovery.py:484, :542).
+    /// other records, such as a KISS TCP client's (Discovery.py).
     #[test]
     fn listing_removes_types_python_does_not_list() {
         let dir = tmpdir("listed_types");
@@ -959,7 +959,7 @@ mod tests {
 
     #[test]
     fn corrupt_file_is_skipped_and_kept() {
-        // Upstream only logs an unreadable record (Discovery.py:578-581).
+        // Upstream only logs an unreadable record (Discovery.py).
         let dir = tmpdir("corrupt");
         let store = DiscoveryStore::open(&dir).unwrap();
         let garbage = store.root().join(hex::encode([0xAB; 32]));

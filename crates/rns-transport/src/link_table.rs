@@ -115,7 +115,7 @@ impl LinkTable {
     }
 
     /// Unvalidated entries stay until their proof deadline so rediscovery can
-    /// act on them (Transport.py:1036-1046).
+    /// act on them (Transport.py).
     pub fn remove_interface(&mut self, interface_id: InterfaceId) {
         self.entries.retain(|_, entry| {
             !entry.validated

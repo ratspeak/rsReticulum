@@ -249,9 +249,9 @@ impl TransportActor {
         self.process_announce_queues(now);
     }
 
-    /// Transport.py:1118-1160@1.6.0. A leaf or shared-instance client lingers
+    /// Transport.py A leaf or shared-instance client lingers
     /// never-used paths for 12 minutes, a transport node for 1.75 hours
-    /// (Transport.py:451-454@1.6.0).
+    /// (Transport.py).
     fn cull_path_table(&mut self, now: f64) {
         let linger = if !self.is_transport_enabled || self.shared_instance_client_mode {
             UNUSED_PATH_LINGER_LEAF
@@ -283,7 +283,7 @@ impl TransportActor {
         blocked_interface: Option<InterfaceId>,
         now: f64,
     ) -> bool {
-        // Transport.py:1420-1426@1.6.0: a destination is queued once.
+        // Transport.py: a destination is queued once.
         if self
             .pending_discovery_prs
             .iter()
@@ -324,7 +324,7 @@ impl TransportActor {
         };
         self.last_discovery_pr_tx = now;
 
-        // Transport.py:4061-4080: one tag, stamped once when stamping is on,
+        // Transport.py: one tag, stamped once when stamping is on,
         // on every interface but the blocked one.
         let request_tag = rns_crypto::random::random_bytes(16);
         self.forward_path_request(
@@ -432,7 +432,7 @@ impl TransportActor {
         self.last_held_announce_check = 0.0;
     }
 
-    /// Python `Interface.process_announce_queue` (Interface.py:410-451):
+    /// Python `Interface.process_announce_queue` (Interface.py):
     /// drop stale entries, send the fewest-hops, oldest entry, and consume it
     /// whatever the send outcome. Python re-arms a timer at each `wait_time`;
     /// here each tick sends every entry whose slot has passed, chaining slots
@@ -559,7 +559,7 @@ impl TransportActor {
             .map_or(f64::INFINITY, |entry| entry.announce_allowed_at)
     }
 
-    /// Python's interface job (Transport.py:1329-1337): re-evaluate both burst
+    /// Python's interface job (Transport.py): re-evaluate both burst
     /// limiters, then release at most one held announce per interface.
     fn process_held_announces(&mut self, _now: f64) {
         let iface_ids: Vec<InterfaceId> = self.interfaces.keys().copied().collect();
@@ -577,7 +577,7 @@ impl TransportActor {
                     "releasing held announce"
                 );
 
-                // Released announces re-enter as ingress limited (Interface.py:300).
+                // Released announces re-enter as ingress limited (Interface.py).
                 self.inbound_rx.push_ingress_limited(
                     &self.inbound_queues,
                     crate::inbound_queues::Queued::ReleasedAnnounce(announce),
@@ -675,7 +675,7 @@ impl TransportActor {
             );
         }
 
-        // Identity.py:466-470: expire remembered ratchets past RATCHET_EXPIRY.
+        // Identity.py: expire remembered ratchets past RATCHET_EXPIRY.
         let mut expired = 0usize;
         for announce in self.recent_announces.values_mut() {
             if announce.ratchet.is_some() && announce.live_ratchet(now).is_none() {
@@ -833,7 +833,7 @@ mod cleanup_tests {
         assert!(actor.recent_announces.is_empty());
     }
 
-    /// Transport.py:1420-1426@1.6.0: a destination already waiting in the
+    /// Transport.py: a destination already waiting in the
     /// discovery queue is not queued again.
     #[test]
     fn discovery_queue_holds_a_destination_once() {
@@ -844,7 +844,7 @@ mod cleanup_tests {
         assert_eq!(actor.pending_discovery_prs.len(), 2);
     }
 
-    /// Transport.py:1022-1029, 1249-1253@1.6.0: one cull pass removes every
+    /// Transport.py: one cull pass removes every
     /// reverse entry past REVERSE_TIMEOUT, with no batch cap.
     #[test]
     fn one_cull_removes_every_stale_reverse_entry() {

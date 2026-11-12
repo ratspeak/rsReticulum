@@ -1,5 +1,5 @@
 //! `rngit perms` (`group_permissions` and `repository_permissions`,
-//! `server.py:1241-1339@1.6.0`).
+//! `server.py`).
 
 use std::io::Write;
 
@@ -17,7 +17,7 @@ pub enum PermsTarget {
     Repository,
 }
 
-/// `args.remote.rstrip("/")` and the component count (`server.py:245-249`);
+/// `args.remote.rstrip("/")` and the component count (`server.py`);
 /// `None` is "Invalid URL".
 pub fn perms_target(remote: &str) -> Option<(String, PermsTarget)> {
     let remote = remote.trim_end_matches('/').to_string();

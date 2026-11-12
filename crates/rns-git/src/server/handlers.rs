@@ -1,4 +1,4 @@
-//! `/git/*` request handlers (`server.py:2870-2929@1.6.0`).
+//! `/git/*` request handlers (`server.py`).
 
 use std::process::{Command, Stdio};
 
@@ -39,7 +39,7 @@ pub(super) fn get<'a>(map: &'a [(Value, Value)], key: &Value) -> Option<&'a Valu
 /// A request map and its parsed repository path.
 type Parsed<'a> = (&'a [(Value, Value)], Option<(&'a str, &'a str)>);
 
-/// Common checks of every handler (`server.py:2872-2874`); `Err` is the reply.
+/// Common checks of every handler (`server.py`); `Err` is the reply.
 /// `Ok(None)` is upstream raising before its try (key 0 not a string), which
 /// sends no response.
 fn request_path<'a>(
@@ -61,7 +61,7 @@ fn request_path<'a>(
     Ok(Some((map, parse_repository_path(path))))
 }
 
-/// `handle_list` (`server.py:2870-2929`). `None` sends no response.
+/// `handle_list` (`server.py`). `None` sends no response.
 pub fn handle_list(
     repos: &Repositories,
     identity: Option<&[u8; 16]>,
@@ -159,7 +159,7 @@ pub fn identity_text(identity: Option<&[u8; 16]>) -> String {
     identity.map_or("None".to_string(), |h| format!("<{}>", hex::encode(h)))
 }
 
-/// `log_request` (`server.py:2705-2707`).
+/// `log_request` (`server.py`).
 pub fn log_request(repos: &Repositories, message: &str, identity: Option<&[u8; 16]>) {
     if identity.is_some_and(|h| repos.blocked.iter().any(|b| b.as_slice() == h)) {
         tracing::debug!("Blocked: {message}");
@@ -239,7 +239,7 @@ fn writable_repository(
         .clone())
 }
 
-/// `handle_fetch` (`server.py:2931-3004`). `None` sends no response.
+/// `handle_fetch` (`server.py`). `None` sends no response.
 pub fn handle_fetch(
     repos: &std::sync::RwLock<Repositories>,
     stats: &Stats,
@@ -363,7 +363,7 @@ fn fetch_bundle(
     })
 }
 
-/// `handle_push` (`server.py:3006-3100`). `None` sends no response.
+/// `handle_push` (`server.py`). `None` sends no response.
 pub fn handle_push(
     repos: &std::sync::RwLock<Repositories>,
     stats: &Stats,
@@ -540,7 +540,7 @@ fn push_operations(
     Ok(vec![super::RES_OK])
 }
 
-/// `handle_delete` (`server.py:3102-3134`). `None` sends no response.
+/// `handle_delete` (`server.py`). `None` sends no response.
 pub fn handle_delete(
     repos: &std::sync::RwLock<Repositories>,
     stats: &Stats,
@@ -590,10 +590,10 @@ pub fn handle_delete(
     }
 }
 
-/// `REPO_CREATE_PERMS_TEMPLATE` (`server.py:5090`).
+/// `REPO_CREATE_PERMS_TEMPLATE` (`server.py`).
 pub(super) const REPO_CREATE_PERMS_TEMPLATE: &str = "adm:{IDENTITY_HASH}";
 
-/// `handle_create` (`server.py:3141-3211`). `None` sends no response.
+/// `handle_create` (`server.py`). `None` sends no response.
 /// Group permissions are checked without the blocklist, as upstream does.
 pub fn handle_create(
     repos: &std::sync::RwLock<Repositories>,

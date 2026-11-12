@@ -1,5 +1,5 @@
 //! `git-remote-rns`: the git remote helper for `rns://` URLs
-//! (`RNS/Utilities/rngit/client.py@1.6.0`).
+//! (`RNS/Utilities/rngit/client.py`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,11 +18,11 @@ use rns_runtime::reticulum::{LinkConnectOptions, ReticulumHandle};
 use rns_tools::rsg::pyfmt::py_fromhex;
 use rns_transport::messages::PathRequestOptions;
 
-/// `RNS.LOG_MAXSIZE` (`RNS/__init__.py:74`).
+/// `RNS.LOG_MAXSIZE` (`RNS/__init__.py`).
 const LOG_MAXSIZE: u64 = 5 * 1024 * 1024;
 
 /// `client_log`, appended per line and rotated to `.1` past `LOG_MAXSIZE`
-/// as `RNS.log` does with `LOG_FILE` (`RNS/__init__.py:137-143`).
+/// as `RNS.log` does with `LOG_FILE` (`RNS/__init__.py`).
 #[derive(Clone)]
 struct ClientLog(PathBuf);
 
@@ -109,7 +109,7 @@ fn response_value(value: rmpv::Value) -> Response {
     }
 }
 
-/// `abort()`; `sys.exit` also runs Reticulum's exit handler (Reticulum.py:389).
+/// `abort()`; `sys.exit` also runs Reticulum's exit handler (Reticulum.py).
 fn abort(
     reason: Abort,
     link: Option<&LinkSessionHandle>,
@@ -133,7 +133,7 @@ async fn path_ready(handle: &ReticulumHandle, hash: [u8; 16]) -> bool {
         && matches!(handle.recall_without_use(hash).await, Ok(Some(_)))
 }
 
-/// `Transport.await_path` with `medium_path_timeout(PATH_TIMEOUT)` (`client.py:229`).
+/// `Transport.await_path` with `medium_path_timeout(PATH_TIMEOUT)` (`client.py`).
 async fn await_path(handle: &ReticulumHandle, hash: [u8; 16]) -> bool {
     if path_ready(handle, hash).await {
         return true;
@@ -234,7 +234,7 @@ fn main() {
     }
     let destination = config.resolve_destination(&url.destination);
 
-    // connect_server (client.py:223-244)
+    // connect_server (client.py)
     let hash = match py_fromhex(&destination) {
         Ok(hash) => hash,
         Err(e) => abort(
@@ -274,7 +274,7 @@ fn main() {
     status("\rEstablishing link...");
 
     // The Link fails at its own establishment timeout, which ends run()'s
-    // max(15, establishment_timeout) wait (client.py:341-346).
+    // max(15, establishment_timeout) wait (client.py).
     let options = LinkConnectOptions {
         client_label: "git-remote-rns".to_string(),
         identify: true,

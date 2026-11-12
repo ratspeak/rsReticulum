@@ -10,7 +10,7 @@ pub(super) struct DiscoveryOperation {
     pub(super) timeout: f64,
     requesters: Vec<Waiter>,
     /// False while the entry only batches requesters behind an in-flight
-    /// request and no fan-out has started (Transport.py:2150-2156@1.6.0).
+    /// request and no fan-out has started (Transport.py).
     engaged: bool,
 }
 
@@ -181,7 +181,7 @@ impl TransportActor {
     }
 
     /// Add a requester behind an in-flight path request without starting a
-    /// fan-out (Transport.py:2143-2156@1.6.0).
+    /// fan-out (Transport.py).
     pub(super) fn batch_inflight_requester(
         &mut self,
         destination: [u8; 16],
@@ -193,7 +193,7 @@ impl TransportActor {
 
     /// `engage` starts a fan-out unless one is already engaged; an entry that
     /// only batched requesters is engaged with a fresh deadline
-    /// (Transport.py:3888-3926@1.6.0).
+    /// (Transport.py).
     fn admit_discovery_requester(
         &mut self,
         destination: [u8; 16],
@@ -304,7 +304,7 @@ impl TransportActor {
         if !now.is_finite() || now >= operation.timeout {
             return;
         }
-        // Python recalls the answered identity with use marking (Transport.py:2696).
+        // Python recalls the answered identity with use marking (Transport.py).
         if !operation.requesters.is_empty() {
             self.use_destination(&destination);
         }

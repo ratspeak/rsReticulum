@@ -1,4 +1,4 @@
-//! `/media` and the `/file/*` handlers (`pages.py:1750-2037@1.6.0`).
+//! `/media` and the `/file/*` handlers (`pages.py`).
 
 use std::io::{Read, Seek, Write};
 use std::path::PathBuf;

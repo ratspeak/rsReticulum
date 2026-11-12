@@ -353,7 +353,7 @@ pub fn split_stamp(body: &[u8]) -> Result<(&[u8], &[u8]), AppDataError> {
 }
 
 /// Decode the first MessagePack value as an info map, accepting exactly what
-/// upstream's handler accepts (RNS/Discovery.py:338-466@1.6.0). Trailing bytes
+/// upstream's handler accepts (RNS/Discovery.py). Trailing bytes
 /// after the first value are ignored, as upstream's unpacker does.
 ///
 /// The name falls back to `Discovered <type>` when it is unset or sanitizes to
@@ -470,7 +470,7 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
 }
 
 /// The keys upstream's handler reads unconditionally for an interface type
-/// (RNS/Discovery.py:380-455@1.6.0).
+/// (RNS/Discovery.py).
 fn type_keys(interface_type: &str) -> &'static [u8] {
     match interface_type {
         "BackboneInterface" | "TCPServerInterface" => &[key::REACHABLE_ON, key::PORT],
@@ -559,7 +559,7 @@ fn python_unpackable(v: &Value) -> bool {
     }
 }
 
-/// Upstream `InterfaceAnnounceHandler.sanitize_name` (RNS/Discovery.py:272-279
+/// Upstream `InterfaceAnnounceHandler.sanitize_name` (RNS/Discovery.py
 /// @1.6.0) on a string: drop non-ASCII, strip whitespace, collapse runs of 5, 3
 /// and then 2 spaces, then strip leading characters that are not ASCII letters
 /// or digits and trailing ones that are not those or `)`. May return "".
@@ -679,7 +679,7 @@ mod tests {
     }
 
     /// Python 1.5.5 packs the implementation name and version right after
-    /// the transport id (Discovery.py:170-178).
+    /// the transport id (Discovery.py).
     #[test]
     fn implementation_keys_follow_the_transport_id_as_python_packs_them() {
         let mut info = sample_backbone();
@@ -707,7 +707,7 @@ mod tests {
         assert_eq!(decode_info(&encoded.packed).unwrap(), info);
     }
 
-    /// Python reads the keys without checking their type (Discovery.py:348-349).
+    /// Python reads the keys without checking their type (Discovery.py).
     #[test]
     fn an_implementation_that_is_not_a_string_is_ignored() {
         let mut map = info_to_map(&sample_backbone());
@@ -746,7 +746,7 @@ mod tests {
             rmpv::encode::write_value(&mut bytes, &Value::Map(entries)).unwrap();
             bytes
         };
-        // Upstream requires the key and a float or nil (Discovery.py:349).
+        // Upstream requires the key and a float or nil (Discovery.py).
         assert!(matches!(
             decode_info(&encode_map(None)),
             Err(AppDataError::MissingKey(key::LATITUDE))
@@ -842,7 +842,7 @@ mod tests {
     }
 
     /// Python's announcer always writes a radio type's parameters, unset ones
-    /// as nil, and its receiver reads them unguarded (Discovery.py:218-234,
+    /// as nil, and its receiver reads them unguarded (Discovery.py,
     /// :410-456).
     #[test]
     fn radio_types_carry_every_parameter_python_reads() {

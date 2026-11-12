@@ -137,7 +137,7 @@ pub struct RncpSendRequest<'a> {
 
 /// One transfer progress update: the logical fraction, and the bytes of the
 /// current segment moved on the link, `get_segment_progress() *
-/// get_transfer_size()` as rncp's `-P` rate reads them (rncp.py:330-331).
+/// get_transfer_size()` as rncp's `-P` rate reads them (rncp.py).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RncpProgress {
     pub progress: f32,
@@ -182,7 +182,7 @@ pub enum RncpEvent {
 }
 
 /// The value a fetch handler answers with, and the status a fetch client
-/// derives from it (rncp.py:172-208, 463-474).
+/// derives from it (rncp.py).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FetchReply {
     Found,
@@ -292,7 +292,7 @@ fn process_cwd() -> String {
 }
 
 /// The path a fetch request names, or `None` when it falls outside the jail
-/// (rncp.py:177-185). `jail` is already absolute and normalised.
+/// (rncp.py). `jail` is already absolute and normalised.
 fn fetch_request_path(
     jail: Option<&str>,
     data: &str,
@@ -450,7 +450,7 @@ pub async fn spawn_rncp_listener(
         Arc::new(cfg.allowed.iter().copied().collect());
     let allow_all = cfg.allow_all;
 
-    // Every incoming link: ACCEPT_APP with the identity check (rncp.py:234-266).
+    // Every incoming link: ACCEPT_APP with the identity check (rncp.py).
     let (identified_tx, mut identified_rx) = mpsc::channel::<([u8; 16], [u8; 16])>(64);
     link_mgr.set_link_identified_channel(identified_tx);
     link_mgr.set_resource_strategy(ResourceStrategy::AcceptApp);
@@ -584,7 +584,7 @@ pub async fn spawn_rncp_listener(
     })
 }
 
-/// Upstream's `fetch_request` (rncp.py:172-208). The LinkManager has already
+/// Upstream's `fetch_request` (rncp.py). The LinkManager has already
 /// applied the ALLOW_ALL / ALLOW_LIST policy.
 fn serve_fetch(
     request: DestinationRequest,
@@ -662,7 +662,7 @@ async fn save_payload(
     data: &[u8],
     overwrite: bool,
 ) -> Result<PathBuf, String> {
-    // rncp.py:286-293: the basename must name an entry directly in save_dir.
+    // rncp.py: the basename must name an entry directly in save_dir.
     let basename = basename(file_name).to_string();
     if basename.is_empty() || basename == "." || basename == ".." {
         return Err(format!("invalid save path for {file_name:?}"));
@@ -857,7 +857,7 @@ async fn query(
         .map_err(|_| RncpError::TransportUnavailable)
 }
 
-/// Path wait, link request and identification (rncp.py:394-450, 651-706).
+/// Path wait, link request and identification (rncp.py).
 /// The path wait lasts `path_timeout`; the proof wait ends at the later of
 /// that deadline and the link establishment timeout.
 async fn establish(
@@ -875,7 +875,7 @@ async fn establish(
     )
     .await?;
 
-    // Link.py:308-309: first_hop_timeout + ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, hops).
+    // Link.py: first_hop_timeout + ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, hops).
     let hops = match query(transport_tx, TransportQuery::HopsTo { dest: dest_hash }).await? {
         TransportQueryResponse::IntResult(hops) => u8::try_from(hops.max(1)).unwrap_or(u8::MAX),
         _ => 1,
@@ -1001,7 +1001,7 @@ async fn close_link<T>(
     }
 }
 
-/// Run the initiator side of the link watchdog (Link.py:799-857): keepalives,
+/// Run the initiator side of the link watchdog (Link.py): keepalives,
 /// stale detection and request timeouts.
 async fn service_link(
     transport_tx: &mpsc::Sender<TransportMessage>,
@@ -1178,7 +1178,7 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
                 }
             }
             rns_wire::context::PacketContext::ResourcePrf => {
-                // PROOF+RESOURCE_PRF plaintext = resource_hash(32) || proof(32) (Packet.py:195-197).
+                // PROOF+RESOURCE_PRF plaintext = resource_hash(32) || proof(32) (Packet.py).
                 if body.len() < 64 {
                     continue;
                 }
@@ -1316,7 +1316,7 @@ async fn discover_pubkey(
         })
         .await
         .map_err(|_| RncpError::TransportUnavailable)?;
-    // rncp.py:394-406: one path request, then poll has_path until the deadline.
+    // rncp.py: one path request, then poll has_path until the deadline.
     let deadline = Instant::now() + path_wait;
     loop {
         if let TransportQueryResponse::BoolResult(true) =
@@ -1580,7 +1580,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                         }
                     }
                     TransferAction::Failed(reason) => failed = Some(reason),
-                    // Out of retries: Resource.cancel() sends RCL (Resource.py:1133-1139).
+                    // Out of retries: Resource.cancel() sends RCL (Resource.py).
                     TransferAction::SendCancel(_, resource_hash) => {
                         if let Ok(encrypted) = link.encrypt(&resource_hash) {
                             let raw = build_data_packet(

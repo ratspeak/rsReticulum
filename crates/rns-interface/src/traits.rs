@@ -131,7 +131,7 @@ pub(crate) fn python_host(host: &str) -> std::borrow::Cow<'_, str> {
 
 /// Start a client connection as Python does: traffic queued while offline,
 /// after a failed first connect or during an outage, is dropped
-/// (TCPInterface.py:314-315), then the connection's synthesis is queued, and
+/// (TCPInterface.py), then the connection's synthesis is queued, and
 /// only then does the interface report online. A first connect that succeeded
 /// before the handle was returned is already online and has nothing to drop.
 pub(crate) async fn open_client_connection(
@@ -169,7 +169,7 @@ pub enum InterfaceMode {
     Roaming = 0x04,
     Boundary = 0x05,
     Gateway = 0x06,
-    /// Python 1.3.8 `MODE_INTERNAL` (Interface.py:51) — local/shared-instance interfaces.
+    /// Python 1.3.8 `MODE_INTERNAL` (Interface.py) — local/shared-instance interfaces.
     Internal = 0x07,
 }
 

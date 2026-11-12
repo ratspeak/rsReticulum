@@ -22,9 +22,9 @@ async fn is_local_destination(handle: &ReticulumHandle, dest: [u8; 16]) -> bool 
 }
 
 /// `rnstatus -R` and `rnpath -R` take the remote's transport identity hash
-/// and derive `rnstransport.remote.management` from it (rnstatus.py:367-369),
+/// and derive `rnstransport.remote.management` from it (rnstatus.py),
 /// because Python registers that destination on `Transport.identity`
-/// (Transport.py:367-368).
+/// (Transport.py).
 #[tokio::test]
 async fn remote_management_answers_on_the_transport_identity() {
     let dir = config_dir(

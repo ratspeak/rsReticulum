@@ -1007,7 +1007,7 @@ impl Destination {
     }
 
     /// As [`Self::create_announce_at`], appending the stamp extension to the
-    /// resolved app data before signing (Destination.py:347-361@1.6.0). Pass
+    /// resolved app data before signing (Destination.py). Pass
     /// [`Self::announce_stamp_ext`] when the stamp policy stamps destinations.
     pub fn create_announce_with_ext_at(
         &mut self,
@@ -1311,7 +1311,7 @@ pub const DESTINATION_STAMP_EXTENSION: &str = ".dstamp";
 pub const STAMP_FILE_VERSION: u64 = 1;
 const STAMP_FILE_MAX_LEN: usize = 1024;
 
-/// `<storage>/stamps/<hex hash>.dstamp` (Stamps.py:871-875@1.6.0).
+/// `<storage>/stamps/<hex hash>.dstamp` (Stamps.py).
 pub fn destination_stamp_path(
     storage_dir: &std::path::Path,
     destination_hash: &[u8; 16],

@@ -1,4 +1,4 @@
-//! The stats page charts (`render_chart_halfblock`, `render_combined_chart`, `pages.py:2740-2928@1.6.0`).
+//! The stats page charts (`render_chart_halfblock`, `render_combined_chart`, `pages.py`).
 
 use super::{CLR_DIM, RCLR_DOWNLOAD, RCLR_FETCH, RCLR_PUSH, RCLR_VIEW};
 

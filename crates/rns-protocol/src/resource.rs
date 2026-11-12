@@ -53,7 +53,7 @@ pub const PROCESSING_GRACE: f64 = 1.0;
 pub const PART_TIMEOUT_FACTOR: f64 = 4.0;
 pub const PART_TIMEOUT_FACTOR_AFTER_RTT: f64 = 2.0;
 pub const PROOF_TIMEOUT_FACTOR: f64 = 3.0;
-/// Proof-cache queries a sender makes before giving up (Resource.py:1106).
+/// Proof-cache queries a sender makes before giving up (Resource.py).
 pub const PROOF_CACHE_QUERIES: usize = 3;
 pub const RETRY_GRACE_TIME: f64 = 0.25;
 pub const PER_RETRY_DELAY: f64 = 0.5;
@@ -201,7 +201,7 @@ impl WindowState {
     }
 
     /// Grow the window after a drained request round; the minimum follows a
-    /// growing window (Resource.py:917-920).
+    /// growing window (Resource.py).
     pub fn grow(&mut self) {
         if self.window < self.window_max {
             self.window += 1;
@@ -213,13 +213,13 @@ impl WindowState {
     }
 
     /// Count a fast round from the first part's request/response rate
-    /// (Resource.py:866-875). Fast rounds are never reset.
+    /// (Resource.py). Fast rounds are never reset.
     pub fn on_first_part(&mut self, req_resp_rate: f64) {
         self.count_fast(req_resp_rate);
     }
 
     /// Count fast and very-slow rounds from a drained window's data rate
-    /// (Resource.py:930-940). Very-slow rounds count only before any fast
+    /// (Resource.py). Very-slow rounds count only before any fast
     /// round, and demotion leaves the current window unclamped.
     pub fn on_window_drained(&mut self, req_data_rate: f64) {
         self.count_fast(req_data_rate);
@@ -245,7 +245,7 @@ impl WindowState {
 
     /// Shrink after a part timeout. Nothing changes at the window minimum;
     /// otherwise the ceiling follows, closing a gap wider than the
-    /// flexibility by one more step (Resource.py:633-638).
+    /// flexibility by one more step (Resource.py).
     pub fn shrink(&mut self) {
         if self.window > self.window_min {
             self.window -= 1;
@@ -836,7 +836,7 @@ pub enum ResourceError {
     #[error("decompression failed")]
     DecompressionFailed,
     /// Upstream rejects this with RESOURCE_RCL and tears the Link down
-    /// (Resource.py:703-709); every other assembly error sends nothing.
+    /// (Resource.py); every other assembly error sends nothing.
     #[error("decompressed resource exceeds the size limit")]
     DecompressedTooLarge,
     #[error("invalid metadata prefix: declared {declared} bytes, available {available} bytes")]
@@ -867,7 +867,7 @@ pub const MAX_RESOURCE_SIZE: usize = 134_217_727;
 /// Default bound on the advertised total size of an inbound Resource that is
 /// reassembled in memory (128 MiB - 1). Local difference from upstream, which
 /// assembles every inbound Resource to storage and has no such bound
-/// (Resource.py:202-207, 714-754@1.6.0). Streaming inbound reassembly to the
+/// (Resource.py). Streaming inbound reassembly to the
 /// consumer would remove the need for it.
 pub const DEFAULT_INBOUND_REASSEMBLY_LIMIT: usize = MAX_RESOURCE_SIZE;
 
@@ -1485,7 +1485,7 @@ pub enum TransferAction {
 }
 
 /// Packet hash of the RESOURCE_PRF packet a receiver sends on `link_id`
-/// with `proof_data`, the key a CACHE_REQUEST names (Resource.py:670-673).
+/// with `proof_data`, the key a CACHE_REQUEST names (Resource.py).
 pub fn resource_proof_packet_hash(link_id: &[u8; 16], proof_data: &[u8]) -> [u8; 32] {
     let header = rns_wire::header::PacketHeader {
         flags: rns_wire::flags::PacketFlags {
@@ -1539,7 +1539,7 @@ pub struct OutboundTransfer {
     // Python sets the sender's `rtt` once, from advertisement to first request.
     rtt_sampled: bool,
     failure_reason: Option<String>,
-    /// Proof-cache queries left before the sender gives up (Resource.py:1106).
+    /// Proof-cache queries left before the sender gives up (Resource.py).
     proof_queries_left: usize,
     /// Advertisement wait per attempt before PROCESSING_GRACE; `None` uses
     /// `rtt * TRAFFIC_TIMEOUT_FACTOR`, as Resource does without a timeout.
@@ -1712,7 +1712,7 @@ impl OutboundTransfer {
     }
 
     /// Python `Resource.cancel()` on the initiator: fail and send ICL
-    /// (Resource.py:1124-1132). The owner sends it only while the Link is
+    /// (Resource.py). The owner sends it only while the Link is
     /// active, then concludes; the next poll returns `Failed(reason)`.
     pub fn cancel(&mut self, reason: &str) -> TransferAction {
         self.resource.state = ResourceState::Failed;
@@ -1756,7 +1756,7 @@ impl OutboundTransfer {
         }
     }
 
-    /// Python's AWAITING_PROOF watchdog (Resource.py:656-675).
+    /// Python's AWAITING_PROOF watchdog (Resource.py).
     fn check_proof_timeout(&mut self) -> TransferAction {
         if self.proof_wait_started().elapsed() <= self.proof_wait() {
             return TransferAction::None;
@@ -2057,7 +2057,7 @@ impl OutboundTransfer {
             }
         }
 
-        // Resource.request (Resource.py:1009-1106).
+        // Resource.request (Resource.py).
         let now = Instant::now();
         if !self.rtt_sampled {
             self.rtt_sampled = true;
@@ -2112,7 +2112,7 @@ impl OutboundTransfer {
 
     fn progress_timeout(&self) -> Duration {
         // rtt * timeout_factor * max_retries + sender_grace_time + the
-        // receiver's summed per-retry delays (Resource.py:647-649).
+        // receiver's summed per-retry delays (Resource.py).
         let retry_wait = PER_RETRY_DELAY * (MAX_RETRIES * (MAX_RETRIES + 1) / 2) as f64;
         self.rtt
             .saturating_mul(rns_link::constants::TRAFFIC_TIMEOUT_FACTOR as u32)
@@ -2225,7 +2225,7 @@ pub struct InboundTransfer {
     rtt_seeded: bool,
 }
 
-/// Link facts an incoming resource starts from (Resource.py:215-224, 565-575).
+/// Link facts an incoming resource starts from (Resource.py).
 #[derive(Debug, Clone, Copy)]
 pub struct InboundLinkFacts {
     pub rtt: Duration,
@@ -2334,7 +2334,7 @@ impl InboundTransfer {
 
     /// Refresh `self.eifr` in bits/sec: the last window's data rate, else
     /// the previous resource's EIFR, else `establishment_cost * 8 / rtt`
-    /// (Resource.py:565-575).
+    /// (Resource.py).
     pub fn update_eifr(&mut self) {
         let rtt_secs = self.rtt.as_secs_f64().max(0.001);
         let rate = if self.req_data_rtt_rate != 0.0 {
@@ -2366,7 +2366,7 @@ impl InboundTransfer {
             return TransferAction::None;
         }
         let payload_len = data.len();
-        // Every part, duplicates included, is activity (Resource.py:850-852).
+        // Every part, duplicates included, is activity (Resource.py).
         self.last_activity = Instant::now();
         self.retries_left = MAX_RETRIES;
 
@@ -2376,7 +2376,7 @@ impl InboundTransfer {
             if let Some(sent) = self.req_sent {
                 let sample = self.last_activity.duration_since(sent);
                 if !self.rtt_seeded {
-                    // The first sample keeps the Link RTT (Resource.py:859-860).
+                    // The first sample keeps the Link RTT (Resource.py).
                     self.rtt_seeded = true;
                 } else if sample < self.rtt {
                     self.rtt = self.rtt.mul_f64(0.95).max(sample);
@@ -2410,7 +2410,7 @@ impl InboundTransfer {
         }
 
         if self.outstanding_parts == 0 {
-            // Resource.py:914-942.
+            // Resource.py.
             self.resource.window.grow();
             if let Some(sent_at) = self.req_sent {
                 let rtt = self.last_activity.duration_since(sent_at).as_secs_f64();
@@ -2504,7 +2504,7 @@ impl InboundTransfer {
             .map_or(0, |len| rns_wire::constants::HEADER_MINSIZE + len);
         self.req_resp = None;
         // Snapshot the byte counter so the next round's completion can
-        // compute the delta over this window. Python Resource.py:964.
+        // compute the delta over this window. Python Resource.py.
         self.rtt_rxd_bytes_at_part_req = self.rtt_rxd_bytes;
 
         TransferAction::SendRequest(request_data)
@@ -2578,7 +2578,7 @@ impl InboundTransfer {
                 self.waiting_for_hmu = false;
                 return self.request_next();
             } else {
-                // Resource.cancel() on the receiver sends RCL (Resource.py:644-646, 1133-1139).
+                // Resource.cancel() on the receiver sends RCL (Resource.py).
                 return self.cancel();
             }
         }
@@ -3115,7 +3115,7 @@ mod tests {
     }
 
     // A very-slow demotion lowers the ceiling but never clamps the current window,
-    // and fast rounds are only counted, never reset (Resource.py:930-940).
+    // and fast rounds are only counted, never reset (Resource.py).
     #[test]
     fn very_slow_demotion_keeps_window_and_counters_are_sticky() {
         let mut w = WindowState::new();
@@ -3877,7 +3877,7 @@ mod tests {
             panic!()
         };
         // The sender RTT is the advertisement-to-first-request time, set once
-        // (Resource.py:1009-1013).
+        // (Resource.py).
         sender.started_at = ago_or_skip!(Duration::from_secs(30));
         sender.handle_request(&request);
         assert!(sender.rtt >= Duration::from_secs(30));
@@ -3912,7 +3912,7 @@ mod tests {
         assert_eq!(sender.resource.state, ResourceState::Advertised);
         receiver.receive_part(sender.resource.parts[0].clone());
         // Resource.receive_part refreshes activity and retries for every part,
-        // duplicates included (Resource.py:850-852).
+        // duplicates included (Resource.py).
         receiver.retries_left = 3;
         receiver.receive_part(sender.resource.parts[0].clone());
         assert_eq!(receiver.retries_left, MAX_RETRIES);
@@ -4645,7 +4645,7 @@ mod tests {
         let mut multi_in = MultiSegmentInbound::new(total_segments, original_hash);
 
         for mut segment in multi_out.segments {
-            // Receivers strip metadata from segment 1 only (Resource.py:718).
+            // Receivers strip metadata from segment 1 only (Resource.py).
             let mut flags = segment.flags;
             flags.has_metadata &= segment.segment_index == 1;
             let mut inbound = InboundTransfer::from_advertisement(

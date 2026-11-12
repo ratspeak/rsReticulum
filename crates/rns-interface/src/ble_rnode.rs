@@ -1296,7 +1296,7 @@ impl BleRNodeConfig {
 }
 
 /// Station-ID beacon parameters, disabled for oversized callsigns
-/// (Python RNodeInterface.py:333-343).
+/// (Python RNodeInterface.py).
 fn beacon_from_config(config: &BleRNodeConfig) -> Option<(Duration, Bytes)> {
     config
         .id_interval
@@ -6749,8 +6749,8 @@ mod tests {
     }
 
     /// Python's `RNodeInterface` also drives BLE: any READY releases the queue
-    /// (RNodeInterface.py:1099-1100), and the last RSSI, SNR and quality stay
-    /// on the interface across packets (:881-896).
+    /// (RNodeInterface.py), and the last RSSI, SNR and quality stay
+    /// on the interface across packets.
     #[tokio::test]
     async fn native_ble_any_ready_releases_the_queue_and_signal_stats_persist() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -7797,7 +7797,7 @@ mod tests {
             q: Some(100.0),
         };
         let before = signal;
-        // Python keeps r_stat_rssi/snr/q after a packet (RNodeInterface.py:707-710).
+        // Python keeps r_stat_rssi/snr/q after a packet (RNodeInterface.py).
         for _ in 0..2 {
             let rnode::RNodeResponse::Packet(rns_transport::messages::TransportMessage::Inbound(
                 packet,
@@ -7831,7 +7831,7 @@ mod tests {
         assert_eq!(signal.rssi, Some(-65.0));
     }
 
-    /// Python RNodeInterface.py:883-894: each SNR report also sets the quality
+    /// Python RNodeInterface.py: each SNR report also sets the quality
     /// for the reported spreading factor; without one the old value stays.
     #[test]
     fn test_response_snr_updates_quality_for_the_reported_spreading_factor() {
@@ -7852,7 +7852,7 @@ mod tests {
         assert_eq!((signal.snr, signal.q), (Some(8.0), Some(52.6)));
     }
 
-    /// Python RNodeInterface.py:1099-1100 runs `process_queue` for each READY
+    /// Python RNodeInterface.py runs `process_queue` for each READY
     /// payload byte, whatever its value.
     #[test]
     fn test_response_ready_ignores_the_payload_value() {

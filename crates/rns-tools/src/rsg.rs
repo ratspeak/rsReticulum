@@ -1,5 +1,5 @@
 //! RSG/RSM signature containers: `create_rsg`, `validate_rsg` and
-//! `extract_signed_rsg_data` from `RNS/Utilities/rnid.py:400-487@1.6.0`.
+//! `extract_signed_rsg_data` from `RNS/Utilities/rnid.py`.
 //! Validation follows Python's control flow, including which malformed
 //! envelopes are "invalid" and which raise (rnid exits 254 for those).
 
@@ -391,7 +391,7 @@ pub fn validate_rsg(
 }
 
 /// The state `Identity.load_public_key` leaves a public-only identity in
-/// (`RNS/Identity.py:1136-1156@1.6.0`).
+/// (`RNS/Identity.py`).
 enum SigningKey {
     /// The X25519 key did not load: `validate` raises.
     None,
@@ -445,7 +445,7 @@ pub enum RsmStructure {
     Invalid(&'static str),
 }
 
-/// Python `check_release_rsm_structure` (`RNS/Utilities/rnid.py:588-600@1.6.0`)
+/// Python `check_release_rsm_structure` (`RNS/Utilities/rnid.py`)
 /// over the signed data of a valid manifest. `Err` is the exception text.
 pub fn check_release_rsm_structure(signed_data: &Value) -> Result<RsmStructure, String> {
     let release_meta = py_get(signed_data, "meta")?;

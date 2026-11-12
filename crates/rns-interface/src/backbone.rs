@@ -75,7 +75,7 @@ const MAX_TRACKED_FAST_FLAP_IPS: usize = 4096;
 #[derive(Debug, Clone)]
 pub struct BackboneServerConfig {
     pub name: String,
-    /// Host to bind; required unless `device` is set (BackboneInterface.py:162-168).
+    /// Host to bind; required unless `device` is set (BackboneInterface.py).
     pub listen_ip: Option<String>,
     pub listen_port: u16,
     pub prefer_ipv6: bool,
@@ -125,7 +125,7 @@ pub struct BackboneClientConfig {
     pub target_port: u16,
     pub prefer_ipv6: bool,
     /// Parsed like Python, which stores it but connects with
-    /// [`INITIAL_CONNECT_TIMEOUT`] (BackboneInterface.py:979).
+    /// [`INITIAL_CONNECT_TIMEOUT`] (BackboneInterface.py).
     pub connect_timeout_secs: u64,
     /// Retries allowed within one outage; `None` retries forever.
     pub max_reconnect_tries: Option<usize>,
@@ -155,7 +155,7 @@ impl BackboneClientConfig {
         }
     }
 
-    /// Python `str(BackboneClientInterface)` (BackboneInterface.py:1114-1117).
+    /// Python `str(BackboneClientInterface)` (BackboneInterface.py).
     pub fn python_name(&self) -> String {
         format!(
             "BackboneInterface[{}/{}:{}]",
@@ -412,7 +412,7 @@ async fn backbone_read_loop(
     rxb: ByteCounter,
     (bitrate, ifac_size): (u64, usize),
 ) {
-    // ReceiveBuffer(HW_MTU, HEADER_MINSIZE, HW_MTU + ifac_size) (BackboneInterface.py:892-893@1.6.0).
+    // ReceiveBuffer(HW_MTU, HEADER_MINSIZE, HW_MTU + ifac_size) (BackboneInterface.py).
     let hw_mtu = crate::tcp::hardware_mtu(bitrate, None) as usize;
     let mut deframer = hdlc::HdlcDeframer::with_limits(
         hw_mtu,
@@ -969,7 +969,7 @@ pub async fn spawn_backbone_client_observed(
     let task_egress = egress.clone();
     let (teardown_tx, teardown) = crate::tcp::ClientTeardown::channel();
     // Python connects once, synchronously, before the interface is handed to
-    // transport (BackboneInterface.py:921-922, :979).
+    // transport (BackboneInterface.py).
     let initial_timeout = Duration::from_secs(INITIAL_CONNECT_TIMEOUT);
     let mut initial_attempt = Some(
         tokio::time::timeout(
@@ -986,7 +986,7 @@ pub async fn spawn_backbone_client_observed(
         let max_tries = config.max_reconnect_tries;
         // Every attempt after the first follows a failure or an outage.
         let mut attempted = false;
-        // Retries within the current outage (BackboneInterface.py:1007-1023).
+        // Retries within the current outage (BackboneInterface.py).
         let mut attempts: usize = 0;
 
         loop {
@@ -1014,7 +1014,7 @@ pub async fn spawn_backbone_client_observed(
 
             tune_stream(&stream);
             attempts = 0;
-            // Python synthesizes on every connection (BackboneInterface.py:922,
+            // Python synthesizes on every connection (BackboneInterface.py,
             // :1019).
             let synthesis = config
                 .tunnel_identity

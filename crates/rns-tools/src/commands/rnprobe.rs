@@ -103,7 +103,7 @@ pub(crate) async fn main() {
         );
         return;
     };
-    // rnprobe.py:57-67: input errors print to stdout and exit 0.
+    // rnprobe.py: input errors print to stdout and exit 0.
     let dest_hash: [u8; 16] = if dest_hex.chars().count() != 32 {
         println!("Destination length is invalid, must be 32 hexadecimal characters (16 bytes).");
         return;
@@ -169,7 +169,7 @@ async fn run(args: &Args, handle: &ReticulumHandle, dest_hash: [u8; 16], full_na
     let size = args.size.unwrap_or(DEFAULT_PROBE_SIZE);
     let timeout = args.timeout.filter(|t| *t != 0.0);
 
-    // rnprobe.py:79-95.
+    // rnprobe.py.
     if !local_has_path(handle, dest_hash).await {
         let _ = handle
             .request_path(dest_hash, PathRequestOptions::default())
@@ -231,7 +231,7 @@ async fn run(args: &Args, handle: &ReticulumHandle, dest_hash: [u8; 16], full_na
         if sent > 0 {
             tokio::time::sleep(wait).await;
         }
-        // rnprobe.py:114-119: the packed length is reported.
+        // rnprobe.py: the packed length is reported.
         let payload = rns_crypto::random::random_bytes(size);
         let packet = match destination.pack_packet(
             &payload,
@@ -281,7 +281,7 @@ async fn run(args: &Args, handle: &ReticulumHandle, dest_hash: [u8; 16], full_na
             flush();
         }
 
-        // rnprobe.py:134-143, and the receipt's own timeout (Packet.py:432-433).
+        // rnprobe.py, and the receipt's own timeout (Packet.py).
         let probe_deadline = deadline_after(probe_timeout(handle, dest_hash, timeout).await);
         let outcome = probe.wait(probe_deadline, json).await;
         match outcome {
@@ -379,7 +379,7 @@ async fn send_probe(
     identity: &rns_identity::identity::Identity,
     dest_hash: [u8; 16],
 ) -> Option<PendingProbe> {
-    // Packet.py:430-433: first-hop timeout plus TIMEOUT_PER_HOP per hop.
+    // Packet.py: first-hop timeout plus TIMEOUT_PER_HOP per hop.
     let first_hop = handle
         .first_hop_timeout(dest_hash)
         .await
@@ -459,7 +459,7 @@ impl PendingProbe {
     }
 }
 
-/// rnprobe.py:165-186: over RPC on a shared-instance client, else from the proof packet.
+/// rnprobe.py: over RPC on a shared-instance client, else from the proof packet.
 async fn reception_stats(
     handle: &ReticulumHandle,
     proof_hash: Option<[u8; 32]>,
@@ -523,7 +523,7 @@ fn f32_to_f64(value: f32) -> f64 {
     format!("{value}").parse().unwrap_or(f64::from(value))
 }
 
-/// rnprobe.py:157-163.
+/// rnprobe.py.
 fn rtt_string(rtt: Duration) -> String {
     let rtt = rtt.as_secs_f64();
     if rtt >= 1.0 {

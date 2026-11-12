@@ -1,4 +1,4 @@
-//! `rngit release` (`ReticulumGitClient` release methods, `server.py:715-1239@1.6.0`).
+//! `rngit release` (`ReticulumGitClient` release methods, `server.py`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use crate::server::client::ClientConfig;
 use crate::server::releases::py_basename;
 use crate::server::{IDX_REPOSITORY, RES_DISALLOWED, RES_INVALID_REQ, RES_NOT_FOUND};
 
-/// The `rngit release` operations (`server.py:89-98`).
+/// The `rngit release` operations (`server.py`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReleaseOp {
     List,
@@ -185,7 +185,7 @@ fn py_str(value: &Value) -> String {
     rns_tools::rsg::pyfmt::py_str(value)
 }
 
-/// `list_releases` after the Link is up (`server.py:774-818`).
+/// `list_releases` after the Link is up (`server.py`).
 pub fn list_releases(
     out: &mut dyn Write,
     remote: &mut dyn Remote,
@@ -272,7 +272,7 @@ pub fn list_releases(
     Ok(())
 }
 
-/// `view_release` after the Link is up (`server.py:832-877`).
+/// `view_release` after the Link is up (`server.py`).
 pub fn view_release(
     out: &mut dyn Write,
     remote: &mut dyn Remote,
@@ -344,7 +344,7 @@ pub fn view_release(
 }
 
 /// `delete_release` and `latest_release` after the Link is up
-/// (`server.py:1160-1192`, `1203-1239`): confirm, then send.
+/// (`server.py`): confirm, then send.
 pub fn confirm_and_send(
     out: &mut dyn Write,
     input: &mut dyn std::io::BufRead,
@@ -433,7 +433,7 @@ pub fn fnmatch(name: &str, pattern: &str) -> bool {
     go(&name, &pattern)
 }
 
-/// `signer` on fetch/verify: a 32-hex required signer hash (`server.py:881-884`).
+/// `signer` on fetch/verify: a 32-hex required signer hash (`server.py`).
 pub fn required_signer(signer: Option<&str>) -> Result<Option<Vec<u8>>, Fail> {
     let Some(signer) = signer.filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -461,7 +461,7 @@ impl Manifest {
     }
 }
 
-/// The manifest checks of `fetch_release` (`server.py:888-898`, `936-945`).
+/// The manifest checks of `fetch_release` (`server.py`).
 /// `inside_try` selects how an exception surfaces.
 fn check_manifest(
     rsg: Vec<u8>,
@@ -530,7 +530,7 @@ fn file_valid(rsg: &[u8], path: &Path, required: Option<&[u8]>) -> Result<bool, 
     .map_err(|e| Fail::Abort(format!("Error fetching release: {e}")))
 }
 
-/// `fetch_release` (`server.py:879-1013`); `verify` is `offline`. Files land
+/// `fetch_release` (`server.py`); `verify` is `offline`. Files land
 /// in the current directory. `Ok` is the exit code.
 pub fn fetch_release(
     out: &mut dyn Write,
@@ -765,10 +765,10 @@ pub fn fetch_release(
     Ok(0)
 }
 
-/// `RELEASE_NOTES_TEMPLATE` (`server.py:5081-5084`).
+/// `RELEASE_NOTES_TEMPLATE` (`server.py`).
 const RELEASE_NOTES_TEMPLATE: &str = "# Enter release notes for {TAG}.\n# Lines starting with '#' will be ignored.\n# Save and exit the editor when done, or exit without saving to abort.\n";
 
-/// `_edit_release_notes` (`server.py:719-760`). `None` cancels the release.
+/// `_edit_release_notes` (`server.py`). `None` cancels the release.
 fn edit_release_notes(out: &mut dyn Write, tag: &str) -> Option<String> {
     let mut editor = std::env::var("EDITOR").unwrap_or_default();
     if editor.is_empty() {
@@ -825,7 +825,7 @@ fn edit_release_notes(out: &mut dyn Write, tag: &str) -> Option<String> {
     (!notes.is_empty()).then_some(notes)
 }
 
-/// `__commit_hash_from_tag` (`server.py:395-410`), run in `./`.
+/// `__commit_hash_from_tag` (`server.py`), run in `./`.
 fn commit_hash_from_tag(tag: &str) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["rev-list", "-n", "1", tag])
@@ -860,7 +860,7 @@ fn generation_failed(e: impl std::fmt::Display) -> Fail {
     Fail::Abort(format!("Release manifest generation failed: {e}"))
 }
 
-/// `create_release` (`server.py:1015-1149`). `signer` is an identity path;
+/// `create_release` (`server.py`). `signer` is an identity path;
 /// without it the client identity signs. `Ok` is the exit code.
 #[allow(clippy::too_many_arguments)]
 pub fn create_release(
@@ -1077,7 +1077,7 @@ pub fn create_release(
     Ok(0)
 }
 
-/// `list` and `view` share the connect-then-request shape (`server.py:762-877`).
+/// `list` and `view` share the connect-then-request shape (`server.py`).
 pub fn run_simple(
     out: &mut dyn Write,
     input: &mut dyn std::io::BufRead,

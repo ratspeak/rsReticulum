@@ -11,7 +11,7 @@ fn limited() -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
 }
 
 /// Python `process_announce_queue` consumes the entry and counts it sent
-/// whatever `Transport.transmit` did with it (Interface.py:436-443).
+/// whatever `Transport.transmit` did with it (Interface.py).
 #[test]
 fn announce_queue_full_send_consumes_entry_and_counts_it() {
     let (mut actor, _) = TransportActor::new();

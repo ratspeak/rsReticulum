@@ -321,7 +321,7 @@ impl Config {
     }
 
     /// The `[filter]` section as Python `Reticulum.__apply_config` reads it
-    /// (Reticulum.py:487-503); malformed values are errors.
+    /// (Reticulum.py); malformed values are errors.
     pub fn filter_policy(
         &self,
     ) -> Result<rns_transport::destination_filter::FilterPolicy, ConfigError> {

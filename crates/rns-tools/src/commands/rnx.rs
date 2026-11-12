@@ -170,7 +170,7 @@ async fn start(args: &Args, interrupt: &ShutdownSignal) -> ReticulumHandle {
     }
 }
 
-/// `prepare_identity` (rnx.py:50-61): load the identity file or write a new one there.
+/// `prepare_identity` (rnx.py): load the identity file or write a new one there.
 fn prepare_identity(path: Option<&Path>, handle: &ReticulumHandle) -> Identity {
     let path = path.map(Path::to_path_buf).unwrap_or_else(|| {
         StoragePaths::from_config_dir(&handle.config_dir)
@@ -341,7 +341,7 @@ async fn listen(args: &Args, interrupt: &ShutdownSignal) -> ! {
     rns_tools::exit(&handle, 0).await;
 }
 
-/// `spin` (rnx.py:254-272): an animated message on stdout while `until` runs.
+/// `spin` (rnx.py): an animated message on stdout while `until` runs.
 async fn spin<F: std::future::Future>(msg: &str, until: F) -> F::Output {
     const SYMS: [char; 7] = ['⢄', '⢂', '⢁', '⡁', '⡈', '⡐', '⡠'];
     let mut out = std::io::stdout();
@@ -373,7 +373,7 @@ fn secs(seconds: f64) -> Duration {
 }
 
 async fn run_client(args: &Args, handle: &ReticulumHandle, destination_hash: [u8; 16]) -> i32 {
-    // rnx.py:345
+    // rnx.py
     handle.wants_destination_type(APP_NAME).await;
     let identity = prepare_identity(args.identity.as_deref(), handle);
     let mut client = Client {
@@ -410,7 +410,7 @@ async fn run_commands(args: &Args, client: &mut Client<'_>, timeout: Timeout) ->
     interactive(args, client, timeout).await
 }
 
-/// The interactive loop (rnx.py:613-666).
+/// The interactive loop (rnx.py).
 async fn interactive(args: &Args, client: &mut Client<'_>, timeout: Timeout) -> i32 {
     let (line_tx, mut line_rx) = mpsc::channel::<Option<String>>(1);
     std::thread::spawn(move || {
@@ -469,7 +469,7 @@ struct Client<'a> {
 }
 
 impl Client<'_> {
-    /// Ensure a path, as `execute` does before linking (rnx.py:350-354).
+    /// Ensure a path, as `execute` does before linking (rnx.py).
     async fn ensure_path(&self, timeout: Timeout) -> bool {
         let handle = self.handle;
         let hash = self.destination_hash;
@@ -494,7 +494,7 @@ impl Client<'_> {
         tokio::time::timeout(secs(wait), found).await.is_ok()
     }
 
-    /// Open the Link with `max(-w, establishment timeout)` (rnx.py:366-376).
+    /// Open the Link with `max(-w, establishment timeout)` (rnx.py).
     /// Returns the session and its measured round trip.
     async fn connect(&self, noid: bool, timeout: Timeout) -> Option<(LinkSession, f64)> {
         let handle = self.handle;
@@ -585,7 +585,7 @@ impl Client<'_> {
         );
         tokio::pin!(request);
         // `-W` bounds only the result transfer; when it passes, the receipt
-        // still holds no response (rnx.py:425-430, 443, 527-532).
+        // still holds no response (rnx.py).
         let result = match args.result_timeout {
             Some(w) => tokio::select! {
                 r = &mut request => Some(r),
@@ -647,7 +647,7 @@ impl Client<'_> {
     }
 }
 
-/// Write remote output first, then the trailer lines, as rnx.py:461-520 orders them.
+/// Write remote output first, then the trailer lines, as rnx.py orders them.
 fn write_split(parsed: &rns_tools::rnx::Response, rendered: &rns_tools::rnx::Rendered) {
     let remote_out = parsed.stdout.as_deref().map_or(0, <[u8]>::len);
     let (out, trailer) = rendered
@@ -663,7 +663,7 @@ fn write_split(parsed: &rns_tools::rnx::Response, rendered: &rns_tools::rnx::Ren
     let _ = stdout.flush();
 }
 
-/// `len(umsgpack.packb([time.time(), path_hash, data]))` (Link.py:573-574).
+/// `len(umsgpack.packb([time.time(), path_hash, data]))` (Link.py).
 fn packed_request_size(data: &rmpv::Value) -> u64 {
     let request = rmpv::Value::Array(vec![
         rmpv::Value::F64(0.0),

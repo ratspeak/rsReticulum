@@ -177,7 +177,7 @@ pub(crate) struct ValidatedLinkProof {
 /// Wait for the first cryptographically valid LRPROOF while the Link remains
 /// pending. Invalid candidates are unauthenticated input and cannot terminate
 /// establishment or select the endpoint interface. A signed proof that closes
-/// the Link (a low-order key, as Link.py:533-536) ends the wait.
+/// the Link (a low-order key, as Link.py) ends the wait.
 pub(crate) async fn wait_for_valid_proof(
     delivery_rx: &mut mpsc::Receiver<DestinationEvent>,
     link: &mut Link,
@@ -238,7 +238,7 @@ pub(crate) async fn wait_for_valid_proof(
 }
 
 /// What Link.py takes from the path table for a new initiator Link
-/// (Link.py:304-309): the hops and the first-hop timeout that extends the
+/// (Link.py): the hops and the first-hop timeout that extends the
 /// establishment timeout.
 pub(crate) async fn initiator_path_timing(
     transport_tx: &mpsc::Sender<TransportMessage>,
@@ -284,7 +284,7 @@ async fn query(
 }
 
 /// Record an inbound packet on an initiator Link as Link.py's `__receive`
-/// does (Link.py:1024-1032): a keepalive refreshes liveness but not data,
+/// does (Link.py): a keepalive refreshes liveness but not data,
 /// and the responder-only 0xFF request is ignored.
 pub(crate) fn record_initiator_inbound(link: &mut Link, raw: &[u8]) {
     let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(raw) else {

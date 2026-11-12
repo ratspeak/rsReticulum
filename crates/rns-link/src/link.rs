@@ -160,7 +160,7 @@ fn peer_reported_rtt(secs: f64) -> Option<Duration> {
 }
 
 /// Length of a handshake packet as Link.py counts it in `establishment_cost`:
-/// the HEADER_1 packet carrying `payload` (Link.py:215, :401, :459, :496).
+/// the HEADER_1 packet carrying `payload` (Link.py).
 fn packet_len(payload: &[u8]) -> usize {
     rns_wire::constants::HEADER_MINSIZE + payload.len()
 }
@@ -222,8 +222,8 @@ pub struct Link {
     pub establishment_rate: Option<f64>,
     /// Expected in-flight data rate (bits/sec), refreshed after each resource transfer.
     pub expected_rate: Option<f64>,
-    /// Path length in hops: initiator sets it at creation (Link.py:282), the
-    /// destination side from the LRRTT packet at activation (Link.py:525).
+    /// Path length in hops: initiator sets it at creation (Link.py), the
+    /// destination side from the LRRTT packet at activation (Link.py).
     pub expected_hops: Option<u8>,
 
     pub destination_hash: [u8; 16],
@@ -330,7 +330,7 @@ impl Link {
 
     /// Create an outbound link with caller-supplied ephemeral keys, such as
     /// keys from [`crate::stamp::generate_stamped_ephemeral_keys`], signalling
-    /// `signalled_mtu` as Link.py:392-397@1.6.0 does.
+    /// `signalled_mtu` as Link.py does.
     pub fn new_initiator_with_keys(
         destination_hash: [u8; 16],
         hops: u8,
@@ -480,7 +480,7 @@ impl Link {
         ) {
             Ok(keys) => keys,
             Err(error) => {
-                // Link.py closes the link when the key exchange raises (Link.py:533-536).
+                // Link.py closes the link when the key exchange raises (Link.py).
                 self.state = LinkState::Closed;
                 self.purge_keys();
                 return Err(error.into());
@@ -584,7 +584,7 @@ impl Link {
         if !ENABLED_MODES.contains(&request.signalling.mode) {
             return Err(HandshakeError::UnsupportedMode(request.signalling.mode));
         }
-        // The offered MTU is adopted unclamped (Link.py:202-207@1.6.0).
+        // The offered MTU is adopted unclamped (Link.py).
         let accepted_mtu = LinkMtu::try_from_signal(Some(request.signalling.mtu))?;
         let accepted_mdu = accepted_mtu.checked_mdu()?;
 
@@ -651,7 +651,7 @@ impl Link {
             establishment_cost,
             establishment_rate: None,
             expected_rate: None,
-            // Populated by the runtime from the LRRTT packet hops (Link.py:525).
+            // Populated by the runtime from the LRRTT packet hops (Link.py).
             expected_hops: None,
             destination_hash,
             stamp_value: crate::stamp::link_request_stamp_value(&destination_hash, request_data),
@@ -681,7 +681,7 @@ impl Link {
     /// An undecryptable packet is ignored. A decrypted payload that is not a
     /// msgpack number returns [`HandshakeError::MalformedRtt`] and leaves the
     /// link in HANDSHAKE; Link.py tears the link down in that case
-    /// (Link.py:622-624), which the owner must do.
+    /// (Link.py), which the owner must do.
     pub fn receive_rtt_packet(&mut self, encrypted_data: &[u8]) -> Result<(), HandshakeError> {
         if self.state != LinkState::Handshake {
             return Err(HandshakeError::InvalidSignature);
@@ -1502,7 +1502,7 @@ impl Link {
     }
 
     /// `bytes` is the link payload after the context byte (ciphertext), the
-    /// same unit as `record_rx` — Packet.py:291 txbytes += len(ciphertext).
+    /// same unit as `record_rx` — Packet.py txbytes += len(ciphertext).
     pub fn record_tx(&mut self, bytes: usize) {
         self.tx_bytes += bytes as u64;
         self.tx_count += 1;
@@ -1528,7 +1528,7 @@ impl Link {
             .should_respond_to_keepalive_at(Instant::now())
     }
 
-    /// `bytes` is the link payload after the context byte (Link.py:929).
+    /// `bytes` is the link payload after the context byte (Link.py).
     pub fn record_rx(&mut self, bytes: usize) {
         self.rx_bytes += bytes as u64;
         self.rx_count += 1;
@@ -1655,7 +1655,7 @@ impl Link {
                 LinkAction::None
             }
             LinkState::Active => {
-                // One Link.py watchdog pass (Link.py:831-845): the keepalive
+                // One Link.py watchdog pass (Link.py): the keepalive
                 // and the STALE transition can happen together.
                 let send_keepalive = self.keepalive.should_send_keepalive_at(now);
                 if send_keepalive {
@@ -1705,14 +1705,14 @@ impl Link {
     }
 
     /// Record that an inbound packet other than a keepalive arrived; refreshes
-    /// `no_data_for` (Link.py:1030).
+    /// `no_data_for` (Link.py).
     pub fn record_inbound_data(&mut self) {
         self.keepalive.last_data = std::time::Instant::now();
     }
 
     /// Close reason Link.py records for a close started on this side:
     /// `InitiatorClosed` on the initiator, `DestinationClosed` on the
-    /// responder (Link.py:756-757). `Timeout` is kept.
+    /// responder (Link.py). `Timeout` is kept.
     fn local_close_reason(&self, reason: CloseReason) -> CloseReason {
         match reason {
             CloseReason::Timeout => CloseReason::Timeout,
@@ -1736,7 +1736,7 @@ impl Link {
     }
 
     /// Handle a received teardown packet and close the link on success. The
-    /// reason names the peer's role (Link.py:764-765).
+    /// reason names the peer's role (Link.py).
     pub fn receive_teardown(&mut self, encrypted_data: &[u8]) -> bool {
         match self.decrypt(encrypted_data) {
             Ok(plaintext) => {
@@ -1897,7 +1897,7 @@ impl Link {
     }
 
     /// Resource part size on this Link: `mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE`
-    /// (Resource.py:346-347@1.6.0).
+    /// (Resource.py).
     pub fn resource_sdu(&self) -> usize {
         (self.mtu as usize).saturating_sub(rns_wire::constants::HEADER_MAXSIZE + 1)
     }
@@ -3371,8 +3371,8 @@ mod tests {
         assert!(link.keepalive.last_keepalive_sent.is_some());
     }
 
-    /// Initiator knows expected_hops at creation (Link.py:282); the responder
-    /// side stays unset until the runtime observes the LRRTT hops (Link.py:525).
+    /// Initiator knows expected_hops at creation (Link.py); the responder
+    /// side stays unset until the runtime observes the LRRTT hops (Link.py).
     #[test]
     fn test_expected_hops_initiator_only_at_creation() {
         let dest_hash = [0xAB; 16];
@@ -3694,7 +3694,7 @@ mod tests {
     }
 
     /// Link.py's initiator goes STALE only on a watchdog pass that also sends a
-    /// keepalive (Link.py:836-843), whatever the phase of a 1 s tick.
+    /// keepalive (Link.py), whatever the phase of a 1 s tick.
     #[test]
     fn initiator_sends_a_keepalive_on_the_tick_it_goes_stale() {
         for phase_ms in [0u64, 300, 600, 900] {

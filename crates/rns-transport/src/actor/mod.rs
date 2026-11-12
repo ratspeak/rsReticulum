@@ -124,7 +124,7 @@ pub struct TransportActor {
     /// Python's interface traffic count and top-level stats counters.
     traffic_count: rpc::TrafficCount,
     /// Python's `local_client_rssi_cache`, `_snr_cache` and `_q_cache`: one
-    /// 512-entry list per metric, first match wins (Transport.py:320-324).
+    /// 512-entry list per metric, first match wins (Transport.py).
     pub packet_rssi_cache: VecDeque<([u8; 32], f32)>,
     pub packet_snr_cache: VecDeque<([u8; 32], f32)>,
     pub packet_q_cache: VecDeque<([u8; 32], f32)>,
@@ -151,7 +151,7 @@ pub struct TransportActor {
     /// App names of registered destinations; link-id channel aliases are not here.
     registered_destination_names: HashMap<[u8; 16], String>,
     /// RESOURCE_PRF packets this instance sent, which Python force-caches
-    /// (Resource.py:775-777), with the time each was stored.
+    /// (Resource.py), with the time each was stored.
     proof_cache: HashMap<[u8; 32], (Bytes, f64)>,
     proof_cache_order: VecDeque<[u8; 32]>,
     /// Duplex routes for Links whose initiator and responder are registered
@@ -162,7 +162,7 @@ pub struct TransportActor {
     // Only active caller-owned temporary destinations can allocate an attempt.
     pending_local_link_requests: HashMap<[u8; 16], HashMap<InterfaceId, crate::InterfaceOwnerId>>,
     /// Destination and path hops of each pending local Link request, Python's
-    /// `link.expected_hops` (Link.py:307), until a proof re-balances it.
+    /// `link.expected_hops` (Link.py), until a proof re-balances it.
     pending_local_link_hops: HashMap<[u8; 16], ([u8; 16], Option<u8>)>,
     /// Destination of each sent local Link request, with the route it was
     /// sent on, until the Link is bound (established) or abandoned; Python's
@@ -204,7 +204,7 @@ pub struct TransportActor {
 
     last_tables_cull: f64,
     /// Last never-used path pool check; starts at construction so the first
-    /// check waits one interval (Transport.py:516@1.6.0).
+    /// check waits one interval (Transport.py).
     pub path_pool_last_checked: f64,
     /// Destinations with a path request admitted and not yet answered
     /// (Python `inflight_path_requests`), with the admission time.
@@ -260,9 +260,9 @@ pub struct TransportActor {
     /// public table mutation does not publish a snapshot; a poisoned snapshot
     /// lock prevents publication.
     pub blackholed_snapshot: Arc<std::sync::RwLock<HashSet<[u8; 16]>>>,
-    /// Per-packet announce validation results (Identity.py:676-715).
+    /// Per-packet announce validation results (Identity.py).
     pub announce_validation: crate::announce_validation::AnnounceValidationCache,
-    /// Path-request stamp worker and generated-stamp cache (Transport.py:209-217).
+    /// Path-request stamp worker and generated-stamp cache (Transport.py).
     pub pr_stamper: crate::pr_stamper::PathRequestStamper,
 
     /// Whether this actor currently uses a shared-instance peer. Routing policy
@@ -369,7 +369,7 @@ pub struct RecentAnnounce {
     /// without valid payloads are rejected.
     pub name_hash: [u8; 10],
     /// Network stamp from the announce extension, kept even when it is below
-    /// the required value (Identity.py:109-126).
+    /// the required value (Identity.py).
     pub stamp: Option<[u8; rns_identity::stamps::NETWORK_STAMP_SIZE]>,
     /// Stamp value; 0 for an unstamped announce, as upstream stores it.
     pub stamp_value: f64,
@@ -379,7 +379,7 @@ pub struct RecentAnnounce {
 
 impl RecentAnnounce {
     /// Remember a ratchet carried by an announce. Re-receiving the same ratchet
-    /// keeps its first receive time (Identity.py:535-551, Storage.py:429-451).
+    /// keeps its first receive time (Identity.py, Storage.py).
     pub(crate) fn remember_ratchet(&mut self, ratchet: Option<[u8; 32]>, now: f64) {
         if let Some(ratchet) = ratchet
             && self.ratchet != Some(ratchet)
@@ -472,7 +472,7 @@ impl TransportActor {
     }
 
     /// As [`Self::new_with_capacity`], with per-class inbound queue lengths
-    /// for registered interfaces (`qlen_in_*`, Transport.py:420-427).
+    /// for registered interfaces (`qlen_in_*`, Transport.py).
     pub fn new_with_queues(
         channel_cap: usize,
         hashlist_cap: usize,
@@ -703,7 +703,7 @@ impl TransportActor {
     }
 
     /// Path requests from an interface in a path-request burst wait in the
-    /// ingress-limited queue, behind every other class (Transport.py:2133-2134).
+    /// ingress-limited queue, behind every other class (Transport.py).
     fn handle_inbound_event(
         &mut self,
         class: crate::inbound_queues::TrafficClass,
@@ -724,7 +724,7 @@ impl TransportActor {
                     .push_ingress_limited(&self.inbound_queues, Queued::Message(msg));
             }
             Queued::Message(msg) => {
-                // Python carries the class on the packet into path_request (Transport.py:3761).
+                // Python carries the class on the packet into path_request (Transport.py).
                 self.processing_ingress_limited = class == TrafficClass::IngressLimited;
                 self.handle_message(*msg);
                 self.processing_ingress_limited = false;
@@ -1195,7 +1195,7 @@ impl TransportActor {
                         existing.owner.retire();
                     }
                     self.path_table.drop_all_via(id);
-                    // A new interface starts without a tunnel (Interface.py:127).
+                    // A new interface starts without a tunnel (Interface.py).
                     self.void_tunnel_interface(id);
                     self.link_table.remove_interface(id);
                     self.retire_recursive_discovery_interface(id);
@@ -1318,7 +1318,7 @@ impl TransportActor {
                     return;
                 }
                 // Local Links stay out of the transit link table, which Python
-                // reserves for relayed Links (Transport.py:3264-3273).
+                // reserves for relayed Links (Transport.py).
 
                 // Link-addressed packets (LRRTT, Resource, Keepalive, …) use
                 // link_id as their destination_hash, not the original
@@ -1380,7 +1380,7 @@ impl TransportActor {
             .is_some_and(|entry| entry.role == InterfaceRole::SharedInstancePeer)
     }
 
-    /// Python 1.3.8 Transport.should_apply_delta (Transport.py:1356-1359):
+    /// Python 1.3.8 Transport.should_apply_delta (Transport.py):
     /// mangle only locally-originated (hops==0) non-PLAIN/GROUP packets, never
     /// when this node is itself a shared-instance client, and never on
     /// local-client / shared-instance edges.
@@ -1398,7 +1398,7 @@ impl TransportActor {
             && !self.is_shared_instance_peer_interface(interface_id)
     }
 
-    /// Python 1.3.8 Transport.mangle_hops (Transport.py:1362-1365): rewrite
+    /// Python 1.3.8 Transport.mangle_hops (Transport.py): rewrite
     /// the hops byte to the per-boot delta. `transport_insert` additionally
     /// re-frames a HEADER_1 announce as HEADER_2|TRANSPORT carrying this
     /// node's transport identity hash (packet grows by 17 bytes).
@@ -1487,7 +1487,7 @@ impl TransportActor {
         self.state_dirty = true;
     }
 
-    /// Python 1.3.8 Transport.py:234-238: when transport is disabled and
+    /// Python 1.3.8 Transport.py: when transport is disabled and
     /// `static_transport_identity` is unset (the default), the wire-facing
     /// transport identity becomes a fresh per-boot identity while the
     /// persisted one is retained as `internal_identity_hash`
@@ -1516,7 +1516,7 @@ impl TransportActor {
     /// Rebuild the shared blackhole snapshot from the authoritative table.
     /// Called after every blackhole-table mutation; TTL-expired entries drop
     /// out here and on the periodic cull (Python parity: the 60s expiry job,
-    /// Transport.py:986-1002).
+    /// Transport.py).
     fn publish_blackhole_snapshot(&mut self) {
         // Identity._reset_validation_caches on every blackhole change.
         self.announce_validation.reset();
@@ -1548,7 +1548,7 @@ impl TransportActor {
     }
 
     /// Python `shared_connection_reappeared`: each registered destination
-    /// announces as a path response (Transport.py:4203-4207); owners of
+    /// announces as a path response (Transport.py); owners of
     /// non-SINGLE destinations refuse to build an announce.
     fn request_announces_from_local_destinations(&mut self) {
         let destinations: Vec<(
@@ -1712,7 +1712,7 @@ impl TransportActor {
     }
 
     /// Reap waiters whose caller gave up. The caller owns the deadline, as
-    /// Python `await_path(timeout)` does (Transport.py:3666-3683).
+    /// Python `await_path(timeout)` does (Transport.py).
     fn expire_path_waiters(&mut self, _now: f64) {
         self.path_waiters.retain(|_, waiters| {
             waiters.retain(|(reply, _)| !reply.is_closed());
@@ -1773,7 +1773,7 @@ impl TransportActor {
         }
     }
 
-    /// Transport.py:839-866@1.6.0: a Link that was never established expires
+    /// Transport.py: a Link that was never established expires
     /// the path on a non-transport instance and, unless this is a
     /// shared-instance client, queues a throttled rediscovery request.
     /// Unlike upstream, a route newer than the one the request used is kept.
@@ -1806,8 +1806,8 @@ impl TransportActor {
         }
     }
 
-    /// Transport.py:3632-3648@1.6.0, with the lifetime of the interface the
-    /// path was learned on (:3616-3621).
+    /// Transport.py, with the lifetime of the interface the
+    /// path was learned on.
     pub(super) fn mark_path_responsive(&mut self, dest: &[u8; 16]) -> bool {
         let Some(interface_id) = self.path_table.get(dest).map(|path| path.interface_id) else {
             return false;
@@ -1962,7 +1962,7 @@ impl TransportActor {
         match entry.tx.try_send(data) {
             Ok(()) => {
                 self.count_tx_packet();
-                // Python counts every transmitted announce (Transport.py:1827).
+                // Python counts every transmitted announce (Transport.py).
                 if rns_wire::header::PacketHeader::unpack(raw).is_ok_and(|(header, _)| {
                     header.flags.packet_type == rns_wire::flags::PacketType::Announce
                 }) {
@@ -2066,7 +2066,7 @@ impl TransportActor {
         }
     }
 
-    /// Transport.prioritize_interfaces (Transport.py:704-706): fastest first,
+    /// Transport.prioritize_interfaces (Transport.py): fastest first,
     /// registration order among equal bitrates.
     fn prioritized_interface_ids(&self) -> Vec<InterfaceId> {
         let mut ids: Vec<InterfaceId> = self.interfaces.keys().copied().collect();
@@ -2088,11 +2088,11 @@ impl TransportActor {
             .into_iter()
             .filter(|id| {
                 let entry = &self.interfaces[id];
-                // Transport.py:1676: broadcast only where OUT and online.
+                // Transport.py: broadcast only where OUT and online.
                 except != Some(*id) && entry.direction.outbound && !offline_for_send(entry)
             })
             .collect();
-        // Python 1.3.8 Transport.py:1342-1344: locally-originated non-announce
+        // Python 1.3.8 Transport.py: locally-originated non-announce
         // packets get the per-boot hops delta, decided per egress interface.
         let delta_header = (self.local_hops_delta != 0)
             .then(|| rns_wire::header::PacketHeader::unpack(raw).ok())
@@ -2133,7 +2133,7 @@ impl TransportActor {
             return false;
         }
 
-        // Python 1.3.8 Transport.py:1210-1240 hoists the instance-local check
+        // Python 1.3.8 Transport.py hoists the instance-local check
         // and the announce's next-hop (learned-from) interface.
         // `from_iface_mode`: None = no live path; Some(None) = path via an
         // unregistered interface (Python's mode-less hasattr case);
@@ -2150,7 +2150,7 @@ impl TransportActor {
             .is_some_and(|i| i.announces_to_internal == Some(true));
 
         // Mode-independent gate: a non-local announce whose next-hop interface
-        // doesn't exist is never rebroadcast (Transport.py:1216-1218).
+        // doesn't exist is never rebroadcast (Transport.py).
         if !local && from_iface_mode.is_none() {
             pathing!(
                 dest = hex::encode(destination_hash),
@@ -2161,7 +2161,7 @@ impl TransportActor {
         }
 
         // Per-interface announces_from_internal opt-out for internal-origin
-        // announces; checked before the egress-mode gates (Transport.py:1220).
+        // announces; checked before the egress-mode gates (Transport.py).
         if !local
             && !entry.announces_from_internal
             && from_iface_mode == Some(Some(InterfaceMode::Internal))
@@ -2179,7 +2179,7 @@ impl TransportActor {
             InterfaceMode::Internal => {
                 // Internal egress relays everything except mode-less-origin
                 // announces and, unless the origin sets announces_to_internal,
-                // boundary-origin ones (Transport.py:1706-1714@1.6.0).
+                // boundary-origin ones (Transport.py).
                 local
                     || match from_iface_mode {
                         Some(None) => false,
@@ -2229,7 +2229,7 @@ impl TransportActor {
             .collect();
         let mut accepted = false;
         for id in ids {
-            // Python 1.3.8 Transport.py:1345: delta-mangled HEADER_1 announces
+            // Python 1.3.8 Transport.py: delta-mangled HEADER_1 announces
             // are re-framed as HEADER_2|TRANSPORT with our transport identity.
             let sent = match &header {
                 Some(h) if self.should_apply_delta(h, id) => {
@@ -2348,8 +2348,8 @@ impl TransportActor {
     }
 
     /// `None` when the cached announce fails to parse — Python 1.3.8
-    /// Transport.py:2984 treats that as a cache miss and never emits the raw
-    /// bytes (unpack also rejects hops >= PATHFINDER_M, Packet.py:247-248).
+    /// Transport.py treats that as a cache miss and never emits the raw
+    /// bytes (unpack also rejects hops >= PATHFINDER_M, Packet.py).
     fn path_response_from_cached_announce(
         &self,
         cached_raw: &[u8],
@@ -2474,7 +2474,7 @@ fn offline_for_send(entry: &InterfaceEntry) -> bool {
     entry.role != InterfaceRole::LocalClient && interface_marked_offline(entry)
 }
 
-/// Seconds until the next capped announce may leave (Interface.py:428-430).
+/// Seconds until the next capped announce may leave (Interface.py).
 fn announce_wait_time(entry: &InterfaceEntry, len: usize) -> f64 {
     (len as f64 * 8.0 / entry.bitrate as f64) / entry.announce_cap
 }
@@ -2521,7 +2521,7 @@ fn rand_window() -> f64 {
     r * PATHFINDER_RW
 }
 
-/// Python `path_request` search decision (Transport.py:3774-3784@1.6.0):
+/// Python `path_request` search decision (Transport.py):
 /// `None` means no search, `Some(None)` a search on every interface, and
 /// `Some(Some(modes))` a search limited to those interface modes.
 fn path_search_modes(
@@ -2531,7 +2531,7 @@ fn path_search_modes(
     if recursive_prs || mode_discovers_unknown_paths(mode) {
         Some(None)
     } else if mode == InterfaceMode::Boundary {
-        // Interface.py:56@1.6.0 BOUNDARY_SEARCH_MODES.
+        // Interface.py BOUNDARY_SEARCH_MODES.
         Some(Some(&[InterfaceMode::Boundary, InterfaceMode::Gateway]))
     } else {
         None
@@ -2539,7 +2539,7 @@ fn path_search_modes(
 }
 
 fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
-    // Python 1.3.8 Interface.py:55 DISCOVER_PATHS_FOR.
+    // Python 1.3.8 Interface.py DISCOVER_PATHS_FOR.
     matches!(
         mode,
         InterfaceMode::AccessPoint
@@ -7847,7 +7847,7 @@ mod tests {
         let dest_hash = [0xAA; 16];
         let next_hop = [0xBB; 16];
 
-        // Transport.py:1659-1664: a one-hop neighbour is sent the raw packet.
+        // Transport.py: a one-hop neighbour is sent the raw packet.
         let path_entry =
             crate::path_table::PathEntry::new(Some(next_hop), 1, 1, InterfaceMode::Gateway);
         actor.path_table.insert(dest_hash, path_entry);
@@ -8360,7 +8360,7 @@ mod tests {
         );
     }
 
-    /// Python `Transport._outbound` (Transport.py:1746-1791): a capped
+    /// Python `Transport._outbound` (Transport.py): a capped
     /// rebroadcast leaves at once on an empty queue and opens the
     /// `tx_time / announce_cap` window; the next one queues behind it and
     /// `process_announce_queues` releases it only once the window passes.
@@ -8397,7 +8397,7 @@ mod tests {
         assert!(actor.interfaces[&1].announce_queue.is_empty());
     }
 
-    /// Python 1.3.8 Transport.py:1286-1308 keeps one queued announce per
+    /// Python 1.3.8 Transport.py keeps one queued announce per
     /// destination and replaces it only when the wire emission time advances.
     #[test]
     fn rebroadcast_queue_coalesces_destination_to_freshest_announce() {
@@ -8574,7 +8574,7 @@ mod tests {
         );
     }
 
-    // Python 1.3.8 Transport.py:234-238: transport disabled + default config
+    // Python 1.3.8 Transport.py: transport disabled + default config
     // swaps the wire-facing identity to a per-boot ephemeral one, keeping the
     // persisted hash as the internal identity.
     #[test]
@@ -8649,7 +8649,7 @@ mod tests {
         assert_eq!(actor.ephemeral_identity_hash, None);
     }
 
-    // ---- local_hops_delta (Python 1.3.8 Transport.py:1356-1365, 1.3.7
+    // ---- local_hops_delta (Python 1.3.8 Transport.py.3.7
     // eacff56f instance-local exclusions) ----
 
     fn make_data_packet_with_dest_type(
@@ -8711,7 +8711,7 @@ mod tests {
         assert_eq!(&sent[2..], &raw[2..]);
         while rx.try_recv().is_ok() {} // drain the automatic path request
 
-        // PLAIN and GROUP destinations are excluded (Transport.py:1358).
+        // PLAIN and GROUP destinations are excluded (Transport.py).
         for dest_type in [
             rns_wire::flags::DestinationType::Plain,
             rns_wire::flags::DestinationType::Group,
@@ -8784,7 +8784,7 @@ mod tests {
         let (entry, mut rx) = make_test_interface("iface1");
         actor.interfaces.insert(1, entry);
 
-        // Transport-wrapped send (Transport.py:1153): hops byte = delta.
+        // Transport-wrapped send (Transport.py): hops byte = delta.
         let dest_a = [0x31; 16];
         actor.path_table.insert(
             dest_a,
@@ -8803,7 +8803,7 @@ mod tests {
         assert_eq!(header.transport_id, Some([0xBB; 16]));
         assert_eq!(header.hops, 3, "wrapped send must carry the delta");
 
-        // Direct send (Transport.py:1186-1187): mangle_hops.
+        // Direct send (Transport.py): mangle_hops.
         let dest_b = [0x32; 16];
         actor.path_table.insert(
             dest_b,
@@ -8863,7 +8863,7 @@ mod tests {
     #[test]
     fn local_hops_delta_link_table_substitution_and_instance_local_exemption() {
         // Shared-instance host forwarding link traffic for a local client
-        // (Transport.py:1731).
+        // (Transport.py).
         let (mut actor, _tx) = TransportActor::new();
         actor.local_hops_delta = 6;
 
@@ -8953,7 +8953,7 @@ mod tests {
     #[test]
     fn local_hops_delta_lrproof_transit_exclusions() {
         // Destination is a local client, initiator is external: the proof
-        // leaving the instance gets the delta (Transport.py:2222).
+        // leaving the instance gets the delta (Transport.py).
         let (mut actor, _tx) = TransportActor::new();
         actor.local_hops_delta = 6;
         actor.is_transport_enabled = true;
@@ -9051,7 +9051,7 @@ mod tests {
     #[test]
     fn local_hops_delta_reverse_proof_exclusions() {
         // Proof originated by a local client heading to an external requester
-        // gets the delta (Transport.py:2287).
+        // gets the delta (Transport.py).
         let (mut actor, _tx) = TransportActor::new();
         actor.local_hops_delta = 6;
         actor.is_transport_enabled = true;
@@ -9103,7 +9103,7 @@ mod tests {
 
     #[test]
     fn local_hops_delta_strips_transport_header_on_local_client_delivery() {
-        // Transport.py:1613-1619: with the delta active, HEADER_2 frames
+        // Transport.py: with the delta active, HEADER_2 frames
         // delivered to a local shared client lose their transport headers.
         let (mut actor, _tx) = TransportActor::new();
         actor.local_hops_delta = 6;
@@ -9149,7 +9149,7 @@ mod tests {
     }
 
     // Shared snapshot consumed by the runtime link layer for the Python 1.3.8
-    // Link.py:966-968 blackholed-identity link teardown.
+    // Link.py blackholed-identity link teardown.
     #[test]
     fn blackhole_snapshot_tracks_rpc_mutations() {
         let (mut actor, _tx) = TransportActor::new();
@@ -10076,7 +10076,7 @@ mod tests {
         );
     }
 
-    /// Python 1.3.8 Packet.py:247-248: raw hops byte >= PATHFINDER_M is
+    /// Python 1.3.8 Packet.py: raw hops byte >= PATHFINDER_M is
     /// malformed for every packet type; 127 is the maximum valid value.
     #[test]
     fn inbound_hop_count_at_or_above_max_is_dropped_for_all_packet_types() {
@@ -10560,7 +10560,7 @@ mod tests {
         else {
             panic!("receipt not delivered");
         };
-        // Packet.py:505,529@1.6.0: the receipt keeps the proof packet.
+        // Packet.py: the receipt keeps the proof packet.
         assert_eq!(
             proof_hash,
             Some(rns_wire::hash::packet_hash(
@@ -10651,7 +10651,7 @@ mod tests {
         );
     }
 
-    /// Python 1.3.8 Transport.py:1216-1218: mode-independent block when the
+    /// Python 1.3.8 Transport.py: mode-independent block when the
     /// destination is not instance-local and no next-hop interface exists.
     #[test]
     fn announce_broadcast_blocked_without_next_hop_interface_unless_local() {
@@ -10679,7 +10679,7 @@ mod tests {
         );
     }
 
-    /// Python 1.3.8 Transport.py:1220-1236: internal-mode egress and
+    /// Python 1.3.8 Transport.py: internal-mode egress and
     /// announces_from_internal origin gating.
     #[test]
     fn internal_mode_announce_gating_matches_python_138() {
@@ -10715,7 +10715,7 @@ mod tests {
             "full egress relays boundary-origin announces"
         );
 
-        // Transport.py:1711@1.6.0: a boundary origin with announces_to_internal
+        // Transport.py: a boundary origin with announces_to_internal
         // set passes internal egress.
         actor.interfaces.get_mut(&1).unwrap().announces_to_internal = Some(true);
         actor.broadcast_announce_on_interfaces(&raw_b, None);
@@ -10767,7 +10767,7 @@ mod tests {
         );
     }
 
-    /// Python 1.3.8 Transport.py:1219-1221: announces_from_internal=False on
+    /// Python 1.3.8 Transport.py: announces_from_internal=False on
     /// the egress interface blocks internal-origin announces, ordered before
     /// the egress-mode gates.
     #[test]
@@ -10815,9 +10815,9 @@ mod tests {
         );
     }
 
-    /// Python 1.3.8 Transport.py:2946-2947 (commit 03ddb082): recursive_prs
+    /// Python 1.3.8 Transport.py (commit 03ddb082): recursive_prs
     /// forces unknown-path discovery independent of interface mode; Internal
-    /// joins DISCOVER_PATHS_FOR (Interface.py:55).
+    /// joins DISCOVER_PATHS_FOR (Interface.py).
     #[test]
     fn recursive_prs_option_forces_unknown_path_discovery() {
         assert!(mode_discovers_unknown_paths(InterfaceMode::Internal));
@@ -10846,7 +10846,7 @@ mod tests {
         );
     }
 
-    /// Python 1.3.8 Transport.py:2685-2697: next_hop/next_hop_interface fall
+    /// Python 1.3.8 Transport.py: next_hop/next_hop_interface fall
     /// back to the transport identity / shared-instance interface for
     /// instance-local destinations.
     #[test]
@@ -10939,7 +10939,7 @@ mod tests {
         ));
     }
 
-    /// Python 1.3.8 Transport.py:2984: a cached announce that fails to unpack
+    /// Python 1.3.8 Transport.py: a cached announce that fails to unpack
     /// is a miss — no path response is synthesized from raw bytes.
     #[test]
     fn path_response_from_unparseable_cached_announce_is_a_miss() {
@@ -11317,7 +11317,7 @@ mod tests {
     }
 
     /// Python 1.5 counts a path request only once its tag passes the
-    /// duplicate gate (Transport.py:1847-1858), where 1.4 counted every one.
+    /// duplicate gate (Transport.py), where 1.4 counted every one.
     #[test]
     fn duplicate_path_requests_do_not_count_toward_ingress_frequency() {
         let (mut actor, _tx) = TransportActor::new();

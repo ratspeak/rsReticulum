@@ -543,7 +543,7 @@ impl PersistentRatchetRing {
         let mut ring = if self.path.is_file() {
             RatchetRing::load_verified(&self.path, identity)?.into_ring()
         } else {
-            // Destination.py:569-573: a missing file is re-initialised as an empty ring.
+            // Destination.py: a missing file is re-initialised as an empty ring.
             let ring = RatchetRing::new();
             ring.save_verified(&self.path, identity)?;
             ring

@@ -158,7 +158,7 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
         );
     }
 
-    // Publisher files are written only when fetched (Discovery.py:938-943).
+    // Publisher files are written only when fetched (Discovery.py).
     if let Some(local_identity_hash) = snapshot.transport_identity_hash {
         let blackhole_dir = dir.join("blackhole");
         if let Err(e) = crate::persistence::save_local_blackhole_file(
@@ -331,7 +331,7 @@ impl TransportActor {
     /// Full persist of routing state, known destinations and the hashlist
     /// (Python `Reticulum.__persist_data`), off-actor.
     pub(super) fn persist_data_async(&mut self) {
-        // Reticulum.py:1415@1.6.0: a persist already running skips this one untimed.
+        // Reticulum.py: a persist already running skips this one untimed.
         if self
             .routing_save_in_flight
             .load(std::sync::atomic::Ordering::Acquire)
@@ -703,7 +703,7 @@ impl TransportActor {
             return;
         };
         let now_ts = now();
-        // Python defers the first announce-cache clean (Transport.py:509).
+        // Python defers the first announce-cache clean (Transport.py).
         self.last_announce_cache_sweep = now_ts + ANNOUNCE_CACHE_SWEEP_DEFER;
 
         // Python destination_table — canonical interop shape. Defer interface
@@ -759,7 +759,7 @@ impl TransportActor {
                                 interface_name: cached.interface_reference.clone(),
                                 interface_hash: Some(pe.interface_hash.to_vec()),
                                 packet_hash: Some(pe.packet_hash.to_vec()),
-                                // Transport.py:557@1.6.0: a legacy row loads as used now.
+                                // Transport.py: a legacy row loads as used now.
                                 used: Some(pe.used.unwrap_or(now_ts)),
                             });
                         self.recent_announces
@@ -861,7 +861,7 @@ impl TransportActor {
 
         // Python tunnels — canonical interop shape. A path loads only when
         // its cached announce is present, and every tunnel loads unbound
-        // until a synthesis rebinds it (Transport.py:462-499).
+        // until a synthesis rebinds it (Transport.py).
         let python_tunnels_path = dir.join("tunnels");
         let loaded_python_tunnel_table = if python_tunnels_path.exists() {
             match crate::persistence::load_python_tunnel_table(&python_tunnels_path) {
@@ -912,7 +912,7 @@ impl TransportActor {
                                     .map(|blob| blob.to_vec())
                                     .collect(),
                                 packet_hash: Some(tp.packet_hash.to_vec()),
-                                // Transport.py:617@1.6.0: a legacy row loads as used now.
+                                // Transport.py: a legacy row loads as used now.
                                 used: Some(tp.used.unwrap_or(now_ts)),
                             });
                             self.recent_announces
@@ -1071,7 +1071,7 @@ impl TransportActor {
     }
 
     /// Write `blackhole/local` now, as upstream does on every local change
-    /// (Transport.py:4489-4491, 4512-4514).
+    /// (Transport.py).
     pub(super) fn persist_local_blackhole(&mut self) {
         if self.shared_instance_client_mode {
             return;

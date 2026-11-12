@@ -38,12 +38,12 @@ pub struct DiscoveryInterfaceConfig {
     /// uses [`ANNOUNCE_JOB_INTERVAL_SECS`]; zero permits immediate preparation.
     pub announce_interval_secs: u64,
     /// Sender's generation target (`discovery_stamp_value`); 0 means
-    /// [`DEFAULT_STAMP_VALUE`] (Discovery.py:134). A value outside `0..=100`
+    /// [`DEFAULT_STAMP_VALUE`] (Discovery.py). A value outside `0..=100`
     /// cannot be generated and the interface is not announced. Raising this
     /// through `reconfigure` alone does not invalidate an unchanged stamp.
     pub stamp_value: f64,
     /// Announce and path-request costs required on this interface, advertised
-    /// as `DST_COST` / `PR_COST` (Discovery.py:171-172).
+    /// as `DST_COST` / `PR_COST` (Discovery.py).
     pub dst_cost: Option<f64>,
     pub pr_cost: Option<f64>,
     /// Endpoint address (IP / host / I2P b32) — optional.
@@ -118,7 +118,7 @@ impl DiscoveryInterfaceConfig {
             .any(|t| *t == self.interface_type)
     }
 
-    /// The value stamps are generated at (Discovery.py:134).
+    /// The value stamps are generated at (Discovery.py).
     pub fn effective_stamp_value(&self) -> f64 {
         if self.stamp_value == 0.0 {
             DEFAULT_STAMP_VALUE
@@ -185,7 +185,7 @@ pub enum SkipReason {
     /// search), or its stamp had the wrong length.
     StampGenerationFailed,
     /// The effective stamp value is outside `0..=100` or not a number, which
-    /// upstream refuses to generate (Stamps.py:255).
+    /// upstream refuses to generate (Stamps.py).
     StampValueOutOfRange,
     /// Encryption requested but no encryptor supplied to preparation.
     EncryptorMissing,
@@ -356,7 +356,7 @@ impl Announcer {
             let target_value = state.config.effective_stamp_value();
             if !(0.0..=STAMP_COST_CAP).contains(&target_value) {
                 // Upstream consumes the interval before generating, so this is
-                // reported once per interval (Discovery.py:110-121).
+                // reported once per interval (Discovery.py).
                 state.last_announce_at = Some(now);
                 tracing::error!(
                     interface_id = id,
@@ -685,7 +685,7 @@ mod tests {
     }
 
     /// The announcer names its own stack and version, as Python names "RNS"
-    /// and its `__version__` (Discovery.py:46-47, :173-174).
+    /// and its `__version__` (Discovery.py).
     #[test]
     fn announces_name_the_rust_implementation_and_its_version() {
         let mut a = Announcer::new(static_stamper());

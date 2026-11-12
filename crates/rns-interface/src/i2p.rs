@@ -268,7 +268,7 @@ async fn sam_session_create<R: AsyncRead + Unpin>(
 
 /// i2plib `stream_connect` resolves a destination ending in `.i2p` with
 /// `NAMING LOOKUP` on its own SAM connection and connects to the full key
-/// (RNS/vendor/i2plib/aiosam.py:34-50, :120-121).
+/// (RNS/vendor/i2plib/aiosam.py).
 async fn sam_resolve_destination(
     sam_host: &str,
     sam_port: u16,
@@ -388,7 +388,7 @@ async fn connect_to_sam(sam_host: &str, sam_port: u16) -> Result<TcpStream, SamE
     let addr = format!("{}:{}", sam_host, sam_port);
     let stream = TcpStream::connect(&addr).await.map_err(SamError::Io)?;
     let _ = stream.set_nodelay(true);
-    // Python's per-platform I2P peer timeouts (I2PInterface.py:443-455).
+    // Python's per-platform I2P peer timeouts (I2PInterface.py).
     crate::tcp::set_tcp_keepalive_tuned(&stream, true);
     Ok(stream)
 }
@@ -452,7 +452,7 @@ impl I2PServerConfig {
 }
 
 /// i2plib's signature type for new destinations, EdDSA-SHA512-Ed25519
-/// (RNS/vendor/i2plib/sam.py:91-93).
+/// (RNS/vendor/i2plib/sam.py).
 const NEW_DESTINATION_SIGNATURE_TYPE: u8 = 7;
 
 /// The stored key, `None` when there is none yet, read into buffers that are
@@ -483,7 +483,7 @@ fn store_private_key(path: &std::path::Path, key: &str) -> std::io::Result<()> {
 
 /// The b32 address of the destination in a SAM private key: the hash of its
 /// first 387 bytes plus its certificate (i2plib `Destination.base32`,
-/// RNS/vendor/i2plib/sam.py:113-129).
+/// RNS/vendor/i2plib/sam.py).
 pub fn destination_b32(private_key: &str) -> Option<String> {
     let key = i2p_base64_decode(private_key)?;
     let certificate = usize::from(u16::from_be_bytes(key.get(385..387)?.try_into().ok()?));
@@ -568,7 +568,7 @@ impl I2PClientConfig {
         }
     }
 
-    /// Python `str(I2PInterfacePeer)` (I2PInterface.py:714-715).
+    /// Python `str(I2PInterfacePeer)` (I2PInterface.py).
     pub fn python_name(&self) -> String {
         format!("I2PInterfacePeer[{}]", self.name)
     }
@@ -780,7 +780,7 @@ pub async fn spawn_i2p_client(
             );
 
             pacer.reset();
-            // Python synthesizes on every connection (I2PInterface.py:503,
+            // Python synthesizes on every connection (I2PInterface.py,
             // :533).
             let synthesis = config
                 .tunnel_identity
@@ -1496,7 +1496,7 @@ mod tests {
     }
 
     /// Only the destination, keys plus certificate, names the address
-    /// (i2plib sam.py:113-129); the golden is checked against i2plib in tests.
+    /// (i2plib sam.py); the golden is checked against i2plib in tests.
     #[test]
     fn the_b32_address_hashes_only_the_destination() {
         let ed25519 = [5, 0, 4, 0, 7, 0, 0];

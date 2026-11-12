@@ -1,5 +1,5 @@
 //! Node configuration: `ReticulumGitNode.__init__` and `__apply_config`
-//! (`server.py:2018-2249@1.6.0`).
+//! (`server.py`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use super::perms::{ALL_TGTS, resolve_identity_alias};
 use super::py_len;
 
 /// The file upstream writes when the config directory has none
-/// (`__default_rngit_config__`, `server.py:4913-5080`).
+/// (`__default_rngit_config__`, `server.py`).
 pub const DEFAULT_CONFIG: &str = include_str!("default_config.txt");
 
 pub const DEFAULT_NODE_NAME: &str = "Anonymous Git Node";
@@ -177,7 +177,7 @@ impl NodeConfig {
 }
 
 /// The config directory as `ReticulumGitNode.__init__` picks it
-/// (`server.py:2021-2028`).
+/// (`server.py`).
 pub fn resolve_config_dir(configdir: Option<&Path>) -> PathBuf {
     if let Some(dir) = configdir {
         return dir.to_path_buf();
@@ -195,7 +195,7 @@ pub fn resolve_config_dir(configdir: Option<&Path>) -> PathBuf {
 }
 
 /// The config text, writing [`DEFAULT_CONFIG`] first when the file is
-/// missing (`__create_default_config`, `server.py:2070-2075`).
+/// missing (`__create_default_config`, `server.py`).
 pub fn read_or_create_config(configdir: &Path) -> std::io::Result<String> {
     let path = configdir.join("config");
     if path.is_file() {

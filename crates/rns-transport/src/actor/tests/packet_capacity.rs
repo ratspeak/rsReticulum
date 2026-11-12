@@ -78,7 +78,7 @@ fn packet_capacity_opaque_modes_relay_unless_a_clamp_is_needed() {
             vec![0x42; 64]
         );
     }
-    // A sub-base offer is relayed without a range check (Transport.py:2338-2361).
+    // A sub-base offer is relayed without a range check (Transport.py).
     for mtu in [1, 499] {
         let exact = payload(1, mtu);
         assert_eq!(
@@ -116,7 +116,7 @@ fn packet_capacity_checks_clear_and_wire_with_ifac_before_admission() {
     let (tx, mut messages) = mpsc::channel(4);
     actor.local_destinations.insert(dest);
     actor.destination_channels.insert(dest, tx);
-    // Transport.py:2014@1.6.0 bounds the IFAC-stripped frame by HW_MTU + ifac_size.
+    // Transport.py bounds the IFAC-stripped frame by HW_MTU + ifac_size.
     let mut clear = make_data_packet(dest, 0).to_vec();
     clear.resize(508 + 8, 0);
     ingress(

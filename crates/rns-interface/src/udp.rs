@@ -50,7 +50,7 @@ impl UdpInterfaceConfig {
 }
 
 /// Python `get_broadcast_for_if`: the network broadcast of the device's first
-/// IPv4 address, computed from its prefix (UDPInterface.py:50-54, netinfo.py:66-70).
+/// IPv4 address, computed from its prefix (UDPInterface.py, netinfo.py).
 fn broadcast_for_device(device: &str) -> Option<std::net::Ipv4Addr> {
     if_addrs::get_if_addrs()
         .ok()?
@@ -93,7 +93,7 @@ pub async fn spawn_udp_interface(
     }
 
     // Python listens only when both the address and the port are known, and
-    // otherwise stays offline, so transport never sends on it (UDPInterface.py:90-108).
+    // otherwise stays offline, so transport never sends on it (UDPInterface.py).
     let socket = match (listen_ip_cfg.as_deref(), config.listen_port) {
         (Some(ip), Some(port)) => {
             let socket = UdpSocket::bind((ip, port)).await?;
@@ -108,7 +108,7 @@ pub async fn spawn_udp_interface(
     let online2 = online.clone();
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
     let name = config.name.clone();
-    // UDPInterface.py:141-142 renders the bind address as configured.
+    // UDPInterface.py renders the bind address as configured.
     let shown_port = match &socket {
         Some(socket) => socket.local_addr()?.port(),
         None => config.listen_port.unwrap_or(0),
@@ -147,8 +147,8 @@ pub async fn spawn_udp_interface(
     };
 
     // Sends use their own broadcast socket, as Python's per-send socket does,
-    // so send errors never reach the listener (UDPInterface.py:131-140).
-    // Transport skips an offline interface (Transport.py:1676), so a
+    // so send errors never reach the listener (UDPInterface.py).
+    // Transport skips an offline interface (Transport.py), so a
     // forward-only interface never transmits either.
     let send_socket = match forward_addr {
         Some(_) if listening => {

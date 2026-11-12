@@ -1,6 +1,6 @@
 //! Destination-type announce filtering, Python `Transport` `blocked_destination_types`,
 //! `allowed_destination_types`, `client_destination_types` and
-//! `required_destinations_only` (Transport.py:267-272, 4620-4695).
+//! `required_destinations_only` (Transport.py).
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,7 +11,7 @@ pub const NAME_HASH_LEN: usize = 10;
 
 pub type NameHash = [u8; NAME_HASH_LEN];
 
-/// The `[filter]` configuration (Reticulum.py:487-503).
+/// The `[filter]` configuration (Reticulum.py).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterPolicy {
     pub required_only: bool,
@@ -35,7 +35,7 @@ impl Default for FilterPolicy {
 }
 
 impl FilterPolicy {
-    /// Python clamps `hop_limiter` to `0..=PATHFINDER_M` (Reticulum.py:503).
+    /// Python clamps `hop_limiter` to `0..=PATHFINDER_M` (Reticulum.py).
     pub fn clamp_hop_limiter(value: i64) -> u8 {
         value.clamp(0, i64::from(crate::constants::PATHFINDER_M)) as u8
     }
@@ -140,7 +140,7 @@ impl DestinationTypeFilter {
         self.names.get(hash).map_or("unknown", String::as_str)
     }
 
-    /// The decision inside Python `Transport.inbound` (Transport.py:2035-2041),
+    /// The decision inside Python `Transport.inbound` (Transport.py),
     /// given the wire hop count before the inbound increment.
     pub fn admits(&self, hash: &NameHash, source: AnnounceSource, wire_hops: u8) -> bool {
         if self.blocked.contains(hash) {

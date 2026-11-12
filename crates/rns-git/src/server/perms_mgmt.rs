@@ -1,5 +1,5 @@
 //! `/mgmt/perms`: group and repository permission files
-//! (`handle_perms` and helpers, `server.py:4443-4643@1.6.0`).
+//! (`handle_perms` and helpers, `server.py`).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -24,7 +24,7 @@ fn py_strip(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
 }
 
-/// The validation every permission setter runs (`server.py:4380-4393`,
+/// The validation every permission setter runs (`server.py`,
 /// `4504-4517`): the first statement that does not parse, by 1-based line.
 pub(crate) fn invalid_line(content: &str, aliases: &BTreeMap<String, String>) -> Option<String> {
     for (number, line) in py_splitlines(content).into_iter().enumerate() {
@@ -114,7 +114,7 @@ fn write_allowed(path: &Path, content: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// `_group_permissions` and its steps (`server.py:4473-4547`).
+/// `_group_permissions` and its steps (`server.py`).
 fn group_permissions(
     repos: &RwLock<Repositories>,
     config: &NodeConfig,
@@ -158,7 +158,7 @@ fn group_permissions(
     Ok(vec![RES_OK])
 }
 
-/// `update_repository_permissions` (`server.py:2604-2619`): the repository
+/// `update_repository_permissions` (`server.py`): the repository
 /// file alone replaces the repository's lists.
 fn update_repository_permissions(repos: &mut Repositories, group: &str, repository: &str) {
     let aliases = repos.aliases.clone();
@@ -179,7 +179,7 @@ fn update_repository_permissions(repos: &mut Repositories, group: &str, reposito
     }
 }
 
-/// `_repository_permissions` and its steps (`server.py:4549-4635`). Setting
+/// `_repository_permissions` and its steps (`server.py`). Setting
 /// takes group READ and ADMIN on top of repository ADMIN.
 fn repository_permissions(
     repos: &RwLock<Repositories>,
@@ -229,7 +229,7 @@ fn repository_permissions(
     Ok(vec![RES_OK])
 }
 
-/// `handle_perms` (`server.py:4443-4471`).
+/// `handle_perms` (`server.py`).
 pub fn handle_perms(
     repos: &RwLock<Repositories>,
     config: &NodeConfig,

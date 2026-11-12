@@ -1,5 +1,5 @@
 //! Link request stamps: the initiator's X25519 key is a stamp over the
-//! destination hash and its Ed25519 key (RNS/Link.py:187-200, :344-382@1.6.0).
+//! destination hash and its Ed25519 key (RNS/Link.py).
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use crate::handshake::EphemeralKeys;
 
 const KEYSTAMP_POOLING_THRESHOLD: f64 = 10.0;
 
-/// The link request stamping switches an initiator reads (Transport.py:196-205@1.6.0).
+/// The link request stamping switches an initiator reads (Transport.py).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LinkStampPolicy {
     /// Python `STAMP_LRS`.
@@ -42,14 +42,14 @@ impl Default for LinkStampPolicy {
 
 impl LinkStampPolicy {
     /// The cost to stamp a request at, given the destination's recalled link
-    /// cost; `None` means unstamped keys (Link.py:310-313).
+    /// cost; `None` means unstamped keys (Link.py).
     pub fn request_cost(&self, recalled: Option<f64>) -> Option<f64> {
         let cost = recalled.or(self.always_stamp_lrs.then_some(self.lr_cost))?;
         (cost != 0.0 && self.stamp_lrs).then_some(cost)
     }
 
     /// A stop control whose deadline is `timeout` from now. Costs from 10 up
-    /// use every CPU, as Python pools keystamp work there (Stamps.py:336@1.6.0).
+    /// use every CPU, as Python pools keystamp work there (Stamps.py).
     pub fn control(&self, cost: f64) -> StampControl {
         let threads = if cost >= KEYSTAMP_POOLING_THRESHOLD {
             std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
@@ -113,7 +113,7 @@ impl LinkRequestStamper {
     }
 
     /// Create an initiator Link with a stamped request where upstream stamps
-    /// one, signalling `signalled_mtu` (Link.py:392-397@1.6.0). Blocks the
+    /// one, signalling `signalled_mtu` (Link.py). Blocks the
     /// calling thread while grinding, up to the policy timeout.
     pub fn new_initiator(
         &self,

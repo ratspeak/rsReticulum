@@ -1,4 +1,4 @@
-//! The Nomad Network page node (`RNS/Utilities/rngit/pages.py@1.6.0`).
+//! The Nomad Network page node (`RNS/Utilities/rngit/pages.py`).
 
 mod chart;
 mod files;
@@ -108,7 +108,7 @@ const PLAIN_TEMPLATES: [&str; 12] = [
     "work", "work_doc",
 ];
 
-/// The `[pages]` keys `NomadNetworkNode.__init__` reads (`pages.py:159-177`).
+/// The `[pages]` keys `NomadNetworkNode.__init__` reads (`pages.py`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageOptions {
     pub use_nerdfonts: bool,
@@ -400,7 +400,7 @@ impl PageNode {
         }
     }
 
-    /// `render_template` (`pages.py:292-313`).
+    /// `render_template` (`pages.py`).
     pub(crate) fn render(
         &self,
         page_content: &str,

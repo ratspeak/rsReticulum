@@ -84,7 +84,7 @@ impl KeepaliveState {
 
     pub(crate) fn should_send_keepalive_at(&self, now: Instant) -> bool {
         // Upstream's responder answers only when a full interval has passed
-        // since its own last packet (Link.py:1219@1.6.0), which is its reply
+        // since its own last packet (Link.py), which is its reply
         // to the previous keepalive: a request sent exactly on the interval
         // arrives a moment early by the responder's clock and gets no reply.
         let interval = self.keepalive_interval.mul_f64(1.0 + KEEPALIVE_SEND_MARGIN);
@@ -124,7 +124,7 @@ impl KeepaliveState {
 
     pub(crate) fn is_stale_at(&self, now: Instant) -> bool {
         // The initiator's watchdog runs on the stretched interval, so its second
-        // keepalive and the STALE transition still share one pass (Link.py:836-843).
+        // keepalive and the STALE transition still share one pass (Link.py).
         let stale_time = if self.is_initiator {
             self.stale_time.mul_f64(1.0 + KEEPALIVE_SEND_MARGIN)
         } else {

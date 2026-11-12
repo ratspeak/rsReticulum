@@ -1,5 +1,5 @@
 //! `rngit work` (`ReticulumGitClient.work_*` and the editor helpers,
-//! `server.py:1347-1923@1.6.0`).
+//! `server.py`).
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -15,12 +15,12 @@ use super::releases::{Connect, Fail, Remote, Response};
 use crate::server::client::{ClientConfig, client_config_dir};
 use crate::server::{APP_NAME, IDX_REPOSITORY};
 
-/// `COMMENT_TEMPLATE`, `CREATE_DOC_TEMPLATE` and `PERMISSIONS_TEMPLATE` (`server.py:5086-5088`).
+/// `COMMENT_TEMPLATE`, `CREATE_DOC_TEMPLATE` and `PERMISSIONS_TEMPLATE` (`server.py`).
 pub const COMMENT_TEMPLATE: &str = "# Remove this line and enter your update. Save and exit when done, or save an empty document to abort abort.";
 pub const CREATE_DOC_TEMPLATE: &str = "# Remove this line and enter your document content. Save and exit when done, or save an empty document to abort abort.";
 pub const PERMISSIONS_TEMPLATE: &str = "# No permissions are currently defined for this entity. Add them below, and save and exit when you are done.";
 
-/// The `rngit work` operations (`server.py:112-122`).
+/// The `rngit work` operations (`server.py`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkOp {
     List,
@@ -228,7 +228,7 @@ fn py_strip(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
 }
 
-/// `_edit_work_content` (`server.py:1844-1887`): template lines are dropped,
+/// `_edit_work_content` (`server.py`): template lines are dropped,
 /// the rest stripped; empty is None.
 pub fn edit_work_content(out: &mut dyn Write, content: &str, is_comment: bool) -> Option<String> {
     let editor = find_editor(out)?;
@@ -259,7 +259,7 @@ pub fn edit_work_content(out: &mut dyn Write, content: &str, is_comment: bool) -
     }
 }
 
-/// `_edit_permissions` (`server.py:1889-1923`): the file as saved, even empty.
+/// `_edit_permissions` (`server.py`): the file as saved, even empty.
 pub fn edit_permissions(out: &mut dyn Write, content: &str) -> Option<String> {
     let editor = find_editor(out)?;
     let template = if content.is_empty() {
@@ -284,7 +284,7 @@ fn request(repo_path: &str, fields: Vec<(&str, Value)>) -> Value {
 
 const CLEAR: &str = "\r                       \r";
 
-/// `work_list` after the Link is up (`server.py:1359-1402`).
+/// `work_list` after the Link is up (`server.py`).
 fn work_list(
     out: &mut dyn Write,
     remote: &mut dyn Remote,
@@ -377,7 +377,7 @@ fn work_list(
     Ok(())
 }
 
-/// `work_view` after the Link is up (`server.py:1416-1477`).
+/// `work_view` after the Link is up (`server.py`).
 fn work_view(
     out: &mut dyn Write,
     remote: &mut dyn Remote,
@@ -486,7 +486,7 @@ fn result_field(body: &[u8], key: &str, context: &str) -> Result<String, Fail> {
         .ok_or_else(|| Fail::Abort(format!("{context}: '{key}'")))
 }
 
-/// `work_create` and `work_propose` after the Link is up (`server.py:1491-1567`).
+/// `work_create` and `work_propose` after the Link is up (`server.py`).
 fn work_new(
     out: &mut dyn Write,
     remote: &mut dyn Remote,
@@ -539,7 +539,7 @@ fn work_new(
     Ok(())
 }
 
-/// `work_edit` after the Link is up (`server.py:1581-1621`).
+/// `work_edit` after the Link is up (`server.py`).
 fn work_edit(
     out: &mut dyn Write,
     remote: &mut dyn Remote,
@@ -590,7 +590,7 @@ fn work_edit(
     Ok(())
 }
 
-/// `work_delete` after the Link is up (`server.py:1635-1661`).
+/// `work_delete` after the Link is up (`server.py`).
 fn work_delete(
     out: &mut dyn Write,
     input: &mut dyn BufRead,
@@ -626,7 +626,7 @@ fn work_delete(
     Ok(())
 }
 
-/// `work_comment` after the Link is up (`server.py:1675-1704`).
+/// `work_comment` after the Link is up (`server.py`).
 fn work_comment(
     out: &mut dyn Write,
     remote: &mut dyn Remote,
@@ -658,7 +658,7 @@ fn work_comment(
     Ok(())
 }
 
-/// `work_complete` and `work_activate` after the Link is up (`server.py:1718-1782`).
+/// `work_complete` and `work_activate` after the Link is up (`server.py`).
 fn work_move(
     out: &mut dyn Write,
     remote: &mut dyn Remote,
@@ -686,7 +686,7 @@ fn work_move(
 }
 
 /// The get, edit and set round of every permissions command
-/// (`server.py:1255-1287`, `1796-1834`).
+/// (`server.py`).
 pub(crate) fn edit_remote_permissions(
     out: &mut dyn Write,
     remote: &mut dyn Remote,
@@ -709,7 +709,7 @@ pub(crate) fn edit_remote_permissions(
 }
 
 /// `rngit work <repository> <operation>` once Reticulum is up
-/// (`server.py:106-122`, `1347-1838`). `Ok` is the exit code.
+/// (`server.py`). `Ok` is the exit code.
 pub fn run_work(
     out: &mut dyn Write,
     input: &mut dyn BufRead,

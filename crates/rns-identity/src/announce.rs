@@ -310,7 +310,7 @@ impl AnnounceData {
     }
 }
 
-/// Trailing announce stamp extension: marker, flags, stamp, lr_cost (Identity.py:86-90).
+/// Trailing announce stamp extension: marker, flags, stamp, lr_cost (Identity.py).
 pub const ANNOUNCE_EXT_LENGTH: usize = 18;
 pub const ANNOUNCE_EXT_HEADER_LENGTH: usize = 2;
 pub const ANNOUNCE_EXT_MARKER: u8 = 0xC1;
@@ -329,7 +329,7 @@ pub struct AnnounceStampExt {
 }
 
 impl AnnounceStampExt {
-    /// `0xC1 | flags | stamp | cost_bytes[1] | cost_bytes[0]` (Destination.py:351-352).
+    /// `0xC1 | flags | stamp | cost_bytes[1] | cost_bytes[0]` (Destination.py).
     pub fn encode(&self) -> Result<[u8; ANNOUNCE_EXT_LENGTH], crate::stamps::StampError> {
         let cost = crate::stamps::cost_to_bytes(self.lr_cost)?;
         let mut ext = [0u8; ANNOUNCE_EXT_LENGTH];
@@ -400,7 +400,7 @@ pub enum AnnounceExtParse<'a> {
     Present(AnnounceExt<'a>),
 }
 
-/// Parse the last 18 bytes of app_data as a stamp extension (Identity.py:840-856).
+/// Parse the last 18 bytes of app_data as a stamp extension (Identity.py).
 pub fn parse_announce_ext(app_data: Option<&[u8]>) -> AnnounceExtParse<'_> {
     let Some(app_data) = app_data else {
         return AnnounceExtParse::Absent;
@@ -455,7 +455,7 @@ impl AnnounceStampCheck {
 }
 
 impl AnnounceData {
-    /// Check the stamp extension against `required_value` (Identity.py:840-870).
+    /// Check the stamp extension against `required_value` (Identity.py).
     /// The workblock is `destination_hash || public_key || name_hash`, unexpanded.
     pub fn check_stamp(
         &self,

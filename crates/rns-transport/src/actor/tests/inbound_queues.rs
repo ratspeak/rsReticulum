@@ -1,4 +1,4 @@
-//! Per-class inbound queues (Transport.py:50-97, :2133-2134, :2165-2170).
+//! Per-class inbound queues (Transport.py).
 use super::*;
 use crate::inbound_queues::{InboundQueueLengths, Queued, TrafficClass};
 
@@ -153,7 +153,7 @@ fn path_requests_during_a_path_request_burst_wait_behind_every_other_class() {
 
 /// Python decides at preprocess time and passes `ingress_limited` into
 /// `path_request`, so a queued ingress-limited request is never forwarded
-/// recursively even if the burst ended meanwhile (Transport.py:3761, :3777, :3903).
+/// recursively even if the burst ended meanwhile (Transport.py).
 #[test]
 fn an_ingress_limited_path_request_is_not_forwarded_recursively() {
     for (class, forwarded) in [

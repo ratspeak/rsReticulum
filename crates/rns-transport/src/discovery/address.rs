@@ -1,5 +1,5 @@
 //! Endpoint checks upstream applies to `reachable_on`: `is_ip_address` and
-//! `is_hostname` (RNS/Discovery.py:982-1007@1.6.0). Upstream uses them on
+//! `is_hostname` (RNS/Discovery.py). Upstream uses them on
 //! receive, before announcing and when listing stored records.
 
 use std::net::{Ipv4Addr, Ipv6Addr};

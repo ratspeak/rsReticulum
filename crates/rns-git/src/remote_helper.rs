@@ -1,5 +1,5 @@
 //! `git-remote-rns`, the git remote helper for `rns://` URLs
-//! (`RNS/Utilities/rngit/client.py@1.6.0`), without the network part.
+//! (`RNS/Utilities/rngit/client.py`), without the network part.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -15,18 +15,18 @@ use crate::server::{
     IDX_REPOSITORY, IDX_RESULT_CODE, PATH_DELETE, PATH_FETCH, PATH_LIST, PATH_PUSH,
 };
 
-/// The file written when the config directory has none (`client.py:681-718`).
+/// The file written when the config directory has none (`client.py`).
 pub const DEFAULT_CLIENT_CONFIG: &str = include_str!("client_default_config.txt");
 
 pub const REF_BATCH_SIZE: usize = 25;
 pub const PATH_TIMEOUT: f64 = 15.0;
-/// `send_request`'s default timeout, used for every request (`client.py:310`).
+/// `send_request`'s default timeout, used for every request (`client.py`).
 pub const REQUEST_TIMEOUT: f64 = 7200.0;
 
 const LOG_NONE: i64 = -1;
 const LOG_EXTREME: i64 = 8;
 
-/// The parts of an `rns://<destination>/<group>/<repo>` URL (`client.py:60-71`).
+/// The parts of an `rns://<destination>/<group>/<repo>` URL (`client.py`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelperUrl {
     pub destination: String,
@@ -35,7 +35,7 @@ pub struct HelperUrl {
 }
 
 impl HelperUrl {
-    /// The repository path sent on the wire (`client.py:117`).
+    /// The repository path sent on the wire (`client.py`).
     pub fn repo_path(&self) -> String {
         format!("{}/{}", self.group, self.repo)
     }
@@ -64,7 +64,7 @@ pub fn parse_args(args: &[String]) -> Result<HelperUrl, (String, i32)> {
     })
 }
 
-/// The config directory (`client.py:134-137`). When `~/.config/rngit/config`
+/// The config directory (`client.py`). When `~/.config/rngit/config`
 /// exists upstream picks `~/.rngit/reticulum`, not `~/.config/rngit`.
 pub fn resolve_config_dir(configdir: Option<&Path>, home: &Path) -> PathBuf {
     if let Some(dir) = configdir {
@@ -78,7 +78,7 @@ pub fn resolve_config_dir(configdir: Option<&Path>, home: &Path) -> PathBuf {
     }
 }
 
-/// What `__apply_config` takes from `client_config` (`client.py:168-187`).
+/// What `__apply_config` takes from `client_config` (`client.py`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     pub ref_batch_size: usize,
@@ -164,7 +164,7 @@ impl ClientConfig {
         })
     }
 
-    /// `__resolve_destination_alias` (`client.py:206-215`): a 32-character hex
+    /// `__resolve_destination_alias` (`client.py`): a 32-character hex
     /// string as given, else a configured alias, else the input unchanged.
     pub fn resolve_destination(&self, destination: &str) -> String {
         if is_hash_hex(destination) {
@@ -177,7 +177,7 @@ impl ClientConfig {
     }
 }
 
-/// Load `client_identity`, creating it when missing (`client.py:189-196`).
+/// Load `client_identity`, creating it when missing (`client.py`).
 /// A new identity that cannot be saved is still used, as upstream does.
 pub fn load_or_create_identity(path: &Path) -> Option<Identity> {
     if path.is_file() {
@@ -248,7 +248,7 @@ impl Abort {
     }
 }
 
-/// `escape_for_stdout` (`client.py:451-464`), per code point.
+/// `escape_for_stdout` (`client.py`), per code point.
 pub fn escape_for_stdout(value: &str) -> String {
     let mut out = String::from("\"");
     for c in value.chars() {
@@ -377,7 +377,7 @@ impl<T: Transport> RemoteHelper<T> {
             .ok_or_else(|| Abort::new("Request failed or timed out"))
     }
 
-    /// The command loop (`client.py:337-421`), from `run()` after the link is up.
+    /// The command loop (`client.py`), from `run()` after the link is up.
     pub fn run(
         &mut self,
         stdin: &mut dyn BufRead,
@@ -464,7 +464,7 @@ impl<T: Transport> RemoteHelper<T> {
         Ok(())
     }
 
-    /// `handle_git_list` (`client.py:423-449`).
+    /// `handle_git_list` (`client.py`).
     fn handle_list(
         &mut self,
         stdout: &mut dyn Write,
@@ -521,7 +521,7 @@ impl<T: Transport> RemoteHelper<T> {
             .collect()
     }
 
-    /// `process_fetch_queue` (`client.py:466-545`).
+    /// `process_fetch_queue` (`client.py`).
     fn process_fetch_queue(
         &mut self,
         mut queue: Vec<(String, String)>,
@@ -646,7 +646,7 @@ impl<T: Transport> RemoteHelper<T> {
         })
     }
 
-    /// `process_push_queue` (`client.py:547-678`).
+    /// `process_push_queue` (`client.py`).
     fn process_push_queue(
         &mut self,
         queue: Vec<(String, String)>,

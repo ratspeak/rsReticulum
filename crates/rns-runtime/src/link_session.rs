@@ -1217,7 +1217,7 @@ impl LinkSession {
         let (mut link, request_data) =
             crate::link_stamp::new_initiator(&transport_tx, config.destination_hash, config.hops)
                 .await?;
-        // Python starts the establishment watchdog after stamping (Link.py:404-405).
+        // Python starts the establishment watchdog after stamping (Link.py).
         let deadline = Instant::now()
             .checked_add(config.establishment_timeout)
             .ok_or_else(|| LinkSessionError::HandshakeFailed("unrepresentable timeout".into()))?;
@@ -2346,7 +2346,7 @@ async fn send_resource_action(
             rns_wire::flags::PacketType::Data,
         ),
         TransferAction::SendCancel(cancel_type, resource_hash) => {
-            // Resource.cancel() sends ICL/RCL only on an active Link (Resource.py:1126, 1134).
+            // Resource.cancel() sends ICL/RCL only on an active Link (Resource.py).
             if link.state != LinkState::Active {
                 return Ok(());
             }
@@ -3314,7 +3314,7 @@ async fn complete_inbound_segment(
             .map_err(|_| rns_protocol::resource::ResourceError::DecryptFailed)
     };
     let completion = inbound.transfer.complete(Some(&decrypt));
-    // Link.resource_concluded (Link.py:1344-1350).
+    // Link.resource_concluded (Link.py).
     resources.last_inbound = Some((
         inbound.transfer.resource.window.window,
         inbound.transfer.eifr,
@@ -3328,7 +3328,7 @@ async fn complete_inbound_segment(
         Ok(completed) => completed,
         Err(error) => {
             // Only a decompression overflow is rejected and tears the Link
-            // down; a corrupt assembly sends nothing (Resource.py:703-709, 732-738).
+            // down; a corrupt assembly sends nothing (Resource.py).
             let reject = matches!(
                 error,
                 rns_protocol::resource::ResourceError::DecompressedTooLarge
@@ -3676,7 +3676,7 @@ async fn handle_inbound_resource_cancel(
     let Some(inbound) = resources.inbound.get_mut(&segment) else {
         return;
     };
-    // Link.py:1199-1206 runs Resource.cancel(), which answers with RCL.
+    // Link.py runs Resource.cancel(), which answers with RCL.
     let action = inbound.transfer.cancel();
     let resource_id = inbound.resource_id;
     let _ = send_resource_action(transport_tx, attached_interface, link, action).await;

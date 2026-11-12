@@ -158,7 +158,7 @@ pub(crate) fn stat_entries(
                 i2p_connectable: e.i2p_connectable,
                 i2p_b32: e.i2p_b32.map(|b32| format!("{b32}.b32.i2p")),
                 tunnel_state: e.i2p_tunnel_state.map(|state| {
-                    // I2PInterfacePeer.TUNNEL_STATE_* (Reticulum.py:1638-1647).
+                    // I2PInterfacePeer.TUNNEL_STATE_* (Reticulum.py).
                     match state {
                         0x01 => "Tunnel Active",
                         0x00 => "Creating Tunnel",
@@ -525,7 +525,7 @@ async fn respond(request: RpcRequest, backend: &RpcBackend) -> Result<Vec<u8>, R
 
 /// Python's `Transport.lowest_interface_bitrate`: the minimum over online
 /// interfaces with a bitrate, keeping the last value when none qualifies
-/// (Transport.py:708).
+/// (Transport.py).
 async fn lowest_interface_bitrate(backend: &RpcBackend) -> Result<Option<u64>, RpcResponse> {
     use rns_transport::messages::{TransportQuery, TransportQueryResponse};
     let interfaces =
@@ -551,7 +551,7 @@ async fn lowest_interface_bitrate(backend: &RpcBackend) -> Result<Option<u64>, R
     Ok(*cached)
 }
 
-/// Python's `Transport.medium_path_timeout()` for a known bitrate (Transport.py:3550-3553).
+/// Python's `Transport.medium_path_timeout()` for a known bitrate (Transport.py).
 fn medium_path_timeout(lowest_bitrate: u64) -> f64 {
     let bits = (rns_wire::constants::MTU * 8) as f64;
     2.0 * (bits / lowest_bitrate.max(crate::constants::MINIMUM_BITRATE) as f64)
@@ -881,7 +881,7 @@ async fn process_rpc_request(
         }
         RpcRequest::DropAnnounceQueues => {
             match authoritative_query!(TransportQuery::DropAnnounceQueues, "announce queue drop") {
-                // Transport.drop_announce_queues returns None (Transport.py:4214-4224).
+                // Transport.drop_announce_queues returns None (Transport.py).
                 TransportQueryResponse::Ok => RpcResponse::OptBoolResult(None),
                 _ => unexpected_transport_response("announce queue drop"),
             }
@@ -927,7 +927,7 @@ async fn process_rpc_request(
             reason,
         } => {
             let Some(hash) = hash_to_array(&identity_hash) else {
-                // Reticulum.py:2192,2203: a wrong-length hash answers False.
+                // Reticulum.py: a wrong-length hash answers False.
                 return RpcResponse::BoolResult(false);
             };
             // `until` (absolute unix ts) → relative TTL; past timestamps
@@ -958,7 +958,7 @@ async fn process_rpc_request(
         }
         RpcRequest::UnblackholeIdentity { identity_hash } => {
             let Some(hash) = hash_to_array(&identity_hash) else {
-                // Reticulum.py:2192,2203: a wrong-length hash answers False.
+                // Reticulum.py: a wrong-length hash answers False.
                 return RpcResponse::BoolResult(false);
             };
             match authoritative_query!(
@@ -1273,7 +1273,7 @@ mod tests {
     }
 
     /// A transport instance adds its identity, network identity, uptime and
-    /// probe responder to the stats dict (Reticulum.py:1700-1705).
+    /// probe responder to the stats dict (Reticulum.py).
     #[tokio::test]
     async fn interface_stats_answer_names_the_transport_instance() {
         let (actor, tx) = rns_transport::actor::TransportActor::new();

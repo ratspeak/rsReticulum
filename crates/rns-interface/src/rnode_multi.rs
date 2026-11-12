@@ -187,7 +187,7 @@ pub struct RNodeMultiConfig {
     /// Up to `MAX_SUBINTERFACES` radios on this device.
     pub subinterfaces: Vec<SubInterfaceConfig>,
     /// Station-ID beacon, parent-level: when due, the callsign is sent on
-    /// all subinterfaces (Python RNodeMultiInterface.py:849-859).
+    /// all subinterfaces (Python RNodeMultiInterface.py).
     pub id_interval: Option<u64>,
     pub id_callsign: Option<Vec<u8>>,
 }
@@ -976,7 +976,7 @@ pub async fn spawn_rnode_multi_interface_observed(
             online: online.clone(),
             rxb: Some(rxb.clone()),
             txb: Some(txb.clone()),
-            // RNodeMultiInterface.py:1164-1165.
+            // RNodeMultiInterface.py.
             inspection: Some(
                 rnode::RNodeRadioStats::inspection(radio.clone(), rnode::RNodeRadioKind::Sub)
                     .with_identity(rns_transport::messages::InterfaceIdentity::new(
@@ -1042,7 +1042,7 @@ pub async fn spawn_rnode_multi_interface_observed(
     };
     handles.insert(0, parent);
 
-    // Python RNodeMultiInterface.py:281-291 — oversized callsigns disable beaconing.
+    // Python RNodeMultiInterface.py — oversized callsigns disable beaconing.
     let beacon: Option<(Duration, Bytes)> = config
         .id_interval
         .zip(config.id_callsign.clone())
@@ -1299,7 +1299,7 @@ impl MultiDriver {
         }
         let sub = &self.subs[local];
         sub.txb.fetch_add(data.len() as u64, Ordering::Relaxed);
-        // Python's parent counts the KISS-escaped payload (RNodeMultiInterface.py:540-544).
+        // Python's parent counts the KISS-escaped payload (RNodeMultiInterface.py).
         self.parent_txb
             .fetch_add(kiss::escape(&data).len() as u64, Ordering::Relaxed);
         let frame = build_subinterface_data_frame(sub.vport, &data);

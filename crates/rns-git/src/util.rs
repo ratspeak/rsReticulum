@@ -1,8 +1,8 @@
-//! Request validators from `RNS/Utilities/rngit/util.py@1.6.0`.
+//! Request validators from `RNS/Utilities/rngit/util.py`.
 
 use rns_tools::rsg::pyfmt::py_fromhex;
 
-/// Python `san_ref` (`util.py:36-63`): the ref when it passes upstream's
+/// Python `san_ref` (`util.py`): the ref when it passes upstream's
 /// subset of `git check-ref-format`. A ref without `/` (`HEAD`, `main`) and
 /// any character below `(` are rejected, as upstream does.
 pub fn san_ref(reference: &str) -> Option<&str> {
@@ -29,7 +29,7 @@ pub fn san_ref(reference: &str) -> Option<&str> {
     Some(reference)
 }
 
-/// Python `san_refs` (`util.py:65-70`) for a list: the list when every ref
+/// Python `san_refs` (`util.py`) for a list: the list when every ref
 /// passes [`san_ref`]. Upstream returns an empty list unchanged, which its
 /// callers then treat as a failure because it is falsy.
 pub fn san_refs<S: AsRef<str>>(refs: &[S]) -> Option<&[S]> {
@@ -38,7 +38,7 @@ pub fn san_refs<S: AsRef<str>>(refs: &[S]) -> Option<&[S]> {
         .then_some(refs)
 }
 
-/// Python `san_sha` (`util.py:73-77`): at least 40 characters that
+/// Python `san_sha` (`util.py`): at least 40 characters that
 /// `bytes.fromhex` accepts. There is no upper bound, and `fromhex` skips
 /// whitespace between byte pairs.
 pub fn san_sha(sha: &str) -> Option<&str> {

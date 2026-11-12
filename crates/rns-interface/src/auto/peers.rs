@@ -96,7 +96,7 @@ impl Core {
         self.timed_out.insert(ifname.to_string(), timed_out)
     }
 
-    /// `add_peer` (AutoInterface.py:526-607): a beacon from `addr` passed the
+    /// `add_peer` (AutoInterface.py): a beacon from `addr` passed the
     /// token check on `ifname`.
     pub fn discovered(
         &mut self,
@@ -149,7 +149,7 @@ impl Core {
     }
 
     /// `process_incoming` of the parent and the peer child
-    /// (AutoInterface.py:613-615, :652-668): only data from a source with a
+    /// (AutoInterface.py): only data from a source with a
     /// spawned child is delivered, duplicates seen on another NIC within the
     /// TTL are dropped, and delivered data refreshes the peer.
     pub fn inbound(&mut self, src: Ipv6Addr, data: &[u8], now: Instant) -> Option<ChildLink> {
@@ -167,7 +167,7 @@ impl Core {
         Some(child)
     }
 
-    /// Timed-out peers (`peer_jobs`, AutoInterface.py:382-396).
+    /// Timed-out peers (`peer_jobs`, AutoInterface.py).
     pub fn expire(&mut self, now: Instant, peering_timeout: f64) -> Vec<(Ipv6Addr, Peer)> {
         let expired: Vec<Ipv6Addr> = self
             .peers
@@ -181,7 +181,7 @@ impl Core {
             .collect()
     }
 
-    /// Peers due a reverse peering beacon (AutoInterface.py:398-408).
+    /// Peers due a reverse peering beacon (AutoInterface.py).
     pub fn reverse_due(&mut self, now: Instant, interval: f64) -> Vec<(Ipv6Addr, String, u32)> {
         let mut due = Vec::new();
         for (addr, peer) in &mut self.peers {

@@ -37,7 +37,7 @@ pub enum InterfaceStatValue {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct InterfaceInspectionSnapshot {
     /// Radio keys Python emits only for interfaces that have them
-    /// (Reticulum.py:1651-1690), e.g. `frequency` or `noise_floor`.
+    /// (Reticulum.py), e.g. `frequency` or `noise_floor`.
     pub radio: Vec<(&'static str, InterfaceStatValue)>,
     pub active_clients: Option<u64>,
     pub blocked_ips: Option<u64>,
@@ -1063,13 +1063,13 @@ pub enum TransportQuery {
     /// entries without losing their explicit blocks.
     ClearSystemBlackholes,
     /// Build the `/list` reply: the whole blackhole table, with `publisher` as
-    /// the source of local entries (Transport.py:4589-4596).
+    /// the source of local entries (Transport.py).
     BuildBlackholeManifest {
         publisher: [u8; 16],
     },
     /// Merge a `/list` reply fetched from `publisher`, adding only identities
     /// not yet present, and store the reply as the publisher's blackhole file
-    /// when anything was added (Discovery.py:920-946). The caller must have
+    /// when anything was added (Discovery.py). The caller must have
     /// authenticated the publisher. Returns the number added, or an error when
     /// the reply is not a map.
     ApplyBlackholeManifest {
@@ -1216,12 +1216,12 @@ pub struct PathTableRpcEntry {
     pub hash: [u8; 16],
     pub timestamp: f64,
     /// Next hop; for a direct path this is the destination hash itself, as
-    /// upstream stores it (Transport.py:2480).
+    /// upstream stores it (Transport.py).
     pub via: Option<[u8; 16]>,
     pub hops: u8,
     pub expires: f64,
     /// Destination stamp value: `None` for an unknown destination, 0 when
-    /// known but unstamped (Reticulum.py:1884-1885).
+    /// known but unstamped (Reticulum.py).
     pub value: Option<f64>,
     /// Last path use in Unix seconds; 0 when never used.
     pub used: f64,
@@ -1310,8 +1310,8 @@ pub struct InterfaceStatRpcEntry {
     pub radio: Vec<(&'static str, InterfaceStatValue)>,
 }
 
-/// Python's top-level `get_interface_stats()` counters (Reticulum.py:1806-1852,
-/// Transport.py:736-814). Byte totals are cumulative over top-level,
+/// Python's top-level `get_interface_stats()` counters (Reticulum.py,
+/// Transport.py). Byte totals are cumulative over top-level,
 /// non-shared-instance interfaces; speeds are bits per second and frequencies
 /// per second over the last second.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]

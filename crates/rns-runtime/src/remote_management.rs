@@ -64,7 +64,7 @@ pub(crate) async fn start_remote_management_with_stats(
         app_name,
         Some(signing_key),
     );
-    // Python's management Links take the Link default (Link.py:239).
+    // Python's management Links take the Link default (Link.py).
     lm.set_resource_strategy(rns_link::link::ResourceStrategy::AcceptNone);
 
     let status_hash: [u8; 16] = truncated_hash(STATUS_PATH.as_bytes());
@@ -139,9 +139,9 @@ fn peer_allowed(allowed: &[[u8; 16]], peer: &[u8; 16]) -> bool {
 
 /// Request: `[include_link_count, include_profiling?]`.
 /// Response: the control port's stats dict, then the link count when it is
-/// asked for, then the profiling results when they are (Transport.py:3325-3337).
+/// asked for, then the profiling results when they are (Transport.py).
 /// Rust runs no profiler, so those are nil, as Python's are until its profiler
-/// has run (Reticulum.py:1956-1965).
+/// has run (Reticulum.py).
 fn handle_status(
     tx: &mpsc::Sender<TransportMessage>,
     data: &[u8],
@@ -182,7 +182,7 @@ fn handle_status(
 
 /// Request: `[command: "table"|"rates", destination?: bytes, max_hops?: int]`.
 /// Response: the control port's path or rate table, filtered
-/// (Transport.py:3346-3371).
+/// (Transport.py).
 fn handle_path(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec<u8>> {
     let request = parse_path_request(data)?;
     let destination = request.destination.as_ref();
@@ -237,7 +237,7 @@ fn handle_path(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec<u
 }
 
 /// Python keeps an entry when a destination argument other than nil equals
-/// its hash (Transport.py:3361, :3368), so a hash of another length, or one
+/// its hash (Transport.py), so a hash of another length, or one
 /// sent as a string, matches nothing.
 fn wanted(destination: Option<&rmpv::Value>, hash: &[u8; 16]) -> bool {
     match destination {
@@ -247,7 +247,7 @@ fn wanted(destination: Option<&rmpv::Value>, hash: &[u8; 16]) -> bool {
     }
 }
 
-/// Python's `hops <= max_hops` (Reticulum.py:1738), or `None` where Python
+/// Python's `hops <= max_hops` (Reticulum.py), or `None` where Python
 /// cannot compare the two, which makes its handler raise and send nothing.
 fn within_hops(max_hops: Option<&rmpv::Value>, hops: u8) -> Option<bool> {
     let Some(max_hops) = max_hops.filter(|max_hops| !max_hops.is_nil()) else {
@@ -263,7 +263,7 @@ fn within_hops(max_hops: Option<&rmpv::Value>, hops: u8) -> Option<bool> {
     }
 }
 
-/// Python's `/status` flags (Transport.py:3329-3335).
+/// Python's `/status` flags (Transport.py).
 #[derive(Debug, PartialEq, Eq)]
 struct StatusRequest {
     link_count: bool,
@@ -271,7 +271,7 @@ struct StatusRequest {
 }
 
 /// `None` unless the request is a non-empty list, which Python leaves
-/// unanswered (Transport.py:3329).
+/// unanswered (Transport.py).
 fn parse_status_request(data: &[u8]) -> Option<StatusRequest> {
     let v: rmpv::Value = rmp_serde::from_slice(data).ok()?;
     let flags = v.as_array().filter(|flags| !flags.is_empty())?;
@@ -292,7 +292,7 @@ fn python_eq_true(value: &rmpv::Value) -> bool {
     }
 }
 
-/// Python's `/path` arguments, kept as sent (Transport.py:3350-3355).
+/// Python's `/path` arguments, kept as sent (Transport.py).
 struct PathRequest {
     command: String,
     destination: Option<rmpv::Value>,
@@ -603,7 +603,7 @@ mod tests {
     }
 
     /// Python's `/status` answers with `get_interface_stats()` itself
-    /// (Transport.py:3325-3337), so `rnstatus -R` needs the full 1.5.5 key set.
+    /// (Transport.py), so `rnstatus -R` needs the full 1.5.5 key set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_status_carries_every_python_155_key() {
         let tx = spawn_mock_transport();
@@ -652,8 +652,8 @@ mod tests {
     }
 
     /// `rnpath -R -r` sorts the remote rate table on `last` and reads every
-    /// rate field (rnpath.py:327-370); Python returns whole rate-table entries
-    /// (Transport.py:3364-3369, Reticulum.py:1747-1766).
+    /// rate field (rnpath.py); Python returns whole rate-table entries
+    /// (Transport.py, Reticulum.py).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_rates_return_whole_python_rate_entries() {
         let tx = spawn_mock_transport();
@@ -709,8 +709,8 @@ mod tests {
 
     /// Python appends the link count when the first flag `== True`, then the
     /// profiling results when the second does, and answers nothing unless the
-    /// request is a non-empty list (Transport.py:3325-3337). Until a profiler
-    /// has run, the results are nil (Reticulum.py:1956-1965).
+    /// request is a non-empty list (Transport.py). Until a profiler
+    /// has run, the results are nil (Reticulum.py).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_status_flags_follow_python() {
         use rmpv::Value;
@@ -809,8 +809,8 @@ mod tests {
     }
 
     /// Python keeps a path when `hops <= max_hops` compares true and a
-    /// destination argument equals its hash (Reticulum.py:1738,
-    /// Transport.py:3361, :3368): a hash of another length, or one sent as a
+    /// destination argument equals its hash (Reticulum.py,
+    /// Transport.py): a hash of another length, or one sent as a
     /// string, matches nothing, and a `max_hops` it cannot compare raises,
     /// so no answer is sent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

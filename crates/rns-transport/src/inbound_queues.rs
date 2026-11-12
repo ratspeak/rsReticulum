@@ -1,5 +1,5 @@
 //! Per-class inbound queues in front of transport processing
-//! (Transport.py:50-97, :2165-2170). Announce, path-request and
+//! (Transport.py). Announce, path-request and
 //! ingress-limited packets are dropped and counted when their queue is full;
 //! data waits for room instead of being dropped.
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::messages::TransportMessage;
 
-/// Python `Transport.TC_*` (Transport.py:155-158), drained in this order.
+/// Python `Transport.TC_*` (Transport.py), drained in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrafficClass {
     Data = 0,
@@ -18,9 +18,9 @@ pub enum TrafficClass {
     IngressLimited = 3,
 }
 
-/// Python `Transport.INBOUND_*_QUEUE_LENGTH` (Transport.py:186-189),
+/// Python `Transport.INBOUND_*_QUEUE_LENGTH` (Transport.py),
 /// overridden by `[reticulum] qlen_in_*`. Zero selects the default, as
-/// `Transport.start` does (Transport.py:420-423).
+/// `Transport.start` does (Transport.py).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InboundQueueLengths {
     pub data: usize,
@@ -83,7 +83,7 @@ pub struct InboundQueues {
 /// An item taken from the inbound queues.
 pub(crate) enum Queued {
     Message(Box<TransportMessage>),
-    /// A held announce the interface released (Interface.py:300).
+    /// A held announce the interface released (Interface.py).
     ReleasedAnnounce(crate::ingress::HeldAnnounce),
 }
 
@@ -96,7 +96,7 @@ pub(crate) struct InboundReceivers {
 
 impl InboundReceivers {
     /// The next queued event and its class, in Python's drain order
-    /// (Transport.py:73-84).
+    /// (Transport.py).
     pub(crate) fn poll_recv(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -121,7 +121,7 @@ impl InboundReceivers {
     }
 
     /// Queue an item as ingress limited, dropping and counting it when that
-    /// queue is full (Transport.py:2133-2134, :2165-2169).
+    /// queue is full (Transport.py).
     pub(crate) fn push_ingress_limited(&mut self, queues: &InboundQueues, event: Queued) {
         if self.ingress_limited.len() >= queues.lengths.il {
             queues.count_drop(TrafficClass::IngressLimited);
@@ -262,7 +262,7 @@ fn path_request_destination() -> &'static [u8; 16] {
 
 /// The class `Transport.preprocess_inbound` gives a frame before ingress
 /// limiting: announces, then anything addressed to the path-request
-/// destination, then data (Transport.py:2024-2072). With the receiving
+/// destination, then data (Transport.py). With the receiving
 /// interface's IFAC key, only the header is unmasked; the tag is verified
 /// later. Frames that cannot be read are data; the actor rejects them.
 pub fn traffic_class(raw: &[u8], ifac: Option<(&[u8; 64], usize)>) -> TrafficClass {

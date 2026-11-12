@@ -1,7 +1,7 @@
 //! Proof-of-work stamper for discovery announces.
 //!
 //! [`RnsDiscoveryStamper`] is the stamp construction upstream uses
-//! (`self.stamper = RNS.Stamps`, Discovery.py:87,266 at 1.6.0): a 32-byte
+//! (`self.stamper = RNS.Stamps`, Discovery.py at 1.6.0): a 32-byte
 //! stamp over a 20-round workblock of the info hash, with fractional values.
 //! The trait remains so embedders can substitute an implementation; methods
 //! are synchronous and callers choose where expensive generation runs.
@@ -52,7 +52,7 @@ impl RnsDiscoveryStamper {
 
 /// Upstream's worker count for a search: one per core up to 12 cores, else
 /// half the cores, and a single worker below [`POOLING_THRESHOLD_COST`]
-/// (Stamps.py:268-274, 416-419).
+/// (Stamps.py).
 pub fn generation_threads(target_value: f64) -> NonZeroUsize {
     // Upstream compares the fixed-point cost, so 13.999 already pools.
     let pooled = stamps::cost_to_fp(target_value)

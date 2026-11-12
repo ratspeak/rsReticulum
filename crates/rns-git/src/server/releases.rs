@@ -1,4 +1,4 @@
-//! `/mgmt/release` and the on-disk release tree (`server.py:3368-3788`).
+//! `/mgmt/release` and the on-disk release tree (`server.py`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -225,7 +225,7 @@ fn meta_int(meta: &[(String, String)], key: &str) -> Result<i64, Raised> {
     }
 }
 
-/// `ConfigObj._quote` (`configobj.py:1749-1837`) without the triple-quote
+/// `ConfigObj._quote` (`configobj.py`) without the triple-quote
 /// path, which no release key needs.
 fn quote_value(value: &str) -> Option<String> {
     if value.is_empty() {
@@ -289,7 +289,7 @@ pub(crate) fn data_for_pages(release_dir: &Path, tag: &str) -> Option<Value> {
     release_data(release_dir, tag).ok().flatten()
 }
 
-/// One list entry (`server.py:3425-3450`), in insertion order.
+/// One list entry (`server.py`), in insertion order.
 fn list_entry(release_dir: &Path, entry: &str) -> Result<Value, Raised> {
     let meta = read_meta(&release_dir.join("META"))?;
     let created = meta_int(&meta, "created")?;
@@ -333,7 +333,7 @@ fn list_entry(release_dir: &Path, entry: &str) -> Result<Value, Raised> {
     ]))
 }
 
-/// `releases_list_data` (`server.py:3406-3480`): the entries, newest first,
+/// `releases_list_data` (`server.py`): the entries, newest first,
 /// and the published tag the `latest` file names.
 fn releases_list_data(releases_path: &Path) -> Result<(Vec<Value>, Option<String>), Raised> {
     if !releases_path.is_dir() {
@@ -388,7 +388,7 @@ fn releases_list_data(releases_path: &Path) -> Result<(Vec<Value>, Option<String
     Ok((releases, latest_release))
 }
 
-/// `release_data` (`server.py:3492-3547`).
+/// `release_data` (`server.py`).
 fn release_data(release_dir: &Path, tag: &str) -> Result<Option<Value>, Raised> {
     let meta_path = release_dir.join("META");
     if !meta_path.is_file() {
@@ -511,7 +511,7 @@ fn release_dir_of(releases_path: &Path, tag: &str) -> Result<PathBuf, Vec<u8>> {
     Ok(release_dir)
 }
 
-/// `_release_list` (`server.py:3482-3490`).
+/// `_release_list` (`server.py`).
 fn release_list(releases_path: &Path) -> Vec<u8> {
     if !releases_path.is_dir() {
         return prepend(0, &pack(&Value::Array(Vec::new())).unwrap_or_default());
@@ -530,7 +530,7 @@ fn release_list(releases_path: &Path) -> Vec<u8> {
     }
 }
 
-/// `_release_view` (`server.py:3549-3575`).
+/// `_release_view` (`server.py`).
 fn release_view(releases_path: &Path, data: &[(Value, Value)]) -> Vec<u8> {
     let tag = match lookup_tag(data) {
         Ok(Some(tag)) => tag,
@@ -554,7 +554,7 @@ fn release_view(releases_path: &Path, data: &[(Value, Value)]) -> Vec<u8> {
     }
 }
 
-/// `_release_fetch` (`server.py:3577-3608`).
+/// `_release_fetch` (`server.py`).
 fn release_fetch(releases_path: &Path, data: &[(Value, Value)]) -> Result<Reply, Raised> {
     let Some(tag) = lookup_tag_unresolved(data)? else {
         return Ok(Reply::Bytes(status(
@@ -626,7 +626,7 @@ fn tag_exists(repository_path: &Path, tag: &str) -> Result<bool, Raised> {
     Ok(output.status.success())
 }
 
-/// `_release_create_init` (`server.py:3619-3667`).
+/// `_release_create_init` (`server.py`).
 fn release_create_init(
     releases_path: &Path,
     repository_path: &Path,
@@ -725,7 +725,7 @@ fn write_thanks(path: &Path) -> Result<(), Raised> {
     std::fs::write(path, pack(&value)?).map_err(|_| Raised)
 }
 
-/// `_release_create_artifact` (`server.py:3669-3704`).
+/// `_release_create_artifact` (`server.py`).
 fn release_create_artifact(releases_path: &Path, data: &[(Value, Value)]) -> Vec<u8> {
     let tag = get(data, "tag").cloned().unwrap_or_else(|| Value::from(""));
     let artifact_name = get(data, "artifact_name").cloned().unwrap_or(Value::Nil);
@@ -787,7 +787,7 @@ fn release_create_artifact(releases_path: &Path, data: &[(Value, Value)]) -> Vec
     }
 }
 
-/// `_release_create_finalize` (`server.py:3706-3741`).
+/// `_release_create_finalize` (`server.py`).
 fn release_create_finalize(releases_path: &Path, data: &[(Value, Value)]) -> Vec<u8> {
     let tag = match checked_tag(data, "No tag specified") {
         Ok(tag) => tag,
@@ -834,7 +834,7 @@ fn write_latest(releases_path: &Path, tag: &str) -> Result<(), Raised> {
     std::fs::rename(&tmp_path, &latest_path).map_err(|_| Raised)
 }
 
-/// `_release_delete` (`server.py:3743-3761`).
+/// `_release_delete` (`server.py`).
 fn release_delete(releases_path: &Path, data: &[(Value, Value)]) -> Vec<u8> {
     let tag = match checked_tag(data, "No tag specified") {
         Ok(tag) => tag,
@@ -859,7 +859,7 @@ fn release_delete(releases_path: &Path, data: &[(Value, Value)]) -> Vec<u8> {
     }
 }
 
-/// `_release_latest` (`server.py:3763-3788`).
+/// `_release_latest` (`server.py`).
 fn release_latest(releases_path: &Path, data: &[(Value, Value)]) -> Vec<u8> {
     let tag = match checked_tag(data, "No tag specified") {
         Ok(tag) => tag,
@@ -886,7 +886,7 @@ fn release_latest(releases_path: &Path, data: &[(Value, Value)]) -> Vec<u8> {
     }
 }
 
-/// `_release_create` (`server.py:3610-3617`).
+/// `_release_create` (`server.py`).
 fn release_create(
     releases_path: &Path,
     repository_path: &Path,
@@ -904,7 +904,7 @@ fn release_create(
     }
 }
 
-/// `handle_release` (`server.py:3368-3404`). `None` when upstream raises
+/// `handle_release` (`server.py`). `None` when upstream raises
 /// before its try (key 0 not a string: no response is sent).
 pub fn handle_release(
     repos: &RwLock<Repositories>,

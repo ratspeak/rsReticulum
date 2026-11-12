@@ -552,7 +552,7 @@ impl TransportActor {
         let Some(entry) = self.interfaces.get_mut(&interface) else {
             return Admission::Retired;
         };
-        // Transport.py:3940 and :1676: offline interfaces get no request.
+        // Transport.py and :1676: offline interfaces get no request.
         if !entry.direction.outbound || offline_for_send(entry) {
             return Admission::Retired;
         }

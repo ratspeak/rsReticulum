@@ -45,7 +45,7 @@ const LOCAL_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_LINK_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_HOPS: u8 = 8;
 const MGMT_APP: &str = "rnstransport.remote.management";
-/// rnstatus.py:79.
+/// rnstatus.py.
 const CLR: &str = "\r                                                          \r";
 
 #[derive(Parser)]
@@ -199,7 +199,7 @@ fn warn_deprecated_spellings() {
 }
 
 /// Output of one run. Direct output is written out at each progress point;
-/// monitor mode buffers a whole frame, as rnstatus.py:930-951 does.
+/// monitor mode buffers a whole frame, as rnstatus.py does.
 struct Out {
     buf: String,
     direct: bool,
@@ -292,7 +292,7 @@ pub(crate) async fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
-/// rnstatus.py:920-955: one instance across refreshes; each frame is
+/// rnstatus.py: one instance across refreshes; each frame is
 /// rendered into a buffer, then printed after `ESC[H ESC[2J`.
 async fn run_monitor(args: &Args, session: &Session) -> u8 {
     let interrupt = ShutdownSignal::new();
@@ -308,7 +308,7 @@ async fn run_monitor(args: &Args, session: &Session) -> u8 {
             _ = tokio::time::sleep(monitor_sleep(args.monitor_interval, started.elapsed())) => {}
             _ = interrupt.wait() => {}
         }
-        // rnstatus.py:965-966: KeyboardInterrupt prints an empty line.
+        // rnstatus.py: KeyboardInterrupt prints an empty line.
         if interrupt.is_triggered() {
             write_stdout("\n");
             return 0;
@@ -316,19 +316,19 @@ async fn run_monitor(args: &Args, session: &Session) -> u8 {
     }
 }
 
-/// rnstatus.py:953-955: sleep `max(interval - render time, 0.2)`.
+/// rnstatus.py: sleep `max(interval - render time, 0.2)`.
 fn monitor_sleep(interval_secs: f64, elapsed: Duration) -> Duration {
     Duration::from_secs_f64((interval_secs - elapsed.as_secs_f64()).max(0.2))
 }
 
 /// The Reticulum instance rnstatus runs with: a shared-instance client for
 /// local queries, as `RNS.Reticulum(require_shared_instance=True)`, or any
-/// instance for `-R` (rnstatus.py:157-169).
+/// instance for `-R` (rnstatus.py).
 struct Session {
     handle: ReticulumHandle,
     rpc_key: Vec<u8>,
     first_remote_request: std::sync::atomic::AtomicBool,
-    /// Monitor mode's remote link, reused while it stays up (rnstatus.py:139-146).
+    /// Monitor mode's remote link, reused while it stays up (rnstatus.py).
     remote_link: tokio::sync::Mutex<Option<RemoteLink>>,
 }
 
@@ -410,7 +410,7 @@ impl Session {
         rmpv::decode::read_value(&mut bytes.as_slice()).map_err(|e| e.to_string())
     }
 
-    /// `program_setup` (rnstatus.py:155-880).
+    /// `program_setup` (rnstatus.py).
     async fn status(&self, args: &Args, out: &mut Out) -> Flow {
         for (name, operation) in [
             (&args.attach, ManageOperation::Attach),
@@ -495,7 +495,7 @@ impl Session {
         }
     }
 
-    /// `--attach/--detach/--reload` (rnstatus.py:171-198).
+    /// `--attach/--detach/--reload` (rnstatus.py).
     async fn manage(&self, operation: ManageOperation, name: &str, out: &mut Out) -> u8 {
         let (verb, done, doing) = match operation {
             ManageOperation::Attach => ("attach", "attached", "attaching"),
@@ -542,7 +542,7 @@ fn local_rpc_key(config_dir: &Path, rc: &ReticulumConfig) -> Vec<u8> {
     }
 }
 
-/// rnstatus.py:373-391: the remote hash and management identity, or the
+/// rnstatus.py: the remote hash and management identity, or the
 /// message upstream prints before exiting 20.
 fn remote_inputs(remote: &str, identity: Option<&Path>) -> Result<([u8; 16], Identity), String> {
     let Some(identity_path) = identity else {
@@ -584,7 +584,7 @@ fn expand_user(path: &Path) -> PathBuf {
 }
 
 impl Session {
-    /// rnstatus.py:66-151 `get_remote_status`: wait for a path, then ask
+    /// rnstatus.py `get_remote_status`: wait for a path, then ask
     /// `/status` over a link. `Err` carries an exit code.
     async fn remote_status(
         &self,
@@ -626,7 +626,7 @@ impl Session {
             out.flush_now();
         }
         // The first request asks for profiling too; refreshes send only the
-        // link-count flag (rnstatus.py:115,126).
+        // link-count flag (rnstatus.py).
         let request = if first {
             Value::Array(vec![
                 Value::Boolean(args.link_stats),
@@ -695,7 +695,7 @@ impl Session {
         Ok(result)
     }
 
-    /// `-d`/`-D` (rnstatus.py:216-367).
+    /// `-d`/`-D` (rnstatus.py).
     async fn discovered(&self, args: &Args, out: &mut Out) -> u8 {
         let paths = StoragePaths::from_config_dir(&self.handle.config_dir);
         let store = match DiscoveryStore::open(&paths.storage_dir) {
@@ -794,7 +794,7 @@ async fn one_shot_query(
 
 impl Session {
     /// Monitor mode: request on the remote link while it is active, else open
-    /// a new one (rnstatus.py:139-146).
+    /// a new one (rnstatus.py).
     async fn monitor_query(
         &self,
         identity_hash: [u8; 16],
@@ -887,7 +887,7 @@ impl Session {
 
 /// The stored info dictionary as `list_discovered_interfaces` returns it:
 /// the file's keys in order, the name sanitized, `"None"` IFAC values
-/// dropped, and the status appended (Discovery.py:533-568).
+/// dropped, and the status appended (Discovery.py).
 fn stored_info(root: &Path, record: &DiscoveredInterface) -> Value {
     let mut map = std::fs::read(root.join(record.filename()))
         .ok()
@@ -915,7 +915,7 @@ fn set_key(map: &mut Vec<(Value, Value)>, key: &str, value: Value) {
 }
 
 // ---------------------------------------------------------------------------
-// The stats renderer: rnstatus.py:410-870.
+// The stats renderer: rnstatus.py.
 
 const HIDDEN_PREFIXES: &[&str] = &[
     "LocalInterface[",
@@ -926,7 +926,7 @@ const HIDDEN_PREFIXES: &[&str] = &[
     "I2PInterfacePeer[Connected peer",
 ];
 
-/// Python's sort keys (rnstatus.py:432-454); an unknown key sorts nothing.
+/// Python's sort keys (rnstatus.py); an unknown key sorts nothing.
 fn sort_key(name: &str) -> Option<fn(&Value) -> f64> {
     fn k(i: &Value, key: &str) -> f64 {
         num(get(i, key)).f()
@@ -1084,7 +1084,7 @@ fn render_status(
     outln!(out);
 }
 
-/// One interface block (rnstatus.py:481-758).
+/// One interface block (rnstatus.py).
 fn render_interface(out: &mut Out, ifstat: &Value, name: &str, args: &Args) {
     let astats = args.announce_stats;
     let pstats = args.pr_stats;
@@ -1448,7 +1448,7 @@ fn render_interface(out: &mut Out, ifstat: &Value, name: &str, args: &Args) {
     outln!(out, "    Traffic   : {txstat}\n                {rxstat}");
 }
 
-/// The optional radio, Weave and I2P lines (rnstatus.py:554-619), with
+/// The optional radio, Weave and I2P lines (rnstatus.py), with
 /// upstream's labels as printed.
 fn render_radio_lines(out: &mut Out, ifstat: &Value) {
     if has(ifstat, "noise_floor") {
@@ -1560,7 +1560,7 @@ fn render_radio_lines(out: &mut Out, ifstat: &Value) {
     }
 }
 
-/// The traffic totals blocks (rnstatus.py:770-833).
+/// The traffic totals blocks (rnstatus.py).
 fn render_totals(out: &mut Out, stats: &Value, astats: bool, pstats: bool, pps: bool) {
     let n = |k: &str| num(get(stats, k)).f();
     let (mut rxb_str, mut txb_str) = pair(n("rxb"), n("txb"));
@@ -1649,7 +1649,7 @@ fn pair(rx: f64, tx: f64) -> (String, String) {
     (rx, tx)
 }
 
-/// `-q` (rnstatus.py:836-853).
+/// `-q` (rnstatus.py).
 fn render_queues(out: &mut Out, stats: &Value) {
     let line = |pressure: &str, count: &str, dropped: &str, label: &str| {
         let d = get(stats, dropped);
@@ -1692,7 +1692,7 @@ fn render_queues(out: &mut Out, stats: &Value) {
     );
 }
 
-/// `RNS.Profiler.format_results` (RNS/__init__.py:581-620).
+/// `RNS.Profiler.format_results` (RNS/__init__.py).
 fn format_profiling(results: &Value) -> String {
     let tags: Vec<&Value> = match results {
         Value::Map(entries) => entries.iter().map(|(_, v)| v).collect(),
@@ -1899,7 +1899,7 @@ fn pad(s: &mut String, width: usize) {
 }
 
 /// `json.dumps` with default separators; bytes are written as hex, which
-/// is what rnstatus converts them to before dumping (rnstatus.py:227-233,412-425).
+/// is what rnstatus converts them to before dumping (rnstatus.py).
 fn py_json(value: &Value) -> String {
     match value {
         Value::Nil | Value::Ext(..) => "null".to_string(),
@@ -1984,7 +1984,7 @@ fn unix_now() -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Discovered interfaces (rnstatus.py:236-367).
+// Discovered interfaces (rnstatus.py).
 
 fn print_discovered_summary(
     out: &mut Out,
@@ -2179,7 +2179,7 @@ fn finite_location(value: Option<f64>) -> Option<f64> {
     value.filter(|number| number.is_finite())
 }
 
-/// Python's `impl_name version`, when the record names both (rnstatus.py:250-251).
+/// Python's `impl_name version`, when the record names both (rnstatus.py).
 fn discovered_stack(record: &DiscoveredInterface) -> Option<String> {
     match (&record.info.impl_name, &record.info.impl_version) {
         (Some(name), Some(version)) if !name.is_empty() && !version.is_empty() => {
@@ -2190,7 +2190,7 @@ fn discovered_stack(record: &DiscoveredInterface) -> Option<String> {
 }
 
 /// Whether Python lists this record: stale and stack-less records are hidden
-/// unless asked for (rnstatus.py:255-256).
+/// unless asked for (rnstatus.py).
 fn discovered_shown(record: &DiscoveredInterface, show_stale: bool, show_unknown: bool) -> bool {
     (show_stale || record.status != Some(DiscoveryStatus::Stale))
         && (show_unknown || discovered_stack(record).is_some())

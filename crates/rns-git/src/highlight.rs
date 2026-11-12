@@ -1,8 +1,8 @@
-//! Micron syntax highlighting: a port of `RNS/Utilities/rngit/highlight.py@1.6.0`.
+//! Micron syntax highlighting: a port of `RNS/Utilities/rngit/highlight.py`.
 //!
 //! Upstream colours code only when the optional Pygments package is
-//! installed (`highlight.py:141-154`, `:178-202`). This port has no lexer and
-//! always takes upstream's path without Pygments (`highlight.py:156-176`):
+//! installed (`highlight.py`). This port has no lexer and
+//! always takes upstream's path without Pygments (`highlight.py`):
 //! a Micron literal block. [`MicronFormatter`] is ported for token streams
 //! from any lexer that names its tokens the way Pygments does.
 
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 /// Theme key to `rrggbb` colour; `None` means no colour tag.
 pub type Theme = HashMap<String, Option<String>>;
 
-/// Python `SyntaxHighlighter._get_default_theme` (`highlight.py:44-139`).
+/// Python `SyntaxHighlighter._get_default_theme` (`highlight.py`).
 pub fn default_theme() -> Theme {
     DEFAULT_THEME
         .iter()
@@ -19,7 +19,7 @@ pub fn default_theme() -> Theme {
         .collect()
 }
 
-/// Python `SyntaxHighlighter` (`highlight.py:35-209`) without Pygments.
+/// Python `SyntaxHighlighter` (`highlight.py`) without Pygments.
 #[derive(Debug, Clone)]
 pub struct SyntaxHighlighter {
     pub theme: Theme,
@@ -43,7 +43,7 @@ impl SyntaxHighlighter {
         false
     }
 
-    /// Python `highlight` (`highlight.py:156-176`). Upstream doubles
+    /// Python `highlight` (`highlight.py`). Upstream doubles
     /// backslashes on every path except empty content.
     pub fn highlight(
         &self,
@@ -58,7 +58,7 @@ impl SyntaxHighlighter {
     }
 }
 
-/// Python `highlight_code` (`highlight.py:312-314`).
+/// Python `highlight_code` (`highlight.py`).
 pub fn highlight_code(
     content: &str,
     filename: Option<&str>,
@@ -68,12 +68,12 @@ pub fn highlight_code(
     SyntaxHighlighter::new(theme).highlight(content, filename, language)
 }
 
-/// Python `_plain_text` (`highlight.py:204-206`).
+/// Python `_plain_text` (`highlight.py`).
 fn plain_text(content: &str) -> String {
     format!("`=\n{}\n`=", content.replace('`', "\\`"))
 }
 
-/// Python `MicronFormatter` (`highlight.py:212-309`).
+/// Python `MicronFormatter` (`highlight.py`).
 #[derive(Debug, Clone)]
 pub struct MicronFormatter {
     pub theme: Theme,
@@ -84,7 +84,7 @@ impl MicronFormatter {
         Self { theme }
     }
 
-    /// Python `format` (`highlight.py:217-278`). A token type is its dotted
+    /// Python `format` (`highlight.py`). A token type is its dotted
     /// Pygments name, such as `Token.Name.Function`.
     pub fn format<'a>(&self, tokens: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
         let mut out = String::new();
@@ -148,7 +148,7 @@ impl MicronFormatter {
     }
 }
 
-/// Python `_get_color_key_for_token` (`highlight.py:280-297`): the nearest
+/// Python `_get_color_key_for_token` (`highlight.py`): the nearest
 /// mapped ancestor of the token type.
 fn color_key_for_token(ttype: &str) -> Option<&'static str> {
     let mut current = Some(ttype);
@@ -161,7 +161,7 @@ fn color_key_for_token(ttype: &str) -> Option<&'static str> {
     None
 }
 
-/// Python `_escape_value` (`highlight.py:303-305`).
+/// Python `_escape_value` (`highlight.py`).
 fn escape_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('`', "\\`")
 }

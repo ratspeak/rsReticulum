@@ -1,7 +1,7 @@
 //! Network stamp policy: the switches and costs Python keeps on `Transport`.
 //!
-//! Python reference: `RNS/Transport.py:191-210` and the `[stamps]` parser in
-//! `RNS/Reticulum.py:505-551` (1.6.0).
+//! Python reference: `RNS/Transport.py` and the `[stamps]` parser in
+//! `RNS/Reticulum.py` (1.6.0).
 
 pub use rns_identity::stamps::{LINK_COST_CAP, STAMP_COST_CAP};
 

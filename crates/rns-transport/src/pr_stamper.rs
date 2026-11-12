@@ -1,4 +1,4 @@
-//! Path-request stamp generation off the actor loop (Transport.py:1466-1493,
+//! Path-request stamp generation off the actor loop (Transport.py,
 //! :4018-4051 at 1.6.0): a bounded, key-coalescing queue served by one worker
 //! thread, and the actor-side cache of generated stamps.
 

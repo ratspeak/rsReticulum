@@ -329,7 +329,7 @@ fn parse_interface_mode(s: &str) -> Option<InterfaceMode> {
         "roaming" => Some(InterfaceMode::Roaming),
         "boundary" => Some(InterfaceMode::Boundary),
         "gateway" | "gw" => Some(InterfaceMode::Gateway),
-        // Python 1.3.8 MODE_INTERNAL (Reticulum.py:721,737-738).
+        // Python 1.3.8 MODE_INTERNAL (Reticulum.py).
         "internal" => Some(InterfaceMode::Internal),
         _ => None,
     }
@@ -794,7 +794,7 @@ fn synthesize_tcp_client(
                 field: format!("{name}.fixed_mtu"),
                 message: "must be a representable nonnegative integer".into(),
             })?;
-        // Python's `if fixed_mtu:` leaves zero unset (TCPInterface.py:110).
+        // Python's `if fixed_mtu:` leaves zero unset (TCPInterface.py).
         config.fixed_mtu = (mtu != 0).then_some(mtu);
     }
     if let Some(retries) = section.get_uint("max_reconnect_tries") {
@@ -812,7 +812,7 @@ fn synthesize_tcp_client(
 }
 
 /// The bitrate `optimise_mtu` uses and the IFAC size a frame may add to the
-/// hardware MTU (Reticulum.py:1018-1020, :1127-1131@1.6.0).
+/// hardware MTU (Reticulum.py).
 fn receive_sizing(
     section: &ConfigSection,
     post_init: &InterfacePostInit,
@@ -851,7 +851,7 @@ fn ifac_credential(
 }
 
 /// Validate explicit IFAC byte sizes and TCP client `fixed_mtu` before driver
-/// startup. A fixed MTU must be at least 500 (TCPInterface.py:110-116). This
+/// startup. A fixed MTU must be at least 500 (TCPInterface.py). This
 /// does not validate every interface field; automatic capacity selection
 /// happens during runtime registration.
 pub fn validate_config_capacity(
@@ -885,7 +885,7 @@ fn synthesize_tcp_server(
     mode: InterfaceMode,
 ) -> Result<InterfaceConfig, InterfaceFactoryError> {
     // `port` wins over `listen_port`; `listen_ip` or `device` is required
-    // (TCPInterface.py:523-524, :541-550).
+    // (TCPInterface.py).
     let port = match parse_port_opt(name, "port", section)? {
         Some(port) => port,
         None => parse_port_opt(name, "listen_port", section)?.ok_or_else(|| {
@@ -938,7 +938,7 @@ fn synthesize_udp(
         config.forward_ip = Some(ip.to_string());
     }
     config.forward_port = parse_port_opt(name, "forward_port", section)?;
-    // `port` defaults both ports (UDPInterface.py:68-72).
+    // `port` defaults both ports (UDPInterface.py).
     let port = parse_port_opt(name, "port", section)?;
     config.listen_port = config.listen_port.or(port);
     config.forward_port = config.forward_port.or(port);
@@ -1055,7 +1055,7 @@ fn synthesize_kiss_serial(
 
     let baud_rate = parse_serial_line_value(name, section, &["speed", "baud_rate"], 9600u32)?;
 
-    // Python KISSInterface.py:86-97 — TNC timing defaults 350/20/64/20,
+    // Python KISSInterface.py — TNC timing defaults 350/20/64/20,
     // serial 8N1, flow_control off, optional station-ID beacon.
     let tnc = parse_kiss_tnc_params(name, section)?;
     Ok(InterfaceConfig::KissSerial(KissSerialConfig {
@@ -1114,13 +1114,13 @@ fn synthesize_auto(
         .unwrap_or(rns_interface::auto::McastAddrType::Temporary);
 
     // Python `as_list`; an empty whitelist allows every interface
-    // (AutoInterface.py:111-112, :229).
+    // (AutoInterface.py).
     let devices = section
         .get_list("devices")
         .filter(|devices| !devices.is_empty());
     let ignored_devices = section.get_list("ignored_devices").unwrap_or_default();
 
-    // Reticulum.py:1018-1020, :1204: only `bitrate` counts, and only from
+    // Reticulum.py: only `bitrate` counts, and only from
     // MINIMUM_BITRATE up; a user `configured_bitrate` key is overwritten.
     let configured_bitrate = section
         .get_uint("bitrate")
@@ -1554,14 +1554,14 @@ fn synthesize_i2p(
     mode: InterfaceMode,
 ) -> Result<InterfaceConfig, InterfaceFactoryError> {
     let connectable = section.get_bool("connectable").unwrap_or(false);
-    // Python `as_list`: each item is a peer (I2PInterface.py:731, :812-813).
+    // Python `as_list`: each item is a peer (I2PInterface.py).
     let peers = section.get_list("peers").unwrap_or_default();
     // Python has neither key and runs the interface idle; nothing to register.
     if !connectable && peers.is_empty() {
         warn!(interface = %name, "I2PInterface has neither connectable nor peers; nothing to do");
         return Err(InterfaceFactoryError::Disabled(name.to_string()));
     }
-    // Rust-only keys first, then i2plib's `I2P_SAM_ADDRESS` (i2plib/utils.py:29-35).
+    // Rust-only keys first, then i2plib's `I2P_SAM_ADDRESS` (i2plib/utils.py).
     let env_address = std::env::var("I2P_SAM_ADDRESS").ok().and_then(|value| {
         let (host, port) = value.split_once(':')?;
         Some((
@@ -1831,7 +1831,7 @@ fn synthesize_ax25kiss(
     let baud_rate = parse_serial_line_value(name, section, &["speed", "baud_rate"], 9600u32)?;
 
     // Python AX25KISSInterface requires an explicit 0..=15 SSID
-    // (default -1 fails validation, AX25KISSInterface.py:138-139).
+    // (default -1 fails validation, AX25KISSInterface.py).
     let ssid_raw = section
         .get_int("ssid")
         .ok_or_else(|| InterfaceFactoryError::MissingField {
@@ -1846,7 +1846,7 @@ fn synthesize_ax25kiss(
     }
     let ssid = ssid_raw as u8;
 
-    // Python defaults: 350/20/64/20 (AX25KISSInterface.py:141-144).
+    // Python defaults: 350/20/64/20 (AX25KISSInterface.py).
     let tnc = parse_kiss_tnc_params(name, section)?;
     let preamble = u32::from(tnc.preamble_ms);
     let txtail = u32::from(tnc.txtail_ms);
@@ -1879,7 +1879,7 @@ fn synthesize_backbone(
     mode: InterfaceMode,
     client_type: bool,
 ) -> Result<InterfaceConfig, InterfaceFactoryError> {
-    // Reticulum.py:1210-1222: `listen_on`, `remote` and `port` overwrite
+    // Reticulum.py: `listen_on`, `remote` and `port` overwrite
     // `listen_ip`, `target_host` and both ports; `target_host` or the client
     // type selects a client.
     let listen_ip = section
@@ -1969,7 +1969,7 @@ fn synthesize_backbone(
 }
 
 /// Python parses the stamp cost keys before checking `enabled`, so a bad value
-/// aborts startup even on a disabled interface (Reticulum.py:963-971).
+/// aborts startup even on a disabled interface (Reticulum.py).
 pub fn validate_stamp_costs(
     name: &str,
     section: &ConfigSection,
@@ -2288,7 +2288,7 @@ mod tests {
         let mut section = enabled_section();
         section.set("type", "TCPServerInterface");
         section.set("listen_port", "4242");
-        // Upstream requires `listen_ip` or `device` (TCPInterface.py:550).
+        // Upstream requires `listen_ip` or `device` (TCPInterface.py).
         assert!(matches!(
             synthesize_interface("test_srv", &section),
             Err(InterfaceFactoryError::MissingField { field, .. }) if field == "listen_ip"
@@ -2513,7 +2513,7 @@ mod tests {
         assert_eq!(pi.announce_rate_penalty, Some(0));
     }
 
-    /// Python KISSInterface.py:86-97 defaults: 350/20/64/20, 8N1, no beacon.
+    /// Python KISSInterface.py defaults: 350/20/64/20, 8N1, no beacon.
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_kiss_defaults_match_python() {
@@ -2563,7 +2563,7 @@ mod tests {
         }
     }
 
-    /// Python AX25KISSInterface.py:141-144 defaults + 0..=15 SSID requirement.
+    /// Python AX25KISSInterface.py defaults + 0..=15 SSID requirement.
     #[cfg(feature = "serial")]
     #[test]
     fn test_synthesize_ax25kiss_defaults_and_ssid() {
@@ -2894,7 +2894,7 @@ mod tests {
     }
 
     /// Python reads both lists with `as_list`, and an empty whitelist allows
-    /// every interface (AutoInterface.py:111-112, :154-162, :229).
+    /// every interface (AutoInterface.py).
     #[test]
     fn auto_device_lists_read_like_python_as_list() {
         let lists = |devices: &str, ignored: &str| {
@@ -3474,7 +3474,7 @@ mod tests {
         assert_eq!(pi.announce_cap, None);
     }
 
-    /// Python takes each `as_list` item as a peer (I2PInterface.py:731, :812-813).
+    /// Python takes each `as_list` item as a peer (I2PInterface.py).
     #[test]
     fn i2p_peers_read_like_python_as_list() {
         let peers = |value: &str| {
@@ -3674,7 +3674,7 @@ mod tests {
         ));
 
         section.set("port", "4242");
-        // A listener needs `listen_ip` or `device` (BackboneInterface.py:162-168).
+        // A listener needs `listen_ip` or `device` (BackboneInterface.py).
         assert!(matches!(
             synthesize_interface("backbone_defaults", &section),
             Err(InterfaceFactoryError::MissingField { field, .. }) if field == "listen_ip"

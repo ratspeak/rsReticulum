@@ -4298,7 +4298,7 @@ mod tests {
         assert_eq!(received.load(Ordering::Relaxed), 0);
     }
 
-    /// Python RNodeInterface.py:881-896: the last RSSI, SNR and quality stay
+    /// Python RNodeInterface.py: the last RSSI, SNR and quality stay
     /// on the interface, so every later packet carries them.
     #[tokio::test]
     async fn usb_packets_carry_the_last_signal_report() {

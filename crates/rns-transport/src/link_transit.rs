@@ -25,7 +25,7 @@ pub enum LinkTransitError {
     StaleInterface,
 }
 
-/// Python's relay MTU clamp (Transport.py:2338-2361@1.6.0): strip the trailer
+/// Python's relay MTU clamp (Transport.py): strip the trailer
 /// when the egress cannot upgrade, clamp to `min(next-hop, previous-hop)`
 /// hardware MTU when either is below the offer, otherwise relay unchanged.
 /// IFAC is not subtracted. The 64-byte request body is never touched.
@@ -69,7 +69,7 @@ pub(crate) fn attenuate_request(
     ))
 }
 
-/// Python's clamp of a request to a local destination (Transport.py:2816-2836@1.6.0):
+/// Python's clamp of a request to a local destination (Transport.py):
 /// an offer above the receiving interface's hardware MTU, or above the base MTU
 /// when that interface cannot upgrade, is lowered to it. `None` keeps the bytes.
 pub(crate) fn clamp_local_request(

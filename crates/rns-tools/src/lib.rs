@@ -189,7 +189,7 @@ where
 }
 
 /// The line rnstatus and rnpath print for a remote link's `teardown_reason`,
-/// none for a local close (rnstatus.py:87-100, rnpath.py:62-76).
+/// none for a local close (rnstatus.py, rnpath.py).
 pub fn link_closed_text(reason: Option<rns_runtime::prelude::CloseReason>) -> Option<&'static str> {
     use rns_runtime::prelude::CloseReason;
     match reason {
@@ -206,7 +206,7 @@ pub fn link_closed_text(reason: Option<rns_runtime::prelude::CloseReason>) -> Op
 const EXIT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Shut the runtime down as Python's exit handler does before the process
-/// ends (Reticulum.py:186-195): a shared-instance client first deregisters its
+/// ends (Reticulum.py): a shared-instance client first deregisters its
 /// destination types, so no registration outlives the tool run.
 pub async fn shut_down(handle: &ReticulumHandle) {
     let _ = tokio::time::timeout(EXIT_SHUTDOWN_DEADLINE, handle.shutdown_and_wait()).await;
@@ -220,7 +220,7 @@ pub async fn exit(handle: &ReticulumHandle, code: i32) -> ! {
 
 /// Destination types a tool that talks to the shared instance over RPC alone
 /// registers there, with its own requester hash, as upstream's tools do
-/// through `Reticulum.wants_destination_type` (Reticulum.py:2224-2267).
+/// through `Reticulum.wants_destination_type` (Reticulum.py).
 pub struct RpcRegistration {
     endpoint: SharedInstanceRpcEndpoint,
     rpc_key: Vec<u8>,
@@ -285,8 +285,8 @@ impl RpcRegistration {
     }
 }
 
-/// Reticulum.get_medium_path_timeout (Reticulum.py:2011-2029): ask the shared
-/// instance, or compute Transport.medium_path_timeout (Transport.py:3550-3553)
+/// Reticulum.get_medium_path_timeout (Reticulum.py): ask the shared
+/// instance, or compute Transport.medium_path_timeout (Transport.py)
 /// from the lowest online interface bitrate. 0 when unknown or on error.
 pub async fn medium_path_timeout(handle: &ReticulumHandle) -> f64 {
     if handle.instance_mode == InstanceMode::Client {

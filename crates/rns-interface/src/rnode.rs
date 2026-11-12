@@ -2459,7 +2459,7 @@ impl RNodeStream {
         // the same read timeout as a serial port.
         stream.set_read_timeout(Some(Duration::from_millis(RNODE_READ_TIMEOUT_MS)))?;
         stream.set_nodelay(true)?;
-        // RNodeInterface.py:1516-1527,1557-1558: the full set on Linux only,
+        // RNodeInterface.py: the full set on Linux only,
         // keepalive with the idle time on Apple, nothing elsewhere.
         #[cfg(target_os = "linux")]
         crate::socket_tuning::set_keepalive_tuned(
@@ -3362,7 +3362,7 @@ pub struct RNodeSignalStats {
 }
 
 /// What an RNode last reported about its radio, kept as Python keeps the
-/// `r_*` attributes that `get_interface_stats()` reads (Reticulum.py:1651-1690).
+/// `r_*` attributes that `get_interface_stats()` reads (Reticulum.py).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RNodeRadioStats {
     pub frequency: Option<u32>,
@@ -3388,10 +3388,10 @@ pub struct RNodeRadioStats {
 /// Which upstream class the report belongs to: their attributes differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RNodeRadioKind {
-    /// `RNodeInterface` (RNodeInterface.py:785-1070).
+    /// `RNodeInterface` (RNodeInterface.py).
     Single,
     /// `RNodeSubInterface`: its own radio settings and signal, airtime fixed
-    /// at 0.0 because the parent keeps channel time (RNodeMultiInterface.py:625-800, 998-1001).
+    /// at 0.0 because the parent keeps channel time (RNodeMultiInterface.py).
     Sub,
 }
 
@@ -3407,7 +3407,7 @@ impl RNodeRadioStats {
             CMD_BANDWIDTH => self.bandwidth = u32_at(frame).or(self.bandwidth),
             CMD_TXPOWER => {
                 if let Some(&byte) = frame.first() {
-                    // The multi-radio parent reads it signed (RNodeMultiInterface.py:655).
+                    // The multi-radio parent reads it signed (RNodeMultiInterface.py).
                     self.txpower = Some(match kind {
                         RNodeRadioKind::Single => i64::from(byte),
                         RNodeRadioKind::Sub => i64::from(byte as i8),
@@ -3491,7 +3491,7 @@ impl RNodeRadioStats {
                 keys.push(("interference_last_ts", V::Float(ts)));
                 keys.push(("interference_last_dbm", V::Int(dbm)));
             }
-            // RNodeInterface.get_battery_state_string (RNodeInterface.py:1218-1226).
+            // RNodeInterface.get_battery_state_string (RNodeInterface.py).
             match self.battery_state {
                 0x00 => {}
                 0x01 => keys.push(("battery_state", V::Str("discharging".into()))),
@@ -3801,7 +3801,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
     let radio_stats = Arc::new(std::sync::Mutex::new(RNodeRadioStats::default()));
     let task_radio_stats = radio_stats.clone();
     let mode = config.mode;
-    // Python RNodeInterface.py:333-343: oversized callsigns disable beaconing.
+    // Python RNodeInterface.py: oversized callsigns disable beaconing.
     let beacon: Option<(Duration, Bytes)> = config
         .id_interval
         .zip(config.id_callsign.clone())
@@ -5102,7 +5102,7 @@ mod tests {
         assert!(!message.contains("port parse"), "{message}");
     }
 
-    /// Python parity (RNodeInterface.py:878,880): RSSI = raw byte − 157,
+    /// Python parity (RNodeInterface.py): RSSI = raw byte − 157,
     /// SNR = signed byte × 0.25.
     #[test]
     fn test_rssi_snr_decode_matches_python() {
@@ -5256,7 +5256,7 @@ mod tests {
         );
     }
 
-    /// Byte-exact vs Python `setSTALock`/`setLTALock` (RNodeInterface.py:612-630):
+    /// Byte-exact vs Python `setSTALock`/`setLTALock` (RNodeInterface.py):
     /// `at = int(pct * 100)` big-endian u16, KISS-escaped, framed per command.
     #[test]
     fn test_airtime_sequence_matches_python_encoding() {

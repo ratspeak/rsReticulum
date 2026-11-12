@@ -26,7 +26,7 @@ pub enum AwaitPathError {
 }
 
 /// Wait up to `timeout` for a cached or newly learned path to `destination_hash`.
-/// A zero `timeout` means `PATH_REQUEST_TIMEOUT`, as Python's `await_path` (Transport.py:3678).
+/// A zero `timeout` means `PATH_REQUEST_TIMEOUT`, as Python's `await_path` (Transport.py).
 /// The deadline includes waiting to submit the command, not just its reply.
 /// Success reflects actor path state and does not probe the remote application.
 ///

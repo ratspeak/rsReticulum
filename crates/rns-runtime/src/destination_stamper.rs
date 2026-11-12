@@ -1,9 +1,9 @@
 //! Destination stamps for announces, generated off the async runtime.
 //!
 //! Python reference (1.6.0): `Destination.announce`, `_await_stamp` and
-//! `_announce` (`RNS/Destination.py:208-213, 266-365`), the stamper queue
-//! (`RNS/Transport.py:99-120, 1445-1493`) and stamp persistence
-//! (`RNS/Stamps.py:862-930`). One worker thread serves every destination of
+//! `_announce` (`RNS/Destination.py`), the stamper queue
+//! (`RNS/Transport.py`) and stamp persistence
+//! (`RNS/Stamps.py`). One worker thread serves every destination of
 //! the process, one job at a time. An announce requested while its stamp is
 //! missing or below target is parked and sent when the stamp is ready.
 

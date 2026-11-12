@@ -354,7 +354,7 @@ async fn run(args: &Args, ctx: &mut Ctx) -> u8 {
         std::io::stderr,
     );
 
-    // validate_args (rnid.py:84-101)
+    // validate_args (rnid.py)
     let ops = [
         paths_active(&args.encrypt),
         paths_active(&args.decrypt),
@@ -793,7 +793,7 @@ async fn recall(
     let Some((dest, key)) = found else {
         return Ok(None);
     };
-    // Identity.recall marks the matched destination used (Identity.py:148,158).
+    // Identity.recall marks the matched destination used (Identity.py).
     let _ = handle
         .query_control(TransportQuery::UseDestination { dest: *dest })
         .await;
@@ -834,7 +834,7 @@ async fn spin(
 }
 
 // ---------------------------------------------------------------------------
-// Identity loading and resolution (rnid.py:200-370)
+// Identity loading and resolution (rnid.py)
 // ---------------------------------------------------------------------------
 
 /// `RNS.Identity.from_file`: the file always holds a 64-byte private key.
@@ -1198,7 +1198,7 @@ async fn announce(args: &Args, ctx: &mut Ctx, aspects: &str, identity: &Identity
     Ok(())
 }
 
-/// `validate()` for one path (rnid.py:606-671). Unlike upstream, the legacy
+/// `validate()` for one path (rnid.py). Unlike upstream, the legacy
 /// branch checks every listed file before succeeding.
 fn validate(args: &Args, path: &str, target: &Target<'_>) -> Step {
     let validate_path = expanduser(path);
@@ -1423,7 +1423,7 @@ fn validate_message(args: &Args, signature_path: &str, target: &Target<'_>) -> S
     Ok(())
 }
 
-/// The `recurse()` metadata printer of `validate_message` (rnid.py:701-723).
+/// The `recurse()` metadata printer of `validate_message` (rnid.py).
 fn format_meta_entry(out: &mut String, entry: &Value, key: &str, level: usize) {
     const MAX_WIDTH: usize = 64;
     let indent = "  ".repeat(level);
@@ -1701,7 +1701,7 @@ fn read_full(input: &mut std::fs::File, buffer: &mut [u8]) -> std::io::Result<us
 
 fn decrypt(args: &Args, path: &str, identity: &Identity) -> Step {
     let rfe_path = expanduser(path);
-    // Case-sensitive, and only the final suffix is stripped (rnid.py:903-908).
+    // Case-sensitive, and only the final suffix is stripped (rnid.py).
     let Some(stem) = rfe_path.strip_suffix(".rfe") else {
         println!("The file {rfe_path} does not appear to be a Reticulum encrypted file");
         return Err(R_INVALID_FILE);
@@ -1876,7 +1876,7 @@ fn wrap_rsg(rsg: &[u8]) -> String {
     wrap_rsg_str(&String::from_utf8_lossy(rsg))
 }
 
-/// `wrap_rsg_str` (rnid.py:524-536): 64-character rows padded with `=`.
+/// `wrap_rsg_str` (rnid.py): 64-character rows padded with `=`.
 fn wrap_rsg_str(rsg: &str) -> String {
     const HEADER: &str = "#### Start of rsg data ";
     const FOOTER: &str = " End of rsg data ####";

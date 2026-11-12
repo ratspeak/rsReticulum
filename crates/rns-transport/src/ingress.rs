@@ -52,7 +52,7 @@ pub struct IngressOverrides {
 pub struct IngressOverrideError {
     pub field: &'static str,
 }
-// Interface.py@1.6.0 only compares a frequency, so a negative one is kept and always trips.
+// Interface.py only compares a frequency, so a negative one is kept and always trips.
 fn valid_frequency(value: f64) -> bool {
     value.is_finite()
 }
@@ -359,7 +359,7 @@ impl IngressController {
         self.sent_path_request_bytes(0);
     }
 
-    /// Python `received_announce(size)` (Interface.py:307-311).
+    /// Python `received_announce(size)` (Interface.py).
     pub fn received_announce_bytes(&mut self, size: usize) {
         self.announces_received = self.announces_received.saturating_add(1);
         self.spawned_received_announce(size);
@@ -381,7 +381,7 @@ impl IngressController {
     }
 
     /// A spawned child's announce on its parent: a frequency sample and the
-    /// bytes, but no count (`from_spawned=True`, TCPInterface.py:655-673).
+    /// bytes, but no count (`from_spawned=True`, TCPInterface.py).
     pub fn spawned_received_announce(&mut self, size: usize) {
         self.announce_rx_bytes = self.announce_rx_bytes.saturating_add(size as u64);
         push_sample(&mut self.ia_freq_deque, IA_FREQ_SAMPLES, Instant::now());
@@ -576,7 +576,7 @@ impl IngressController {
     /// `max_held` is reached; existing destinations can still be replaced.
     /// This does not consult the enabled flag or a limiter decision.
     pub fn hold_announce(&mut self, announce: HeldAnnounce) {
-        // Python 1.3.8 Interface.py:221-222: announces already at the hop cap
+        // Python 1.3.8 Interface.py: announces already at the hop cap
         // would be dropped by every receiver on release — don't hold them.
         if announce.hops >= PATHFINDER_M - 1 {
             return;
@@ -787,7 +787,7 @@ mod tests {
     }
 
     /// Python 1.5.5 counts every announce and path request it receives or
-    /// sends (`arxc`/`atxc`/`prxc`/`ptxc`, Interface.py:303-325), past the
+    /// sends (`arxc`/`atxc`/`prxc`/`ptxc`, Interface.py), past the
     /// bounded frequency windows and with ingress control off.
     #[test]
     fn announce_and_path_request_counts_outlast_the_sample_windows() {
@@ -1000,7 +1000,7 @@ mod tests {
 
     #[test]
     fn hold_announce_ignores_max_hop_announces() {
-        // Python 1.3.8 Interface.py:221-222: hops >= PATHFINDER_M-1 not held.
+        // Python 1.3.8 Interface.py: hops >= PATHFINDER_M-1 not held.
         let mut ctrl = IngressController::new();
         ctrl.hold_announce(HeldAnnounce {
             raw: Bytes::from_static(&[1, 2, 3]),

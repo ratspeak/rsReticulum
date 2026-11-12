@@ -59,7 +59,7 @@ pub const CMD_REMOTE_INPUT: u16 = 0x0A01;
 pub const EVT_MSG: u16 = 0x0000;
 pub const EVT_SYSTEM_BOOT: u16 = 0x0001;
 pub const EVT_CORE_INIT: u16 = 0x0002;
-// "Board hardware initialization" (1.3.8 WeaveInterface.py:342, newer firmware boot event)
+// "Board hardware initialization" (1.3.8 WeaveInterface.py, newer firmware boot event)
 pub const EVT_BOARD_INIT: u16 = 0x0003;
 
 // Driver events (0x1xxx)
@@ -115,7 +115,7 @@ pub const EVT_STAT_UPTIME: u16 = 0xE001;
 pub const EVT_STAT_TIMEBASE: u16 = 0xE002;
 pub const EVT_STAT_CPU: u16 = 0xE003;
 pub const EVT_STAT_TASK_CPU: u16 = 0xE004;
-// EVT_STAT_MEMORY data = [free u32 BE][total u32 BE] (1.3.8 WeaveInterface.py:760-761)
+// EVT_STAT_MEMORY data = [free u32 BE][total u32 BE] (1.3.8 WeaveInterface.py)
 pub const EVT_STAT_MEMORY: u16 = 0xE005;
 pub const EVT_STAT_STORAGE: u16 = 0xE006;
 

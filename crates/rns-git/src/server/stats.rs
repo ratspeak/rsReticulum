@@ -1,5 +1,5 @@
 //! Node statistics: the stats file, the recording gates and the repository
-//! summary (`server.py:2077-2096`, `4640-4911@1.6.0`).
+//! summary (`server.py`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmpv::Value;
 
-/// `stats_job_interval` (`server.py:1993`), seconds between writes of the file.
+/// `stats_job_interval` (`server.py`), seconds between writes of the file.
 pub const STATS_JOB_INTERVAL: u64 = 180;
 
 /// A node of the stats tree. Maps refer to children by index, so one child can
@@ -22,7 +22,7 @@ enum Node {
 ///
 /// Upstream creates missing groups and repositories from the class attributes
 /// `STATS_INIT_GROUP` and `STATS_INIT_REPO` without copying them
-/// (`server.py:4642-4643`), so every group and repository first recorded in a
+/// (`server.py`), so every group and repository first recorded in a
 /// process is the same object, and counts recorded under one show under all.
 #[derive(Debug)]
 struct Tree {
@@ -232,7 +232,7 @@ impl Gate {
 }
 
 /// The stats file, its ignore lists and the recording gates
-/// (`server.py:1988-2096`, `4763-4911`).
+/// (`server.py`).
 #[derive(Debug)]
 pub struct Stats {
     tree: Mutex<Tree>,
@@ -242,7 +242,7 @@ pub struct Stats {
 }
 
 impl Stats {
-    /// `__load_stats` (`server.py:2077-2088`). A missing file is written with
+    /// `__load_stats` (`server.py`). A missing file is written with
     /// the initial value; a file that cannot be read leaves the initial value.
     /// `ignored` is `stats_ignore_identities`; upstream parses
     /// `stats_push_ignore_identities` too but never reads it.
@@ -276,7 +276,7 @@ impl Stats {
         &self.path
     }
 
-    /// `__persist_stats` (`server.py:2090-2096`): `stats.tmp`, renamed over the file.
+    /// `__persist_stats` (`server.py`): `stats.tmp`, renamed over the file.
     pub fn persist(&self) {
         let tree = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         let bytes = encode(&tree.to_value(tree.root));
@@ -299,7 +299,7 @@ impl Stats {
         }
     }
 
-    /// `view_succeeded` (`server.py:4763-4768`): the front page, a group, or a repository.
+    /// `view_succeeded` (`server.py`): the front page, a group, or a repository.
     pub fn view_succeeded(
         &self,
         group: Option<&str>,
@@ -316,22 +316,22 @@ impl Stats {
         }
     }
 
-    /// `fetch_succeeded` (`server.py:4770-4773`).
+    /// `fetch_succeeded` (`server.py`).
     pub fn fetch_succeeded(&self, group: &str, repo: &str, identity: Option<&[u8; 16]>) {
         self.repo_event(Gate::Repo("fetch"), group, repo, identity, true);
     }
 
-    /// `push_succeeded` (`server.py:4775-4777`): no ignore list is consulted.
+    /// `push_succeeded` (`server.py`): no ignore list is consulted.
     pub fn push_succeeded(&self, group: &str, repo: &str) {
         self.repo_event(Gate::Repo("push"), group, repo, None, false);
     }
 
-    /// `download_succeeded` (`server.py:4779-4782`).
+    /// `download_succeeded` (`server.py`).
     pub fn download_succeeded(&self, group: &str, repo: &str, identity: Option<&[u8; 16]>) {
         self.repo_event(Gate::Repo("download"), group, repo, identity, true);
     }
 
-    /// `release_download_succeeded` (`server.py:4784-4787`).
+    /// `release_download_succeeded` (`server.py`).
     pub fn release_download_succeeded(&self, group: &str, repo: &str, identity: Option<&[u8; 16]>) {
         self.repo_event(Gate::Repo("release_download"), group, repo, identity, true);
     }
@@ -352,7 +352,7 @@ impl Stats {
         }
     }
 
-    /// `repository_stats` (`server.py:4645-4761`): `None` without the stats permission.
+    /// `repository_stats` (`server.py`): `None` without the stats permission.
     pub fn repository_stats(
         &self,
         repos: &super::layout::Repositories,
@@ -524,7 +524,7 @@ fn local_date(secs: i64) -> (i64, i64, i64) {
     )
 }
 
-/// `_get_day` (`server.py:4789-4792`): `%Y-%m-%d` in local time.
+/// `_get_day` (`server.py`): `%Y-%m-%d` in local time.
 pub fn local_day(secs: i64) -> String {
     let (year, month, day) = local_date(secs);
     format!("{year:04}-{month:02}-{day:02}")

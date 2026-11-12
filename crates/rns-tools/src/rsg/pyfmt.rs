@@ -1,5 +1,5 @@
 //! Python `str()`/`repr()` rendering of msgpack values, as printed by
-//! `rnid -V <file>.rsm --meta` (`RNS/Utilities/rnid.py:697-723@1.6.0`),
+//! `rnid -V <file>.rsm --meta` (`RNS/Utilities/rnid.py`),
 //! and of the exceptions the rsg tools print.
 
 use rmpv::Value;

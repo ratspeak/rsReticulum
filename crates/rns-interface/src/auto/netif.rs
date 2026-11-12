@@ -78,7 +78,7 @@ pub fn list_network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
 }
 
 /// Clear the scope that BSD kernels embed in the second segment of a
-/// link-local address (`descope_linklocal`, AutoInterface.py:80-85).
+/// link-local address (`descope_linklocal`, AutoInterface.py).
 #[cfg(any(target_os = "macos", test))]
 fn normalize_link_local_addr(addr: Ipv6Addr) -> Ipv6Addr {
     if (addr.segments()[0] & 0xffc0) != 0xfe80 {

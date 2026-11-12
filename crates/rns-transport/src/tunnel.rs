@@ -150,7 +150,7 @@ impl Default for TunnelTable {
     }
 }
 
-/// Expired, or set to expire implausibly late (Transport.py:1022-1027).
+/// Expired, or set to expire implausibly late (Transport.py).
 fn is_stale(entry: &TunnelEntry, now: f64) -> bool {
     entry.expires <= now || entry.expires > now + 2.0 * crate::constants::TUNNEL_TIMEOUT as f64
 }
@@ -437,7 +437,7 @@ mod tests {
     }
 
     /// Python expires a tunnel TUNNEL_TIMEOUT after its synthesis
-    /// (Transport.py:2821), so the next cull keeps it.
+    /// (Transport.py), so the next cull keeps it.
     #[test]
     fn a_handled_tunnel_expires_after_tunnel_timeout_and_survives_the_cull() {
         let mut table = TunnelTable::new();

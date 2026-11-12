@@ -1,4 +1,4 @@
-//! The rngit repository node (`RNS/Utilities/rngit/server.py@1.6.0`).
+//! The rngit repository node (`RNS/Utilities/rngit/server.py`).
 
 pub mod client;
 pub mod config;
@@ -11,7 +11,7 @@ pub mod releases;
 pub mod stats;
 pub mod work;
 
-/// `APP_NAME` plus the aspect (`__init__.py:31`, `server.py:2063`).
+/// `APP_NAME` plus the aspect (`__init__.py`, `server.py`).
 pub const APP_NAME: &str = "git.repositories";
 
 pub const PATH_LIST: &str = "/git/list";

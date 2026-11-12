@@ -329,7 +329,7 @@ async fn wait_for_response(
 ) -> Result<Vec<u8>, LinkClientError> {
     // The request timeout, capped by the overall deadline, applies until a
     // response Resource is accepted;
-    // after that the Resource watchdog ends a stalled transfer (Link.py:1475-1522).
+    // after that the Resource watchdog ends a stalled transfer (Link.py).
     // Between segments no watchdog runs, so the request timeout bounds each gap.
     let request_bound = deadline >= req_timeout;
     let deadline_at = Instant::now() + deadline.min(req_timeout);
@@ -455,7 +455,7 @@ async fn wait_for_response(
 
                             let rtt = link.rtt.unwrap_or(Duration::from_millis(500));
                             let mut flags = adv.flags;
-                            // Only segment 1 carries metadata bytes (Resource.py:718).
+                            // Only segment 1 carries metadata bytes (Resource.py).
                             if adv.segment_index > 1 {
                                 flags.has_metadata = false;
                             }
@@ -723,7 +723,7 @@ async fn poll_response_resources(
                 )
                 .await?;
             }
-            // Out of retries: Resource.cancel() sends RCL (Resource.py:1133-1139).
+            // Out of retries: Resource.cancel() sends RCL (Resource.py).
             TransferAction::SendCancel(_, resource_hash) if link.state == LinkState::Active => {
                 send_link_data(
                     transport_tx,

@@ -36,20 +36,20 @@ pub const LINK_TIMEOUT: f64 = 900.0;
 /// for that Link; transport never falls back to another interface.
 pub const LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY: usize = 256;
 
-/// Never-used path linger on a transport node (Transport.py:228@1.6.0).
+/// Never-used path linger on a transport node (Transport.py).
 pub const UNUSED_PATH_LINGER: f64 = 60.0 * 60.0 * 1.75;
 
-/// Never-used path linger on a leaf or shared-instance client (Transport.py:229@1.6.0).
+/// Never-used path linger on a leaf or shared-instance client (Transport.py).
 pub const UNUSED_PATH_LINGER_LEAF: f64 = 60.0 * 12.0;
 
-/// Never-used paths kept by the pool cull (Transport.py:231@1.6.0).
+/// Never-used paths kept by the pool cull (Transport.py).
 pub const PATH_POOL_UNUSED_TARGET: usize = 2048;
 
-/// Interfaces below this bitrate linger never-used paths longer (Transport.py:232-233@1.6.0).
+/// Interfaces below this bitrate linger never-used paths longer (Transport.py).
 pub const PATH_SLOW_BITRATE: u64 = 25_000;
 pub const PATH_SLOW_LINGER_FACTOR: f64 = 10.0;
 
-/// Interval between never-used pool checks (Transport.py:350@1.6.0).
+/// Interval between never-used pool checks (Transport.py).
 pub const PATH_POOL_CHECK_INTERVAL: f64 = 5.0 * 60.0;
 
 /// Reverse table entry timeout (8 minutes).

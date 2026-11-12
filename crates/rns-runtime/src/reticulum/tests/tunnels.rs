@@ -294,7 +294,7 @@ async fn an_i2p_interface_runs_its_server_and_every_peer() {
 }
 
 /// Python announces only the `I2PInterface` itself; its peers are not
-/// discoverable (Interface.py:119, Discovery.py:112, :140). Rust has no
+/// discoverable (Interface.py, Discovery.py). Rust has no
 /// interface for a non-connectable server, so its first peer stands in.
 #[tokio::test]
 async fn a_discoverable_i2p_interface_announces_once() {
@@ -365,7 +365,7 @@ async fn own_b32(handle: &ReticulumHandle) -> String {
 }
 
 /// Python announces a connectable I2P interface at its own b32 address
-/// (Discovery.py:215-216), never at a configured peer's.
+/// (Discovery.py), never at a configured peer's.
 #[tokio::test]
 async fn a_connectable_i2p_interface_announces_its_own_b32() {
     let (sam_port, _streams) = fake_sam(0).await;
@@ -395,7 +395,7 @@ async fn a_connectable_i2p_interface_announces_its_own_b32() {
 /// Python keeps a connectable I2P interface's private key in `storage/i2p`,
 /// in a file named for the interface and the transport identity, and reuses
 /// it, so the interface keeps its address across restarts
-/// (I2PInterface.py:225-255).
+/// (I2PInterface.py).
 #[tokio::test]
 async fn a_connectable_i2p_interface_keeps_its_key_across_restarts() {
     let (sam_port, _streams) = fake_sam(0).await;
@@ -435,7 +435,7 @@ async fn a_connectable_i2p_interface_keeps_its_key_across_restarts() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Python's key file for an I2P interface (I2PInterface.py:229-238).
+/// Python's key file for an I2P interface (I2PInterface.py).
 fn python_i2p_key_file(storage: &Path, name: &str, transport_identity_hash: &[u8; 16]) -> PathBuf {
     let mut material = rns_crypto::sha::sha256(name.as_bytes()).to_vec();
     material.extend_from_slice(&rns_crypto::sha::sha256(transport_identity_hash));
@@ -483,7 +483,7 @@ async fn an_unreadable_i2p_key_file_is_never_replaced() {
 }
 
 /// Python's configured peers take their interface's mode, announce and
-/// ingress settings as well as its IFAC (I2PInterface.py:814-857).
+/// ingress settings as well as its IFAC (I2PInterface.py).
 #[tokio::test]
 async fn configured_i2p_peers_inherit_their_interface_settings() {
     let (sam_port, _streams) = fake_sam(0).await;
@@ -977,7 +977,7 @@ const FIRST_ATTEMPT_TIMEOUT_SECS: u64 = 1;
 /// A failed connection attempt is an outage too: traffic queued while a
 /// client's first attempts fail is dropped, so however much was queued the
 /// synthesis opens the connection (Python drops traffic while offline,
-/// TCPInterface.py:314-315).
+/// TCPInterface.py).
 async fn assert_failed_first_attempts_drop_their_backlog(tag: &str, port: u16, interface: &str) {
     let dir = config_dir(
         tag,

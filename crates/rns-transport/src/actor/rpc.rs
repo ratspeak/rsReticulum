@@ -48,7 +48,7 @@ impl TransportActor {
             }
             TransportQuery::GetInterfaceStats => {
                 let now = now_f64();
-                // Reticulum.py:1620: stats follow Transport.interfaces, bitrate order.
+                // Reticulum.py: stats follow Transport.interfaces, bitrate order.
                 let mut stats: Vec<InterfaceStatRpcEntry> = self
                     .prioritized_interface_ids()
                     .into_iter()
@@ -195,7 +195,7 @@ impl TransportActor {
                 TransportQueryResponse::IntResult(self.link_table.len() as i64)
             }
             // Counts validated links. Python 1.6.0 means to, but indexes the
-            // link id instead of the entry (Transport.py:3577).
+            // link id instead of the entry (Transport.py).
             TransportQuery::GetActiveLinkCount => TransportQueryResponse::IntResult(
                 self.link_table
                     .iter()
@@ -243,7 +243,7 @@ impl TransportActor {
                         timestamp: entry.timestamp,
                     })
                 });
-                // Identity.py:164-170: fall back to a registered local destination.
+                // Identity.py: fall back to a registered local destination.
                 let recalled = recalled.or_else(|| {
                     self.local_destination_keys.get(&dest).map(|public_key| {
                         RecalledDestinationRpcEntry {
@@ -277,7 +277,7 @@ impl TransportActor {
                     .unwrap_or(crate::constants::PATHFINDER_M),
             )),
             TransportQuery::GetNextHop { dest } => {
-                // Python 1.3.8 Transport.py:2685-2688: local destinations
+                // Python 1.3.8 Transport.py: local destinations
                 // resolve to Transport.identity.hash.
                 let next_hop = self
                     .path_table
@@ -292,7 +292,7 @@ impl TransportActor {
                 TransportQueryResponse::HashResult(next_hop)
             }
             TransportQuery::GetNextHopIfName { dest } => {
-                // Python 1.3.8 Transport.py:2691-2697: local destinations
+                // Python 1.3.8 Transport.py: local destinations
                 // resolve to the shared-instance interface (None off shared hosts).
                 let name = self
                     .path_table
@@ -301,7 +301,7 @@ impl TransportActor {
                     .or_else(|| self.local_destination_interface_id(&dest))
                     .and_then(|id| self.interfaces.get(&id))
                     .map(|i| {
-                        // Python answers `str(interface)` (Reticulum.py:1960), as stats name it.
+                        // Python answers `str(interface)` (Reticulum.py), as stats name it.
                         i.inspection
                             .as_ref()
                             .and_then(|source| source.identity())
@@ -406,7 +406,7 @@ impl TransportActor {
                 reason,
                 reason_label,
             } => {
-                // Transport.py:4487-4497: an existing entry is left untouched.
+                // Transport.py: an existing entry is left untouched.
                 if self.blackhole_table.contains(&hash) {
                     return TransportQueryResponse::OptBoolResult(None);
                 }
@@ -770,7 +770,7 @@ impl TransportActor {
 
     /// Next-hop interface for a local destination: the shared-instance server
     /// interface, mirroring Python 1.3.8 Transport.next_hop_interface's
-    /// destinations_map fallback (Transport.py:2695-2696).
+    /// destinations_map fallback (Transport.py).
     fn local_destination_interface_id(
         &self,
         dest: &[u8; 16],
@@ -801,7 +801,7 @@ struct TrafficSample {
 }
 
 /// Python `Transport.count_traffic_loop` state and the packet counters it
-/// reports (Transport.py:736-814).
+/// reports (Transport.py).
 #[derive(Debug)]
 pub(super) struct TrafficCount {
     started: std::time::Instant,
@@ -833,7 +833,7 @@ use crate::messages::TrafficTotalsRpcEntry;
 impl TransportActor {
     /// Python `Interface.received_announce` and siblings: count on the
     /// interface, then the bytes and a frequency sample on its parent
-    /// (Interface.py:307-329, TCPInterface.py:655-673).
+    /// (Interface.py, TCPInterface.py).
     pub(super) fn record_interface_event(
         &mut self,
         id: InterfaceId,
@@ -866,12 +866,12 @@ impl TransportActor {
     }
 
     /// Python `Transport.rx_packets += 1` once a packet passes the packet
-    /// filter (Transport.py:2026).
+    /// filter (Transport.py).
     pub(super) fn count_rx_packet(&mut self) {
         self.traffic_count.totals.rx_packets += 1;
     }
 
-    /// Python `Transport.tx_packets += 1` per `Transport.transmit` (Transport.py:1557).
+    /// Python `Transport.tx_packets += 1` per `Transport.transmit` (Transport.py).
     pub(super) fn count_tx_packet(&mut self) {
         self.traffic_count.totals.tx_packets += 1;
     }
@@ -1000,7 +1000,7 @@ impl TransportActor {
 }
 
 /// A Backbone listener reports its children's bursts: whether any is active,
-/// the earliest activation, and how many (BackboneInterface.py:185-259).
+/// the earliest activation, and how many (BackboneInterface.py).
 fn aggregate_backbone_bursts(stats: &mut [crate::messages::InterfaceStatRpcEntry]) {
     let listeners: Vec<InterfaceId> = stats
         .iter()
@@ -1053,7 +1053,7 @@ fn activation_epoch(now: f64, active: bool, activated: std::time::Instant) -> f6
 }
 
 impl TransportActor {
-    /// Python `Transport.first_hop_timeout` (Transport.py:3539-3542).
+    /// Python `Transport.first_hop_timeout` (Transport.py).
     pub(super) fn first_hop_timeout(&self, dest: &[u8; 16]) -> f64 {
         self.path_table
             .get_live(dest)
@@ -1068,7 +1068,7 @@ impl TransportActor {
     }
 
     /// Python's receipt timeout for a non-Link destination:
-    /// `first_hop_timeout + TIMEOUT_PER_HOP * hops_to` (Packet.py:427-433).
+    /// `first_hop_timeout + TIMEOUT_PER_HOP * hops_to` (Packet.py).
     pub(super) fn default_receipt_timeout(&self, dest: &[u8; 16]) -> std::time::Duration {
         let hops = self
             .path_table
@@ -1081,7 +1081,7 @@ impl TransportActor {
     }
 }
 
-/// Python returns the first matching cache entry (Reticulum.py:2085-2093).
+/// Python returns the first matching cache entry (Reticulum.py).
 fn first_packet_metric(cache: &VecDeque<([u8; 32], f32)>, packet_hash: &[u8; 32]) -> Option<f64> {
     cache
         .iter()

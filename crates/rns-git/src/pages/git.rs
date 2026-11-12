@@ -1,4 +1,4 @@
-//! Git data extraction for the page node (`pages.py:2043-2616@1.6.0`).
+//! Git data extraction for the page node (`pages.py`).
 
 use std::io::Read;
 use std::path::Path;

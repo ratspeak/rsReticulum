@@ -1,5 +1,5 @@
 //! Python remembers the identity of every validated announce before it decides
-//! whether the announce changes a path (Transport.py:2172, Identity.py:511-589):
+//! whether the announce changes a path (Transport.py, Identity.py):
 //! a replay teaches the identity but leaves the path and the handlers alone.
 use super::*;
 use rns_wire::context::PacketContext;
@@ -84,7 +84,7 @@ fn a_replayed_announce_still_teaches_its_identity() {
 }
 
 /// Python's `Identity.remember` refreshes the remembered entry's time and
-/// app data on every validated announce (Identity.py:108-113), which keeps a
+/// app data on every validated announce (Identity.py), which keeps a
 /// pathless destination from being culled.
 #[test]
 fn a_replay_refreshes_the_remembered_identity() {
@@ -109,7 +109,7 @@ fn a_replay_refreshes_the_remembered_identity() {
     );
 }
 
-/// A paused handler is skipped (Transport.py:2769@1.6.0) while the announce
+/// A paused handler is skipped (Transport.py) while the announce
 /// still updates the path table; resuming takes effect for the next announce.
 #[test]
 fn a_paused_handler_skips_announces_but_paths_are_learned() {
@@ -171,7 +171,7 @@ fn announce_at(
 }
 
 /// Python remembers a ratchet only from an announce that carries one
-/// (Identity.py:726), so a newer ratchet-less announce keeps the old ratchet.
+/// (Identity.py), so a newer ratchet-less announce keeps the old ratchet.
 #[test]
 fn a_ratchetless_announce_keeps_the_remembered_ratchet() {
     let mut actor = hub();
@@ -206,8 +206,8 @@ fn recalled_ratchet(actor: &mut TransportActor, dest: [u8; 16]) -> Option<[u8; 3
 }
 
 /// Identity.clean_known_destinations expires remembered ratchets older than
-/// RATCHET_EXPIRY (Identity.py:466-470) and get_ratchet refuses them
-/// (Identity.py:626); the destination itself is kept.
+/// RATCHET_EXPIRY (Identity.py) and get_ratchet refuses them
+/// (Identity.py); the destination itself is kept.
 #[test]
 fn remembered_ratchets_expire_after_thirty_days() {
     let mut actor = hub();
@@ -239,7 +239,7 @@ fn remembered_ratchets_expire_after_thirty_days() {
     );
 }
 
-/// Re-receiving the same ratchet does not restart its expiry (Identity.py:538).
+/// Re-receiving the same ratchet does not restart its expiry (Identity.py).
 #[test]
 fn a_repeated_ratchet_keeps_its_first_receive_time() {
     let mut actor = hub();
