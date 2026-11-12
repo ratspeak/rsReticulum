@@ -46,12 +46,15 @@ pub struct IngressOverrides {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("invalid ingress override {field}: must be finite, nonnegative and representable")]
+#[error(
+    "invalid ingress override {field}: must be finite, and a duration nonnegative and representable"
+)]
 pub struct IngressOverrideError {
     pub field: &'static str,
 }
+// Interface.py@1.6.0 only compares a frequency, so a negative one is kept and always trips.
 fn valid_frequency(value: f64) -> bool {
-    value.is_finite() && value >= 0.0
+    value.is_finite()
 }
 fn valid_time(value: f64) -> bool {
     Duration::try_from_secs_f64(value)
@@ -60,8 +63,8 @@ fn valid_time(value: f64) -> bool {
 }
 
 impl IngressOverrides {
-    /// Reject nonfinite or negative frequencies and durations that cannot be
-    /// added to the current monotonic clock. This does not cap `max_held` or
+    /// Reject nonfinite frequencies and durations that cannot be added to the
+    /// current monotonic clock. This does not cap `max_held` or
     /// establish a maximum memory budget.
     pub fn validate(&self) -> Result<(), IngressOverrideError> {
         for (field, value) in [
@@ -712,6 +715,13 @@ mod tests {
             ..Default::default()
         };
         assert!(super::IngressController::try_with_overrides(&zero).is_ok());
+        let negative = super::IngressOverrides {
+            burst_freq_new: Some(-1.0),
+            burst_freq: Some(-1.0),
+            ..Default::default()
+        };
+        let mut ctrl = super::IngressController::try_with_overrides(&negative).unwrap();
+        assert!(ctrl.should_ingress_limit());
     }
 
     use super::*;

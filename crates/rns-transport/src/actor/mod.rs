@@ -10543,18 +10543,33 @@ mod tests {
         );
 
         let proof = destination.sign(&packet_hash).unwrap();
+        let proof_raw = make_proof_packet_with_payload(truncated_hash, 0, &proof);
         actor.on_inbound(InboundPacket {
-            raw: make_proof_packet_with_payload(truncated_hash, 0, &proof),
+            raw: proof_raw.clone(),
             interface_id: 1,
-            rssi: None,
-            snr: None,
+            rssi: Some(-87.0),
+            snr: Some(6.5),
             q: None,
         });
 
-        assert!(matches!(
-            *status_rx.borrow_and_update(),
-            crate::messages::ReceiptUpdate::Delivered { .. }
-        ));
+        let crate::messages::ReceiptUpdate::Delivered {
+            proof_hash,
+            metrics,
+            ..
+        } = *status_rx.borrow_and_update()
+        else {
+            panic!("receipt not delivered");
+        };
+        // Packet.py:505,529@1.6.0: the receipt keeps the proof packet.
+        assert_eq!(
+            proof_hash,
+            Some(rns_wire::hash::packet_hash(
+                &proof_raw,
+                rns_wire::flags::HeaderType::Header1
+            ))
+        );
+        assert_eq!(metrics.rssi, Some(-87.0));
+        assert_eq!(metrics.snr, Some(6.5));
         assert!(!actor.receipt_table.contains_key(&truncated_hash));
         assert!(!actor.receipt_updates.contains_key(&truncated_hash));
     }

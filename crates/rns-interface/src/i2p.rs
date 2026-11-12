@@ -967,6 +967,12 @@ pub async fn spawn_i2p_server(
             }
             online_task.store(true, Ordering::SeqCst);
 
+            // A child copies its parent's registration (IFAC, ingress control), so accept once it exists.
+            if !transport_tx.ready().await {
+                online_task.store(false, Ordering::SeqCst);
+                return;
+            }
+
             // Each STREAM ACCEPT needs its own SAM TCP connection.
             loop {
                 let accept_conn = match connect_to_sam(&config.sam_host, config.sam_port).await {

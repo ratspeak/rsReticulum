@@ -117,7 +117,7 @@ async fn run_server(sam_port: u16, key_path: PathBuf) {
     config.b32 = Some(b32_tx);
     let (transport_tx, _transport_rx) = tokio::sync::mpsc::channel(16);
     let (handle_tx, _handle_rx) = tokio::sync::mpsc::channel(16);
-    let _handle = spawn_i2p_server(
+    let handle = spawn_i2p_server(
         config,
         1,
         Arc::new(AtomicU64::new(2)),
@@ -126,6 +126,7 @@ async fn run_server(sam_port: u16, key_path: PathBuf) {
     )
     .await
     .unwrap();
+    handle.owner.mark_registered();
     tokio::time::timeout(Duration::from_secs(10), b32_rx.wait_for(Option::is_some))
         .await
         .expect("session created")

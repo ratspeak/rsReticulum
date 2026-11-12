@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use rns_identity::destination::{
     DestType, Destination, DestinationPacketError, DestinationPacketOptions, Direction,
@@ -17,12 +17,12 @@ use rns_identity::destination::{
 use rns_runtime::reticulum::{InstanceMode, ReticulumHandle};
 use rns_tools::RS_RETICULUM_VERSION;
 use rns_tools::format::{pretty_hex_rep, py_float_repr, py_round};
-use rns_transport::link_messages::{DestinationEvent, PacketMetrics};
+use rns_transport::link_messages::PacketMetrics;
 use rns_transport::messages::{
-    OutboundRequest, PathRequestOptions, TransportMessage, TransportQuery, TransportQueryResponse,
+    OutboundRequest, PathRequestOptions, ReceiptUpdate, TrackedReceiptRegistration,
+    TransportMessage, TransportQuery, TransportQueryResponse,
 };
 use rns_wire::constants::{DEFAULT_PER_HOP_TIMEOUT, MTU};
-use rns_wire::receipt::PacketReceipt;
 
 const DEFAULT_PROBE_SIZE: usize = 16;
 const DEFAULT_TIMEOUT: f64 = 12.0;
@@ -359,34 +359,18 @@ async fn run(args: &Args, handle: &ReticulumHandle, dest_hash: [u8; 16], full_na
 enum ProbeResult {
     Delivered {
         rtt: Duration,
-        proof_hash: [u8; 32],
+        proof_hash: Option<[u8; 32]>,
         metrics: PacketMetrics,
     },
-    /// The receipt's own timeout concluded it (PacketReceipt FAILED).
+    /// The receipt concluded without a proof (PacketReceipt FAILED or CULLED).
     Failed,
     /// The probe timeout passed first.
     TimedOut,
 }
 
-/// One sent probe awaiting its proof. The proof is collected on a channel at
-/// the probe's truncated hash and validated against the destination identity,
-/// which keeps the proof packet's hash and reception metrics.
+/// One sent probe awaiting its transport receipt (Python `PacketReceipt`).
 struct PendingProbe {
-    receipt: PacketReceipt,
-    rx: mpsc::Receiver<DestinationEvent>,
-    sent_at: Instant,
-    receipt_deadline: Option<Instant>,
-    transport_tx: mpsc::Sender<TransportMessage>,
-}
-
-impl Drop for PendingProbe {
-    fn drop(&mut self) {
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::DeregisterDestination {
-                hash: self.receipt.truncated_hash,
-            });
-    }
+    status: watch::Receiver<ReceiptUpdate>,
 }
 
 async fn send_probe(
@@ -395,6 +379,7 @@ async fn send_probe(
     identity: &rns_identity::identity::Identity,
     dest_hash: [u8; 16],
 ) -> Option<PendingProbe> {
+    // Packet.py:430-433: first-hop timeout plus TIMEOUT_PER_HOP per hop.
     let first_hop = handle
         .first_hop_timeout(dest_hash)
         .await
@@ -403,26 +388,7 @@ async fn send_probe(
     let hops = local_hops(handle, dest_hash).await;
     let receipt_timeout = first_hop + DEFAULT_PER_HOP_TIMEOUT * f64::from(hops);
 
-    let mut receipt = PacketReceipt::new(packet.packet_hash, packet.truncated_hash, None);
-    receipt.set_destination_identity(dest_hash, Some(identity.get_public_key()));
-    let (tx, rx) = mpsc::channel(16);
-    handle
-        .transport_tx
-        .send(TransportMessage::RegisterDestination {
-            hash: packet.truncated_hash,
-            app_name: "rnprobe.proof".to_string(),
-            delivery_tx: Some(tx),
-        })
-        .await
-        .ok()?;
-    let pending = PendingProbe {
-        receipt,
-        rx,
-        sent_at: Instant::now(),
-        receipt_deadline: deadline_after(receipt_timeout),
-        transport_tx: handle.transport_tx.clone(),
-    };
-    // No transport receipt, so the proof reaches the channel above.
+    let (status_tx, status) = watch::channel(ReceiptUpdate::Sent);
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     handle
         .transport_tx
@@ -432,13 +398,20 @@ async fn send_probe(
                 destination_hash: dest_hash,
             },
             attached_interface: None,
-            receipt: None,
+            receipt: Some(TrackedReceiptRegistration {
+                truncated_hash: packet.truncated_hash,
+                full_hash: packet.packet_hash,
+                destination_hash: dest_hash,
+                destination_public_key: identity.get_public_key(),
+                timeout: Duration::try_from_secs_f64(receipt_timeout).ok(),
+                status_tx,
+            }),
             result_tx,
         })
         .await
         .ok()?;
     result_rx.await.ok()?;
-    Some(pending)
+    Some(PendingProbe { status })
 }
 
 impl PendingProbe {
@@ -447,42 +420,41 @@ impl PendingProbe {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.tick().await;
         loop {
-            tokio::select! {
-                event = self.rx.recv() => {
-                    let Some(DestinationEvent::InboundPacket { raw, metrics, .. }) = event else {
-                        if event.is_none() {
-                            return ProbeResult::Failed;
-                        }
-                        continue;
+            match *self.status.borrow_and_update() {
+                ReceiptUpdate::Sent => {}
+                ReceiptUpdate::Delivered {
+                    rtt,
+                    proof_hash,
+                    metrics,
+                } => {
+                    return ProbeResult::Delivered {
+                        rtt,
+                        proof_hash,
+                        metrics,
                     };
-                    let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(&raw) else {
-                        continue;
-                    };
-                    if header.flags.packet_type != rns_wire::flags::PacketType::Proof {
-                        continue;
-                    }
-                    if self.receipt.validate_proof_from_destination(&raw[offset..]) {
-                        return ProbeResult::Delivered {
-                            rtt: self.sent_at.elapsed(),
-                            proof_hash: rns_wire::hash::packet_hash(&raw, header.flags.header_type),
-                            metrics,
-                        };
-                    }
                 }
-                _ = tick.tick() => {
-                    if passed(probe_deadline) {
-                        return ProbeResult::TimedOut;
-                    }
-                    if passed(self.receipt_deadline) {
-                        return ProbeResult::Failed;
-                    }
-                    if !quiet {
-                        print!("\u{8}\u{8}{} ", SPINNER[i]);
-                        flush();
-                    }
-                    i = (i + 1) % SPINNER.len();
+                ReceiptUpdate::TimedOut | ReceiptUpdate::Failed | ReceiptUpdate::Culled => {
+                    return ProbeResult::Failed;
                 }
             }
+            // An undispatched packet drops its receipt and stays SENT, as upstream's does.
+            if passed(probe_deadline) {
+                return ProbeResult::TimedOut;
+            }
+            tokio::select! {
+                changed = self.status.changed() => {
+                    if changed.is_err() {
+                        tick.tick().await;
+                    }
+                    continue;
+                }
+                _ = tick.tick() => {}
+            }
+            if !quiet {
+                print!("\u{8}\u{8}{} ", SPINNER[i]);
+                flush();
+            }
+            i = (i + 1) % SPINNER.len();
         }
     }
 }
@@ -490,37 +462,38 @@ impl PendingProbe {
 /// rnprobe.py:165-186: over RPC on a shared-instance client, else from the proof packet.
 async fn reception_stats(
     handle: &ReticulumHandle,
-    proof_hash: [u8; 32],
+    proof_hash: Option<[u8; 32]>,
     metrics: PacketMetrics,
 ) -> String {
-    let (rssi, snr, q) = if handle.instance_mode == InstanceMode::Client {
-        let get = |query| async move {
-            match handle.query_control(query).await {
-                Some(TransportQueryResponse::FloatResult(v)) => v,
-                _ => None,
-            }
+    let (rssi, snr, q) =
+        if let (InstanceMode::Client, Some(proof_hash)) = (handle.instance_mode, proof_hash) {
+            let get = |query| async move {
+                match handle.query_control(query).await {
+                    Some(TransportQueryResponse::FloatResult(v)) => v,
+                    _ => None,
+                }
+            };
+            (
+                get(TransportQuery::GetPacketRssi {
+                    packet_hash: proof_hash,
+                })
+                .await,
+                get(TransportQuery::GetPacketSnr {
+                    packet_hash: proof_hash,
+                })
+                .await,
+                get(TransportQuery::GetPacketQ {
+                    packet_hash: proof_hash,
+                })
+                .await,
+            )
+        } else {
+            (
+                metrics.rssi.map(f32_to_f64),
+                metrics.snr.map(f32_to_f64),
+                None,
+            )
         };
-        (
-            get(TransportQuery::GetPacketRssi {
-                packet_hash: proof_hash,
-            })
-            .await,
-            get(TransportQuery::GetPacketSnr {
-                packet_hash: proof_hash,
-            })
-            .await,
-            get(TransportQuery::GetPacketQ {
-                packet_hash: proof_hash,
-            })
-            .await,
-        )
-    } else {
-        (
-            metrics.rssi.map(f32_to_f64),
-            metrics.snr.map(f32_to_f64),
-            None,
-        )
-    };
     format_reception_stats(rssi, snr, q)
 }
 

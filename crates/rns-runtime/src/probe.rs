@@ -7,14 +7,15 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 use rns_identity::destination::{DestType, Destination, Direction, ProofStrategy};
 use rns_identity::identity::Identity;
-use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
+use rns_transport::link_messages::{AnnounceRequest, DestinationEvent, PacketMetrics};
 use rns_transport::messages::{
-    AnnounceRpcEntry, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+    AnnounceRpcEntry, OutboundDispatchResult, OutboundRequest, ReceiptUpdate,
+    TrackedReceiptRegistration, TransportMessage, TransportQuery, TransportQueryResponse,
 };
 use rns_wire::constants::MTU;
 use rns_wire::context::PacketContext;
@@ -56,6 +57,10 @@ pub struct ProbeOutcome {
     pub via: Option<[u8; 16]>,
     pub interface: Option<String>,
     pub destination_hash: [u8; 16],
+    /// Hash of the validated proof packet (Python `receipt.proof_packet.packet_hash`).
+    pub proof_hash: Option<[u8; 32]>,
+    /// Reception metrics of the proof packet.
+    pub metrics: PacketMetrics,
 }
 
 /// Register a SINGLE destination that attempts an implicit signed proof for
@@ -224,47 +229,6 @@ pub(crate) async fn spawn_announced_probe_responder(
     Ok((dest_hash, announce))
 }
 
-/// Filters DeliveryProof fan-out down to this probe's `msg_id`.
-struct DeliveryProofWaiter {
-    msg_id: String,
-    rx: Mutex<mpsc::Receiver<DestinationEvent>>,
-    transport_tx: mpsc::Sender<TransportMessage>,
-    probe_dest_hash: [u8; 16],
-}
-
-impl DeliveryProofWaiter {
-    async fn wait(&self, wait_for: Duration) -> Option<Option<Duration>> {
-        let mut rx = self.rx.lock().await;
-        let deadline = Instant::now() + wait_for;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            let ev = match timeout(remaining, rx.recv()).await {
-                Ok(Some(ev)) => ev,
-                Ok(None) => return None,
-                Err(_) => return None,
-            };
-            if let DestinationEvent::DeliveryProof { msg_id, rtt } = ev
-                && msg_id == self.msg_id
-            {
-                return Some(rtt);
-            }
-        }
-    }
-}
-
-impl Drop for DeliveryProofWaiter {
-    fn drop(&mut self) {
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::DeregisterDestination {
-                hash: self.probe_dest_hash,
-            });
-    }
-}
-
 /// Send `size` bytes of random plaintext to a matching SINGLE destination
 /// and wait for its signed delivery proof. `app_name` and the cached identity
 /// must derive `dest_hash`; callers supply that binding. The encrypted packet
@@ -409,60 +373,52 @@ pub async fn probe_once(
         .checked_add(receipt_wait)
         .ok_or(ProbeError::InvalidTimeout)?;
 
-    // trunc_hash keys `receipt_table`; unique msg_id filters fan-out.
-    let msg_id = format!(
-        "probe.{}.{:x}",
-        hex::encode(&trunc_hash[..4]),
-        std::process::id()
-    );
-    transport_tx
-        .send(TransportMessage::RegisterReceipt {
-            truncated_hash: trunc_hash,
-            full_hash,
-            destination_hash: dest_hash,
-            destination_public_key: pubkey,
-            msg_id: msg_id.clone(),
-            timeout: Some(receipt_wait),
-        })
-        .await
-        .map_err(|_| ProbeError::TransportClosed)?;
-
-    // Fresh identity avoids hash collision with real destinations.
-    let probe_listener = Destination::new(None, Direction::In, DestType::Single, "probe.client")
-        .map_err(|e| ProbeError::Internal(format!("listener dest: {e}")))?;
-    let listener_hash = probe_listener.hash;
-    let (ev_tx, ev_rx) = mpsc::channel::<DestinationEvent>(16);
-    transport_tx
-        .send(TransportMessage::RegisterDestination {
-            hash: listener_hash,
-            app_name: "probe.client".to_string(),
-            delivery_tx: Some(ev_tx),
-        })
-        .await
-        .map_err(|_| ProbeError::TransportClosed)?;
-
-    let waiter = DeliveryProofWaiter {
-        msg_id: msg_id.clone(),
-        rx: Mutex::new(ev_rx),
-        transport_tx: transport_tx.clone(),
-        probe_dest_hash: listener_hash,
-    };
-
+    let (status_tx, mut status_rx) = watch::channel(ReceiptUpdate::Sent);
     let path_meta = collect_path_meta(&transport_tx, dest_hash).await;
-    let send_instant = Instant::now();
+    let (result_tx, result_rx) = oneshot::channel();
     transport_tx
-        .send(TransportMessage::Outbound(OutboundRequest {
-            raw: Bytes::from(raw),
-            destination_hash: dest_hash,
-        }))
+        .send(TransportMessage::SendPacket {
+            request: OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: dest_hash,
+            },
+            attached_interface: None,
+            receipt: Some(TrackedReceiptRegistration {
+                truncated_hash: trunc_hash,
+                full_hash,
+                destination_hash: dest_hash,
+                destination_public_key: pubkey,
+                timeout: Some(receipt_wait),
+                status_tx,
+            }),
+            result_tx,
+        })
         .await
         .map_err(|_| ProbeError::TransportClosed)?;
+    if result_rx.await.map_err(|_| ProbeError::TransportClosed)? != OutboundDispatchResult::Sent {
+        return Err(ProbeError::PacketTimeout);
+    }
 
-    let rtt_from_receipt = waiter
-        .wait(proof_wait)
-        .await
-        .ok_or(ProbeError::PacketTimeout)?;
-    let rtt = rtt_from_receipt.unwrap_or_else(|| send_instant.elapsed());
+    let delivered = timeout(proof_wait, async {
+        loop {
+            match *status_rx.borrow_and_update() {
+                ReceiptUpdate::Sent => {}
+                ReceiptUpdate::Delivered {
+                    rtt,
+                    proof_hash,
+                    metrics,
+                } => return Some((rtt, proof_hash, metrics)),
+                _ => return None,
+            }
+            if status_rx.changed().await.is_err() {
+                return None;
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    let (rtt, proof_hash, metrics) = delivered.ok_or(ProbeError::PacketTimeout)?;
 
     let _ = use_implicit_proof;
 
@@ -472,6 +428,8 @@ pub async fn probe_once(
         via: path_meta.via,
         interface: path_meta.interface,
         destination_hash: dest_hash,
+        proof_hash,
+        metrics,
     })
 }
 

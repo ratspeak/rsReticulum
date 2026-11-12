@@ -823,6 +823,11 @@ pub async fn spawn_tcp_server(
     );
 
     let read_task = tokio::spawn(async move {
+        // A child copies its parent's registration (IFAC, ingress control), so accept once it exists.
+        if !transport_tx.ready().await {
+            online2.store(false, Ordering::SeqCst);
+            return;
+        }
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
@@ -1062,6 +1067,37 @@ mod tests {
         assert_eq!(state.tx_bytes.load(Ordering::Relaxed), 200);
         assert_eq!(state.rx_packets.load(Ordering::Relaxed), 1);
         assert_eq!(state.tx_packets.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn server_accepts_children_only_after_parent_registration() {
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let (handle_tx, mut handle_rx) = mpsc::channel::<InterfaceHandle>(8);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let server = spawn_tcp_server(
+            TcpServerConfig::new("gated-server", "127.0.0.1", port),
+            700,
+            Arc::new(AtomicU64::new(701)),
+            transport_tx,
+            handle_tx,
+        )
+        .await
+        .unwrap();
+        let _peer = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), handle_rx.recv())
+                .await
+                .is_err(),
+            "a child must not be handed off before its parent is registered"
+        );
+        server.owner.mark_registered();
+        let child = tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
+            .await
+            .expect("child after parent registration")
+            .unwrap();
+        assert_eq!(child.parent_id, Some(700));
     }
 
     /// TCP loopback: spawn server + client on localhost:0, roundtrip a packet.

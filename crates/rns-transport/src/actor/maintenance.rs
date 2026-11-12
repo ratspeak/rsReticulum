@@ -160,11 +160,14 @@ impl TransportActor {
                         crate::messages::ReceiptUpdate::TimedOut
                     } else {
                         match receipt.status {
-                            ReceiptStatus::Delivered => receipt
-                                .get_rtt()
-                                .map_or(crate::messages::ReceiptUpdate::Failed, |rtt| {
-                                    crate::messages::ReceiptUpdate::Delivered { rtt }
-                                }),
+                            ReceiptStatus::Delivered => receipt.get_rtt().map_or(
+                                crate::messages::ReceiptUpdate::Failed,
+                                |rtt| crate::messages::ReceiptUpdate::Delivered {
+                                    rtt,
+                                    proof_hash: None,
+                                    metrics: Default::default(),
+                                },
+                            ),
                             ReceiptStatus::Culled => crate::messages::ReceiptUpdate::Culled,
                             ReceiptStatus::Failed | ReceiptStatus::Receiving => {
                                 crate::messages::ReceiptUpdate::Failed

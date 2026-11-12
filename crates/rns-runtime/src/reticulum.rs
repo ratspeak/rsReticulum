@@ -1103,7 +1103,7 @@ impl PacketReceiptHandle {
                         .await
                         .map_err(|_| ReceiptError::TransportClosed)?;
                 }
-                ReceiptUpdate::Delivered { rtt } => return Ok(rtt),
+                ReceiptUpdate::Delivered { rtt, .. } => return Ok(rtt),
                 ReceiptUpdate::TimedOut => return Err(ReceiptError::TimedOut),
                 ReceiptUpdate::Failed => return Err(ReceiptError::Failed),
                 ReceiptUpdate::Culled => return Err(ReceiptError::Culled),
@@ -13425,6 +13425,8 @@ loglevel = 7
             result_tx.send(true).unwrap();
             receipt.status_tx.send_replace(ReceiptUpdate::Delivered {
                 rtt: Duration::from_millis(42),
+                proof_hash: None,
+                metrics: Default::default(),
             });
         });
 

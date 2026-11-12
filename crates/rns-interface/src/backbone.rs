@@ -765,6 +765,11 @@ fn spawn_backbone_server_on_listener(
     });
 
     let read_task = tokio::spawn(async move {
+        // A child copies its parent's registration (IFAC, ingress control), so accept once it exists.
+        if !transport_tx.ready().await {
+            online2.store(false, Ordering::SeqCst);
+            return;
+        }
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
@@ -1249,6 +1254,7 @@ mod tests {
             listener,
         )
         .unwrap();
+        parent.owner.mark_registered();
         let mut peer = TcpStream::connect(addr).await.unwrap();
         let child = handle_rx.recv().await.unwrap();
         child.read_task.abort();

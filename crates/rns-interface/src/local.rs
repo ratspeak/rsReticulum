@@ -668,7 +668,13 @@ pub async fn spawn_local_server(
         "LocalServerInterface",
     );
 
+    let parent_sender = InterfaceTransportSender::bind(id, owner.clone(), transport_tx.clone());
     let read_task = tokio::spawn(async move {
+        // A spawned client takes its role from the shared server's registration.
+        if !parent_sender.ready().await {
+            online2.store(false, Ordering::SeqCst);
+            return;
+        }
         loop {
             match listener.accept().await {
                 Ok((reader, writer, peer)) => {

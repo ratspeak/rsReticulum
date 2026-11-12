@@ -1602,7 +1602,14 @@ impl TransportActor {
 
             if let Some(status_tx) = self.receipt_updates.remove(&header.destination_hash) {
                 let update = rtt.map_or(crate::messages::ReceiptUpdate::Failed, |rtt| {
-                    crate::messages::ReceiptUpdate::Delivered { rtt }
+                    crate::messages::ReceiptUpdate::Delivered {
+                        rtt,
+                        proof_hash: Some(rns_wire::hash::packet_hash(
+                            raw,
+                            header.flags.header_type,
+                        )),
+                        metrics,
+                    }
                 });
                 status_tx.send_replace(update);
             }

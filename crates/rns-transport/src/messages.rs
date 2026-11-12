@@ -197,10 +197,16 @@ pub struct OutboundRequest {
 
 /// Latest state of one explicitly tracked outbound packet. A watch channel
 /// retains the latest state, not an event history; a slow reader may skip updates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReceiptUpdate {
     Sent,
-    Delivered { rtt: std::time::Duration },
+    /// A valid proof concluded the receipt. `proof_hash` and `metrics` describe
+    /// the proof packet (Python `PacketReceipt.proof_packet`), when one was seen.
+    Delivered {
+        rtt: std::time::Duration,
+        proof_hash: Option<[u8; 32]>,
+        metrics: crate::link_messages::PacketMetrics,
+    },
     TimedOut,
     Failed,
     Culled,
