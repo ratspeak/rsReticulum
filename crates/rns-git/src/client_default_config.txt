@@ -1,0 +1,36 @@
+# This is the default rngit client config file.
+
+[client]
+
+# You can control the batch size of ref transfers
+# using the ref_batch_size directive:
+
+ref_batch_size = 25
+
+
+[aliases]
+
+# You can define aliases for commonly used destination
+# hashes in this section. Each line must be in the format
+# aliased_name = DESTINATION_HASH
+#
+# These hashes are used for resolving remote destinations.
+# For rngit node permissions and identity resolution,
+# aliases must be defined in ~/.rngit/config.
+
+# my_node = 063d38912bffc850af4a1b8a270a9d85
+# bobs_node = 714981d03e41deda0e4468cb274414cc
+
+
+[logging]
+# Valid log levels are 0 through 7:
+#   0: Log only critical information
+#   1: Log errors and lower log levels
+#   2: Log warnings and lower log levels
+#   3: Log notices and lower log levels
+#   4: Log info and lower (this is the default)
+#   5: Verbose logging
+#   6: Debug logging
+#   7: Extreme logging
+
+loglevel = 4
