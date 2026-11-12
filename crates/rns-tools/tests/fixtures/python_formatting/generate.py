@@ -10,7 +10,7 @@ import datetime, json, os, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", "..", ".."))
-RNS_DIR = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or os.path.join(WORKSPACE, "upstream", "candidate", "Reticulum")
+RNS_DIR = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or os.path.join(WORKSPACE, "upstream", "Reticulum")
 sys.path.insert(0, RNS_DIR)
 os.environ["TZ"] = "UTC"
 time.tzset()

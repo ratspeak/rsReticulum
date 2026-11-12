@@ -13,7 +13,7 @@ fetch client derives from it (rncp.py:463-474). Writes rncp_fetch.tsv:
 import json, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.abspath(os.path.join(HERE, *[".."] * 6))
-RNS_DIR = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or os.path.join(WORKSPACE, "upstream", "candidate", "Reticulum")
+RNS_DIR = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or os.path.join(WORKSPACE, "upstream", "Reticulum")
 sys.path.insert(0, RNS_DIR)
 import subprocess
 import RNS

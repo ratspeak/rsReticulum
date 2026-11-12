@@ -7,14 +7,14 @@ RawChannelWriter.write with a stub channel at channel.mdu = 425 (Link MDU 431)
 and records, per input, [processed_length, compressed, payload_len].
 
 The upstream tree is RATSPEAK_UPSTREAM_RETICULUM_DIR if set, else
-upstream/candidate/Reticulum in the workspace.
+upstream/Reticulum in the workspace.
 
 Run: python3 generate.py [out_file]   (default: cases.json next to this file)
 """
 import json, os, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.abspath(os.path.join(HERE, *[".."] * 6))
-RNS_DIR = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or os.path.join(WORKSPACE, "upstream", "candidate", "Reticulum")
+RNS_DIR = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or os.path.join(WORKSPACE, "upstream", "Reticulum")
 sys.path.insert(0, RNS_DIR)
 import RNS
 from RNS.Buffer import RawChannelWriter

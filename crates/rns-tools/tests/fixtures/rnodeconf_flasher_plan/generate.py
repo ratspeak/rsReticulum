@@ -15,7 +15,7 @@ import ast, json, os, subprocess, sys, tempfile, textwrap, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", "..", ".."))
-RNS_DIR = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or os.path.join(WORKSPACE, "upstream", "candidate", "Reticulum")
+RNS_DIR = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or os.path.join(WORKSPACE, "upstream", "Reticulum")
 sys.path.insert(0, RNS_DIR)
 HOME = tempfile.mkdtemp(prefix="rnodeconf-home-")
 os.environ["HOME"] = HOME  # rnodeconf creates ~/.config/rnodeconf at import

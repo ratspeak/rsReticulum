@@ -2,14 +2,14 @@
 """Record upstream RNS discovery auto-connect and announce decisions.
 
 Run from anywhere; RNS comes from RATSPEAK_UPSTREAM_RETICULUM_DIR, else
-<workspace>/upstream/candidate/Reticulum. Writes decisions.json beside this file.
+<workspace>/upstream/Reticulum. Writes decisions.json beside this file.
 Every expected value is what the upstream functions return for the input.
 """
 import json, os, stat, subprocess, sys, tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-UPSTREAM = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or str(HERE.parents[4] / "upstream" / "candidate" / "Reticulum")
+UPSTREAM = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or str(HERE.parents[4] / "upstream" / "Reticulum")
 sys.path.insert(0, UPSTREAM)
 _stdout = sys.stdout
 sys.stdout = sys.stderr
