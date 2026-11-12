@@ -19,11 +19,13 @@ use rns_git::server::handlers::{
     Reply, handle_create, handle_delete, handle_fetch, handle_list, handle_push,
 };
 use rns_git::server::layout::{Repositories, git_available};
+use rns_git::server::perms_mgmt::handle_perms;
 use rns_git::server::releases::handle_release;
 use rns_git::server::stats::{STATS_JOB_INTERVAL, Stats};
+use rns_git::server::work::handle_work;
 use rns_git::server::{
-    APP_NAME, PATH_CREATE, PATH_DELETE, PATH_FETCH, PATH_FORK, PATH_LIST, PATH_MIRROR, PATH_PUSH,
-    PATH_RELEASE, PATH_SYNC,
+    APP_NAME, PATH_CREATE, PATH_DELETE, PATH_FETCH, PATH_FORK, PATH_LIST, PATH_MIRROR, PATH_PERMS,
+    PATH_PUSH, PATH_RELEASE, PATH_SYNC, PATH_WORK,
 };
 use rns_identity::destination::{AllowPolicy, Destination};
 use rns_identity::identity::Identity;
@@ -44,6 +46,9 @@ const REPLY_LIMIT: usize = 64 * 1024;
 /// Release list and view replies carry whole notes. Upstream sets no limit;
 /// this one keeps a release job's share of the deferred budget small.
 const RELEASE_REPLY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Work lists and views carry whole documents (each up to `WORK_DOC_LIMIT`).
+const WORK_REPLY_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Admission for the git handlers: the manager's three copies of the request
 /// (payload, value, byte view) and a status-byte or file-backed reply; a refused
@@ -114,6 +119,37 @@ fn deferred(
                     .or_default()
                     .push(tmpdir);
             }
+        });
+    }
+}
+
+type IdentityHandler = Box<
+    dyn Fn(&RwLock<Repositories>, Option<&Identity>, &rmpv::Value) -> Option<Vec<u8>> + Send + Sync,
+>;
+
+/// Run a status-byte handler that needs the caller's public key on the blocking pool.
+fn deferred_with_identity(
+    repositories: Arc<RwLock<Repositories>>,
+    handler: Arc<IdentityHandler>,
+) -> impl Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static {
+    move |request, responder| {
+        let repositories = repositories.clone();
+        let handler = Arc::clone(&handler);
+        tokio::task::spawn_blocking(move || {
+            let outcome = match handler(
+                &repositories,
+                request.remote_identity.as_ref(),
+                &request.value,
+            ) {
+                None => RequestOutcome::Drop,
+                Some(bytes) if bytes.capacity() > responder.response_byte_limit() => {
+                    let mut reply = vec![rns_git::server::RES_REMOTE_FAIL];
+                    reply.extend_from_slice(b"Reply too large for this node");
+                    RequestOutcome::ReplyBytes(reply)
+                }
+                Some(bytes) => RequestOutcome::ReplyBytes(bytes),
+            };
+            let _ = responder.respond(outcome);
         });
     }
 }
@@ -293,6 +329,144 @@ async fn clone_subcommand(op: Operation, argv: Vec<String>) {
         quiet,
     };
     rns_git::client::forks::run(op, args).await
+}
+
+#[derive(Parser)]
+#[command(
+    name = "rngit-rs work",
+    about = "Reticulum Git Work Document Manager",
+    disable_version_flag = true
+)]
+struct WorkCliArgs {
+    /// path to alternative config directory
+    #[arg(long)]
+    config: Option<String>,
+    /// path to alternative Reticulum config directory
+    #[arg(long)]
+    rnsconfig: Option<String>,
+    /// path to identity
+    #[arg(short = 'i', long, value_name = "PATH")]
+    identity: Option<String>,
+    /// document scope: active, completed or all
+    #[arg(long, default_value = "active")]
+    scope: String,
+    /// document title for create
+    #[arg(short = 't', long)]
+    title: Option<String>,
+    /// document ID
+    #[arg(short = 'd', long = "id", allow_negative_numbers = true)]
+    id: Option<i64>,
+    /// URL of remote repository
+    repository: Option<String>,
+    /// list, view, create, propose, edit, delete, update, complete, activate or perms
+    operation: Option<String>,
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    #[arg(short = 'q', long, action = clap::ArgAction::Count)]
+    quiet: u8,
+    #[arg(long)]
+    version: bool,
+}
+
+#[derive(Parser)]
+#[command(
+    name = "rngit-rs perms",
+    about = "Reticulum Git Release Manager",
+    disable_version_flag = true
+)]
+struct PermsCliArgs {
+    /// path to alternative config directory
+    #[arg(long)]
+    config: Option<String>,
+    /// path to alternative Reticulum config directory
+    #[arg(long)]
+    rnsconfig: Option<String>,
+    /// path to release identity
+    #[arg(short = 'i', long, value_name = "PATH")]
+    identity: Option<String>,
+    /// URL of remote group or repository
+    remote: String,
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    #[arg(short = 'q', long, action = clap::ArgAction::Count)]
+    quiet: u8,
+    #[arg(long)]
+    version: bool,
+}
+
+/// `rngit work` (`server.py:182-191`, `255-260`, `106-122`).
+async fn work_subcommand(argv: Vec<String>) {
+    use rns_git::client::work::{CommonArgs, WorkArgs, run_client, run_work};
+    let args = WorkCliArgs::parse_from(argv);
+    if args.version {
+        println!("rngit-rs {RS_RETICULUM_VERSION}");
+        return;
+    }
+    if args.operation.as_deref().is_none_or(str::is_empty) {
+        let _ = WorkCliArgs::command().print_help();
+        println!();
+    }
+    let common = CommonArgs {
+        config: args.config,
+        rnsconfig: args.rnsconfig,
+        identity: args.identity,
+        verbose: args.verbose,
+        quiet: args.quiet,
+    };
+    let operation = args.operation;
+    let work = WorkArgs {
+        remote: args.repository,
+        scope: args.scope,
+        doc_id: args.id,
+        title: args.title,
+    };
+    run_client(
+        common,
+        rns_git::server::PATH_WORK,
+        Box::new(move |out, input, config, connect, identity| {
+            run_work(
+                out,
+                input,
+                config,
+                connect,
+                identity,
+                operation.as_deref(),
+                &work,
+            )
+        }),
+    )
+    .await
+}
+
+/// `rngit perms` (`server.py:175-180`, `245-253`, `100-104`).
+async fn perms_subcommand(argv: Vec<String>) {
+    use rns_git::client::perms::{perms_target, run_perms};
+    use rns_git::client::work::{CommonArgs, run_client};
+    let args = PermsCliArgs::parse_from(argv);
+    if args.version {
+        println!("rngit-rs {RS_RETICULUM_VERSION}");
+        return;
+    }
+    let Some((remote, target)) = perms_target(&args.remote) else {
+        let _ = PermsCliArgs::command().print_help();
+        println!("\nInvalid URL");
+        std::process::exit(1);
+    };
+    let common = CommonArgs {
+        config: args.config,
+        rnsconfig: args.rnsconfig,
+        identity: args.identity,
+        verbose: args.verbose,
+        quiet: args.quiet,
+    };
+    run_client(
+        common,
+        rns_git::server::PATH_PERMS,
+        Box::new(move |out, _input, config, connect, _identity| {
+            run_perms(out, config, connect, &remote, target)
+        }),
+    )
+    .await
 }
 
 #[derive(Parser)]
@@ -783,6 +957,14 @@ async fn main() {
         }
         release(args).await;
         return;
+    } else if argv.get(1).map(String::as_str) == Some("work") {
+        argv.remove(1);
+        work_subcommand(argv).await;
+        return;
+    } else if argv.get(1).map(String::as_str) == Some("perms") {
+        argv.remove(1);
+        perms_subcommand(argv).await;
+        return;
     } else if argv.get(1).map(String::as_str) == Some("create") {
         argv.remove(1);
         let args = CreateArgs::parse_from(argv);
@@ -1017,6 +1199,28 @@ async fn main() {
                     REPLY_LIMIT
                 }),
                 deferred(repositories.clone(), tempdirs.clone(), Arc::new(handler)),
+            )
+            .await;
+        if !matches!(ok, Ok(true)) {
+            tracing::error!("Could not register the {path} handler");
+            rns_tools::exit(&handle, 1).await;
+        }
+    }
+    // Work documents verify signatures, so these handlers take the whole identity.
+    let perms_config = Arc::new(config.clone());
+    let work: IdentityHandler = Box::new(handle_work);
+    let perms: IdentityHandler =
+        Box::new(move |r, i, d| Some(handle_perms(r, &perms_config, i.map(|i| &i.hash), d)));
+    for (path, handler) in [(PATH_WORK, work), (PATH_PERMS, perms)] {
+        let ok = registered
+            .handle
+            .register_deferred_request_handler_with(
+                path,
+                AllowPolicy::AllowAll,
+                Vec::new(),
+                true,
+                admission(WORK_REPLY_LIMIT),
+                deferred_with_identity(repositories.clone(), Arc::new(handler)),
             )
             .await;
         if !matches!(ok, Ok(true)) {

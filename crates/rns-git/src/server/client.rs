@@ -112,6 +112,16 @@ impl ClientConfig {
         Self::decode(&hexhash)
     }
 
+    /// `parse_remote_group_url` (`server.py:446-454`): hash and group.
+    pub fn parse_remote_group_url(&self, remote: &str) -> Result<(Vec<u8>, String), String> {
+        let (hexhash, components) = self.destination(remote)?;
+        if components.len() != 2 {
+            return Err("Invalid number of URL components".into());
+        }
+        let hash = Self::decode(&hexhash)?;
+        Ok((hash, components[1].clone()))
+    }
+
     /// `parse_remote_url` (`server.py:405-413`): hash, group and repository.
     pub fn parse_remote_url(&self, remote: &str) -> Result<(Vec<u8>, String, String), String> {
         let (hexhash, components) = self.destination(remote)?;

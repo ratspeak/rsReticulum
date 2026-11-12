@@ -222,7 +222,7 @@ impl Permissions {
 }
 
 /// Python `str.splitlines`.
-fn py_splitlines(text: &str) -> Vec<&str> {
+pub(crate) fn py_splitlines(text: &str) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut start = 0;
     let mut iter = text.char_indices().peekable();
