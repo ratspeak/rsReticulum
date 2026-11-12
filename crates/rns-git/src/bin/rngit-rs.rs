@@ -65,6 +65,21 @@ fn admission(reply_limit: usize) -> DeferredAdmission {
         .too_large_reply(refusal("Request too large for this node"))
 }
 
+/// A reply that fits the handler's memory limit, or the answer sent in its
+/// place: an over-limit reply would be dropped and leave the client waiting.
+/// The responder counts capacity, so slack is given back first.
+fn fitted(mut bytes: Vec<u8>, limit: usize) -> Result<Vec<u8>, Vec<u8>> {
+    if bytes.len() <= limit {
+        bytes.shrink_to(limit);
+        if bytes.capacity() <= limit {
+            return Ok(bytes);
+        }
+    }
+    let mut reply = vec![rns_git::server::RES_REMOTE_FAIL];
+    reply.extend_from_slice(b"Reply too large for this node");
+    Err(reply)
+}
+
 /// Bundle directories kept until their Link closes (`link.temporary_directories`).
 type LinkTempDirs = Arc<Mutex<HashMap<[u8; 16], Vec<tempfile::TempDir>>>>;
 
@@ -86,13 +101,10 @@ fn deferred(
             let hash = request.remote_identity.as_ref().map(|id| id.hash);
             let (outcome, tmpdir) = match handler(&repositories, hash.as_ref(), &request.value) {
                 None => (RequestOutcome::Drop, None),
-                // An over-limit reply would be dropped and leave the client waiting.
-                Some(Reply::Bytes(bytes)) if bytes.capacity() > responder.response_byte_limit() => {
-                    let mut reply = vec![rns_git::server::RES_REMOTE_FAIL];
-                    reply.extend_from_slice(b"Reply too large for this node");
+                Some(Reply::Bytes(bytes)) => {
+                    let (Ok(reply) | Err(reply)) = fitted(bytes, responder.response_byte_limit());
                     (RequestOutcome::ReplyBytes(reply), None)
                 }
-                Some(Reply::Bytes(bytes)) => (RequestOutcome::ReplyBytes(bytes), None),
                 Some(Reply::File {
                     file,
                     metadata,
@@ -142,16 +154,106 @@ fn deferred_with_identity(
                 &request.value,
             ) {
                 None => RequestOutcome::Drop,
-                Some(bytes) if bytes.capacity() > responder.response_byte_limit() => {
-                    let mut reply = vec![rns_git::server::RES_REMOTE_FAIL];
-                    reply.extend_from_slice(b"Reply too large for this node");
+                Some(bytes) => {
+                    let (Ok(reply) | Err(reply)) = fitted(bytes, responder.response_byte_limit());
                     RequestOutcome::ReplyBytes(reply)
                 }
-                Some(bytes) => RequestOutcome::ReplyBytes(bytes),
             };
             let _ = responder.respond(outcome);
         });
     }
+}
+
+/// Page replies are rendered in memory; this bounds one page or value reply.
+const PAGE_REPLY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Run a page node handler on the blocking pool and answer through the responder.
+fn deferred_page(
+    node: Arc<rns_git::pages::PageNode>,
+) -> impl Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static {
+    use rns_git::pages::{PageReply, PageRequest, file_metadata};
+    move |request, responder| {
+        let node = Arc::clone(&node);
+        tokio::task::spawn_blocking(move || {
+            let reply = node.handle(&PageRequest {
+                path: &request.path,
+                data: &request.value,
+                link_id: request.link_id,
+                identity: request.remote_identity.as_ref().map(|id| id.hash),
+            });
+            let limit = responder.response_byte_limit();
+            let outcome = match reply {
+                PageReply::Drop => RequestOutcome::Drop,
+                PageReply::Page(bytes) => {
+                    let (Ok(reply) | Err(reply)) = fitted(bytes, limit);
+                    RequestOutcome::ReplyBytes(reply)
+                }
+                PageReply::Value(bytes) => match fitted(bytes, limit) {
+                    Ok(value) => RequestOutcome::ReplyValue(value),
+                    Err(refusal) => RequestOutcome::ReplyBytes(refusal),
+                },
+                PageReply::File { file, name } => RequestOutcome::ReplyFile {
+                    source: Box::new(file),
+                    metadata: Some(file_metadata(&name)),
+                },
+            };
+            let _ = responder.respond(outcome);
+        });
+    }
+}
+
+/// The `nomadnetwork.node` destination (`pages.py:179-183`): app data is the node name.
+async fn start_page_node(
+    handle: &rns_runtime::reticulum::ReticulumHandle,
+    identity: Identity,
+    node: rns_git::pages::PageNode,
+) -> Option<rns_runtime::destination_runtime::RegisteredDestination> {
+    let page_hash =
+        Destination::hash_from_name_and_identity(rns_git::pages::APP_NAME, Some(&identity.hash));
+    let options = DestinationRuntimeOptions {
+        endpoint_dispatch: Some(handle.link_endpoint_dispatch_handle()),
+        ..DestinationRuntimeOptions::default()
+    };
+    let registered = match handle
+        .register_destination(identity, rns_git::pages::APP_NAME, options)
+        .await
+    {
+        Ok(registered) => registered,
+        Err(e) => {
+            tracing::error!("Could not register the page node destination: {e}");
+            return None;
+        }
+    };
+    let app_data = node.node_name.as_bytes().to_vec();
+    if let Err(e) = registered.handle.set_default_app_data(Some(app_data)).await {
+        tracing::error!("Could not set the page node app data: {e}");
+        return None;
+    }
+    let node = Arc::new(node);
+    for path in rns_git::pages::PATHS {
+        let auto_compress = path != rns_git::pages::PATH_MEDIA;
+        let ok = registered
+            .handle
+            .register_deferred_request_handler_with(
+                path,
+                AllowPolicy::AllowAll,
+                Vec::new(),
+                auto_compress,
+                admission(PAGE_REPLY_LIMIT),
+                deferred_page(node.clone()),
+            )
+            .await;
+        if !matches!(ok, Ok(true)) {
+            tracing::error!("Could not register the {path} handler");
+            return None;
+        }
+    }
+    tracing::info!(
+        target: rns_tools::NOTICE_TARGET,
+        "Git Nomad Network Node listening on {}",
+        prettyhex(&page_hash)
+    );
+    Some(registered)
 }
 
 #[derive(Parser)]
@@ -1120,6 +1222,7 @@ async fn main() {
         endpoint_dispatch: Some(handle.link_endpoint_dispatch_handle()),
         ..DestinationRuntimeOptions::default()
     };
+    let page_identity = identity.clone();
     let mut registered = match handle
         .register_destination(identity, APP_NAME, options)
         .await
@@ -1234,6 +1337,41 @@ async fn main() {
         prettyhex(&destination_hash)
     );
 
+    let mut pages = None;
+    if config.serve_nomadnet {
+        let options = match rns_git::pages::PageOptions::from_config_text(&text) {
+            Ok(options) => options,
+            Err(e) => {
+                tracing::error!("Could not start the page node: {e}");
+                rns_tools::exit(&handle, 1).await;
+            }
+        };
+        let mut node = rns_git::pages::PageNode::new(
+            repositories.clone(),
+            stats.clone(),
+            config.node_name.clone(),
+            destination_hash,
+            &configdir,
+            options,
+        );
+        let recall_handle = handle.clone();
+        let runtime = tokio::runtime::Handle::current();
+        node.recall = Some(Box::new(move |dest| {
+            let recalled = runtime
+                .block_on(recall_handle.recall_without_use(dest))
+                .ok()??;
+            Some(Destination::hash_from_name_and_identity(
+                rns_git::pages::APP_NAME,
+                Some(&recalled.identity.hash),
+            ))
+        }));
+        match start_page_node(&handle, page_identity, node).await {
+            Some(registered) => pages = Some(registered),
+            None => rns_tools::exit(&handle, 1).await,
+        }
+    }
+    let mut last_page_announce: Option<Instant> = None;
+
     // The jobs loop (server.py:2656-2661): the first tick announces when an interval is set.
     let announce_interval = config.announce_interval;
     let mut last_announce: Option<Instant> = None;
@@ -1268,6 +1406,22 @@ async fn main() {
                 tracing::warn!("Could not announce: {e}");
             }
             last_announce = Some(Instant::now());
+        }
+        // The page node's own jobs loop (pages.py:218-228) announces on the same interval.
+        if let Some(pages) = &pages
+            && announce_interval != 0
+            && last_page_announce
+                .is_none_or(|last| last.elapsed().as_secs_f64() > announce_interval as f64)
+        {
+            tracing::debug!("Announcing page node destination");
+            if let Err(e) = pages
+                .handle
+                .announce(DestinationAnnounceOptions::default())
+                .await
+            {
+                tracing::warn!("Could not announce the page node: {e}");
+            }
+            last_page_announce = Some(Instant::now());
         }
         if last_persist.elapsed() >= Duration::from_secs(STATS_JOB_INTERVAL) {
             let stats = stats.clone();

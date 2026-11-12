@@ -279,6 +279,16 @@ fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// `releases_list_data` for the page node: `None` where upstream returns `(None, None)`.
+pub(crate) fn list_for_pages(releases_path: &Path) -> Option<(Vec<Value>, Option<String>)> {
+    releases_list_data(releases_path).ok()
+}
+
+/// `release_data` for the page node: `None` on a missing or unreadable release.
+pub(crate) fn data_for_pages(release_dir: &Path, tag: &str) -> Option<Value> {
+    release_data(release_dir, tag).ok().flatten()
+}
+
 /// One list entry (`server.py:3425-3450`), in insertion order.
 fn list_entry(release_dir: &Path, entry: &str) -> Result<Value, Raised> {
     let meta = read_meta(&release_dir.join("META"))?;

@@ -208,7 +208,7 @@ pub(crate) fn read_text(path: &Path) -> std::io::Result<String> {
 }
 
 /// `_work_load_document`: any read or decode failure is None.
-fn load_document(path: &Path) -> Option<Value> {
+pub(crate) fn load_document(path: &Path) -> Option<Value> {
     let bytes = std::fs::read(path).ok()?;
     rmpv::decode::read_value(&mut &bytes[..]).ok()
 }
