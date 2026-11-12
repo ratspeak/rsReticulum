@@ -192,6 +192,143 @@ pub fn rns_git::md2micron::MarkdownToMicron::set_url_scope(&mut self, &str)
 impl core::default::Default for rns_git::md2micron::MarkdownToMicron
 pub fn rns_git::md2micron::MarkdownToMicron::default() -> Self
 pub fn rns_git::md2micron::convert_markdown_to_micron(&str) -> core::result::Result<alloc::string::String, rns_git::md2micron::MarkdownError>
+pub mod rns_git::media
+pub const rns_git::media::BACKENDS: [(&str, &[&str]); 5]
+pub const rns_git::media::CONVERSION_TIMEOUT: core::time::Duration
+pub fn rns_git::media::convert_to_webp(&[&str], &std::path::Path, core::option::Option<&std::path::Path>, &str) -> bool
+pub fn rns_git::media::encoder_argv(&[&str], &str) -> core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub fn rns_git::media::select_backend(core::option::Option<&str>, &dyn core::ops::function::Fn(&str) -> bool, core::option::Option<&str>) -> core::option::Option<(&'static str, &'static [&'static str])>
+pub fn rns_git::media::webp_info(&[u8]) -> core::option::Option<(u32, u32)>
+pub fn rns_git::media::which(&str) -> bool
+pub mod rns_git::pages
+pub mod rns_git::pages::git
+pub enum rns_git::pages::git::RunError
+pub rns_git::pages::git::RunError::Failed
+pub rns_git::pages::git::RunError::Timeout
+pub struct rns_git::pages::git::BlobInfo
+pub rns_git::pages::git::BlobInfo::is_binary: bool
+pub rns_git::pages::git::BlobInfo::is_symlink: bool
+pub rns_git::pages::git::BlobInfo::is_tree: bool
+pub rns_git::pages::git::BlobInfo::size: u64
+pub rns_git::pages::git::BlobInfo::symlink_target: core::option::Option<alloc::string::String>
+pub struct rns_git::pages::git::ChangedFile
+pub rns_git::pages::git::ChangedFile::additions: i64
+pub rns_git::pages::git::ChangedFile::deletions: i64
+pub rns_git::pages::git::ChangedFile::path: alloc::string::String
+pub rns_git::pages::git::ChangedFile::status: &'static str
+pub struct rns_git::pages::git::CommitEntry
+pub rns_git::pages::git::CommitEntry::author: alloc::string::String
+pub rns_git::pages::git::CommitEntry::hash: alloc::string::String
+pub rns_git::pages::git::CommitEntry::subject: alloc::string::String
+pub rns_git::pages::git::CommitEntry::timestamp: i64
+pub struct rns_git::pages::git::CommitInfo
+pub rns_git::pages::git::CommitInfo::author_date: alloc::string::String
+pub rns_git::pages::git::CommitInfo::author_email: alloc::string::String
+pub rns_git::pages::git::CommitInfo::author_name: alloc::string::String
+pub rns_git::pages::git::CommitInfo::committer_date: alloc::string::String
+pub rns_git::pages::git::CommitInfo::committer_email: alloc::string::String
+pub rns_git::pages::git::CommitInfo::committer_name: alloc::string::String
+pub rns_git::pages::git::CommitInfo::diff: core::option::Option<alloc::string::String>
+pub rns_git::pages::git::CommitInfo::files: alloc::vec::Vec<rns_git::pages::git::ChangedFile>
+pub rns_git::pages::git::CommitInfo::message: alloc::string::String
+pub rns_git::pages::git::CommitInfo::parents: alloc::vec::Vec<alloc::string::String>
+pub struct rns_git::pages::git::RefInfo
+pub rns_git::pages::git::RefInfo::commit_subject: alloc::string::String
+pub rns_git::pages::git::RefInfo::is_annotated: bool
+pub rns_git::pages::git::RefInfo::is_default: bool
+pub rns_git::pages::git::RefInfo::name: alloc::string::String
+pub rns_git::pages::git::RefInfo::short_hash: alloc::string::String
+pub rns_git::pages::git::RefInfo::tag_message: core::option::Option<alloc::string::String>
+pub struct rns_git::pages::git::SignatureStatus
+pub rns_git::pages::git::SignatureStatus::author_match: bool
+pub rns_git::pages::git::SignatureStatus::message: alloc::string::String
+pub rns_git::pages::git::SignatureStatus::signed: bool
+pub rns_git::pages::git::SignatureStatus::valid: bool
+pub struct rns_git::pages::git::TreeEntry
+pub rns_git::pages::git::TreeEntry::kind: alloc::string::String
+pub rns_git::pages::git::TreeEntry::link_target: core::option::Option<alloc::string::String>
+pub rns_git::pages::git::TreeEntry::name: alloc::string::String
+pub rns_git::pages::git::TreeEntry::size: u64
+pub const rns_git::pages::git::GIT_COMMAND_TIMEOUT: core::time::Duration
+pub fn rns_git::pages::git::blob_content(&std::path::Path, &str, &str) -> core::option::Option<alloc::string::String>
+pub fn rns_git::pages::git::blob_info(&std::path::Path, &str, &str) -> core::option::Option<rns_git::pages::git::BlobInfo>
+pub fn rns_git::pages::git::blob_stream(&std::path::Path, &str, &str) -> core::option::Option<std::fs::File>
+pub fn rns_git::pages::git::commit_count(&std::path::Path, &str) -> u64
+pub fn rns_git::pages::git::commit_info(&std::path::Path, &str) -> core::option::Option<rns_git::pages::git::CommitInfo>
+pub fn rns_git::pages::git::commit_signature(&std::path::Path, &str) -> rns_git::pages::git::SignatureStatus
+pub fn rns_git::pages::git::commits(&std::path::Path, &str, &str, u64, u64) -> core::option::Option<alloc::vec::Vec<rns_git::pages::git::CommitEntry>>
+pub fn rns_git::pages::git::default_branch(&std::path::Path) -> core::option::Option<alloc::string::String>
+pub fn rns_git::pages::git::is_commit(&std::path::Path, &str) -> core::result::Result<bool, rns_git::pages::git::RunError>
+pub fn rns_git::pages::git::readme_content(&std::path::Path) -> core::option::Option<(alloc::string::String, bool)>
+pub fn rns_git::pages::git::refs_info(&std::path::Path, core::option::Option<&str>) -> (alloc::vec::Vec<rns_git::pages::git::RefInfo>, alloc::vec::Vec<rns_git::pages::git::RefInfo>)
+pub fn rns_git::pages::git::repository_description(&std::path::Path) -> core::option::Option<alloc::string::String>
+pub fn rns_git::pages::git::repository_ref_counts(&std::path::Path) -> (usize, usize)
+pub fn rns_git::pages::git::resolve_ref(&std::path::Path, &str) -> core::option::Option<alloc::string::String>
+pub fn rns_git::pages::git::tree_entries(&std::path::Path, &str, &str) -> core::option::Option<alloc::vec::Vec<rns_git::pages::git::TreeEntry>>
+pub enum rns_git::pages::PageReply
+pub rns_git::pages::PageReply::Drop
+pub rns_git::pages::PageReply::File
+pub rns_git::pages::PageReply::File::file: std::fs::File
+pub rns_git::pages::PageReply::File::name: alloc::string::String
+pub rns_git::pages::PageReply::Page(alloc::vec::Vec<u8>)
+pub rns_git::pages::PageReply::Value(alloc::vec::Vec<u8>)
+pub struct rns_git::pages::PageNode
+pub rns_git::pages::PageNode::node_name: alloc::string::String
+pub rns_git::pages::PageNode::options: rns_git::pages::PageOptions
+pub rns_git::pages::PageNode::recall: core::option::Option<rns_git::pages::Recall>
+pub rns_git::pages::PageNode::repos: alloc::sync::Arc<std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>>
+pub rns_git::pages::PageNode::repositories_destination: [u8; 16]
+pub rns_git::pages::PageNode::stats: alloc::sync::Arc<rns_git::server::stats::Stats>
+pub rns_git::pages::PageNode::templates_dir: std::path::PathBuf
+impl rns_git::pages::PageNode
+pub fn rns_git::pages::PageNode::handle(&self, &rns_git::pages::PageRequest<'_>) -> rns_git::pages::PageReply
+pub fn rns_git::pages::PageNode::new(alloc::sync::Arc<std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>>, alloc::sync::Arc<rns_git::server::stats::Stats>, alloc::string::String, [u8; 16], &std::path::Path, rns_git::pages::PageOptions) -> Self
+pub struct rns_git::pages::PageOptions
+pub rns_git::pages::PageOptions::media_conversion: bool
+pub rns_git::pages::PageOptions::use_nerdfonts: bool
+impl rns_git::pages::PageOptions
+pub fn rns_git::pages::PageOptions::from_config_text(&str) -> core::result::Result<Self, rns_runtime::config::ConfigError>
+impl core::default::Default for rns_git::pages::PageOptions
+pub fn rns_git::pages::PageOptions::default() -> Self
+pub struct rns_git::pages::PageRequest<'a>
+pub rns_git::pages::PageRequest::data: &'a rmpv::Value
+pub rns_git::pages::PageRequest::identity: core::option::Option<[u8; 16]>
+pub rns_git::pages::PageRequest::link_id: [u8; 16]
+pub rns_git::pages::PageRequest::path: &'a str
+pub const rns_git::pages::APP_NAME: &str
+pub const rns_git::pages::FILE_ARTIFACT: &str
+pub const rns_git::pages::FILE_DOWNLOAD: &str
+pub const rns_git::pages::FILE_WORKDOC: &str
+pub const rns_git::pages::JOBS_INTERVAL: u64
+pub const rns_git::pages::PATHS: [&str; 17]
+pub const rns_git::pages::PATH_BLOB: &str
+pub const rns_git::pages::PATH_COMMIT: &str
+pub const rns_git::pages::PATH_COMMITS: &str
+pub const rns_git::pages::PATH_GROUP: &str
+pub const rns_git::pages::PATH_INDEX: &str
+pub const rns_git::pages::PATH_MEDIA: &str
+pub const rns_git::pages::PATH_REFS: &str
+pub const rns_git::pages::PATH_RELEASE: &str
+pub const rns_git::pages::PATH_RELEASES: &str
+pub const rns_git::pages::PATH_REPO: &str
+pub const rns_git::pages::PATH_STATS: &str
+pub const rns_git::pages::PATH_TREE: &str
+pub const rns_git::pages::PATH_WORK: &str
+pub const rns_git::pages::PATH_WORK_DOC: &str
+pub const rns_git::pages::VERSION: &str
+pub fn rns_git::pages::file_metadata(&str) -> alloc::vec::Vec<u8>
+pub fn rns_git::pages::m_divider() -> alloc::string::String
+pub fn rns_git::pages::m_escape(&str) -> alloc::string::String
+pub fn rns_git::pages::m_heading(&str, usize) -> alloc::string::String
+pub fn rns_git::pages::m_italic(&str) -> alloc::string::String
+pub fn rns_git::pages::m_link(&str, &str, &[(&str, &str)]) -> alloc::string::String
+pub fn rns_git::pages::m_link_e(&str, &str, &str, &[(&str, &str)]) -> alloc::string::String
+pub fn rns_git::pages::m_link_r(&str, &str, &[(&str, &str)]) -> alloc::string::String
+pub fn rns_git::pages::quote_plus(&str) -> alloc::string::String
+pub fn rns_git::pages::render_chart(&[i64], &[alloc::string::String], &str, core::option::Option<&str>, core::option::Option<f64>) -> alloc::string::String
+pub fn rns_git::pages::render_combined_chart(&[i64], &[i64], &[i64], &[i64], &[alloc::string::String]) -> alloc::string::String
+pub fn rns_git::pages::unquote_plus(&str) -> alloc::string::String
+pub type rns_git::pages::Recall = alloc::boxed::Box<(dyn core::ops::function::Fn([u8; 16]) -> core::option::Option<[u8; 16]> + core::marker::Send + core::marker::Sync)>
 pub mod rns_git::remote_helper
 pub enum rns_git::remote_helper::ClientConfigError
 pub rns_git::remote_helper::ClientConfigError::Io(std::path::PathBuf, core::io::error::Error)

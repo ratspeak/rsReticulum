@@ -105,8 +105,8 @@
       "tier": "tool-internal",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-git.txt",
-      "itemCount": 455,
-      "sha256": "085ac6a8048e377c68d58b01105412b27d48a36896dc1b8169eaaaed25ad027b"
+      "itemCount": 592,
+      "sha256": "153c3459e8150a68a41bf5dd2759483e428dfd04daf72283978cac975c364101"
     },
     {
       "name": "rns-ratkey",
