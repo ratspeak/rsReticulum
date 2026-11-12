@@ -6,8 +6,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use rns_git::client::forks::{ClientArgs, Operation};
+use rns_git::client::releases::{Remote as ReleaseRemote, Response as ReleaseResponse};
 use rns_git::server::config::{
     NodeConfig, load_or_create_identity, read_or_create_config, resolve_config_dir,
 };
@@ -18,10 +19,11 @@ use rns_git::server::handlers::{
     Reply, handle_create, handle_delete, handle_fetch, handle_list, handle_push,
 };
 use rns_git::server::layout::{Repositories, git_available};
+use rns_git::server::releases::handle_release;
 use rns_git::server::stats::{STATS_JOB_INTERVAL, Stats};
 use rns_git::server::{
     APP_NAME, PATH_CREATE, PATH_DELETE, PATH_FETCH, PATH_FORK, PATH_LIST, PATH_MIRROR, PATH_PUSH,
-    PATH_SYNC,
+    PATH_RELEASE, PATH_SYNC,
 };
 use rns_identity::destination::{AllowPolicy, Destination};
 use rns_identity::identity::Identity;
@@ -39,16 +41,20 @@ const JOBS_INTERVAL: Duration = Duration::from_secs(5);
 /// Ceiling for a deferred reply held in memory: status bytes or file metadata.
 const REPLY_LIMIT: usize = 64 * 1024;
 
+/// Release list and view replies carry whole notes. Upstream sets no limit;
+/// this one keeps a release job's share of the deferred budget small.
+const RELEASE_REPLY_LIMIT: usize = 4 * 1024 * 1024;
+
 /// Admission for the git handlers: the manager's three copies of the request
 /// (payload, value, byte view) and a status-byte or file-backed reply; a refused
 /// job answers with `RES_REMOTE_FAIL` and a reason the remote helper prints.
-fn admission() -> DeferredAdmission {
+fn admission(reply_limit: usize) -> DeferredAdmission {
     let refusal = |message: &str| {
         let mut reply = vec![rns_git::server::RES_REMOTE_FAIL];
         reply.extend_from_slice(message.as_bytes());
         reply
     };
-    DeferredAdmission::new(REPLY_LIMIT)
+    DeferredAdmission::new(reply_limit)
         .request_copies(3)
         .busy_reply(refusal("Node busy, try again later"))
         .too_large_reply(refusal("Request too large for this node"))
@@ -283,6 +289,48 @@ async fn clone_subcommand(op: Operation, argv: Vec<String>) {
     rns_git::client::forks::run(op, args).await
 }
 
+#[derive(Parser)]
+#[command(
+    name = "rngit-rs release",
+    about = "Reticulum Git Release Manager",
+    disable_version_flag = true
+)]
+struct ReleaseArgs {
+    /// path to alternative config directory
+    #[arg(long)]
+    config: Option<String>,
+    /// path to alternative Reticulum config directory
+    #[arg(long)]
+    rnsconfig: Option<String>,
+    /// path to release identity
+    #[arg(short = 'i', long, value_name = "PATH")]
+    identity: Option<String>,
+    /// path to signing identity, if different from release identity
+    #[arg(short = 's', long, value_name = "PATH")]
+    signer: Option<String>,
+    /// package name if different from repo name
+    #[arg(short = 'n', long, value_name = "name")]
+    name: Option<String>,
+    /// generate release locally, but don't upload
+    #[arg(short = 'L', long = "local")]
+    local: bool,
+    /// verify manifest locally, but don't fetch updates
+    #[arg(short = 'o', long)]
+    offline: bool,
+    /// URL of remote repository, or path to RSM manifest
+    repository: Option<String>,
+    /// list, view, fetch, verify, create, latest or delete
+    operation: Option<String>,
+    /// tag and path to release artifacts directory
+    target: Option<String>,
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    #[arg(short = 'q', long, action = clap::ArgAction::Count)]
+    quiet: u8,
+    #[arg(long)]
+    version: bool,
+}
+
 /// `ReticulumGitClient.abort` (`server.py:402-403`).
 async fn abort(handle: &rns_runtime::reticulum::ReticulumHandle, message: &str) -> ! {
     println!("{message}");
@@ -441,6 +489,239 @@ async fn create(args: CreateArgs) {
     }
 }
 
+/// Requests on an established Link, made from a blocking thread.
+struct LinkRemote {
+    runtime: tokio::runtime::Handle,
+    session: rns_runtime::link_session::LinkSessionHandle,
+    spool: PathBuf,
+}
+
+impl ReleaseRemote for LinkRemote {
+    fn request(&mut self, data: rmpv::Value, timeout: Duration) -> Option<ReleaseResponse> {
+        let options = rns_runtime::link_session::RequestOptions {
+            timeout: Some(timeout),
+            spool_dir: Some(self.spool.clone()),
+            ..Default::default()
+        };
+        let request =
+            self.session
+                .request_with_options(rns_git::server::PATH_RELEASE, data, options);
+        let response = self
+            .runtime
+            .block_on(async {
+                tokio::time::timeout(timeout + Duration::from_secs(30), request).await
+            })
+            .ok()?
+            .ok()?;
+        Some(match (response.metadata, response.file) {
+            (Some(metadata), Some(file)) => ReleaseResponse::File {
+                path: file,
+                metadata: rmpv::decode::read_value(&mut metadata.as_slice())
+                    .unwrap_or(rmpv::Value::Nil),
+            },
+            _ => match response.value {
+                rmpv::Value::Binary(bytes) => ReleaseResponse::Bytes(bytes),
+                other => ReleaseResponse::Other(other),
+            },
+        })
+    }
+}
+
+/// `rngit release` (`server.py:84-99`, `715-1239`).
+async fn release(args: ReleaseArgs) {
+    use rns_git::client::releases::{Fail, ReleaseOp};
+    use rns_git::server::client::{ClientConfig, client_config_dir};
+    use std::io::Write;
+
+    let configdir = client_config_dir(non_empty(args.config).map(PathBuf::from).as_deref());
+    let rnsconfig = non_empty(args.rnsconfig);
+    let rns_dir = rns_runtime::platform::resolve_config_dir(rnsconfig.as_deref());
+    let configured = rns_runtime::config::Config::from_file(&rns_dir.join("config"))
+        .ok()
+        .and_then(|c| c.section("logging")?.get_int("loglevel"));
+    let level = rns_tools::Utility::Rnir.loglevel(configured, args.verbose, args.quiet, false);
+    rns_tools::init_tracing(
+        level,
+        rns_tools::config_log_timestamps(&rns_dir),
+        true,
+        std::io::stdout,
+    );
+    let handle = match rns_runtime::reticulum::init(
+        rnsconfig.as_deref(),
+        None,
+        ShutdownSignal::new(),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("failed to start reticulum: {e}");
+            std::process::exit(1);
+        }
+    };
+    handle.wants_destination_type(APP_NAME).await;
+    if let Err(e) = std::fs::create_dir_all(&configdir) {
+        abort(
+            &handle,
+            &format!("Could not create {}: {e}", configdir.display()),
+        )
+        .await;
+    }
+    let identity_path = non_empty(args.identity)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| configdir.join("client_identity"));
+    let identity = if identity_path.is_file() {
+        Identity::from_file(&identity_path).ok()
+    } else {
+        let id = Identity::new();
+        id.to_file(&identity_path).ok().map(|_| id)
+    };
+    let Some(identity) = identity else {
+        abort(&handle, "Could not initialize client identity").await;
+    };
+    let config = match ClientConfig::load_or_create(&configdir) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(
+                "Could not parse the configuration at {}",
+                configdir.join("client_config").display()
+            );
+            tracing::error!("Check your configuration file for errors! ({e})");
+            rns_tools::exit(&handle, 255).await;
+        }
+    };
+
+    let Some(operation_name) = args.operation.clone().filter(|o| !o.is_empty()) else {
+        let _ = ReleaseArgs::command().print_help();
+        println!("Invalid operation");
+        rns_tools::exit(&handle, 1).await;
+    };
+    let Some(operation) = ReleaseOp::parse(&operation_name) else {
+        println!("Invalid operation");
+        rns_tools::exit(&handle, 1).await;
+    };
+
+    let runtime = tokio::runtime::Handle::current();
+    let link_handle = handle.clone();
+    let remote_identity = identity.clone();
+    let code = tokio::task::spawn_blocking(move || {
+        let mut out = std::io::stdout();
+        let mut input = std::io::stdin().lock();
+        let spool = match tempfile::TempDir::new() {
+            Ok(dir) => dir,
+            Err(e) => {
+                return Err(Fail::Abort(format!(
+                    "Could not create a temporary directory: {e}"
+                )));
+            }
+        };
+        let mut connect = |remote: &str, failure: &str| -> Result<Box<dyn ReleaseRemote>, Fail> {
+            let destination = match config.parse_remote_destination_url(remote) {
+                Ok(hash) => hash,
+                Err(message) => return Err(Fail::Abort(message)),
+            };
+            let Ok(destination) = <[u8; 16]>::try_from(destination.as_slice()) else {
+                return Err(Fail::Abort("Invalid destination hash length".into()));
+            };
+            let path_timeout = runtime
+                .block_on(rns_tools::medium_path_timeout(&link_handle))
+                .max(15.0);
+            print!("Requesting path... ");
+            let _ = std::io::stdout().flush();
+            if runtime
+                .block_on(
+                    link_handle.await_path(destination, Duration::from_secs_f64(path_timeout)),
+                )
+                .is_err()
+            {
+                println!();
+                return Err(Fail::Abort(format!(
+                    "Could not resolve path to {}",
+                    prettyhex(&destination)
+                )));
+            }
+            print!("\rPath resolved      ");
+            print!("\rEstablishing link... ");
+            let _ = std::io::stdout().flush();
+            let hops = runtime
+                .block_on(link_handle.hops_to(destination))
+                .unwrap_or(1);
+            let first_hop = runtime
+                .block_on(link_handle.first_hop_timeout(destination))
+                .map_or(rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT, |d| {
+                    d.as_secs_f64()
+                });
+            let establishment =
+                first_hop + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT * f64::from(hops.max(1));
+            let options = rns_runtime::reticulum::LinkConnectOptions {
+                path_timeout: Duration::from_secs_f64(path_timeout),
+                establishment_timeout: Some(Duration::from_secs_f64(establishment.max(15.0))),
+                client_label: "rngit".to_string(),
+                identify: true,
+                ..Default::default()
+            };
+            let session = runtime
+                .block_on(link_handle.connect_link(destination, remote_identity.clone(), options))
+                .map_err(|_| Fail::Abort(failure.to_string()))?;
+            print!("\rLink established     ");
+            let _ = std::io::stdout().flush();
+            Ok(Box::new(LinkRemote {
+                runtime: runtime.clone(),
+                session: session.handle,
+                spool: spool.path().to_path_buf(),
+            }))
+        };
+        let result = match operation {
+            ReleaseOp::Fetch | ReleaseOp::Verify => rns_git::client::releases::fetch_release(
+                &mut out,
+                &config,
+                &mut connect,
+                args.repository.as_deref(),
+                args.target.as_deref(),
+                args.signer.as_deref(),
+                operation.offline(),
+            ),
+            ReleaseOp::Create => rns_git::client::releases::create_release(
+                &mut out,
+                &config,
+                &mut connect,
+                &identity,
+                args.repository.as_deref(),
+                args.target.as_deref(),
+                args.signer.as_deref(),
+                args.name.as_deref(),
+                args.local,
+            ),
+            _ => rns_git::client::releases::run_simple(
+                &mut out,
+                &mut input,
+                &config,
+                &mut connect,
+                &operation_name,
+                args.repository.as_deref(),
+                args.target.as_deref(),
+            ),
+        };
+        let _ = out.flush();
+        result
+    })
+    .await
+    .unwrap_or_else(|e| Err(Fail::Raised(format!("release task failed: {e}"))));
+
+    match code {
+        Ok(code) => rns_tools::exit(&handle, code).await,
+        Err(Fail::Abort(message)) => {
+            println!("{message}");
+            rns_tools::exit(&handle, 1).await
+        }
+        Err(Fail::Raised(message)) => {
+            eprintln!("{message}");
+            rns_tools::exit(&handle, 1).await
+        }
+    }
+}
+
 /// `RNS.LOG_MAXSIZE` (`RNS/__init__.py:74`).
 const LOG_MAXSIZE: u64 = 5 * 1024 * 1024;
 
@@ -487,6 +768,15 @@ async fn main() {
     let mut argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("node") {
         argv.remove(1);
+    } else if argv.get(1).map(String::as_str) == Some("release") {
+        argv.remove(1);
+        let args = ReleaseArgs::parse_from(argv);
+        if args.version {
+            println!("rngit-rs {RS_RETICULUM_VERSION}");
+            return;
+        }
+        release(args).await;
+        return;
     } else if argv.get(1).map(String::as_str) == Some("create") {
         argv.remove(1);
         let args = CreateArgs::parse_from(argv);
@@ -697,6 +987,7 @@ async fn main() {
     let fork: Handler = Box::new(|r, i, d| handle_fork(r, i, d).map(Reply::Bytes));
     let mirror: Handler = Box::new(|r, i, d| handle_mirror(r, i, d).map(Reply::Bytes));
     let sync: Handler = Box::new(|r, i, d| handle_sync(r, i, d).map(Reply::Bytes));
+    let release: Handler = Box::new(handle_release);
     for (path, handler) in [
         (PATH_FETCH, fetch),
         (PATH_PUSH, push),
@@ -705,6 +996,7 @@ async fn main() {
         (PATH_FORK, fork),
         (PATH_MIRROR, mirror),
         (PATH_SYNC, sync),
+        (PATH_RELEASE, release),
     ] {
         let ok = registered
             .handle
@@ -713,7 +1005,11 @@ async fn main() {
                 AllowPolicy::AllowAll,
                 Vec::new(),
                 true,
-                admission(),
+                admission(if path == PATH_RELEASE {
+                    RELEASE_REPLY_LIMIT
+                } else {
+                    REPLY_LIMIT
+                }),
                 deferred(repositories.clone(), tempdirs.clone(), Arc::new(handler)),
             )
             .await;

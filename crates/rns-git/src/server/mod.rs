@@ -6,6 +6,7 @@ pub mod forks;
 pub mod handlers;
 pub mod layout;
 pub mod perms;
+pub mod releases;
 pub mod stats;
 
 /// `APP_NAME` plus the aspect (`__init__.py:31`, `server.py:2063`).
@@ -19,6 +20,7 @@ pub const PATH_CREATE: &str = "/git/create";
 pub const PATH_FORK: &str = "/git/fork";
 pub const PATH_SYNC: &str = "/git/sync";
 pub const PATH_MIRROR: &str = "/git/mirror";
+pub const PATH_RELEASE: &str = "/mgmt/release";
 
 pub const RES_OK: u8 = 0x00;
 pub const RES_DISALLOWED: u8 = 0x01;
