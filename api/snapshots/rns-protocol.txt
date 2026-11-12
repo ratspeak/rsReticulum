@@ -33,6 +33,7 @@ pub fn rns_protocol::buffer::StreamWriter::close_simple(&mut self) -> rns_protoc
 pub fn rns_protocol::buffer::StreamWriter::is_closed(&self) -> bool
 pub fn rns_protocol::buffer::StreamWriter::new(u16, usize) -> Self
 pub fn rns_protocol::buffer::StreamWriter::write(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<rns_protocol::stream_data::StreamDataMessage>, rns_protocol::buffer::BufferError>
+pub fn rns_protocol::buffer::StreamWriter::write_once(&mut self, &[u8]) -> core::result::Result<core::option::Option<(rns_protocol::stream_data::StreamDataMessage, usize)>, rns_protocol::buffer::BufferError>
 pub const rns_protocol::buffer::COMPRESSION_TRIES: usize
 pub const rns_protocol::buffer::MAX_CHUNK_LEN: usize
 pub mod rns_protocol::channel
@@ -54,6 +55,7 @@ pub fn rns_protocol::channel::Channel::add_message_handler(&mut self, rns_protoc
 pub fn rns_protocol::channel::Channel::channel_mdu(usize) -> usize
 pub fn rns_protocol::channel::Channel::clear_message_handlers(&mut self)
 pub fn rns_protocol::channel::Channel::compute_timeout(&self, usize) -> f64
+pub fn rns_protocol::channel::Channel::deliverable_types(&self, &[u8]) -> alloc::vec::Vec<u16>
 pub fn rns_protocol::channel::Channel::delivered(&mut self, u16, f64)
 pub fn rns_protocol::channel::Channel::is_drained(&self) -> bool
 pub fn rns_protocol::channel::Channel::is_ready_to_send(&self) -> bool
@@ -61,6 +63,7 @@ pub fn rns_protocol::channel::Channel::new(f64) -> Self
 pub fn rns_protocol::channel::Channel::next_timeout_duration(&self) -> core::option::Option<core::time::Duration>
 pub fn rns_protocol::channel::Channel::outstanding_count(&self) -> usize
 pub fn rns_protocol::channel::Channel::receive(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<(u16, alloc::vec::Vec<u8>)>, rns_protocol::channel::ChannelError>
+pub fn rns_protocol::channel::Channel::receive_unhandled(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<(u16, alloc::vec::Vec<u8>)>, rns_protocol::channel::ChannelError>
 pub fn rns_protocol::channel::Channel::register_message_type(&mut self, u16) -> core::result::Result<(), rns_protocol::channel::ChannelError>
 pub fn rns_protocol::channel::Channel::register_system_type(&mut self, u16)
 pub fn rns_protocol::channel::Channel::remove_message_handler(&mut self, rns_protocol::channel::HandlerId) -> bool
@@ -97,6 +100,7 @@ pub struct rns_protocol::channel::LinkChannel
 impl rns_protocol::channel::LinkChannel
 pub fn rns_protocol::channel::LinkChannel::add_message_handler(&mut self, rns_protocol::channel::MessageCallback) -> rns_protocol::channel::HandlerId
 pub fn rns_protocol::channel::LinkChannel::clear_message_handlers(&mut self)
+pub fn rns_protocol::channel::LinkChannel::deliverable_types(&self, &[u8]) -> alloc::vec::Vec<u16>
 pub fn rns_protocol::channel::LinkChannel::delivered(&mut self, u16, f64)
 pub fn rns_protocol::channel::LinkChannel::delivered_by_packet_hash(&mut self, &[u8; 32], f64) -> core::option::Option<u16>
 pub fn rns_protocol::channel::LinkChannel::is_active(&self) -> bool
@@ -113,6 +117,7 @@ pub fn rns_protocol::channel::LinkChannel::outstanding_count(&self) -> usize
 pub fn rns_protocol::channel::LinkChannel::prepare_send(&mut self, &dyn rns_protocol::channel_message::MessageBase) -> core::result::Result<alloc::vec::Vec<u8>, rns_protocol::channel::ChannelError>
 pub fn rns_protocol::channel::LinkChannel::prepare_send_tracked(&mut self, &dyn rns_protocol::channel_message::MessageBase) -> core::result::Result<rns_protocol::channel::PreparedChannelData, rns_protocol::channel::ChannelError>
 pub fn rns_protocol::channel::LinkChannel::receive_data(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<(u16, alloc::vec::Vec<u8>)>, rns_protocol::channel::ChannelError>
+pub fn rns_protocol::channel::LinkChannel::receive_data_unhandled(&mut self, &[u8]) -> core::result::Result<alloc::vec::Vec<(u16, alloc::vec::Vec<u8>)>, rns_protocol::channel::ChannelError>
 pub fn rns_protocol::channel::LinkChannel::register_message_type(&mut self, u16) -> core::result::Result<(), rns_protocol::channel::ChannelError>
 pub fn rns_protocol::channel::LinkChannel::register_system_type(&mut self, u16)
 pub fn rns_protocol::channel::LinkChannel::remove_message_handler(&mut self, rns_protocol::channel::HandlerId) -> bool
@@ -212,6 +217,7 @@ pub rns_protocol::resource::ResourceError::ControlFrameTooLarge::context: rns_wi
 pub rns_protocol::resource::ResourceError::ControlFrameTooLarge::encoded_len: usize
 pub rns_protocol::resource::ResourceError::ControlFrameTooLarge::mtu: usize
 pub rns_protocol::resource::ResourceError::Corrupt
+pub rns_protocol::resource::ResourceError::DecompressedTooLarge
 pub rns_protocol::resource::ResourceError::DecompressionFailed
 pub rns_protocol::resource::ResourceError::DecryptFailed
 pub rns_protocol::resource::ResourceError::DuplicateSegment
@@ -239,12 +245,18 @@ pub enum rns_protocol::resource::TransferAction
 pub rns_protocol::resource::TransferAction::Complete
 pub rns_protocol::resource::TransferAction::Failed(alloc::string::String)
 pub rns_protocol::resource::TransferAction::None
+pub rns_protocol::resource::TransferAction::QueryProofCache(alloc::vec::Vec<u8>)
 pub rns_protocol::resource::TransferAction::SendAdvertisement(alloc::vec::Vec<u8>)
 pub rns_protocol::resource::TransferAction::SendCancel(rns_protocol::resource::CancelType, [u8; 32])
 pub rns_protocol::resource::TransferAction::SendHmu(alloc::vec::Vec<u8>)
 pub rns_protocol::resource::TransferAction::SendPart(usize, alloc::vec::Vec<u8>)
 pub rns_protocol::resource::TransferAction::SendProof(alloc::vec::Vec<u8>)
 pub rns_protocol::resource::TransferAction::SendRequest(alloc::vec::Vec<u8>)
+pub struct rns_protocol::resource::InboundLinkFacts
+pub rns_protocol::resource::InboundLinkFacts::establishment_cost: usize
+pub rns_protocol::resource::InboundLinkFacts::previous_eifr: core::option::Option<f64>
+pub rns_protocol::resource::InboundLinkFacts::previous_window: core::option::Option<usize>
+pub rns_protocol::resource::InboundLinkFacts::rtt: core::time::Duration
 pub struct rns_protocol::resource::InboundResource
 pub rns_protocol::resource::InboundResource::consecutive_completed: usize
 pub rns_protocol::resource::InboundResource::data_size: usize
@@ -272,6 +284,7 @@ pub fn rns_protocol::resource::InboundResource::with_sdu(usize, usize, usize, [u
 pub struct rns_protocol::resource::InboundTransfer
 pub rns_protocol::resource::InboundTransfer::accepted: bool
 pub rns_protocol::resource::InboundTransfer::eifr: core::option::Option<f64>
+pub rns_protocol::resource::InboundTransfer::establishment_cost: usize
 pub rns_protocol::resource::InboundTransfer::hashmap_height: usize
 pub rns_protocol::resource::InboundTransfer::last_activity: std::time::Instant
 pub rns_protocol::resource::InboundTransfer::outstanding_parts: usize
@@ -280,7 +293,9 @@ pub rns_protocol::resource::InboundTransfer::parts_since_hmu: usize
 pub rns_protocol::resource::InboundTransfer::previous_eifr: core::option::Option<f64>
 pub rns_protocol::resource::InboundTransfer::req_data_rtt_rate: f64
 pub rns_protocol::resource::InboundTransfer::req_resp: core::option::Option<std::time::Instant>
+pub rns_protocol::resource::InboundTransfer::req_resp_rtt_rate: f64
 pub rns_protocol::resource::InboundTransfer::req_sent: core::option::Option<std::time::Instant>
+pub rns_protocol::resource::InboundTransfer::req_sent_bytes: usize
 pub rns_protocol::resource::InboundTransfer::resource: rns_protocol::resource::InboundResource
 pub rns_protocol::resource::InboundTransfer::retries_left: usize
 pub rns_protocol::resource::InboundTransfer::rtt: core::time::Duration
@@ -294,6 +309,7 @@ pub fn rns_protocol::resource::InboundTransfer::check_timeout(&mut self) -> rns_
 pub fn rns_protocol::resource::InboundTransfer::complete(&mut self, core::option::Option<&rns_protocol::resource::ResourceDecryptor<'_>>) -> core::result::Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), rns_protocol::resource::ResourceError>
 pub fn rns_protocol::resource::InboundTransfer::create_hmu(&self) -> alloc::vec::Vec<u8>
 pub fn rns_protocol::resource::InboundTransfer::from_advertisement(usize, usize, usize, [u8; 4], [u8; 32], rns_protocol::resource::ResourceFlags, alloc::vec::Vec<[u8; 4]>, core::time::Duration) -> core::result::Result<Self, rns_protocol::resource::ResourceError>
+pub fn rns_protocol::resource::InboundTransfer::from_advertisement_with_link(usize, usize, usize, [u8; 4], [u8; 32], rns_protocol::resource::ResourceFlags, alloc::vec::Vec<[u8; 4]>, rns_protocol::resource::InboundLinkFacts) -> core::result::Result<Self, rns_protocol::resource::ResourceError>
 pub fn rns_protocol::resource::InboundTransfer::handle_cancel(&mut self)
 pub fn rns_protocol::resource::InboundTransfer::hashmap_update(&mut self, usize, &[u8]) -> rns_protocol::resource::TransferAction
 pub fn rns_protocol::resource::InboundTransfer::progress(&self) -> f64
@@ -309,6 +325,8 @@ impl rns_protocol::resource::LazyMultiSegmentOutbound
 pub fn rns_protocol::resource::LazyMultiSegmentOutbound::new(alloc::vec::Vec<u8>, bool) -> core::result::Result<Self, rns_protocol::resource::ResourceError>
 pub fn rns_protocol::resource::LazyMultiSegmentOutbound::next_segment(&mut self, core::option::Option<&rns_protocol::resource::ResourceEncryptor<'_>>) -> core::result::Result<core::option::Option<rns_protocol::resource::OutboundResource>, rns_protocol::resource::ResourceError>
 pub fn rns_protocol::resource::LazyMultiSegmentOutbound::remaining_segments(&self) -> usize
+pub fn rns_protocol::resource::LazyMultiSegmentOutbound::with_app_flag(self, bool) -> Self
+pub fn rns_protocol::resource::LazyMultiSegmentOutbound::with_link_sdu(self, core::option::Option<usize>) -> Self
 pub fn rns_protocol::resource::LazyMultiSegmentOutbound::with_options(alloc::vec::Vec<u8>, bool, core::option::Option<alloc::vec::Vec<u8>>, core::option::Option<alloc::vec::Vec<u8>>, bool) -> core::result::Result<Self, rns_protocol::resource::ResourceError>
 pub struct rns_protocol::resource::LinkResource
 pub rns_protocol::resource::LinkResource::inbound: core::option::Option<rns_protocol::resource::InboundResource>
@@ -332,6 +350,7 @@ pub rns_protocol::resource::MultiSegmentInbound::data_size: usize
 pub rns_protocol::resource::MultiSegmentInbound::metadata: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_protocol::resource::MultiSegmentInbound::original_hash: [u8; 32]
 pub rns_protocol::resource::MultiSegmentInbound::segments: alloc::vec::Vec<core::option::Option<rns_protocol::resource::InboundResource>>
+pub rns_protocol::resource::MultiSegmentInbound::size_bound: core::option::Option<usize>
 pub rns_protocol::resource::MultiSegmentInbound::total_segments: usize
 impl rns_protocol::resource::MultiSegmentInbound
 pub fn rns_protocol::resource::MultiSegmentInbound::assemble_segment(&mut self, usize, core::option::Option<&rns_protocol::resource::ResourceDecryptor<'_>>) -> core::result::Result<(), rns_protocol::resource::ResourceError>
@@ -343,6 +362,7 @@ pub fn rns_protocol::resource::MultiSegmentInbound::reassemble(&self) -> core::r
 pub fn rns_protocol::resource::MultiSegmentInbound::set_metadata(&mut self, alloc::vec::Vec<u8>)
 pub fn rns_protocol::resource::MultiSegmentInbound::set_segment(&mut self, usize, rns_protocol::resource::InboundResource)
 pub fn rns_protocol::resource::MultiSegmentInbound::set_segment_data(&mut self, usize, alloc::vec::Vec<u8>) -> core::result::Result<(), rns_protocol::resource::ResourceError>
+pub fn rns_protocol::resource::MultiSegmentInbound::with_size_bound(self, usize) -> Self
 pub struct rns_protocol::resource::MultiSegmentOutbound
 pub rns_protocol::resource::MultiSegmentOutbound::data_size: usize
 pub rns_protocol::resource::MultiSegmentOutbound::original_hash: [u8; 32]
@@ -356,7 +376,7 @@ pub fn rns_protocol::resource::MultiSegmentOutbound::is_complete(&self) -> bool
 pub fn rns_protocol::resource::MultiSegmentOutbound::new(alloc::vec::Vec<u8>, bool) -> core::result::Result<Self, rns_protocol::resource::ResourceError>
 pub fn rns_protocol::resource::MultiSegmentOutbound::num_segments(&self) -> usize
 pub fn rns_protocol::resource::MultiSegmentOutbound::with_encrypt(alloc::vec::Vec<u8>, bool, core::option::Option<&rns_protocol::resource::ResourceEncryptor<'_>>) -> core::result::Result<Self, rns_protocol::resource::ResourceError>
-pub fn rns_protocol::resource::MultiSegmentOutbound::with_options(alloc::vec::Vec<u8>, bool, core::option::Option<alloc::vec::Vec<u8>>, core::option::Option<alloc::vec::Vec<u8>>, bool, core::option::Option<&rns_protocol::resource::ResourceEncryptor<'_>>) -> core::result::Result<Self, rns_protocol::resource::ResourceError>
+pub fn rns_protocol::resource::MultiSegmentOutbound::with_options(alloc::vec::Vec<u8>, bool, core::option::Option<alloc::vec::Vec<u8>>, core::option::Option<alloc::vec::Vec<u8>>, bool, core::option::Option<&rns_protocol::resource::ResourceEncryptor<'_>>, core::option::Option<usize>) -> core::result::Result<Self, rns_protocol::resource::ResourceError>
 pub struct rns_protocol::resource::OutboundResource
 pub rns_protocol::resource::OutboundResource::advertisement_data_size: usize
 pub rns_protocol::resource::OutboundResource::data: alloc::vec::Vec<u8>
@@ -387,6 +407,8 @@ pub fn rns_protocol::resource::OutboundResource::validate_proof(&mut self, &[u8]
 pub fn rns_protocol::resource::OutboundResource::with_options(alloc::vec::Vec<u8>, bool, core::option::Option<alloc::vec::Vec<u8>>, core::option::Option<usize>, core::option::Option<&rns_protocol::resource::ResourceEncryptor<'_>>) -> core::result::Result<Self, rns_protocol::resource::ResourceError>
 pub struct rns_protocol::resource::OutboundTransfer
 pub rns_protocol::resource::OutboundTransfer::advertised: bool
+pub rns_protocol::resource::OutboundTransfer::advertisement_mdu: usize
+pub rns_protocol::resource::OutboundTransfer::advertisement_timeout: core::option::Option<core::time::Duration>
 pub rns_protocol::resource::OutboundTransfer::awaiting_hmu: bool
 pub rns_protocol::resource::OutboundTransfer::confirmed_parts: alloc::vec::Vec<bool>
 pub rns_protocol::resource::OutboundTransfer::cursor: usize
@@ -401,7 +423,9 @@ pub rns_protocol::resource::OutboundTransfer::window_cursor: usize
 pub rns_protocol::resource::OutboundTransfer::window_max_sent: usize
 impl rns_protocol::resource::OutboundTransfer
 pub fn rns_protocol::resource::OutboundTransfer::all_confirmed(&self) -> bool
+pub fn rns_protocol::resource::OutboundTransfer::cancel(&mut self, &str) -> rns_protocol::resource::TransferAction
 pub fn rns_protocol::resource::OutboundTransfer::check_timeout(&mut self) -> rns_protocol::resource::TransferAction
+pub fn rns_protocol::resource::OutboundTransfer::failure_reason(&self) -> core::option::Option<&str>
 pub fn rns_protocol::resource::OutboundTransfer::from_prebuilt(rns_protocol::resource::OutboundResource, core::time::Duration) -> Self
 pub fn rns_protocol::resource::OutboundTransfer::handle_cancel(&mut self)
 pub fn rns_protocol::resource::OutboundTransfer::handle_hmu(&mut self, &[u8])
@@ -413,7 +437,9 @@ pub fn rns_protocol::resource::OutboundTransfer::new_encrypted(alloc::vec::Vec<u
 pub fn rns_protocol::resource::OutboundTransfer::progress(&self) -> f64
 pub fn rns_protocol::resource::OutboundTransfer::tick(&mut self) -> rns_protocol::resource::TransferAction
 pub fn rns_protocol::resource::OutboundTransfer::timeout_window(&self) -> core::option::Option<(std::time::Instant, core::time::Duration)>
+pub fn rns_protocol::resource::OutboundTransfer::with_app_flag(self, bool) -> Self
 pub struct rns_protocol::resource::ResourceFlags
+pub rns_protocol::resource::ResourceFlags::app_flag: bool
 pub rns_protocol::resource::ResourceFlags::compressed: bool
 pub rns_protocol::resource::ResourceFlags::encrypted: bool
 pub rns_protocol::resource::ResourceFlags::has_metadata: bool
@@ -430,13 +456,17 @@ pub rns_protocol::resource::WindowState::window: usize
 pub rns_protocol::resource::WindowState::window_max: usize
 pub rns_protocol::resource::WindowState::window_min: usize
 impl rns_protocol::resource::WindowState
-pub fn rns_protocol::resource::WindowState::grow(&mut self, usize)
+pub fn rns_protocol::resource::WindowState::grow(&mut self)
 pub fn rns_protocol::resource::WindowState::new() -> Self
+pub fn rns_protocol::resource::WindowState::on_first_part(&mut self, f64)
+pub fn rns_protocol::resource::WindowState::on_window_drained(&mut self, f64)
 pub fn rns_protocol::resource::WindowState::shrink(&mut self)
 impl core::default::Default for rns_protocol::resource::WindowState
 pub fn rns_protocol::resource::WindowState::default() -> Self
+pub const rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT: usize
 pub const rns_protocol::resource::EIFR_COLD_START_BYTES: usize
 pub const rns_protocol::resource::FAST_RATE_THRESHOLD: usize
+pub const rns_protocol::resource::HASHMAP_IS_EMPTY: u8
 pub const rns_protocol::resource::HASHMAP_IS_EXHAUSTED: u8
 pub const rns_protocol::resource::HASHMAP_IS_NOT_EXHAUSTED: u8
 pub const rns_protocol::resource::HMU_WAIT_FACTOR: f64
@@ -451,6 +481,7 @@ pub const rns_protocol::resource::PART_TIMEOUT_FACTOR: f64
 pub const rns_protocol::resource::PART_TIMEOUT_FACTOR_AFTER_RTT: f64
 pub const rns_protocol::resource::PER_RETRY_DELAY: f64
 pub const rns_protocol::resource::PROCESSING_GRACE: f64
+pub const rns_protocol::resource::PROOF_CACHE_QUERIES: usize
 pub const rns_protocol::resource::PROOF_TIMEOUT_FACTOR: f64
 pub const rns_protocol::resource::RANDOM_HASH_SIZE: usize
 pub const rns_protocol::resource::RATE_FAST: usize
@@ -471,6 +502,7 @@ pub fn rns_protocol::resource::compute_expected_proof(&[u8], &[u8; 32]) -> [u8; 
 pub fn rns_protocol::resource::compute_resource_hash(&[u8], &[u8]) -> [u8; 32]
 pub fn rns_protocol::resource::get_map_hash(&[u8], &[u8]) -> [u8; 4]
 pub fn rns_protocol::resource::parse_hashmap_update(&[u8]) -> core::result::Result<([u8; 32], usize, alloc::vec::Vec<u8>), rns_protocol::resource::ResourceError>
+pub fn rns_protocol::resource::resource_proof_packet_hash(&[u8; 16], &[u8]) -> [u8; 32]
 pub type rns_protocol::resource::ResourceDecryptor<'a> = (dyn core::ops::function::Fn(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_protocol::resource::ResourceError> + 'a)
 pub type rns_protocol::resource::ResourceEncryptor<'a> = (dyn core::ops::function::Fn(&[u8]) -> alloc::vec::Vec<u8> + 'a)
 pub mod rns_protocol::resource_adv
@@ -488,6 +520,7 @@ pub rns_protocol::resource_adv::ResourceAdvertisement::segment_index: usize
 pub rns_protocol::resource_adv::ResourceAdvertisement::total_segments: usize
 pub rns_protocol::resource_adv::ResourceAdvertisement::transfer_size: usize
 impl rns_protocol::resource_adv::ResourceAdvertisement
+pub fn rns_protocol::resource_adv::ResourceAdvertisement::defer_hashmap_if_over(&mut self, usize) -> core::result::Result<(), rns_protocol::resource::ResourceError>
 pub fn rns_protocol::resource_adv::ResourceAdvertisement::encoded_len(&self) -> core::result::Result<usize, rns_protocol::resource::ResourceError>
 pub fn rns_protocol::resource_adv::ResourceAdvertisement::get_map_hashes(&self) -> alloc::vec::Vec<[u8; 4]>
 pub fn rns_protocol::resource_adv::ResourceAdvertisement::new(usize, usize, usize, [u8; 32], alloc::vec::Vec<u8>, rns_protocol::resource::ResourceFlags, &[[u8; 4]], usize) -> Self
@@ -616,7 +649,6 @@ pub const rns_protocol::rnsh::MSG_TYPE_STREAM_DATA: u16
 pub const rns_protocol::rnsh::MSG_TYPE_VERSION_INFO: u16
 pub const rns_protocol::rnsh::MSG_TYPE_WINDOW_SIZE: u16
 pub const rns_protocol::rnsh::PROTOCOL_VERSION: u64
-pub const rns_protocol::rnsh::STREAM_DATA_OVERHEAD: usize
 pub const rns_protocol::rnsh::STREAM_ID_MAX: u16
 pub const rns_protocol::rnsh::STREAM_ID_STDERR: u16
 pub const rns_protocol::rnsh::STREAM_ID_STDIN: u16

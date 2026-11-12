@@ -1,0 +1,455 @@
+pub mod rns_git
+pub mod rns_git::client
+pub mod rns_git::client::forks
+pub enum rns_git::client::forks::Operation
+pub rns_git::client::forks::Operation::Fork
+pub rns_git::client::forks::Operation::Mirror
+pub rns_git::client::forks::Operation::Sync
+pub struct rns_git::client::forks::ClientArgs
+pub rns_git::client::forks::ClientArgs::config: core::option::Option<alloc::string::String>
+pub rns_git::client::forks::ClientArgs::identity: core::option::Option<alloc::string::String>
+pub rns_git::client::forks::ClientArgs::quiet: u8
+pub rns_git::client::forks::ClientArgs::rnsconfig: core::option::Option<alloc::string::String>
+pub rns_git::client::forks::ClientArgs::source: core::option::Option<alloc::string::String>
+pub rns_git::client::forks::ClientArgs::target: alloc::string::String
+pub rns_git::client::forks::ClientArgs::verbose: u8
+pub fn rns_git::client::forks::outcome(rns_git::client::forks::Operation, &str, core::option::Option<&[u8]>) -> core::result::Result<alloc::string::String, alloc::string::String>
+pub async fn rns_git::client::forks::run(rns_git::client::forks::Operation, rns_git::client::forks::ClientArgs) -> never
+pub mod rns_git::client::perms
+pub enum rns_git::client::perms::PermsTarget
+pub rns_git::client::perms::PermsTarget::Group
+pub rns_git::client::perms::PermsTarget::Repository
+pub fn rns_git::client::perms::perms_target(&str) -> core::option::Option<(alloc::string::String, rns_git::client::perms::PermsTarget)>
+pub fn rns_git::client::perms::run_perms(&mut dyn core::io::write::Write, &rns_git::server::client::ClientConfig, &mut rns_git::client::releases::Connect<'_>, &str, rns_git::client::perms::PermsTarget) -> core::result::Result<i32, rns_git::client::releases::Fail>
+pub mod rns_git::client::releases
+pub enum rns_git::client::releases::Fail
+pub rns_git::client::releases::Fail::Abort(alloc::string::String)
+pub rns_git::client::releases::Fail::Raised(alloc::string::String)
+pub enum rns_git::client::releases::ReleaseOp
+pub rns_git::client::releases::ReleaseOp::Create
+pub rns_git::client::releases::ReleaseOp::Delete
+pub rns_git::client::releases::ReleaseOp::Fetch
+pub rns_git::client::releases::ReleaseOp::Latest
+pub rns_git::client::releases::ReleaseOp::List
+pub rns_git::client::releases::ReleaseOp::Verify
+pub rns_git::client::releases::ReleaseOp::View
+impl rns_git::client::releases::ReleaseOp
+pub fn rns_git::client::releases::ReleaseOp::offline(self) -> bool
+pub fn rns_git::client::releases::ReleaseOp::parse(&str) -> core::option::Option<Self>
+pub enum rns_git::client::releases::Response
+pub rns_git::client::releases::Response::Bytes(alloc::vec::Vec<u8>)
+pub rns_git::client::releases::Response::File
+pub rns_git::client::releases::Response::File::metadata: rmpv::Value
+pub rns_git::client::releases::Response::File::path: std::path::PathBuf
+pub rns_git::client::releases::Response::Other(rmpv::Value)
+pub trait rns_git::client::releases::Remote
+pub fn rns_git::client::releases::Remote::request(&mut self, rmpv::Value, core::time::Duration) -> core::option::Option<rns_git::client::releases::Response>
+pub fn rns_git::client::releases::confirm_and_send(&mut dyn core::io::write::Write, &mut dyn alloc::io::buf_read::BufRead, &mut dyn rns_git::client::releases::Remote, &str, &str, &str) -> core::result::Result<(), rns_git::client::releases::Fail>
+pub fn rns_git::client::releases::create_release(&mut dyn core::io::write::Write, &rns_git::server::client::ClientConfig, &mut rns_git::client::releases::Connect<'_>, &rns_identity::identity::Identity, core::option::Option<&str>, core::option::Option<&str>, core::option::Option<&str>, core::option::Option<&str>, bool) -> core::result::Result<i32, rns_git::client::releases::Fail>
+pub fn rns_git::client::releases::expand_user(&str) -> std::path::PathBuf
+pub fn rns_git::client::releases::fetch_release(&mut dyn core::io::write::Write, &rns_git::server::client::ClientConfig, &mut rns_git::client::releases::Connect<'_>, core::option::Option<&str>, core::option::Option<&str>, core::option::Option<&str>, bool) -> core::result::Result<i32, rns_git::client::releases::Fail>
+pub fn rns_git::client::releases::fnmatch(&str, &str) -> bool
+pub fn rns_git::client::releases::iso_utc(i64) -> alloc::string::String
+pub fn rns_git::client::releases::list_releases(&mut dyn core::io::write::Write, &mut dyn rns_git::client::releases::Remote, &str) -> core::result::Result<(), rns_git::client::releases::Fail>
+pub fn rns_git::client::releases::prettyhexrep(&[u8]) -> alloc::string::String
+pub fn rns_git::client::releases::request_field<'a>(&'a [(rmpv::Value, rmpv::Value)], &str) -> core::option::Option<&'a rmpv::Value>
+pub fn rns_git::client::releases::required_signer(core::option::Option<&str>) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, rns_git::client::releases::Fail>
+pub fn rns_git::client::releases::run_simple(&mut dyn core::io::write::Write, &mut dyn alloc::io::buf_read::BufRead, &rns_git::server::client::ClientConfig, &mut rns_git::client::releases::Connect<'_>, &str, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<i32, rns_git::client::releases::Fail>
+pub fn rns_git::client::releases::view_release(&mut dyn core::io::write::Write, &mut dyn rns_git::client::releases::Remote, &str, &str) -> core::result::Result<(), rns_git::client::releases::Fail>
+pub type rns_git::client::releases::Connect<'a> = (dyn core::ops::function::FnMut(&str, &str) -> core::result::Result<alloc::boxed::Box<dyn rns_git::client::releases::Remote>, rns_git::client::releases::Fail> + 'a)
+pub mod rns_git::client::work
+pub enum rns_git::client::work::WorkOp
+pub rns_git::client::work::WorkOp::Activate
+pub rns_git::client::work::WorkOp::Complete
+pub rns_git::client::work::WorkOp::Create
+pub rns_git::client::work::WorkOp::Delete
+pub rns_git::client::work::WorkOp::Edit
+pub rns_git::client::work::WorkOp::List
+pub rns_git::client::work::WorkOp::Perms
+pub rns_git::client::work::WorkOp::Propose
+pub rns_git::client::work::WorkOp::Update
+pub rns_git::client::work::WorkOp::View
+impl rns_git::client::work::WorkOp
+pub fn rns_git::client::work::WorkOp::parse(&str) -> core::option::Option<Self>
+pub struct rns_git::client::work::CommonArgs
+pub rns_git::client::work::CommonArgs::config: core::option::Option<alloc::string::String>
+pub rns_git::client::work::CommonArgs::identity: core::option::Option<alloc::string::String>
+pub rns_git::client::work::CommonArgs::quiet: u8
+pub rns_git::client::work::CommonArgs::rnsconfig: core::option::Option<alloc::string::String>
+pub rns_git::client::work::CommonArgs::verbose: u8
+pub struct rns_git::client::work::WorkArgs
+pub rns_git::client::work::WorkArgs::doc_id: core::option::Option<i64>
+pub rns_git::client::work::WorkArgs::remote: core::option::Option<alloc::string::String>
+pub rns_git::client::work::WorkArgs::scope: alloc::string::String
+pub rns_git::client::work::WorkArgs::title: core::option::Option<alloc::string::String>
+pub const rns_git::client::work::COMMENT_TEMPLATE: &str
+pub const rns_git::client::work::CREATE_DOC_TEMPLATE: &str
+pub const rns_git::client::work::PERMISSIONS_TEMPLATE: &str
+pub fn rns_git::client::work::edit_permissions(&mut dyn core::io::write::Write, &str) -> core::option::Option<alloc::string::String>
+pub fn rns_git::client::work::edit_work_content(&mut dyn core::io::write::Write, &str, bool) -> core::option::Option<alloc::string::String>
+pub async fn rns_git::client::work::run_client(rns_git::client::work::CommonArgs, &'static str, rns_git::client::work::ClientBody) -> never
+pub fn rns_git::client::work::run_work(&mut dyn core::io::write::Write, &mut dyn alloc::io::buf_read::BufRead, &rns_git::server::client::ClientConfig, &mut rns_git::client::releases::Connect<'_>, &rns_identity::identity::Identity, core::option::Option<&str>, &rns_git::client::work::WorkArgs) -> core::result::Result<i32, rns_git::client::releases::Fail>
+pub type rns_git::client::work::ClientBody = alloc::boxed::Box<(dyn core::ops::function::FnOnce(&mut dyn core::io::write::Write, &mut dyn alloc::io::buf_read::BufRead, &rns_git::server::client::ClientConfig, &mut rns_git::client::releases::Connect<'_>, &rns_identity::identity::Identity) -> core::result::Result<i32, rns_git::client::releases::Fail> + core::marker::Send)>
+pub mod rns_git::commitsigs
+pub enum rns_git::commitsigs::HeaderEmail
+pub rns_git::commitsigs::HeaderEmail::DecodeError
+pub rns_git::commitsigs::HeaderEmail::Email(alloc::string::String)
+impl core::fmt::Display for rns_git::commitsigs::HeaderEmail
+pub fn rns_git::commitsigs::HeaderEmail::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_git::commitsigs::SshSignature
+pub rns_git::commitsigs::SshSignature::hash_algorithm: alloc::vec::Vec<u8>
+pub rns_git::commitsigs::SshSignature::namespace: alloc::vec::Vec<u8>
+pub rns_git::commitsigs::SshSignature::public_key: alloc::vec::Vec<u8>
+pub rns_git::commitsigs::SshSignature::reserved: alloc::vec::Vec<u8>
+pub rns_git::commitsigs::SshSignature::signature_data: alloc::vec::Vec<u8>
+pub rns_git::commitsigs::SshSignature::version: u32
+pub const rns_git::commitsigs::HASH_ALGORITHM: &[u8]
+pub const rns_git::commitsigs::NAMESPACE_GIT: &[u8]
+pub const rns_git::commitsigs::RESERVED_EMPTY: &[u8]
+pub const rns_git::commitsigs::SSHSIG_MAGIC: &[u8]
+pub const rns_git::commitsigs::SSHSIG_VERSION: u32
+pub fn rns_git::commitsigs::armor_ssh_signature(&[u8]) -> alloc::string::String
+pub fn rns_git::commitsigs::create_ssh_signature(&[u8], &[u8], &[u8], &[u8], &[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_git::commitsigs::extract_commit_author(&[u8]) -> rns_git::commitsigs::HeaderEmail
+pub fn rns_git::commitsigs::extract_commit_committer(&[u8]) -> rns_git::commitsigs::HeaderEmail
+pub fn rns_git::commitsigs::extract_commit_tagger(&[u8]) -> core::option::Option<(alloc::string::String, bool)>
+pub fn rns_git::commitsigs::get_pubkey_wire_format(&rns_identity::identity::Identity) -> alloc::vec::Vec<u8>
+pub fn rns_git::commitsigs::main() -> std::process::ExitCode
+pub fn rns_git::commitsigs::parse_ssh_signature(&[u8]) -> core::result::Result<rns_git::commitsigs::SshSignature, alloc::string::String>
+pub fn rns_git::commitsigs::ssh_string(&[u8]) -> alloc::vec::Vec<u8>
+pub fn rns_git::commitsigs::unarmor_ssh_signature(&str) -> core::result::Result<alloc::vec::Vec<u8>, alloc::string::String>
+pub mod rns_git::highlight
+pub struct rns_git::highlight::MicronFormatter
+pub rns_git::highlight::MicronFormatter::theme: rns_git::highlight::Theme
+impl rns_git::highlight::MicronFormatter
+pub fn rns_git::highlight::MicronFormatter::format<'a>(&self, impl core::iter::traits::collect::IntoIterator<Item = (&'a str, &'a str)>) -> alloc::string::String
+pub fn rns_git::highlight::MicronFormatter::new(rns_git::highlight::Theme) -> Self
+pub struct rns_git::highlight::SyntaxHighlighter
+pub rns_git::highlight::SyntaxHighlighter::theme: rns_git::highlight::Theme
+impl rns_git::highlight::SyntaxHighlighter
+pub fn rns_git::highlight::SyntaxHighlighter::highlight(&self, &str, core::option::Option<&str>, core::option::Option<&str>) -> alloc::string::String
+pub fn rns_git::highlight::SyntaxHighlighter::new(core::option::Option<rns_git::highlight::Theme>) -> Self
+pub fn rns_git::highlight::SyntaxHighlighter::pygments_available(&self) -> bool
+impl core::default::Default for rns_git::highlight::SyntaxHighlighter
+pub fn rns_git::highlight::SyntaxHighlighter::default() -> Self
+pub fn rns_git::highlight::default_theme() -> rns_git::highlight::Theme
+pub fn rns_git::highlight::highlight_code(&str, core::option::Option<&str>, core::option::Option<&str>, core::option::Option<rns_git::highlight::Theme>) -> alloc::string::String
+pub type rns_git::highlight::Theme = std::collections::hash::map::HashMap<alloc::string::String, core::option::Option<alloc::string::String>>
+pub mod rns_git::md2micron
+pub enum rns_git::md2micron::Align
+pub rns_git::md2micron::Align::Center
+pub rns_git::md2micron::Align::Left
+pub rns_git::md2micron::Align::Right
+pub enum rns_git::md2micron::MarkdownError
+pub rns_git::md2micron::MarkdownError::PlaceholderDigits
+pub rns_git::md2micron::MarkdownError::PlaceholderIndex
+impl core::error::Error for rns_git::md2micron::MarkdownError
+impl core::fmt::Display for rns_git::md2micron::MarkdownError
+pub fn rns_git::md2micron::MarkdownError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_git::md2micron::MarkdownToMicron
+pub rns_git::md2micron::MarkdownToMicron::bold_links: bool
+pub rns_git::md2micron::MarkdownToMicron::link_color: core::option::Option<alloc::string::String>
+pub rns_git::md2micron::MarkdownToMicron::local_url_scope: alloc::string::String
+pub rns_git::md2micron::MarkdownToMicron::max_width: usize
+pub rns_git::md2micron::MarkdownToMicron::syntax_highlighter: core::option::Option<rns_git::highlight::SyntaxHighlighter>
+pub rns_git::md2micron::MarkdownToMicron::underline_links: bool
+impl rns_git::md2micron::MarkdownToMicron
+pub const rns_git::md2micron::MarkdownToMicron::BOLD: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::BOLD_END: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::BULLET: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::CODE_BG: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::CODE_BG_INLINE: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::CODE_FG: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::CODE_RESET: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::ITALIC: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::ITALIC_END: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::LITERAL_END: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::LITERAL_START: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_BL: char
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_BM: char
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_BR: char
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_H: char
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_MIN_COL_WIDTH: usize
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_ML: char
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_MM: char
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_MR: char
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_TL: char
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_TM: char
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_TR: char
+pub const rns_git::md2micron::MarkdownToMicron::TABLE_V: char
+pub const rns_git::md2micron::MarkdownToMicron::UNDERLINE: &'static str
+pub const rns_git::md2micron::MarkdownToMicron::UNDERLINE_END: &'static str
+pub fn rns_git::md2micron::MarkdownToMicron::display_width(&self, &[char]) -> usize
+pub fn rns_git::md2micron::MarkdownToMicron::format_block(&self, &str) -> core::result::Result<alloc::string::String, rns_git::md2micron::MarkdownError>
+pub fn rns_git::md2micron::MarkdownToMicron::format_codeblock_line(&self, &str) -> alloc::string::String
+pub fn rns_git::md2micron::MarkdownToMicron::format_inline(&self, &str) -> core::result::Result<alloc::string::String, rns_git::md2micron::MarkdownError>
+pub fn rns_git::md2micron::MarkdownToMicron::format_line(&self, &str) -> core::result::Result<alloc::string::String, rns_git::md2micron::MarkdownError>
+pub fn rns_git::md2micron::MarkdownToMicron::format_table(&self, &[alloc::string::String], &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, rns_git::md2micron::MarkdownError>
+pub fn rns_git::md2micron::MarkdownToMicron::format_table_raw(&self, &[alloc::string::String], &str) -> alloc::vec::Vec<alloc::string::String>
+pub fn rns_git::md2micron::MarkdownToMicron::new(usize, core::option::Option<rns_git::highlight::SyntaxHighlighter>, core::option::Option<&str>) -> Self
+pub fn rns_git::md2micron::MarkdownToMicron::restore_url_scope(&mut self)
+pub fn rns_git::md2micron::MarkdownToMicron::set_url_scope(&mut self, &str)
+impl core::default::Default for rns_git::md2micron::MarkdownToMicron
+pub fn rns_git::md2micron::MarkdownToMicron::default() -> Self
+pub fn rns_git::md2micron::convert_markdown_to_micron(&str) -> core::result::Result<alloc::string::String, rns_git::md2micron::MarkdownError>
+pub mod rns_git::remote_helper
+pub enum rns_git::remote_helper::ClientConfigError
+pub rns_git::remote_helper::ClientConfigError::Io(std::path::PathBuf, core::io::error::Error)
+pub rns_git::remote_helper::ClientConfigError::Parse(std::path::PathBuf, rns_runtime::config::ConfigError)
+pub rns_git::remote_helper::ClientConfigError::Value(rns_runtime::config::ConfigError)
+impl core::fmt::Display for rns_git::remote_helper::ClientConfigError
+pub fn rns_git::remote_helper::ClientConfigError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum rns_git::remote_helper::Response
+pub rns_git::remote_helper::Response::Bytes(alloc::vec::Vec<u8>)
+pub rns_git::remote_helper::Response::File
+pub rns_git::remote_helper::Response::File::metadata: rmpv::Value
+pub rns_git::remote_helper::Response::File::path: std::path::PathBuf
+pub rns_git::remote_helper::Response::Other(rmpv::Value)
+pub struct rns_git::remote_helper::Abort
+pub rns_git::remote_helper::Abort::code: i32
+pub rns_git::remote_helper::Abort::reason: alloc::string::String
+pub rns_git::remote_helper::Abort::traceback: bool
+impl rns_git::remote_helper::Abort
+pub fn rns_git::remote_helper::Abort::message(&self) -> alloc::string::String
+pub fn rns_git::remote_helper::Abort::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub struct rns_git::remote_helper::ClientConfig
+pub rns_git::remote_helper::ClientConfig::aliases: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub rns_git::remote_helper::ClientConfig::loglevel: core::option::Option<i64>
+pub rns_git::remote_helper::ClientConfig::ref_batch_size: usize
+impl rns_git::remote_helper::ClientConfig
+pub fn rns_git::remote_helper::ClientConfig::load(&std::path::Path) -> core::result::Result<Self, rns_git::remote_helper::ClientConfigError>
+pub fn rns_git::remote_helper::ClientConfig::resolve_destination(&self, &str) -> alloc::string::String
+pub struct rns_git::remote_helper::HelperUrl
+pub rns_git::remote_helper::HelperUrl::destination: alloc::string::String
+pub rns_git::remote_helper::HelperUrl::group: alloc::string::String
+pub rns_git::remote_helper::HelperUrl::repo: alloc::string::String
+impl rns_git::remote_helper::HelperUrl
+pub fn rns_git::remote_helper::HelperUrl::repo_path(&self) -> alloc::string::String
+pub struct rns_git::remote_helper::RemoteHelper<T: rns_git::remote_helper::Transport>
+pub rns_git::remote_helper::RemoteHelper::git_dir: std::path::PathBuf
+pub rns_git::remote_helper::RemoteHelper::progress_enabled: bool
+pub rns_git::remote_helper::RemoteHelper::ref_batch_size: usize
+pub rns_git::remote_helper::RemoteHelper::repo_path: alloc::string::String
+pub rns_git::remote_helper::RemoteHelper::transport: T
+impl<T: rns_git::remote_helper::Transport> rns_git::remote_helper::RemoteHelper<T>
+pub fn rns_git::remote_helper::RemoteHelper<T>::new(T, alloc::string::String, usize, std::path::PathBuf) -> Self
+pub fn rns_git::remote_helper::RemoteHelper<T>::run(&mut self, &mut dyn alloc::io::buf_read::BufRead, &mut dyn core::io::write::Write, &mut dyn core::io::write::Write) -> core::result::Result<(), rns_git::remote_helper::Abort>
+pub const rns_git::remote_helper::DEFAULT_CLIENT_CONFIG: &str
+pub const rns_git::remote_helper::PATH_TIMEOUT: f64
+pub const rns_git::remote_helper::REF_BATCH_SIZE: usize
+pub const rns_git::remote_helper::REQUEST_TIMEOUT: f64
+pub trait rns_git::remote_helper::Transport
+pub fn rns_git::remote_helper::Transport::request(&mut self, &str, rmpv::Value) -> core::option::Option<rns_git::remote_helper::Response>
+pub fn rns_git::remote_helper::escape_for_stdout(&str) -> alloc::string::String
+pub fn rns_git::remote_helper::load_or_create_identity(&std::path::Path) -> core::option::Option<rns_identity::identity::Identity>
+pub fn rns_git::remote_helper::parse_args(&[alloc::string::String]) -> core::result::Result<rns_git::remote_helper::HelperUrl, (alloc::string::String, i32)>
+pub fn rns_git::remote_helper::resolve_config_dir(core::option::Option<&std::path::Path>, &std::path::Path) -> std::path::PathBuf
+pub mod rns_git::server
+pub mod rns_git::server::client
+pub struct rns_git::server::client::ClientConfig
+pub rns_git::server::client::ClientConfig::aliases: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub rns_git::server::client::ClientConfig::loglevel: core::option::Option<i64>
+impl rns_git::server::client::ClientConfig
+pub fn rns_git::server::client::ClientConfig::load_or_create(&std::path::Path) -> core::result::Result<Self, alloc::string::String>
+pub fn rns_git::server::client::ClientConfig::parse(&str) -> core::result::Result<Self, alloc::string::String>
+pub fn rns_git::server::client::ClientConfig::parse_remote_destination_url(&self, &str) -> core::result::Result<alloc::vec::Vec<u8>, alloc::string::String>
+pub fn rns_git::server::client::ClientConfig::parse_remote_group_url(&self, &str) -> core::result::Result<(alloc::vec::Vec<u8>, alloc::string::String), alloc::string::String>
+pub fn rns_git::server::client::ClientConfig::parse_remote_url(&self, &str) -> core::result::Result<(alloc::vec::Vec<u8>, alloc::string::String, alloc::string::String), alloc::string::String>
+pub const rns_git::server::client::DEFAULT_CLIENT_CONFIG: &str
+pub fn rns_git::server::client::client_config_dir(core::option::Option<&std::path::Path>) -> std::path::PathBuf
+pub fn rns_git::server::client::create_outcome(&str, core::option::Option<&[u8]>) -> core::result::Result<alloc::string::String, alloc::string::String>
+pub mod rns_git::server::config
+pub struct rns_git::server::config::NodeConfig
+pub rns_git::server::config::NodeConfig::access: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>
+pub rns_git::server::config::NodeConfig::aliases: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub rns_git::server::config::NodeConfig::announce_interval: i64
+pub rns_git::server::config::NodeConfig::blocked_identities: alloc::vec::Vec<alloc::vec::Vec<u8>>
+pub rns_git::server::config::NodeConfig::loglevel: core::option::Option<i64>
+pub rns_git::server::config::NodeConfig::mirror_interval: i64
+pub rns_git::server::config::NodeConfig::node_name: alloc::string::String
+pub rns_git::server::config::NodeConfig::record_stats: bool
+pub rns_git::server::config::NodeConfig::repositories: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub rns_git::server::config::NodeConfig::serve_nomadnet: bool
+pub rns_git::server::config::NodeConfig::stats_ignored: alloc::vec::Vec<alloc::vec::Vec<u8>>
+pub rns_git::server::config::NodeConfig::stats_push_ignored: alloc::vec::Vec<alloc::vec::Vec<u8>>
+impl rns_git::server::config::NodeConfig
+pub fn rns_git::server::config::NodeConfig::parse(&str, i64) -> core::result::Result<Self, rns_runtime::config::ConfigError>
+impl core::default::Default for rns_git::server::config::NodeConfig
+pub fn rns_git::server::config::NodeConfig::default() -> Self
+pub const rns_git::server::config::DEFAULT_CONFIG: &str
+pub const rns_git::server::config::DEFAULT_NODE_NAME: &str
+pub fn rns_git::server::config::expand_user(&str) -> std::path::PathBuf
+pub fn rns_git::server::config::load_or_create_identity(&std::path::Path) -> core::result::Result<rns_identity::identity::Identity, rns_identity::identity::IdentityError>
+pub fn rns_git::server::config::read_or_create_config(&std::path::Path) -> core::io::error::Result<alloc::string::String>
+pub fn rns_git::server::config::resolve_config_dir(core::option::Option<&std::path::Path>) -> std::path::PathBuf
+pub mod rns_git::server::forks
+pub enum rns_git::server::forks::RepoType
+pub rns_git::server::forks::RepoType::Fork
+pub rns_git::server::forks::RepoType::Mirror
+pub const rns_git::server::forks::CLONE_PROTOS: [&str; 4]
+pub const rns_git::server::forks::SYNC_CHECK_INTERVAL: u64
+pub fn rns_git::server::forks::handle_fork(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, core::option::Option<&[u8; 16]>, &rmpv::Value) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_git::server::forks::handle_mirror(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, core::option::Option<&[u8; 16]>, &rmpv::Value) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_git::server::forks::handle_sync(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, core::option::Option<&[u8; 16]>, &rmpv::Value) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_git::server::forks::mirror_synced(&std::path::Path) -> i64
+pub fn rns_git::server::forks::set_mirror_synced(&std::path::Path) -> bool
+pub fn rns_git::server::forks::sync_mirrors(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, i64, &std::sync::poison::mutex::Mutex<()>)
+pub fn rns_git::server::forks::update_head_to_source_default(&std::path::Path, &str) -> bool
+pub mod rns_git::server::handlers
+pub enum rns_git::server::handlers::Reply
+pub rns_git::server::handlers::Reply::Bytes(alloc::vec::Vec<u8>)
+pub rns_git::server::handlers::Reply::File
+pub rns_git::server::handlers::Reply::File::file: std::fs::File
+pub rns_git::server::handlers::Reply::File::metadata: alloc::vec::Vec<u8>
+pub rns_git::server::handlers::Reply::File::tmpdir: tempfile::dir::TempDir
+pub fn rns_git::server::handlers::handle_create(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, core::option::Option<&[u8; 16]>, &rmpv::Value) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_git::server::handlers::handle_delete(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, &rns_git::server::stats::Stats, core::option::Option<&[u8; 16]>, &rmpv::Value) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_git::server::handlers::handle_fetch(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, &rns_git::server::stats::Stats, core::option::Option<&[u8; 16]>, &rmpv::Value) -> core::option::Option<rns_git::server::handlers::Reply>
+pub fn rns_git::server::handlers::handle_list(&rns_git::server::layout::Repositories, core::option::Option<&[u8; 16]>, &rmpv::Value) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_git::server::handlers::handle_push(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, &rns_git::server::stats::Stats, core::option::Option<&[u8; 16]>, &rmpv::Value) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_git::server::handlers::identity_text(core::option::Option<&[u8; 16]>) -> alloc::string::String
+pub fn rns_git::server::handlers::log_request(&rns_git::server::layout::Repositories, &str, core::option::Option<&[u8; 16]>)
+pub mod rns_git::server::layout
+pub struct rns_git::server::layout::Group
+pub rns_git::server::layout::Group::dynamic_perms: bool
+pub rns_git::server::layout::Group::name: alloc::string::String
+pub rns_git::server::layout::Group::path: alloc::string::String
+pub rns_git::server::layout::Group::permissions: rns_git::server::perms::Permissions
+pub rns_git::server::layout::Group::repositories: alloc::collections::btree::map::BTreeMap<alloc::string::String, rns_git::server::layout::Repository>
+pub struct rns_git::server::layout::Repositories
+pub rns_git::server::layout::Repositories::aliases: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub rns_git::server::layout::Repositories::blocked: alloc::vec::Vec<alloc::vec::Vec<u8>>
+pub rns_git::server::layout::Repositories::groups: alloc::collections::btree::map::BTreeMap<alloc::string::String, rns_git::server::layout::Group>
+impl rns_git::server::layout::Repositories
+pub fn rns_git::server::layout::Repositories::load(&rns_git::server::config::NodeConfig) -> core::result::Result<Self, rns_git::server::perms::AllowedError>
+pub fn rns_git::server::layout::Repositories::load_group(&mut self, &str, &str, &rns_git::server::config::NodeConfig) -> core::result::Result<(), rns_git::server::perms::AllowedError>
+pub fn rns_git::server::layout::Repositories::load_repository(&mut self, &str, &std::path::Path) -> core::result::Result<bool, rns_git::server::perms::AllowedError>
+pub fn rns_git::server::layout::Repositories::repository(&self, &str, &str) -> core::option::Option<&rns_git::server::layout::Repository>
+pub fn rns_git::server::layout::Repositories::resolve_group_permission(&self, &[u8; 16], &str, rns_git::server::perms::Perm) -> bool
+pub fn rns_git::server::layout::Repositories::resolve_permission(&self, &[u8; 16], &str, &str, rns_git::server::perms::Perm) -> bool
+pub fn rns_git::server::layout::Repositories::update_group_permissions(&mut self, &str, &rns_git::server::config::NodeConfig)
+pub struct rns_git::server::layout::Repository
+pub rns_git::server::layout::Repository::fork: core::option::Option<alloc::string::String>
+pub rns_git::server::layout::Repository::group: alloc::string::String
+pub rns_git::server::layout::Repository::mirror: core::option::Option<alloc::string::String>
+pub rns_git::server::layout::Repository::name: alloc::string::String
+pub rns_git::server::layout::Repository::path: std::path::PathBuf
+pub rns_git::server::layout::Repository::permissions: rns_git::server::perms::Permissions
+pub fn rns_git::server::layout::git_available() -> bool
+pub fn rns_git::server::layout::parse_group_path(&str) -> core::option::Option<&str>
+pub fn rns_git::server::layout::parse_repository_path(&str) -> core::option::Option<(&str, &str)>
+pub mod rns_git::server::perms
+pub enum rns_git::server::perms::AllowedError
+pub rns_git::server::perms::AllowedError::Io(core::io::error::Error)
+pub rns_git::server::perms::AllowedError::NotUtf8
+pub enum rns_git::server::perms::Perm
+pub rns_git::server::perms::Perm::Admin
+pub rns_git::server::perms::Perm::Create
+pub rns_git::server::perms::Perm::Interact
+pub rns_git::server::perms::Perm::Propose
+pub rns_git::server::perms::Perm::Read
+pub rns_git::server::perms::Perm::ReadWrite
+pub rns_git::server::perms::Perm::Release
+pub rns_git::server::perms::Perm::Stats
+pub rns_git::server::perms::Perm::Write
+impl rns_git::server::perms::Perm
+pub fn rns_git::server::perms::Perm::code(self) -> u8
+pub enum rns_git::server::perms::PermList
+pub rns_git::server::perms::PermList::Admin
+pub rns_git::server::perms::PermList::Create
+pub rns_git::server::perms::PermList::Interact
+pub rns_git::server::perms::PermList::Propose
+pub rns_git::server::perms::PermList::Read
+pub rns_git::server::perms::PermList::Release
+pub rns_git::server::perms::PermList::Stats
+pub rns_git::server::perms::PermList::Write
+impl rns_git::server::perms::PermList
+pub const rns_git::server::perms::PermList::ALL: [rns_git::server::perms::PermList; 8]
+pub fn rns_git::server::perms::PermList::name(self) -> &'static str
+pub enum rns_git::server::perms::Target
+pub rns_git::server::perms::Target::All
+pub rns_git::server::perms::Target::Identity(alloc::vec::Vec<u8>)
+pub rns_git::server::perms::Target::None
+impl rns_git::server::perms::Target
+pub fn rns_git::server::perms::Target::code(&self) -> core::option::Option<u8>
+pub struct rns_git::server::perms::Permissions
+impl rns_git::server::perms::Permissions
+pub fn rns_git::server::perms::Permissions::add_statement(&mut self, &str, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>)
+pub fn rns_git::server::perms::Permissions::from_allowed_input(&str, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn rns_git::server::perms::Permissions::get(&self, rns_git::server::perms::PermList) -> &[rns_git::server::perms::Target]
+pub const rns_git::server::perms::ALL_TGTS: [&str; 6]
+pub const rns_git::server::perms::TGT_ALL_SMPHR: [&str; 3]
+pub const rns_git::server::perms::TGT_NONE_SMPHR: [&str; 3]
+pub fn rns_git::server::perms::load_allowed_permissions(&std::path::Path, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> core::result::Result<(rns_git::server::perms::Permissions, bool), rns_git::server::perms::AllowedError>
+pub fn rns_git::server::perms::parse_permission(&str, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> (core::option::Option<rns_git::server::perms::Perm>, core::option::Option<rns_git::server::perms::Target>)
+pub fn rns_git::server::perms::resolve_group(&rns_git::server::perms::Permissions, &[u8; 16], rns_git::server::perms::Perm) -> bool
+pub fn rns_git::server::perms::resolve_identity_alias(&str, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> alloc::string::String
+pub fn rns_git::server::perms::resolve_repository(&rns_git::server::perms::Permissions, &rns_git::server::perms::Permissions, &[u8; 16], rns_git::server::perms::Perm) -> bool
+pub mod rns_git::server::perms_mgmt
+pub fn rns_git::server::perms_mgmt::handle_perms(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, &rns_git::server::config::NodeConfig, core::option::Option<&[u8; 16]>, &rmpv::Value) -> alloc::vec::Vec<u8>
+pub mod rns_git::server::releases
+pub fn rns_git::server::releases::handle_release(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, core::option::Option<&[u8; 16]>, &rmpv::Value) -> core::option::Option<rns_git::server::handlers::Reply>
+pub mod rns_git::server::stats
+pub struct rns_git::server::stats::RepositoryStats
+pub rns_git::server::stats::RepositoryStats::activity_level: &'static str
+pub rns_git::server::stats::RepositoryStats::activity_score: i64
+pub rns_git::server::stats::RepositoryStats::actual_days: i64
+pub rns_git::server::stats::RepositoryStats::date_range: alloc::string::String
+pub rns_git::server::stats::RepositoryStats::day_labels: alloc::vec::Vec<alloc::string::String>
+pub rns_git::server::stats::RepositoryStats::days: alloc::vec::Vec<alloc::string::String>
+pub rns_git::server::stats::RepositoryStats::downloads: rns_git::server::stats::Series
+pub rns_git::server::stats::RepositoryStats::downloads_combined: rns_git::server::stats::Series
+pub rns_git::server::stats::RepositoryStats::fetches: rns_git::server::stats::Series
+pub rns_git::server::stats::RepositoryStats::group: alloc::string::String
+pub rns_git::server::stats::RepositoryStats::lookback_days: u32
+pub rns_git::server::stats::RepositoryStats::pushes: rns_git::server::stats::Series
+pub rns_git::server::stats::RepositoryStats::release_downloads: rns_git::server::stats::Series
+pub rns_git::server::stats::RepositoryStats::repository: alloc::string::String
+pub rns_git::server::stats::RepositoryStats::timeline_labels: [alloc::string::String; 2]
+pub rns_git::server::stats::RepositoryStats::views: rns_git::server::stats::Series
+pub struct rns_git::server::stats::Series
+pub rns_git::server::stats::Series::daily: alloc::vec::Vec<i64>
+pub rns_git::server::stats::Series::peak: i64
+pub rns_git::server::stats::Series::peak_day: core::option::Option<alloc::string::String>
+pub rns_git::server::stats::Series::total: i64
+pub struct rns_git::server::stats::Stats
+impl rns_git::server::stats::Stats
+pub fn rns_git::server::stats::Stats::download_succeeded(&self, &str, &str, core::option::Option<&[u8; 16]>)
+pub fn rns_git::server::stats::Stats::fetch_succeeded(&self, &str, &str, core::option::Option<&[u8; 16]>)
+pub fn rns_git::server::stats::Stats::load(std::path::PathBuf, bool, alloc::vec::Vec<alloc::vec::Vec<u8>>) -> Self
+pub fn rns_git::server::stats::Stats::path(&self) -> &std::path::Path
+pub fn rns_git::server::stats::Stats::persist(&self)
+pub fn rns_git::server::stats::Stats::push_succeeded(&self, &str, &str)
+pub fn rns_git::server::stats::Stats::release_download_succeeded(&self, &str, &str, core::option::Option<&[u8; 16]>)
+pub fn rns_git::server::stats::Stats::repository_stats(&self, &rns_git::server::layout::Repositories, &[u8; 16], &str, &str, u32) -> core::option::Option<rns_git::server::stats::RepositoryStats>
+pub fn rns_git::server::stats::Stats::view_succeeded(&self, core::option::Option<&str>, core::option::Option<&str>, core::option::Option<&[u8; 16]>)
+pub const rns_git::server::stats::STATS_JOB_INTERVAL: u64
+pub fn rns_git::server::stats::local_day(i64) -> alloc::string::String
+pub mod rns_git::server::work
+pub const rns_git::server::work::WORK_DOC_LIMIT: usize
+pub fn rns_git::server::work::handle_work(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, core::option::Option<&rns_identity::identity::Identity>, &rmpv::Value) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_git::server::work::resolve_doc_permission(&rns_git::server::layout::Repositories, &[u8; 16], core::option::Option<(&str, &str)>, i128, rns_git::server::perms::Perm) -> bool
+pub const rns_git::server::APP_NAME: &str
+pub const rns_git::server::IDX_GROUP: u8
+pub const rns_git::server::IDX_REPOSITORY: u8
+pub const rns_git::server::IDX_RESULT_CODE: u8
+pub const rns_git::server::PATH_CREATE: &str
+pub const rns_git::server::PATH_DELETE: &str
+pub const rns_git::server::PATH_FETCH: &str
+pub const rns_git::server::PATH_FORK: &str
+pub const rns_git::server::PATH_LIST: &str
+pub const rns_git::server::PATH_MIRROR: &str
+pub const rns_git::server::PATH_PERMS: &str
+pub const rns_git::server::PATH_PUSH: &str
+pub const rns_git::server::PATH_RELEASE: &str
+pub const rns_git::server::PATH_SYNC: &str
+pub const rns_git::server::PATH_WORK: &str
+pub const rns_git::server::RES_DISALLOWED: u8
+pub const rns_git::server::RES_INVALID_REQ: u8
+pub const rns_git::server::RES_NOT_FOUND: u8
+pub const rns_git::server::RES_OK: u8
+pub const rns_git::server::RES_REMOTE_FAIL: u8
+pub mod rns_git::util
+pub fn rns_git::util::san_ref(&str) -> core::option::Option<&str>
+pub fn rns_git::util::san_refs<S: core::convert::AsRef<str>>(&[S]) -> core::option::Option<&[S]>
+pub fn rns_git::util::san_sha(&str) -> core::option::Option<&str>

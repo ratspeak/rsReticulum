@@ -1,15 +1,194 @@
 pub mod rns_tools
 pub mod rns_tools::format
+pub enum rns_tools::format::PyNum
+pub rns_tools::format::PyNum::Float(f64)
+pub rns_tools::format::PyNum::Int(i64)
+impl rns_tools::format::PyNum
+pub fn rns_tools::format::PyNum::f(self) -> f64
+pub fn rns_tools::format::PyNum::i(self) -> i64
+pub fn rns_tools::format::PyNum::py_str(self) -> alloc::string::String
 pub fn rns_tools::format::hex_rep(&[u8]) -> alloc::string::String
+pub fn rns_tools::format::pretty_cost(core::option::Option<f64>) -> alloc::string::String
 pub fn rns_tools::format::pretty_frequency(f64) -> alloc::string::String
 pub fn rns_tools::format::pretty_hex_rep(&[u8]) -> alloc::string::String
 pub fn rns_tools::format::pretty_size(u64) -> alloc::string::String
 pub fn rns_tools::format::pretty_speed(u64) -> alloc::string::String
 pub fn rns_tools::format::pretty_time(f64) -> alloc::string::String
+pub fn rns_tools::format::prettyfrequency(rns_tools::format::PyNum, &str, usize, bool) -> alloc::string::String
+pub fn rns_tools::format::prettyshorttime(f64) -> alloc::string::String
+pub fn rns_tools::format::prettysize(f64, &str) -> alloc::string::String
+pub fn rns_tools::format::prettyspeed(f64) -> alloc::string::String
+pub fn rns_tools::format::prettytime(rns_tools::format::PyNum, bool) -> alloc::string::String
+pub fn rns_tools::format::py_float_repr(f64) -> alloc::string::String
+pub fn rns_tools::format::py_round(f64, usize) -> f64
 pub mod rns_tools::hash
 pub fn rns_tools::hash::format_dest_hash(&[u8; 16]) -> alloc::string::String
 pub fn rns_tools::hash::parse_dest_hash(&str) -> core::result::Result<[u8; 16], alloc::string::String>
+pub mod rns_tools::rnx
+pub enum rns_tools::rnx::ResponseKind
+pub rns_tools::rnx::ResponseKind::Invalid
+pub rns_tools::rnx::ResponseKind::Missing
+pub rns_tools::rnx::ResponseKind::Result(rns_tools::rnx::Response)
+impl rns_tools::rnx::ResponseKind
+pub fn rns_tools::rnx::ResponseKind::from_value(&rmpv::Value) -> Self
+pub enum rns_tools::rnx::Timeout
+pub rns_tools::rnx::Timeout::Default
+pub rns_tools::rnx::Timeout::Given(f64)
+impl rns_tools::rnx::Timeout
+pub fn rns_tools::rnx::Timeout::seconds(self) -> f64
+pub struct rns_tools::rnx::CommandRequest
+pub rns_tools::rnx::CommandRequest::command: alloc::string::String
+pub rns_tools::rnx::CommandRequest::stderr_limit: core::option::Option<i64>
+pub rns_tools::rnx::CommandRequest::stdin: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_tools::rnx::CommandRequest::stdout_limit: core::option::Option<i64>
+pub rns_tools::rnx::CommandRequest::timeout: core::option::Option<f64>
+impl rns_tools::rnx::CommandRequest
+pub fn rns_tools::rnx::CommandRequest::from_value(&rmpv::Value) -> core::option::Option<Self>
+pub struct rns_tools::rnx::CommandResult
+pub rns_tools::rnx::CommandResult::concluded: core::option::Option<f64>
+pub rns_tools::rnx::CommandResult::executed: bool
+pub rns_tools::rnx::CommandResult::retcode: core::option::Option<i64>
+pub rns_tools::rnx::CommandResult::started: f64
+pub rns_tools::rnx::CommandResult::stderr: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_tools::rnx::CommandResult::stderr_len: core::option::Option<u64>
+pub rns_tools::rnx::CommandResult::stdout: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_tools::rnx::CommandResult::stdout_len: core::option::Option<u64>
+impl rns_tools::rnx::CommandResult
+pub fn rns_tools::rnx::CommandResult::to_msgpack(&self) -> alloc::vec::Vec<u8>
+pub fn rns_tools::rnx::CommandResult::to_value(&self) -> rmpv::Value
+pub struct rns_tools::rnx::Rendered
+pub rns_tools::rnx::Rendered::stderr: alloc::vec::Vec<u8>
+pub rns_tools::rnx::Rendered::stdout: alloc::vec::Vec<u8>
+pub struct rns_tools::rnx::Response
+pub rns_tools::rnx::Response::concluded: core::option::Option<f64>
+pub rns_tools::rnx::Response::executed: bool
+pub rns_tools::rnx::Response::retcode: core::option::Option<i64>
+pub rns_tools::rnx::Response::started: core::option::Option<f64>
+pub rns_tools::rnx::Response::stderr: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_tools::rnx::Response::stderr_len: core::option::Option<u64>
+pub rns_tools::rnx::Response::stdout: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_tools::rnx::Response::stdout_len: core::option::Option<u64>
+pub struct rns_tools::rnx::TransferStats
+pub rns_tools::rnx::TransferStats::elapsed: f64
+pub rns_tools::rnx::TransferStats::request_size: core::option::Option<u64>
+pub rns_tools::rnx::TransferStats::response_size: u64
+pub const rns_tools::rnx::APP_NAME: &str
+pub const rns_tools::rnx::COMMAND_PATH: &str
+pub const rns_tools::rnx::DEFAULT_TIMEOUT: i64
+pub const rns_tools::rnx::REMOTE_EXEC_GRACE: f64
+pub fn rns_tools::rnx::allowed_identity_files(core::option::Option<&std::path::Path>) -> alloc::vec::Vec<std::path::PathBuf>
+pub fn rns_tools::rnx::client_result(&rmpv::Value, bool, bool, core::option::Option<i64>, core::option::Option<i64>, core::option::Option<rns_tools::rnx::TransferStats>) -> (rns_tools::rnx::Rendered, core::option::Option<rns_tools::rnx::Response>, i32)
+pub async fn rns_tools::rnx::execute(&rns_tools::rnx::CommandRequest) -> rns_tools::rnx::CommandResult
+pub fn rns_tools::rnx::mirrored_exit_code(core::option::Option<i64>) -> i32
+pub fn rns_tools::rnx::parse_allowed_identities(&str) -> core::result::Result<alloc::vec::Vec<[u8; 16]>, alloc::string::String>
+pub fn rns_tools::rnx::parse_hash_arg(&str) -> core::result::Result<[u8; 16], alloc::string::String>
+pub fn rns_tools::rnx::pretty_time(f64) -> alloc::string::String
+pub fn rns_tools::rnx::py_float(f64) -> alloc::string::String
+pub fn rns_tools::rnx::py_round(f64, usize) -> f64
+pub fn rns_tools::rnx::render(&rns_tools::rnx::Response, bool, core::option::Option<i64>, core::option::Option<i64>, core::option::Option<rns_tools::rnx::TransferStats>) -> rns_tools::rnx::Rendered
+pub fn rns_tools::rnx::request_value(&str, rns_tools::rnx::Timeout, core::option::Option<i64>, core::option::Option<i64>, core::option::Option<&str>) -> rmpv::Value
+pub fn rns_tools::rnx::size_str(f64, char) -> alloc::string::String
+pub fn rns_tools::rnx::truncate(&[u8], core::option::Option<i64>) -> alloc::vec::Vec<u8>
+pub mod rns_tools::rsg
+pub mod rns_tools::rsg::b256
+pub fn rns_tools::rsg::b256::b256_to_bytes(&str) -> core::result::Result<alloc::vec::Vec<u8>, alloc::string::String>
+pub fn rns_tools::rsg::b256::b256rep(&[u8]) -> alloc::string::String
+pub mod rns_tools::rsg::meta
+pub enum rns_tools::rsg::meta::Obj
+pub rns_tools::rsg::meta::Obj::BigInt(alloc::string::String)
+pub rns_tools::rsg::meta::Obj::Bool(bool)
+pub rns_tools::rsg::meta::Obj::Dict(alloc::vec::Vec<(alloc::string::String, rns_tools::rsg::meta::Obj)>)
+pub rns_tools::rsg::meta::Obj::Float(f64)
+pub rns_tools::rsg::meta::Obj::Int(i128)
+pub rns_tools::rsg::meta::Obj::List(alloc::vec::Vec<rns_tools::rsg::meta::Obj>)
+pub rns_tools::rsg::meta::Obj::None
+pub rns_tools::rsg::meta::Obj::Section(usize)
+pub rns_tools::rsg::meta::Obj::Str(alloc::string::String)
+pub rns_tools::rsg::meta::Obj::Tuple(alloc::vec::Vec<rns_tools::rsg::meta::Obj>)
+pub fn rns_tools::rsg::meta::meta_entries(&[(alloc::string::String, rns_tools::rsg::meta::Obj)]) -> core::result::Result<alloc::vec::Vec<(alloc::string::String, rmpv::Value)>, alloc::string::String>
+pub fn rns_tools::rsg::meta::py_float(&str) -> core::option::Option<f64>
+pub fn rns_tools::rsg::meta::py_int(&str) -> core::option::Option<rns_tools::rsg::meta::Obj>
+pub fn rns_tools::rsg::meta::rsg_meta_from_file(&std::path::Path, core::option::Option<&std::path::Path>) -> core::result::Result<alloc::vec::Vec<(alloc::string::String, rns_tools::rsg::meta::Obj)>, alloc::string::String>
+pub fn rns_tools::rsg::meta::rsg_meta_from_str(&str, core::option::Option<&str>) -> core::result::Result<alloc::vec::Vec<(alloc::string::String, rns_tools::rsg::meta::Obj)>, alloc::string::String>
+pub fn rns_tools::rsg::meta::to_msgpack(&rns_tools::rsg::meta::Obj) -> core::result::Result<rmpv::Value, alloc::string::String>
+pub mod rns_tools::rsg::pyfmt
+pub fn rns_tools::rsg::pyfmt::py_bytes_repr(&[u8]) -> alloc::string::String
+pub fn rns_tools::rsg::pyfmt::py_float(f64) -> alloc::string::String
+pub fn rns_tools::rsg::pyfmt::py_fromhex(&str) -> core::result::Result<alloc::vec::Vec<u8>, alloc::string::String>
+pub fn rns_tools::rsg::pyfmt::py_os_error(&core::io::error::Error, &str) -> alloc::string::String
+pub fn rns_tools::rsg::pyfmt::py_repr(&rmpv::Value) -> alloc::string::String
+pub fn rns_tools::rsg::pyfmt::py_str(&rmpv::Value) -> alloc::string::String
+pub fn rns_tools::rsg::pyfmt::py_str_repr(&str) -> alloc::string::String
+pub fn rns_tools::rsg::pyfmt::py_utf8_error(&[u8]) -> core::option::Option<alloc::string::String>
+pub enum rns_tools::rsg::Message<'a>
+pub rns_tools::rsg::Message::File(&'a mut dyn alloc::io::read::Read)
+pub rns_tools::rsg::Message::Unpacked(&'a rmpv::Value)
+pub enum rns_tools::rsg::RequiredSigner<'a>
+pub rns_tools::rsg::RequiredSigner::Hash(&'a [u8])
+pub rns_tools::rsg::RequiredSigner::Identity(&'a rns_identity::identity::Identity)
+pub enum rns_tools::rsg::RsmStructure
+pub rns_tools::rsg::RsmStructure::Invalid(&'static str)
+pub rns_tools::rsg::RsmStructure::Valid
+pub struct rns_tools::rsg::Valid
+pub rns_tools::rsg::Valid::signed_data: rmpv::Value
+pub rns_tools::rsg::Valid::signer_hash: [u8; 16]
+pub const rns_tools::rsg::HASH_TYPE_SHA256: &str
+pub const rns_tools::rsg::SIG_LEN: usize
+pub fn rns_tools::rsg::check_release_rsm_structure(&rmpv::Value) -> core::result::Result<rns_tools::rsg::RsmStructure, alloc::string::String>
+pub fn rns_tools::rsg::create_raw_signature<R: alloc::io::read::Read>(&rns_identity::identity::Identity, R) -> core::result::Result<[u8; 64], alloc::string::String>
+pub fn rns_tools::rsg::create_rsg<R: alloc::io::read::Read>(&rns_identity::identity::Identity, R, bool, core::option::Option<&[(alloc::string::String, rmpv::Value)]>) -> core::result::Result<alloc::vec::Vec<u8>, alloc::string::String>
+pub fn rns_tools::rsg::extract_signed_rsg_data(&[u8]) -> core::option::Option<rmpv::Value>
+pub fn rns_tools::rsg::get_rsg_hash<R: alloc::io::read::Read>(R) -> core::io::error::Result<[u8; 32]>
+pub fn rns_tools::rsg::is_legacy_format(&[u8]) -> bool
+pub fn rns_tools::rsg::pretty_hash(&[u8]) -> alloc::string::String
+pub fn rns_tools::rsg::py_class(&rmpv::Value) -> alloc::string::String
+pub fn rns_tools::rsg::py_contains(core::option::Option<&rmpv::Value>, &str) -> core::result::Result<bool, alloc::string::String>
+pub fn rns_tools::rsg::py_eq(&rmpv::Value, &rmpv::Value) -> bool
+pub fn rns_tools::rsg::py_index<'a>(&'a rmpv::Value, &str) -> core::result::Result<&'a rmpv::Value, alloc::string::String>
+pub fn rns_tools::rsg::py_truthy(&rmpv::Value) -> bool
+pub fn rns_tools::rsg::py_type_name(&rmpv::Value) -> &'static str
+pub fn rns_tools::rsg::unpackb(&[u8]) -> core::option::Option<rmpv::Value>
+pub fn rns_tools::rsg::validate_rsg(&[u8], rns_tools::rsg::Message<'_>, core::option::Option<rns_tools::rsg::RequiredSigner<'_>>) -> core::result::Result<core::option::Option<rns_tools::rsg::Valid>, alloc::string::String>
+pub enum rns_tools::LogLevel
+pub rns_tools::LogLevel::Critical = 0
+pub rns_tools::LogLevel::Debug = 6
+pub rns_tools::LogLevel::Error = 1
+pub rns_tools::LogLevel::Extreme = 8
+pub rns_tools::LogLevel::Info = 4
+pub rns_tools::LogLevel::Notice = 3
+pub rns_tools::LogLevel::Pathing = 7
+pub rns_tools::LogLevel::Verbose = 5
+pub rns_tools::LogLevel::Warning = 2
+impl rns_tools::LogLevel
+pub fn rns_tools::LogLevel::clamped(i64) -> Self
+pub fn rns_tools::LogLevel::filter(self) -> tracing_subscriber::filter::targets::Targets
+pub fn rns_tools::LogLevel::name(self) -> &'static str
+pub fn rns_tools::LogLevel::number(self) -> i32
+pub enum rns_tools::Utility
+pub rns_tools::Utility::Lxmd
+pub rns_tools::Utility::Rncp
+pub rns_tools::Utility::Rnid
+pub rns_tools::Utility::Rnir
+pub rns_tools::Utility::Rnpath
+pub rns_tools::Utility::Rnpkg
+pub rns_tools::Utility::Rnprobe
+pub rns_tools::Utility::Rnsd
+pub rns_tools::Utility::Rnsh
+pub rns_tools::Utility::Rnstatus
+pub rns_tools::Utility::Rnx
+impl rns_tools::Utility
+pub fn rns_tools::Utility::loglevel(self, core::option::Option<i64>, u8, u8, bool) -> rns_tools::LogLevel
+pub struct rns_tools::RpcRegistration
+impl rns_tools::RpcRegistration
+pub async fn rns_tools::RpcRegistration::release(self)
+pub async fn rns_tools::RpcRegistration::want(rns_runtime::reticulum::SharedInstanceRpcEndpoint, alloc::vec::Vec<u8>, &[&str], core::time::Duration) -> Self
+pub const rns_tools::NOTICE_TARGET: &str
+pub const rns_tools::PATHING_TARGET: &str
 pub const rns_tools::RETICULUM_COMPAT_VERSION: &str
 pub const rns_tools::RS_RETICULUM_VERSION: &str
 pub fn rns_tools::config_log_timestamps(&std::path::Path) -> bool
-pub fn rns_tools::init_tracing<W>(tracing_core::metadata::Level, bool, bool, W) where W: for<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> + core::marker::Send + core::marker::Sync + 'static
+pub async fn rns_tools::exit(&rns_runtime::reticulum::ReticulumHandle, i32) -> never
+pub fn rns_tools::init_tracing<W>(rns_tools::LogLevel, bool, bool, W) where W: for<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> + core::marker::Send + core::marker::Sync + 'static
+pub fn rns_tools::link_closed_text(core::option::Option<rns_link::link::CloseReason>) -> core::option::Option<&'static str>
+pub async fn rns_tools::medium_path_timeout(&rns_runtime::reticulum::ReticulumHandle) -> f64
+pub async fn rns_tools::shut_down(&rns_runtime::reticulum::ReticulumHandle)

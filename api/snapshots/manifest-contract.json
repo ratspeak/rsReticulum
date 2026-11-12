@@ -175,6 +175,179 @@
       ]
     },
     {
+      "name": "rns-git",
+      "version": "1.4.0",
+      "rustVersion": "1.89",
+      "edition": "2024",
+      "features": {},
+      "targets": [
+        {
+          "name": "rns_git",
+          "kind": [
+            "lib"
+          ],
+          "crateTypes": [
+            "lib"
+          ],
+          "requiredFeatures": []
+        }
+      ],
+      "dependencies": [
+        {
+          "name": "base64",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.22",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "clap",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^4",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [
+            "derive"
+          ],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "hex",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.4",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "nix",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.29",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [
+            "fs",
+            "term"
+          ],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "rmpv",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "rns-identity",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "~1.4.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-runtime",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "~1.4.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-tools",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "*",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-transport",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "~1.4.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-wire",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "~1.4.0",
+          "optional": false,
+          "defaultFeatures": false,
+          "features": [
+            "std"
+          ],
+          "sourceKind": "path"
+        },
+        {
+          "name": "tempfile",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^3",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "tokio",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [
+            "full"
+          ],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "tracing",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        }
+      ]
+    },
+    {
       "name": "rns-identity",
       "version": "1.4.0",
       "rustVersion": "1.89",
@@ -1488,6 +1661,17 @@
           "sourceKind": "registry"
         },
         {
+          "name": "tempfile",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^3",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
           "name": "thiserror",
           "rename": null,
           "kind": null,
@@ -1731,6 +1915,17 @@
             "std"
           ],
           "sourceKind": "path"
+        },
+        {
+          "name": "rsa",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.9",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
         },
         {
           "name": "serde",

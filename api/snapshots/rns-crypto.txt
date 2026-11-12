@@ -33,7 +33,7 @@ pub fn rns_crypto::ed25519::Ed25519PublicKey::verify(&self, &[u8], &[u8; 64]) ->
 pub mod rns_crypto::hkdf
 pub enum rns_crypto::hkdf::HkdfError
 pub rns_crypto::hkdf::HkdfError::ExpansionFailed
-pub rns_crypto::hkdf::HkdfError::OutputTooLong(usize)
+pub rns_crypto::hkdf::HkdfError::InvalidLength
 pub fn rns_crypto::hkdf::derive_key_64(&[u8], &[u8]) -> core::result::Result<zeroize::Zeroizing<[u8; 64]>, rns_crypto::hkdf::HkdfError>
 pub fn rns_crypto::hkdf::hkdf_sha256(usize, &[u8], core::option::Option<&[u8]>, core::option::Option<&[u8]>) -> core::result::Result<zeroize::Zeroizing<alloc::vec::Vec<u8>>, rns_crypto::hkdf::HkdfError>
 pub mod rns_crypto::hmac
@@ -73,9 +73,11 @@ pub fn rns_crypto::token::decrypt(&[u8], &[u8]) -> core::result::Result<alloc::v
 pub fn rns_crypto::token::encrypt(&[u8], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, rns_crypto::token::TokenError>
 pub fn rns_crypto::token::generate_key() -> zeroize::Zeroizing<alloc::vec::Vec<u8>>
 pub mod rns_crypto::x25519
+pub enum rns_crypto::x25519::X25519Error
+pub rns_crypto::x25519::X25519Error::LowOrderPoint
 pub struct rns_crypto::x25519::X25519PrivateKey
 impl rns_crypto::x25519::X25519PrivateKey
-pub fn rns_crypto::x25519::X25519PrivateKey::exchange(&self, &rns_crypto::x25519::X25519PublicKey) -> [u8; 32]
+pub fn rns_crypto::x25519::X25519PrivateKey::exchange(&self, &rns_crypto::x25519::X25519PublicKey) -> core::result::Result<[u8; 32], rns_crypto::x25519::X25519Error>
 pub fn rns_crypto::x25519::X25519PrivateKey::from_bytes(&[u8; 32]) -> Self
 pub fn rns_crypto::x25519::X25519PrivateKey::generate() -> Self
 pub fn rns_crypto::x25519::X25519PrivateKey::public_key(&self) -> rns_crypto::x25519::X25519PublicKey

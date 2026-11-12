@@ -17,26 +17,33 @@ pub rns_transport::actor::RecentAnnounce::dest_hash: [u8; 16]
 pub rns_transport::actor::RecentAnnounce::hops: u8
 pub rns_transport::actor::RecentAnnounce::is_path_response: bool
 pub rns_transport::actor::RecentAnnounce::last_used: core::option::Option<f64>
+pub rns_transport::actor::RecentAnnounce::lr_cost: core::option::Option<f64>
 pub rns_transport::actor::RecentAnnounce::name_hash: [u8; 10]
 pub rns_transport::actor::RecentAnnounce::packet_hash: core::option::Option<[u8; 32]>
 pub rns_transport::actor::RecentAnnounce::public_key: core::option::Option<[u8; 64]>
 pub rns_transport::actor::RecentAnnounce::ratchet: core::option::Option<[u8; 32]>
 pub rns_transport::actor::RecentAnnounce::ratchet_received: core::option::Option<f64>
 pub rns_transport::actor::RecentAnnounce::retained: bool
+pub rns_transport::actor::RecentAnnounce::stamp: core::option::Option<[u8; 14]>
+pub rns_transport::actor::RecentAnnounce::stamp_value: f64
 pub rns_transport::actor::RecentAnnounce::timestamp: f64
 pub struct rns_transport::actor::TransportActor
 pub rns_transport::actor::TransportActor::announce_sweep_in_flight: alloc::sync::Arc<core::sync::atomic::AtomicBool>
 pub rns_transport::actor::TransportActor::announce_table: rns_transport::announce::AnnounceTable
+pub rns_transport::actor::TransportActor::announce_validation: rns_transport::announce_validation::AnnounceValidationCache
 pub rns_transport::actor::TransportActor::blackhole_sources: alloc::vec::Vec<[u8; 16]>
 pub rns_transport::actor::TransportActor::blackhole_table: rns_transport::blackhole::BlackholeTable
 pub rns_transport::actor::TransportActor::blackholed_snapshot: alloc::sync::Arc<std::sync::poison::rwlock::RwLock<std::collections::hash::set::HashSet<[u8; 16]>>>
 pub rns_transport::actor::TransportActor::channel_drops: u64
 pub rns_transport::actor::TransportActor::destination_channels: std::collections::hash::map::HashMap<[u8; 16], tokio::sync::mpsc::bounded::Sender<rns_transport::link_messages::DestinationEvent>>
+pub rns_transport::actor::TransportActor::destination_filter: rns_transport::destination_filter::DestinationTypeFilter
 pub rns_transport::actor::TransportActor::discovery_pr_tags: std::collections::hash::set::HashSet<[u8; 32]>
 pub rns_transport::actor::TransportActor::discovery_pr_tags_prev: std::collections::hash::set::HashSet<[u8; 32]>
 pub rns_transport::actor::TransportActor::ephemeral_identity_hash: core::option::Option<[u8; 16]>
 pub rns_transport::actor::TransportActor::hashlist_save_in_flight: alloc::sync::Arc<core::sync::atomic::AtomicBool>
 pub rns_transport::actor::TransportActor::held_announces: std::collections::hash::map::HashMap<[u8; 16], rns_transport::announce::AnnounceEntry>
+pub rns_transport::actor::TransportActor::hop_limiter: u8
+pub rns_transport::actor::TransportActor::inflight_path_requests: std::collections::hash::map::HashMap<[u8; 16], f64>
 pub rns_transport::actor::TransportActor::interfaces: std::collections::hash::map::HashMap<rns_transport::messages::InterfaceId, rns_transport::messages::InterfaceEntry>
 pub rns_transport::actor::TransportActor::internal_identity_hash: core::option::Option<[u8; 16]>
 pub rns_transport::actor::TransportActor::is_foreground: alloc::sync::Arc<core::sync::atomic::AtomicBool>
@@ -44,12 +51,15 @@ pub rns_transport::actor::TransportActor::is_shared_instance: bool
 pub rns_transport::actor::TransportActor::is_transport_enabled: bool
 pub rns_transport::actor::TransportActor::last_state_save: f64
 pub rns_transport::actor::TransportActor::link_table: rns_transport::link_table::LinkTable
+pub rns_transport::actor::TransportActor::local_destination_keys: std::collections::hash::map::HashMap<[u8; 16], [u8; 64]>
 pub rns_transport::actor::TransportActor::local_destinations: std::collections::hash::set::HashSet<[u8; 16]>
 pub rns_transport::actor::TransportActor::local_hops_delta: u8
 pub rns_transport::actor::TransportActor::packet_hashlist: rns_transport::hashlist::PacketHashlist
-pub rns_transport::actor::TransportActor::packet_metrics: std::collections::hash::map::HashMap<[u8; 32], rns_transport::link_messages::PacketMetrics>
-pub rns_transport::actor::TransportActor::packet_metrics_order: alloc::collections::vec_deque::VecDeque<[u8; 32]>
+pub rns_transport::actor::TransportActor::packet_q_cache: alloc::collections::vec_deque::VecDeque<([u8; 32], f32)>
+pub rns_transport::actor::TransportActor::packet_rssi_cache: alloc::collections::vec_deque::VecDeque<([u8; 32], f32)>
+pub rns_transport::actor::TransportActor::packet_snr_cache: alloc::collections::vec_deque::VecDeque<([u8; 32], f32)>
 pub rns_transport::actor::TransportActor::path_interface_suppressions: std::collections::hash::map::HashMap<([u8; 16], rns_transport::messages::InterfaceId), f64>
+pub rns_transport::actor::TransportActor::path_pool_last_checked: f64
 pub rns_transport::actor::TransportActor::path_requests: std::collections::hash::map::HashMap<[u8; 16], f64>
 pub rns_transport::actor::TransportActor::path_states: std::collections::hash::map::HashMap<[u8; 16], rns_transport::constants::PathState>
 pub rns_transport::actor::TransportActor::path_table: rns_transport::path_table::PathTable
@@ -57,6 +67,7 @@ pub rns_transport::actor::TransportActor::path_waiters: std::collections::hash::
 pub rns_transport::actor::TransportActor::pending_discovery_prs: alloc::collections::vec_deque::VecDeque<rns_transport::actor::PendingDiscoveryPathRequest>
 pub rns_transport::actor::TransportActor::pending_local_path_requests: std::collections::hash::map::HashMap<[u8; 16], rns_transport::messages::InterfaceId>
 pub rns_transport::actor::TransportActor::pending_path_entries: alloc::vec::Vec<rns_transport::persistence::PersistedPathEntry>
+pub rns_transport::actor::TransportActor::pr_stamper: rns_transport::pr_stamper::PathRequestStamper
 pub rns_transport::actor::TransportActor::rate_table: rns_transport::rate_limit::RateTable
 pub rns_transport::actor::TransportActor::receipt_msg_ids: std::collections::hash::map::HashMap<[u8; 16], alloc::string::String>
 pub rns_transport::actor::TransportActor::receipt_proof_txs: std::collections::hash::map::HashMap<[u8; 16], tokio::sync::mpsc::unbounded::UnboundedSender<rns_transport::link_messages::DestinationEvent>>
@@ -68,6 +79,7 @@ pub rns_transport::actor::TransportActor::routing_save_generation: alloc::sync::
 pub rns_transport::actor::TransportActor::routing_save_in_flight: alloc::sync::Arc<core::sync::atomic::AtomicBool>
 pub rns_transport::actor::TransportActor::routing_save_lock: alloc::sync::Arc<std::sync::poison::mutex::Mutex<()>>
 pub rns_transport::actor::TransportActor::shared_instance_client_mode: bool
+pub rns_transport::actor::TransportActor::stamp_policy: rns_transport::stamps::StampPolicy
 pub rns_transport::actor::TransportActor::state_dirty: bool
 pub rns_transport::actor::TransportActor::static_transport_identity: bool
 pub rns_transport::actor::TransportActor::storage_dir: core::option::Option<std::path::PathBuf>
@@ -84,10 +96,12 @@ pub fn rns_transport::actor::TransportActor::request_recursive_discovery(&mut se
 impl rns_transport::actor::TransportActor
 pub fn rns_transport::actor::TransportActor::has_path(&self, &[u8; 16]) -> bool
 pub fn rns_transport::actor::TransportActor::hops_to(&self, &[u8; 16]) -> core::option::Option<u8>
+pub fn rns_transport::actor::TransportActor::inbound_queues(&self) -> alloc::sync::Arc<rns_transport::inbound_queues::InboundQueues>
 pub fn rns_transport::actor::TransportActor::initialize_storage(&mut self, std::path::PathBuf)
 pub fn rns_transport::actor::TransportActor::link_endpoint_dispatch_handle(&self) -> rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle
 pub fn rns_transport::actor::TransportActor::new() -> (Self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
 pub fn rns_transport::actor::TransportActor::new_with_capacity(usize, usize) -> (Self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
+pub fn rns_transport::actor::TransportActor::new_with_queues(usize, usize, rns_transport::inbound_queues::InboundQueueLengths) -> (Self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
 pub fn rns_transport::actor::TransportActor::persistence_trigger(&self) -> rns_transport::actor::PersistenceTrigger
 pub async fn rns_transport::actor::TransportActor::run(self)
 impl rns_transport::actor::TransportActor
@@ -130,6 +144,33 @@ pub rns_transport::announce_dispatch::AnnounceDispatchResult::NoEligibleInterfac
 pub struct rns_transport::announce_dispatch::AnnounceDispatchHandle
 impl rns_transport::announce_dispatch::AnnounceDispatchHandle
 pub fn rns_transport::announce_dispatch::AnnounceDispatchHandle::try_dispatch(&self, bytes::bytes::Bytes, core::option::Option<rns_transport::messages::InterfaceId>, core::time::Duration) -> core::result::Result<tokio::sync::oneshot::Receiver<rns_transport::announce_dispatch::AnnounceDispatchResult>, rns_transport::announce_dispatch::AnnounceDispatchError>
+pub mod rns_transport::announce_validation
+pub enum rns_transport::announce_validation::CachedAnnounce
+pub rns_transport::announce_validation::CachedAnnounce::Miss
+pub rns_transport::announce_validation::CachedAnnounce::Rejected(rns_transport::announce_validation::InvalidAnnounce)
+pub rns_transport::announce_validation::CachedAnnounce::Valid(rns_transport::announce_validation::ValidatedAnnounce)
+pub enum rns_transport::announce_validation::InvalidAnnounce
+pub rns_transport::announce_validation::InvalidAnnounce::Blackholed
+pub rns_transport::announce_validation::InvalidAnnounce::Invalid
+pub rns_transport::announce_validation::InvalidAnnounce::InvalidStamp(core::option::Option<f64>)
+pub rns_transport::announce_validation::InvalidAnnounce::NoStamp
+pub struct rns_transport::announce_validation::AnnounceValidationCache
+impl rns_transport::announce_validation::AnnounceValidationCache
+pub fn rns_transport::announce_validation::AnnounceValidationCache::insert_invalid(&mut self, [u8; 32], rns_transport::announce_validation::InvalidAnnounce)
+pub fn rns_transport::announce_validation::AnnounceValidationCache::insert_valid(&mut self, [u8; 32], rns_transport::announce_validation::ValidatedAnnounce)
+pub fn rns_transport::announce_validation::AnnounceValidationCache::invalid_len(&self) -> usize
+pub fn rns_transport::announce_validation::AnnounceValidationCache::lookup(&self, &[u8; 32], f64, bool) -> rns_transport::announce_validation::CachedAnnounce
+pub fn rns_transport::announce_validation::AnnounceValidationCache::new() -> Self
+pub fn rns_transport::announce_validation::AnnounceValidationCache::reset(&mut self)
+pub fn rns_transport::announce_validation::AnnounceValidationCache::valid_len(&self) -> usize
+pub struct rns_transport::announce_validation::ValidatedAnnounce
+pub rns_transport::announce_validation::ValidatedAnnounce::app_data: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_transport::announce_validation::ValidatedAnnounce::identity_hash: [u8; 16]
+pub rns_transport::announce_validation::ValidatedAnnounce::lr_cost: core::option::Option<f64>
+pub rns_transport::announce_validation::ValidatedAnnounce::public_key: [u8; 64]
+pub rns_transport::announce_validation::ValidatedAnnounce::ratchet: core::option::Option<[u8; 32]>
+pub rns_transport::announce_validation::ValidatedAnnounce::stamp: core::option::Option<[u8; 14]>
+pub rns_transport::announce_validation::ValidatedAnnounce::stamp_value: core::option::Option<f64>
 pub mod rns_transport::await_path
 pub enum rns_transport::await_path::AwaitPathError
 pub rns_transport::await_path::AwaitPathError::Timeout
@@ -169,6 +210,7 @@ pub rns_transport::blackhole::BlackholeEntry::source: core::option::Option<rns_w
 pub rns_transport::blackhole::BlackholeEntry::ttl: core::option::Option<f64>
 impl rns_transport::blackhole::BlackholeEntry
 pub fn rns_transport::blackhole::BlackholeEntry::reason_str(&self) -> &str
+pub fn rns_transport::blackhole::BlackholeEntry::wire_reason(&self) -> core::option::Option<&str>
 pub struct rns_transport::blackhole::BlackholeTable
 impl rns_transport::blackhole::BlackholeTable
 pub fn rns_transport::blackhole::BlackholeTable::add(&mut self, impl core::convert::Into<rns_wire::types::IdentityHash>, core::option::Option<f64>)
@@ -176,6 +218,7 @@ pub fn rns_transport::blackhole::BlackholeTable::add_from_source(&mut self, impl
 pub fn rns_transport::blackhole::BlackholeTable::add_with_reason(&mut self, impl core::convert::Into<rns_wire::types::IdentityHash>, core::option::Option<f64>, rns_transport::blackhole::BlackholeReason)
 pub fn rns_transport::blackhole::BlackholeTable::add_with_reason_label(&mut self, impl core::convert::Into<rns_wire::types::IdentityHash>, core::option::Option<f64>, rns_transport::blackhole::BlackholeReason, core::option::Option<alloc::string::String>)
 pub fn rns_transport::blackhole::BlackholeTable::clear_system_entries(&mut self) -> usize
+pub fn rns_transport::blackhole::BlackholeTable::contains(&self, &[u8; 16]) -> bool
 pub fn rns_transport::blackhole::BlackholeTable::cull_expired(&mut self) -> usize
 pub fn rns_transport::blackhole::BlackholeTable::insert_entry(&mut self, impl core::convert::Into<rns_wire::types::IdentityHash>, rns_transport::blackhole::BlackholeEntry)
 pub fn rns_transport::blackhole::BlackholeTable::is_blackholed(&self, &[u8; 16]) -> bool
@@ -217,6 +260,7 @@ pub fn rns_transport::constants::InterfaceDirection::bidirectional() -> Self
 pub fn rns_transport::constants::InterfaceDirection::inbound_only() -> Self
 pub fn rns_transport::constants::InterfaceDirection::outbound_only() -> Self
 pub const rns_transport::constants::ANNOUNCES_CHECK_INTERVAL: f64
+pub const rns_transport::constants::ANNOUNCE_CACHE_SWEEP_DEFER: f64
 pub const rns_transport::constants::ANNOUNCE_CACHE_SWEEP_GRACE_SECS: u64
 pub const rns_transport::constants::ANNOUNCE_CACHE_SWEEP_INTERVAL: f64
 pub const rns_transport::constants::ANNOUNCE_CAP: f64
@@ -228,14 +272,15 @@ pub const rns_transport::constants::BLACKHOLE_CHECK_INTERVAL: f64
 pub const rns_transport::constants::CACHE_CLEAN_INTERVAL: f64
 pub const rns_transport::constants::DESTINATION_TIMEOUT: u64
 pub const rns_transport::constants::DISCOVERY_PR_TX_THROTTLE: f64
+pub const rns_transport::constants::EC_BURST_MIN_SAMPLES: usize
 pub const rns_transport::constants::EC_PR_FREQ: f64
 pub const rns_transport::constants::EGRESS_CONTROL: bool
+pub const rns_transport::constants::GRACIOUS_PERSIST_INTERVAL: f64
 pub const rns_transport::constants::HASHLIST_MAXSIZE: usize
 pub const rns_transport::constants::IA_FREQ_SAMPLES: usize
 pub const rns_transport::constants::IC_BURST_FREQ: f64
 pub const rns_transport::constants::IC_BURST_FREQ_NEW: f64
 pub const rns_transport::constants::IC_BURST_HOLD: f64
-pub const rns_transport::constants::IC_BURST_MIN_SAMPLES: usize
 pub const rns_transport::constants::IC_BURST_PENALTY: f64
 pub const rns_transport::constants::IC_DEQUE_MIN_SAMPLE: usize
 pub const rns_transport::constants::IC_HELD_RELEASE_INTERVAL: f64
@@ -246,11 +291,14 @@ pub const rns_transport::constants::INTERFACE_JOBS_INTERVAL: f64
 pub const rns_transport::constants::IP_FREQ_SAMPLES: usize
 pub const rns_transport::constants::JOB_INTERVAL_BG_MS: u64
 pub const rns_transport::constants::JOB_INTERVAL_MS: u64
+pub const rns_transport::constants::KD_FLUSH_INTERVAL: f64
+pub const rns_transport::constants::KNOWN_DESTINATIONS_INTERVAL: f64
 pub const rns_transport::constants::LINKS_CHECK_INTERVAL: f64
 pub const rns_transport::constants::LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY: usize
 pub const rns_transport::constants::LINK_TIMEOUT: f64
 pub const rns_transport::constants::LOCAL_CLIENT_CACHE_MAXSIZE: usize
 pub const rns_transport::constants::LOCAL_REBROADCASTS_MAX: u32
+pub const rns_transport::constants::MAX_ANNOUNCE_DRAIN_PER_TICK: usize
 pub const rns_transport::constants::MAX_DISCOVERY_PR_TAGS: usize
 pub const rns_transport::constants::MAX_HELD_ANNOUNCES: usize
 pub const rns_transport::constants::MAX_QUEUED_ANNOUNCES: usize
@@ -266,17 +314,23 @@ pub const rns_transport::constants::PATHFINDER_G: f64
 pub const rns_transport::constants::PATHFINDER_M: u8
 pub const rns_transport::constants::PATHFINDER_R: u8
 pub const rns_transport::constants::PATHFINDER_RW: f64
+pub const rns_transport::constants::PATH_POOL_CHECK_INTERVAL: f64
+pub const rns_transport::constants::PATH_POOL_UNUSED_TARGET: usize
 pub const rns_transport::constants::PATH_REQUEST_GATE_TIMEOUT: f64
 pub const rns_transport::constants::PATH_REQUEST_GRACE: f64
 pub const rns_transport::constants::PATH_REQUEST_MI: f64
 pub const rns_transport::constants::PATH_REQUEST_RG: f64
 pub const rns_transport::constants::PATH_REQUEST_TIMEOUT: f64
+pub const rns_transport::constants::PATH_SLOW_BITRATE: u64
+pub const rns_transport::constants::PATH_SLOW_LINGER_FACTOR: f64
 pub const rns_transport::constants::PENDING_PRS_CHECK_INTERVAL: f64
 pub const rns_transport::constants::PERSIST_RANDOM_BLOBS: usize
 pub const rns_transport::constants::PR_ADMISSION_DEADLINE: f64
 pub const rns_transport::constants::PR_FREQ_DECAY: f64
 pub const rns_transport::constants::PR_MINFREQ_HZ: f64
 pub const rns_transport::constants::QUEUED_ANNOUNCE_LIFE: f64
+pub const rns_transport::constants::RATE_TABLE_CULL_INTERVAL: f64
+pub const rns_transport::constants::RATE_TABLE_RETAIN: f64
 pub const rns_transport::constants::RECEIPTS_CHECK_INTERVAL: f64
 pub const rns_transport::constants::REVERSE_TIMEOUT: u64
 pub const rns_transport::constants::ROAMING_PATH_TIME: u64
@@ -286,7 +340,42 @@ pub const rns_transport::constants::TABLES_CULL_INTERVAL: f64
 pub const rns_transport::constants::TUNNEL_PATH_TIMEOUT: u64
 pub const rns_transport::constants::TUNNEL_TIMEOUT: u64
 pub const rns_transport::constants::UNUSED_DESTINATION_LINGER: f64
+pub const rns_transport::constants::UNUSED_PATH_LINGER: f64
+pub const rns_transport::constants::UNUSED_PATH_LINGER_LEAF: f64
+pub mod rns_transport::destination_filter
+pub enum rns_transport::destination_filter::AnnounceSource
+pub rns_transport::destination_filter::AnnounceSource::LocalClient
+pub rns_transport::destination_filter::AnnounceSource::Other
+pub rns_transport::destination_filter::AnnounceSource::SharedInstance
+pub struct rns_transport::destination_filter::DestinationTypeFilter
+impl rns_transport::destination_filter::DestinationTypeFilter
+pub fn rns_transport::destination_filter::DestinationTypeFilter::admits(&self, &rns_transport::destination_filter::NameHash, rns_transport::destination_filter::AnnounceSource, u8) -> bool
+pub fn rns_transport::destination_filter::DestinationTypeFilter::allow(&mut self, &str)
+pub fn rns_transport::destination_filter::DestinationTypeFilter::apply_policy(&mut self, &rns_transport::destination_filter::FilterPolicy)
+pub fn rns_transport::destination_filter::DestinationTypeFilter::block(&mut self, &str)
+pub fn rns_transport::destination_filter::DestinationTypeFilter::is_wanted(&self, &rns_transport::destination_filter::NameHash) -> bool
+pub fn rns_transport::destination_filter::DestinationTypeFilter::required_only(&self) -> bool
+pub fn rns_transport::destination_filter::DestinationTypeFilter::set_required_only(&mut self, bool)
+pub fn rns_transport::destination_filter::DestinationTypeFilter::type_name(&self, &rns_transport::destination_filter::NameHash) -> &str
+pub fn rns_transport::destination_filter::DestinationTypeFilter::unwants(&mut self, &str, &[u8]) -> bool
+pub fn rns_transport::destination_filter::DestinationTypeFilter::unwants_all(&mut self, &[u8]) -> bool
+pub fn rns_transport::destination_filter::DestinationTypeFilter::wants(&mut self, &str, alloc::vec::Vec<u8>) -> bool
+pub struct rns_transport::destination_filter::FilterPolicy
+pub rns_transport::destination_filter::FilterPolicy::allowed_types: alloc::vec::Vec<alloc::string::String>
+pub rns_transport::destination_filter::FilterPolicy::hop_limiter: u8
+pub rns_transport::destination_filter::FilterPolicy::ignored_types: alloc::vec::Vec<alloc::string::String>
+pub rns_transport::destination_filter::FilterPolicy::required_only: bool
+impl rns_transport::destination_filter::FilterPolicy
+pub fn rns_transport::destination_filter::FilterPolicy::clamp_hop_limiter(i64) -> u8
+impl core::default::Default for rns_transport::destination_filter::FilterPolicy
+pub fn rns_transport::destination_filter::FilterPolicy::default() -> Self
+pub const rns_transport::destination_filter::NAME_HASH_LEN: usize
+pub type rns_transport::destination_filter::NameHash = [u8; 10]
 pub mod rns_transport::discovery
+pub mod rns_transport::discovery::address
+pub fn rns_transport::discovery::address::is_hostname(&str) -> core::option::Option<bool>
+pub fn rns_transport::discovery::address::is_ip_address(&str) -> bool
+pub fn rns_transport::discovery::address::is_valid_address(&str) -> core::option::Option<bool>
 pub mod rns_transport::discovery::announcer
 pub enum rns_transport::discovery::announcer::SkipReason
 pub rns_transport::discovery::announcer::SkipReason::EncryptionFailed
@@ -295,11 +384,12 @@ pub rns_transport::discovery::announcer::SkipReason::NotDiscoverable
 pub rns_transport::discovery::announcer::SkipReason::RateLimited
 pub rns_transport::discovery::announcer::SkipReason::RateLimited::remaining_secs: u64
 pub rns_transport::discovery::announcer::SkipReason::StampGenerationFailed
+pub rns_transport::discovery::announcer::SkipReason::StampValueOutOfRange
 pub rns_transport::discovery::announcer::SkipReason::TypeNotAdvertisable
 pub struct rns_transport::discovery::announcer::AnnounceRequest
 pub rns_transport::discovery::announcer::AnnounceRequest::app_data: alloc::vec::Vec<u8>
 pub rns_transport::discovery::announcer::AnnounceRequest::interface_id: rns_transport::messages::InterfaceId
-pub rns_transport::discovery::announcer::AnnounceRequest::stamp_value: u8
+pub rns_transport::discovery::announcer::AnnounceRequest::stamp_value: f64
 pub struct rns_transport::discovery::announcer::Announcer
 impl rns_transport::discovery::announcer::Announcer
 pub fn rns_transport::discovery::announcer::Announcer::commit(&mut self, &rns_transport::discovery::announcer::PreparedAnnounce, f64) -> bool
@@ -310,6 +400,7 @@ pub fn rns_transport::discovery::announcer::Announcer::new(alloc::sync::Arc<dyn 
 pub fn rns_transport::discovery::announcer::Announcer::prepare(&mut self, f64, core::option::Option<rns_transport::discovery::announcer::EncryptFn<'_>>) -> (alloc::vec::Vec<rns_transport::discovery::announcer::PreparedAnnounce>, alloc::vec::Vec<(rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::SkipReason)>)
 pub fn rns_transport::discovery::announcer::Announcer::reconfigure(&mut self, rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::DiscoveryInterfaceConfig) -> bool
 pub fn rns_transport::discovery::announcer::Announcer::register(&mut self, rns_transport::messages::InterfaceId, [u8; 16], rns_transport::discovery::announcer::DiscoveryInterfaceConfig)
+pub fn rns_transport::discovery::announcer::Announcer::stamp_control(&self) -> &rns_identity::stamps::StampControl
 pub fn rns_transport::discovery::announcer::Announcer::tick(&mut self, f64, core::option::Option<rns_transport::discovery::announcer::EncryptFn<'_>>) -> (alloc::vec::Vec<rns_transport::discovery::announcer::AnnounceRequest>, alloc::vec::Vec<(rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::SkipReason)>)
 pub struct rns_transport::discovery::announcer::DiscoveryInterfaceConfig
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::announce_interval_secs: u64
@@ -317,6 +408,7 @@ pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::bandwidth: co
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::channel: core::option::Option<u16>
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::coding_rate: core::option::Option<u8>
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::discoverable: bool
+pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::dst_cost: core::option::Option<f64>
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::encrypt: bool
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::frequency: core::option::Option<u64>
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::height: core::option::Option<f64>
@@ -325,16 +417,19 @@ pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::ifac_netname:
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::interface_type: alloc::string::String
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::latitude: core::option::Option<f64>
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::longitude: core::option::Option<f64>
-pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::modulation: core::option::Option<alloc::string::String>
-pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::name: alloc::string::String
+pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::modulation: core::option::Option<rns_transport::discovery::app_data::DiscoveryModulation>
+pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::name: core::option::Option<alloc::string::String>
+pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::operator_lxmf_address: core::option::Option<[u8; 16]>
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::port: core::option::Option<u16>
+pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::pr_cost: core::option::Option<f64>
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::reachable_on: core::option::Option<alloc::string::String>
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::signed: bool
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::spreading_factor: core::option::Option<u8>
-pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::stamp_value: u8
+pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::stamp_value: f64
 pub rns_transport::discovery::announcer::DiscoveryInterfaceConfig::transport_enabled: bool
 impl rns_transport::discovery::announcer::DiscoveryInterfaceConfig
-pub fn rns_transport::discovery::announcer::DiscoveryInterfaceConfig::backbone(alloc::string::String, alloc::string::String, u16) -> Self
+pub fn rns_transport::discovery::announcer::DiscoveryInterfaceConfig::backbone(core::option::Option<alloc::string::String>, alloc::string::String, u16) -> Self
+pub fn rns_transport::discovery::announcer::DiscoveryInterfaceConfig::effective_stamp_value(&self) -> f64
 pub fn rns_transport::discovery::announcer::DiscoveryInterfaceConfig::is_advertisable(&self) -> bool
 pub struct rns_transport::discovery::announcer::PreparedAnnounce
 impl rns_transport::discovery::announcer::PreparedAnnounce
@@ -355,10 +450,21 @@ pub rns_transport::discovery::app_data::AppDataError::TypeMismatch
 pub rns_transport::discovery::app_data::AppDataError::TypeMismatch::expected: &'static str
 pub rns_transport::discovery::app_data::AppDataError::TypeMismatch::key: u8
 pub rns_transport::discovery::app_data::AppDataError::UnsupportedInterfaceType(alloc::string::String)
+pub enum rns_transport::discovery::app_data::DiscoveryModulation
+pub rns_transport::discovery::app_data::DiscoveryModulation::Int(i64)
+pub rns_transport::discovery::app_data::DiscoveryModulation::Str(alloc::string::String)
+impl rns_transport::discovery::app_data::DiscoveryModulation
+pub fn rns_transport::discovery::app_data::DiscoveryModulation::from_value(&rmpv::Value) -> core::option::Option<Self>
+pub fn rns_transport::discovery::app_data::DiscoveryModulation::to_value(&self) -> rmpv::Value
+impl core::fmt::Display for rns_transport::discovery::app_data::DiscoveryModulation
+pub fn rns_transport::discovery::app_data::DiscoveryModulation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for rns_transport::discovery::app_data::DiscoveryModulation
+pub fn rns_transport::discovery::app_data::DiscoveryModulation::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
 pub struct rns_transport::discovery::app_data::DiscoveryInfo
 pub rns_transport::discovery::app_data::DiscoveryInfo::bandwidth: core::option::Option<u64>
 pub rns_transport::discovery::app_data::DiscoveryInfo::channel: core::option::Option<u16>
 pub rns_transport::discovery::app_data::DiscoveryInfo::coding_rate: core::option::Option<u8>
+pub rns_transport::discovery::app_data::DiscoveryInfo::dst_cost: core::option::Option<f64>
 pub rns_transport::discovery::app_data::DiscoveryInfo::frequency: core::option::Option<u64>
 pub rns_transport::discovery::app_data::DiscoveryInfo::height: core::option::Option<f64>
 pub rns_transport::discovery::app_data::DiscoveryInfo::ifac_netkey: core::option::Option<alloc::string::String>
@@ -368,9 +474,11 @@ pub rns_transport::discovery::app_data::DiscoveryInfo::impl_version: core::optio
 pub rns_transport::discovery::app_data::DiscoveryInfo::interface_type: alloc::string::String
 pub rns_transport::discovery::app_data::DiscoveryInfo::latitude: core::option::Option<f64>
 pub rns_transport::discovery::app_data::DiscoveryInfo::longitude: core::option::Option<f64>
-pub rns_transport::discovery::app_data::DiscoveryInfo::modulation: core::option::Option<alloc::string::String>
+pub rns_transport::discovery::app_data::DiscoveryInfo::modulation: core::option::Option<rns_transport::discovery::app_data::DiscoveryModulation>
 pub rns_transport::discovery::app_data::DiscoveryInfo::name: alloc::string::String
+pub rns_transport::discovery::app_data::DiscoveryInfo::operator_lxmf_address: core::option::Option<[u8; 16]>
 pub rns_transport::discovery::app_data::DiscoveryInfo::port: core::option::Option<u16>
+pub rns_transport::discovery::app_data::DiscoveryInfo::pr_cost: core::option::Option<f64>
 pub rns_transport::discovery::app_data::DiscoveryInfo::reachable_on: core::option::Option<alloc::string::String>
 pub rns_transport::discovery::app_data::DiscoveryInfo::spreading_factor: core::option::Option<u8>
 pub rns_transport::discovery::app_data::DiscoveryInfo::transport_enabled: bool
@@ -402,8 +510,9 @@ pub rns_transport::discovery::blackhole_manifest::BlackholeManifestEntry::reason
 pub rns_transport::discovery::blackhole_manifest::BlackholeManifestEntry::source: rns_wire::types::IdentityHash
 pub rns_transport::discovery::blackhole_manifest::BlackholeManifestEntry::until: core::option::Option<f64>
 pub fn rns_transport::discovery::blackhole_manifest::apply_manifest(&mut rns_transport::blackhole::BlackholeTable, &[([u8; 16], rns_transport::discovery::blackhole_manifest::BlackholeManifestEntry)], f64) -> usize
-pub fn rns_transport::discovery::blackhole_manifest::build_local_manifest(&rns_transport::blackhole::BlackholeTable, rns_wire::types::IdentityHash, core::option::Option<&std::collections::hash::set::HashSet<[u8; 16]>>) -> core::result::Result<alloc::vec::Vec<u8>, rns_transport::discovery::blackhole_manifest::ManifestError>
+pub fn rns_transport::discovery::blackhole_manifest::build_manifest(&rns_transport::blackhole::BlackholeTable, rns_wire::types::IdentityHash) -> core::result::Result<alloc::vec::Vec<u8>, rns_transport::discovery::blackhole_manifest::ManifestError>
 pub fn rns_transport::discovery::blackhole_manifest::decode_manifest(&[u8]) -> core::result::Result<alloc::vec::Vec<([u8; 16], rns_transport::discovery::blackhole_manifest::BlackholeManifestEntry)>, rns_transport::discovery::blackhole_manifest::ManifestError>
+pub fn rns_transport::discovery::blackhole_manifest::decode_published_manifest(&[u8], rns_wire::types::IdentityHash) -> core::result::Result<alloc::vec::Vec<([u8; 16], rns_transport::discovery::blackhole_manifest::BlackholeManifestEntry)>, rns_transport::discovery::blackhole_manifest::ManifestError>
 pub mod rns_transport::discovery::blackhole_subscriber
 pub struct rns_transport::discovery::blackhole_subscriber::SubscriberState
 impl rns_transport::discovery::blackhole_subscriber::SubscriberState
@@ -425,6 +534,7 @@ pub mod rns_transport::discovery::constants::key
 pub const rns_transport::discovery::constants::key::BANDWIDTH: u8
 pub const rns_transport::discovery::constants::key::CHANNEL: u8
 pub const rns_transport::discovery::constants::key::CODING_RATE: u8
+pub const rns_transport::discovery::constants::key::DST_COST: u8
 pub const rns_transport::discovery::constants::key::FREQUENCY: u8
 pub const rns_transport::discovery::constants::key::HEIGHT: u8
 pub const rns_transport::discovery::constants::key::IFAC_NETKEY: u8
@@ -434,7 +544,9 @@ pub const rns_transport::discovery::constants::key::LATITUDE: u8
 pub const rns_transport::discovery::constants::key::LONGITUDE: u8
 pub const rns_transport::discovery::constants::key::MODULATION: u8
 pub const rns_transport::discovery::constants::key::NAME: u8
+pub const rns_transport::discovery::constants::key::OP_ADDR: u8
 pub const rns_transport::discovery::constants::key::PORT: u8
+pub const rns_transport::discovery::constants::key::PR_COST: u8
 pub const rns_transport::discovery::constants::key::REACHABLE_ON: u8
 pub const rns_transport::discovery::constants::key::SPREADING_FACTOR: u8
 pub const rns_transport::discovery::constants::key::TRANSPORT: u8
@@ -451,7 +563,7 @@ pub const rns_transport::discovery::constants::BLACKHOLE_INITIAL_WAIT_SECS: u64
 pub const rns_transport::discovery::constants::BLACKHOLE_JOB_INTERVAL_SECS: u64
 pub const rns_transport::discovery::constants::BLACKHOLE_SOURCE_TIMEOUT_SECS: u64
 pub const rns_transport::discovery::constants::BLACKHOLE_UPDATE_INTERVAL_SECS: u64
-pub const rns_transport::discovery::constants::DEFAULT_STAMP_VALUE: u8
+pub const rns_transport::discovery::constants::DEFAULT_STAMP_VALUE: f64
 pub const rns_transport::discovery::constants::DETACH_THRESHOLD_TICKS: u64
 pub const rns_transport::discovery::constants::DISCOVERABLE_INTERFACE_TYPES: &[&str]
 pub const rns_transport::discovery::constants::DISCOVERED_INTERFACE_TYPES: &[&str]
@@ -466,11 +578,12 @@ pub const rns_transport::discovery::constants::STAMP_SIZE: usize
 pub const rns_transport::discovery::constants::THRESHOLD_REMOVE_SECS: u64
 pub const rns_transport::discovery::constants::THRESHOLD_STALE_SECS: u64
 pub const rns_transport::discovery::constants::THRESHOLD_UNKNOWN_SECS: u64
-pub const rns_transport::discovery::constants::WORKBLOCK_EXPAND_ROUNDS: u32
+pub const rns_transport::discovery::constants::WORKBLOCK_EXPAND_ROUNDS: usize
 pub mod rns_transport::discovery::key
 pub const rns_transport::discovery::key::BANDWIDTH: u8
 pub const rns_transport::discovery::key::CHANNEL: u8
 pub const rns_transport::discovery::key::CODING_RATE: u8
+pub const rns_transport::discovery::key::DST_COST: u8
 pub const rns_transport::discovery::key::FREQUENCY: u8
 pub const rns_transport::discovery::key::HEIGHT: u8
 pub const rns_transport::discovery::key::IFAC_NETKEY: u8
@@ -480,7 +593,9 @@ pub const rns_transport::discovery::key::LATITUDE: u8
 pub const rns_transport::discovery::key::LONGITUDE: u8
 pub const rns_transport::discovery::key::MODULATION: u8
 pub const rns_transport::discovery::key::NAME: u8
+pub const rns_transport::discovery::key::OP_ADDR: u8
 pub const rns_transport::discovery::key::PORT: u8
+pub const rns_transport::discovery::key::PR_COST: u8
 pub const rns_transport::discovery::key::REACHABLE_ON: u8
 pub const rns_transport::discovery::key::SPREADING_FACTOR: u8
 pub const rns_transport::discovery::key::TRANSPORT: u8
@@ -495,6 +610,7 @@ pub rns_transport::discovery::receiver::Outcome::Rejected(rns_transport::discove
 pub rns_transport::discovery::receiver::Reason::DecodeFailed
 pub rns_transport::discovery::receiver::Reason::DecryptFailed
 pub rns_transport::discovery::receiver::Reason::EncryptedWithoutKey
+pub rns_transport::discovery::receiver::Reason::HopLimit
 pub rns_transport::discovery::receiver::Reason::Malformed
 pub rns_transport::discovery::receiver::Reason::MissingAppData
 pub rns_transport::discovery::receiver::Reason::StampInvalid
@@ -506,7 +622,7 @@ pub struct rns_transport::discovery::receiver::ReceiverConfig
 pub rns_transport::discovery::receiver::ReceiverConfig::decryptor: core::option::Option<alloc::sync::Arc<dyn rns_transport::discovery::receiver::DiscoveryDecryptor>>
 pub rns_transport::discovery::receiver::ReceiverConfig::discovery_sources: core::option::Option<alloc::vec::Vec<[u8; 16]>>
 pub rns_transport::discovery::receiver::ReceiverConfig::observer: core::option::Option<tokio::sync::mpsc::bounded::Sender<rns_transport::discovery::storage::DiscoveredInterface>>
-pub rns_transport::discovery::receiver::ReceiverConfig::required_value: u8
+pub rns_transport::discovery::receiver::ReceiverConfig::required_value: f64
 pub rns_transport::discovery::receiver::ReceiverConfig::stamper: alloc::sync::Arc<dyn rns_transport::discovery::stamper::DiscoveryStamper>
 pub rns_transport::discovery::receiver::ReceiverConfig::store: alloc::sync::Arc<rns_transport::discovery::storage::DiscoveryStore>
 impl rns_transport::discovery::receiver::ReceiverConfig
@@ -527,17 +643,28 @@ pub fn rns_transport::discovery::receiver::spawn_with_metrics(rns_transport::dis
 pub mod rns_transport::discovery::stamper
 pub struct rns_transport::discovery::stamper::NullStamper
 impl rns_transport::discovery::stamper::DiscoveryStamper for rns_transport::discovery::stamper::NullStamper
-pub fn rns_transport::discovery::stamper::NullStamper::generate(&self, &[u8; 32], u8) -> core::option::Option<alloc::vec::Vec<u8>>
-pub fn rns_transport::discovery::stamper::NullStamper::valid(&self, &[u8; 32], &[u8], u8) -> bool
-pub fn rns_transport::discovery::stamper::NullStamper::value(&self, &[u8; 32], &[u8]) -> u8
+pub fn rns_transport::discovery::stamper::NullStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::discovery::stamper::NullStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn rns_transport::discovery::stamper::NullStamper::value(&self, &[u8; 32], &[u8]) -> f64
+pub struct rns_transport::discovery::stamper::RnsDiscoveryStamper
+impl rns_transport::discovery::stamper::DiscoveryStamper for rns_transport::discovery::stamper::RnsDiscoveryStamper
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> f64
+pub const rns_transport::discovery::stamper::POOLING_THRESHOLD_COST: f64
 pub trait rns_transport::discovery::stamper::DiscoveryStamper: core::marker::Send + core::marker::Sync
-pub fn rns_transport::discovery::stamper::DiscoveryStamper::generate(&self, &[u8; 32], u8) -> core::option::Option<alloc::vec::Vec<u8>>
-pub fn rns_transport::discovery::stamper::DiscoveryStamper::valid(&self, &[u8; 32], &[u8], u8) -> bool
-pub fn rns_transport::discovery::stamper::DiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> u8
+pub fn rns_transport::discovery::stamper::DiscoveryStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::discovery::stamper::DiscoveryStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn rns_transport::discovery::stamper::DiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> f64
 impl rns_transport::discovery::stamper::DiscoveryStamper for rns_transport::discovery::stamper::NullStamper
-pub fn rns_transport::discovery::stamper::NullStamper::generate(&self, &[u8; 32], u8) -> core::option::Option<alloc::vec::Vec<u8>>
-pub fn rns_transport::discovery::stamper::NullStamper::valid(&self, &[u8; 32], &[u8], u8) -> bool
-pub fn rns_transport::discovery::stamper::NullStamper::value(&self, &[u8; 32], &[u8]) -> u8
+pub fn rns_transport::discovery::stamper::NullStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::discovery::stamper::NullStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn rns_transport::discovery::stamper::NullStamper::value(&self, &[u8; 32], &[u8]) -> f64
+impl rns_transport::discovery::stamper::DiscoveryStamper for rns_transport::discovery::stamper::RnsDiscoveryStamper
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> f64
+pub fn rns_transport::discovery::stamper::generation_threads(f64) -> core::num::nonzero::NonZeroUsize
 pub mod rns_transport::discovery::storage
 pub enum rns_transport::discovery::storage::DiscoveryStatus
 pub rns_transport::discovery::storage::DiscoveryStatus::Available
@@ -552,14 +679,14 @@ pub rns_transport::discovery::storage::StorageError::Encode(alloc::string::Strin
 pub rns_transport::discovery::storage::StorageError::Io(core::io::error::Error)
 pub rns_transport::discovery::storage::StorageError::Shape
 pub struct rns_transport::discovery::storage::DiscoveredInterface
-pub rns_transport::discovery::storage::DiscoveredInterface::discovered: u64
+pub rns_transport::discovery::storage::DiscoveredInterface::discovered: f64
 pub rns_transport::discovery::storage::DiscoveredInterface::heard_count: u64
 pub rns_transport::discovery::storage::DiscoveredInterface::hops: u8
 pub rns_transport::discovery::storage::DiscoveredInterface::info: rns_transport::discovery::app_data::DiscoveryInfo
-pub rns_transport::discovery::storage::DiscoveredInterface::last_heard: u64
+pub rns_transport::discovery::storage::DiscoveredInterface::last_heard: f64
 pub rns_transport::discovery::storage::DiscoveredInterface::network_id: [u8; 16]
 pub rns_transport::discovery::storage::DiscoveredInterface::stamp: alloc::vec::Vec<u8>
-pub rns_transport::discovery::storage::DiscoveredInterface::stamp_value: u8
+pub rns_transport::discovery::storage::DiscoveredInterface::stamp_value: f64
 pub rns_transport::discovery::storage::DiscoveredInterface::status: core::option::Option<rns_transport::discovery::storage::DiscoveryStatus>
 impl rns_transport::discovery::storage::DiscoveredInterface
 pub fn rns_transport::discovery::storage::DiscoveredInterface::discovery_hash(&self) -> [u8; 32]
@@ -567,11 +694,13 @@ pub fn rns_transport::discovery::storage::DiscoveredInterface::filename(&self) -
 pub struct rns_transport::discovery::storage::DiscoveryStore
 impl rns_transport::discovery::storage::DiscoveryStore
 pub fn rns_transport::discovery::storage::DiscoveryStore::list(&self, core::option::Option<&[[u8; 16]]>) -> core::result::Result<alloc::vec::Vec<rns_transport::discovery::storage::DiscoveredInterface>, rns_transport::discovery::storage::StorageError>
+pub fn rns_transport::discovery::storage::DiscoveryStore::list_filtered(&self, core::option::Option<&[[u8; 16]]>, &std::collections::hash::set::HashSet<[u8; 16]>) -> core::result::Result<alloc::vec::Vec<rns_transport::discovery::storage::DiscoveredInterface>, rns_transport::discovery::storage::StorageError>
 pub fn rns_transport::discovery::storage::DiscoveryStore::open(&std::path::Path) -> core::result::Result<Self, rns_transport::discovery::storage::StorageError>
 pub fn rns_transport::discovery::storage::DiscoveryStore::remove(&self, &[u8; 16], &str) -> core::result::Result<bool, rns_transport::discovery::storage::StorageError>
 pub fn rns_transport::discovery::storage::DiscoveryStore::root(&self) -> &std::path::Path
 pub fn rns_transport::discovery::storage::DiscoveryStore::upsert(&self, rns_transport::discovery::storage::DiscoveredInterface) -> core::result::Result<(), rns_transport::discovery::storage::StorageError>
-pub fn rns_transport::discovery::storage::classify(u64) -> rns_transport::discovery::storage::DiscoveryStatus
+pub fn rns_transport::discovery::storage::classify(f64) -> rns_transport::discovery::storage::DiscoveryStatus
+pub fn rns_transport::discovery::storage::config_entry(&rns_transport::discovery::storage::DiscoveredInterface) -> core::option::Option<alloc::string::String>
 pub fn rns_transport::discovery::storage::discovery_hash(&[u8; 16], &str) -> [u8; 32]
 pub enum rns_transport::discovery::DiscoveryStatus
 pub rns_transport::discovery::DiscoveryStatus::Available
@@ -595,6 +724,7 @@ pub rns_transport::discovery::Outcome::Rejected(rns_transport::discovery::receiv
 pub rns_transport::discovery::Reason::DecodeFailed
 pub rns_transport::discovery::Reason::DecryptFailed
 pub rns_transport::discovery::Reason::EncryptedWithoutKey
+pub rns_transport::discovery::Reason::HopLimit
 pub rns_transport::discovery::Reason::Malformed
 pub rns_transport::discovery::Reason::MissingAppData
 pub rns_transport::discovery::Reason::StampInvalid
@@ -609,11 +739,12 @@ pub rns_transport::discovery::SkipReason::NotDiscoverable
 pub rns_transport::discovery::SkipReason::RateLimited
 pub rns_transport::discovery::SkipReason::RateLimited::remaining_secs: u64
 pub rns_transport::discovery::SkipReason::StampGenerationFailed
+pub rns_transport::discovery::SkipReason::StampValueOutOfRange
 pub rns_transport::discovery::SkipReason::TypeNotAdvertisable
 pub struct rns_transport::discovery::AnnounceRequest
 pub rns_transport::discovery::AnnounceRequest::app_data: alloc::vec::Vec<u8>
 pub rns_transport::discovery::AnnounceRequest::interface_id: rns_transport::messages::InterfaceId
-pub rns_transport::discovery::AnnounceRequest::stamp_value: u8
+pub rns_transport::discovery::AnnounceRequest::stamp_value: f64
 pub struct rns_transport::discovery::Announcer
 impl rns_transport::discovery::announcer::Announcer
 pub fn rns_transport::discovery::announcer::Announcer::commit(&mut self, &rns_transport::discovery::announcer::PreparedAnnounce, f64) -> bool
@@ -624,6 +755,7 @@ pub fn rns_transport::discovery::announcer::Announcer::new(alloc::sync::Arc<dyn 
 pub fn rns_transport::discovery::announcer::Announcer::prepare(&mut self, f64, core::option::Option<rns_transport::discovery::announcer::EncryptFn<'_>>) -> (alloc::vec::Vec<rns_transport::discovery::announcer::PreparedAnnounce>, alloc::vec::Vec<(rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::SkipReason)>)
 pub fn rns_transport::discovery::announcer::Announcer::reconfigure(&mut self, rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::DiscoveryInterfaceConfig) -> bool
 pub fn rns_transport::discovery::announcer::Announcer::register(&mut self, rns_transport::messages::InterfaceId, [u8; 16], rns_transport::discovery::announcer::DiscoveryInterfaceConfig)
+pub fn rns_transport::discovery::announcer::Announcer::stamp_control(&self) -> &rns_identity::stamps::StampControl
 pub fn rns_transport::discovery::announcer::Announcer::tick(&mut self, f64, core::option::Option<rns_transport::discovery::announcer::EncryptFn<'_>>) -> (alloc::vec::Vec<rns_transport::discovery::announcer::AnnounceRequest>, alloc::vec::Vec<(rns_transport::messages::InterfaceId, rns_transport::discovery::announcer::SkipReason)>)
 pub struct rns_transport::discovery::BlackholeManifestEntry
 pub rns_transport::discovery::BlackholeManifestEntry::reason: alloc::string::String
@@ -641,14 +773,14 @@ pub fn rns_transport::discovery::blackhole_subscriber::SubscriberState::with_upd
 impl core::default::Default for rns_transport::discovery::blackhole_subscriber::SubscriberState
 pub fn rns_transport::discovery::blackhole_subscriber::SubscriberState::default() -> Self
 pub struct rns_transport::discovery::DiscoveredInterface
-pub rns_transport::discovery::DiscoveredInterface::discovered: u64
+pub rns_transport::discovery::DiscoveredInterface::discovered: f64
 pub rns_transport::discovery::DiscoveredInterface::heard_count: u64
 pub rns_transport::discovery::DiscoveredInterface::hops: u8
 pub rns_transport::discovery::DiscoveredInterface::info: rns_transport::discovery::app_data::DiscoveryInfo
-pub rns_transport::discovery::DiscoveredInterface::last_heard: u64
+pub rns_transport::discovery::DiscoveredInterface::last_heard: f64
 pub rns_transport::discovery::DiscoveredInterface::network_id: [u8; 16]
 pub rns_transport::discovery::DiscoveredInterface::stamp: alloc::vec::Vec<u8>
-pub rns_transport::discovery::DiscoveredInterface::stamp_value: u8
+pub rns_transport::discovery::DiscoveredInterface::stamp_value: f64
 pub rns_transport::discovery::DiscoveredInterface::status: core::option::Option<rns_transport::discovery::storage::DiscoveryStatus>
 impl rns_transport::discovery::storage::DiscoveredInterface
 pub fn rns_transport::discovery::storage::DiscoveredInterface::discovery_hash(&self) -> [u8; 32]
@@ -659,6 +791,7 @@ pub rns_transport::discovery::DiscoveryInterfaceConfig::bandwidth: core::option:
 pub rns_transport::discovery::DiscoveryInterfaceConfig::channel: core::option::Option<u16>
 pub rns_transport::discovery::DiscoveryInterfaceConfig::coding_rate: core::option::Option<u8>
 pub rns_transport::discovery::DiscoveryInterfaceConfig::discoverable: bool
+pub rns_transport::discovery::DiscoveryInterfaceConfig::dst_cost: core::option::Option<f64>
 pub rns_transport::discovery::DiscoveryInterfaceConfig::encrypt: bool
 pub rns_transport::discovery::DiscoveryInterfaceConfig::frequency: core::option::Option<u64>
 pub rns_transport::discovery::DiscoveryInterfaceConfig::height: core::option::Option<f64>
@@ -667,38 +800,47 @@ pub rns_transport::discovery::DiscoveryInterfaceConfig::ifac_netname: core::opti
 pub rns_transport::discovery::DiscoveryInterfaceConfig::interface_type: alloc::string::String
 pub rns_transport::discovery::DiscoveryInterfaceConfig::latitude: core::option::Option<f64>
 pub rns_transport::discovery::DiscoveryInterfaceConfig::longitude: core::option::Option<f64>
-pub rns_transport::discovery::DiscoveryInterfaceConfig::modulation: core::option::Option<alloc::string::String>
-pub rns_transport::discovery::DiscoveryInterfaceConfig::name: alloc::string::String
+pub rns_transport::discovery::DiscoveryInterfaceConfig::modulation: core::option::Option<rns_transport::discovery::app_data::DiscoveryModulation>
+pub rns_transport::discovery::DiscoveryInterfaceConfig::name: core::option::Option<alloc::string::String>
+pub rns_transport::discovery::DiscoveryInterfaceConfig::operator_lxmf_address: core::option::Option<[u8; 16]>
 pub rns_transport::discovery::DiscoveryInterfaceConfig::port: core::option::Option<u16>
+pub rns_transport::discovery::DiscoveryInterfaceConfig::pr_cost: core::option::Option<f64>
 pub rns_transport::discovery::DiscoveryInterfaceConfig::reachable_on: core::option::Option<alloc::string::String>
 pub rns_transport::discovery::DiscoveryInterfaceConfig::signed: bool
 pub rns_transport::discovery::DiscoveryInterfaceConfig::spreading_factor: core::option::Option<u8>
-pub rns_transport::discovery::DiscoveryInterfaceConfig::stamp_value: u8
+pub rns_transport::discovery::DiscoveryInterfaceConfig::stamp_value: f64
 pub rns_transport::discovery::DiscoveryInterfaceConfig::transport_enabled: bool
 impl rns_transport::discovery::announcer::DiscoveryInterfaceConfig
-pub fn rns_transport::discovery::announcer::DiscoveryInterfaceConfig::backbone(alloc::string::String, alloc::string::String, u16) -> Self
+pub fn rns_transport::discovery::announcer::DiscoveryInterfaceConfig::backbone(core::option::Option<alloc::string::String>, alloc::string::String, u16) -> Self
+pub fn rns_transport::discovery::announcer::DiscoveryInterfaceConfig::effective_stamp_value(&self) -> f64
 pub fn rns_transport::discovery::announcer::DiscoveryInterfaceConfig::is_advertisable(&self) -> bool
 pub struct rns_transport::discovery::DiscoveryStore
 impl rns_transport::discovery::storage::DiscoveryStore
 pub fn rns_transport::discovery::storage::DiscoveryStore::list(&self, core::option::Option<&[[u8; 16]]>) -> core::result::Result<alloc::vec::Vec<rns_transport::discovery::storage::DiscoveredInterface>, rns_transport::discovery::storage::StorageError>
+pub fn rns_transport::discovery::storage::DiscoveryStore::list_filtered(&self, core::option::Option<&[[u8; 16]]>, &std::collections::hash::set::HashSet<[u8; 16]>) -> core::result::Result<alloc::vec::Vec<rns_transport::discovery::storage::DiscoveredInterface>, rns_transport::discovery::storage::StorageError>
 pub fn rns_transport::discovery::storage::DiscoveryStore::open(&std::path::Path) -> core::result::Result<Self, rns_transport::discovery::storage::StorageError>
 pub fn rns_transport::discovery::storage::DiscoveryStore::remove(&self, &[u8; 16], &str) -> core::result::Result<bool, rns_transport::discovery::storage::StorageError>
 pub fn rns_transport::discovery::storage::DiscoveryStore::root(&self) -> &std::path::Path
 pub fn rns_transport::discovery::storage::DiscoveryStore::upsert(&self, rns_transport::discovery::storage::DiscoveredInterface) -> core::result::Result<(), rns_transport::discovery::storage::StorageError>
 pub struct rns_transport::discovery::NullStamper
 impl rns_transport::discovery::stamper::DiscoveryStamper for rns_transport::discovery::stamper::NullStamper
-pub fn rns_transport::discovery::stamper::NullStamper::generate(&self, &[u8; 32], u8) -> core::option::Option<alloc::vec::Vec<u8>>
-pub fn rns_transport::discovery::stamper::NullStamper::valid(&self, &[u8; 32], &[u8], u8) -> bool
-pub fn rns_transport::discovery::stamper::NullStamper::value(&self, &[u8; 32], &[u8]) -> u8
+pub fn rns_transport::discovery::stamper::NullStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::discovery::stamper::NullStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn rns_transport::discovery::stamper::NullStamper::value(&self, &[u8; 32], &[u8]) -> f64
 pub struct rns_transport::discovery::ReceiverConfig
 pub rns_transport::discovery::ReceiverConfig::decryptor: core::option::Option<alloc::sync::Arc<dyn rns_transport::discovery::receiver::DiscoveryDecryptor>>
 pub rns_transport::discovery::ReceiverConfig::discovery_sources: core::option::Option<alloc::vec::Vec<[u8; 16]>>
 pub rns_transport::discovery::ReceiverConfig::observer: core::option::Option<tokio::sync::mpsc::bounded::Sender<rns_transport::discovery::storage::DiscoveredInterface>>
-pub rns_transport::discovery::ReceiverConfig::required_value: u8
+pub rns_transport::discovery::ReceiverConfig::required_value: f64
 pub rns_transport::discovery::ReceiverConfig::stamper: alloc::sync::Arc<dyn rns_transport::discovery::stamper::DiscoveryStamper>
 pub rns_transport::discovery::ReceiverConfig::store: alloc::sync::Arc<rns_transport::discovery::storage::DiscoveryStore>
 impl rns_transport::discovery::receiver::ReceiverConfig
 pub fn rns_transport::discovery::receiver::ReceiverConfig::process_event(&self, &rns_transport::messages::AnnounceHandlerEvent) -> rns_transport::discovery::receiver::Outcome
+pub struct rns_transport::discovery::RnsDiscoveryStamper
+impl rns_transport::discovery::stamper::DiscoveryStamper for rns_transport::discovery::stamper::RnsDiscoveryStamper
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> f64
 pub const rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS: u64
 pub const rns_transport::discovery::APP_NAME: &str
 pub const rns_transport::discovery::AUTOCONNECT_INTERFACE_TYPES: &[&str]
@@ -713,7 +855,7 @@ pub const rns_transport::discovery::BLACKHOLE_SOURCE_TIMEOUT: core::time::Durati
 pub const rns_transport::discovery::BLACKHOLE_SOURCE_TIMEOUT_SECS: u64
 pub const rns_transport::discovery::BLACKHOLE_UPDATE_INTERVAL: core::time::Duration
 pub const rns_transport::discovery::BLACKHOLE_UPDATE_INTERVAL_SECS: u64
-pub const rns_transport::discovery::DEFAULT_STAMP_VALUE: u8
+pub const rns_transport::discovery::DEFAULT_STAMP_VALUE: f64
 pub const rns_transport::discovery::DETACH_THRESHOLD_TICKS: u64
 pub const rns_transport::discovery::DISCOVERABLE_INTERFACE_TYPES: &[&str]
 pub const rns_transport::discovery::DISCOVERED_INTERFACE_TYPES: &[&str]
@@ -728,20 +870,25 @@ pub const rns_transport::discovery::STAMP_SIZE: usize
 pub const rns_transport::discovery::THRESHOLD_REMOVE_SECS: u64
 pub const rns_transport::discovery::THRESHOLD_STALE_SECS: u64
 pub const rns_transport::discovery::THRESHOLD_UNKNOWN_SECS: u64
-pub const rns_transport::discovery::WORKBLOCK_EXPAND_ROUNDS: u32
+pub const rns_transport::discovery::WORKBLOCK_EXPAND_ROUNDS: usize
 pub trait rns_transport::discovery::DiscoveryDecryptor: core::marker::Send + core::marker::Sync
 pub fn rns_transport::discovery::DiscoveryDecryptor::decrypt(&self, &[u8]) -> core::option::Option<alloc::vec::Vec<u8>>
 pub trait rns_transport::discovery::DiscoveryStamper: core::marker::Send + core::marker::Sync
-pub fn rns_transport::discovery::DiscoveryStamper::generate(&self, &[u8; 32], u8) -> core::option::Option<alloc::vec::Vec<u8>>
-pub fn rns_transport::discovery::DiscoveryStamper::valid(&self, &[u8; 32], &[u8], u8) -> bool
-pub fn rns_transport::discovery::DiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> u8
+pub fn rns_transport::discovery::DiscoveryStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::discovery::DiscoveryStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn rns_transport::discovery::DiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> f64
 impl rns_transport::discovery::stamper::DiscoveryStamper for rns_transport::discovery::stamper::NullStamper
-pub fn rns_transport::discovery::stamper::NullStamper::generate(&self, &[u8; 32], u8) -> core::option::Option<alloc::vec::Vec<u8>>
-pub fn rns_transport::discovery::stamper::NullStamper::valid(&self, &[u8; 32], &[u8], u8) -> bool
-pub fn rns_transport::discovery::stamper::NullStamper::value(&self, &[u8; 32], &[u8]) -> u8
+pub fn rns_transport::discovery::stamper::NullStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::discovery::stamper::NullStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn rns_transport::discovery::stamper::NullStamper::value(&self, &[u8; 32], &[u8]) -> f64
+impl rns_transport::discovery::stamper::DiscoveryStamper for rns_transport::discovery::stamper::RnsDiscoveryStamper
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> f64
 pub fn rns_transport::discovery::apply_manifest(&mut rns_transport::blackhole::BlackholeTable, &[([u8; 16], rns_transport::discovery::blackhole_manifest::BlackholeManifestEntry)], f64) -> usize
-pub fn rns_transport::discovery::build_local_manifest(&rns_transport::blackhole::BlackholeTable, rns_wire::types::IdentityHash, core::option::Option<&std::collections::hash::set::HashSet<[u8; 16]>>) -> core::result::Result<alloc::vec::Vec<u8>, rns_transport::discovery::blackhole_manifest::ManifestError>
+pub fn rns_transport::discovery::build_manifest(&rns_transport::blackhole::BlackholeTable, rns_wire::types::IdentityHash) -> core::result::Result<alloc::vec::Vec<u8>, rns_transport::discovery::blackhole_manifest::ManifestError>
 pub fn rns_transport::discovery::decode_manifest(&[u8]) -> core::result::Result<alloc::vec::Vec<([u8; 16], rns_transport::discovery::blackhole_manifest::BlackholeManifestEntry)>, rns_transport::discovery::blackhole_manifest::ManifestError>
+pub fn rns_transport::discovery::decode_published_manifest(&[u8], rns_wire::types::IdentityHash) -> core::result::Result<alloc::vec::Vec<([u8; 16], rns_transport::discovery::blackhole_manifest::BlackholeManifestEntry)>, rns_transport::discovery::blackhole_manifest::ManifestError>
 pub fn rns_transport::discovery::discovery_hash(&[u8; 16], &str) -> [u8; 32]
 pub mod rns_transport::hashlist
 pub struct rns_transport::hashlist::PacketHashlist
@@ -764,13 +911,33 @@ pub fn rns_transport::hashlist::PacketHashlist::default() -> Self
 pub mod rns_transport::ifac
 pub enum rns_transport::ifac::IfacSignError
 pub rns_transport::ifac::IfacSignError::InvalidTagSize
-pub rns_transport::ifac::IfacSignError::PacketTooLarge
 pub rns_transport::ifac::IfacSignError::ShortPacket
-pub const rns_transport::ifac::MAX_IFAC_WIRE_BYTES: usize
 pub fn rns_transport::ifac::has_ifac_flag(&[u8]) -> bool
 pub fn rns_transport::ifac::ifac_sign(&[u8], &[u8; 64], usize) -> alloc::vec::Vec<u8>
 pub fn rns_transport::ifac::ifac_verify(&[u8], &[u8; 64], usize) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn rns_transport::ifac::try_ifac_sign(&[u8], &[u8; 64], usize) -> core::result::Result<alloc::vec::Vec<u8>, rns_transport::ifac::IfacSignError>
+pub mod rns_transport::inbound_queues
+pub enum rns_transport::inbound_queues::TrafficClass
+pub rns_transport::inbound_queues::TrafficClass::Announce = 1
+pub rns_transport::inbound_queues::TrafficClass::Data = 0
+pub rns_transport::inbound_queues::TrafficClass::IngressLimited = 3
+pub rns_transport::inbound_queues::TrafficClass::PathRequest = 2
+pub struct rns_transport::inbound_queues::InboundQueueLengths
+pub rns_transport::inbound_queues::InboundQueueLengths::announce: usize
+pub rns_transport::inbound_queues::InboundQueueLengths::data: usize
+pub rns_transport::inbound_queues::InboundQueueLengths::il: usize
+pub rns_transport::inbound_queues::InboundQueueLengths::pr: usize
+impl core::default::Default for rns_transport::inbound_queues::InboundQueueLengths
+pub fn rns_transport::inbound_queues::InboundQueueLengths::default() -> Self
+pub struct rns_transport::inbound_queues::InboundQueueSnapshot
+pub rns_transport::inbound_queues::InboundQueueSnapshot::dropped: [u64; 4]
+pub rns_transport::inbound_queues::InboundQueueSnapshot::heights: [usize; 4]
+pub rns_transport::inbound_queues::InboundQueueSnapshot::lengths: [usize; 4]
+pub struct rns_transport::inbound_queues::InboundQueues
+impl rns_transport::inbound_queues::InboundQueues
+pub fn rns_transport::inbound_queues::InboundQueues::lengths(&self) -> rns_transport::inbound_queues::InboundQueueLengths
+pub fn rns_transport::inbound_queues::InboundQueues::snapshot(&self) -> rns_transport::inbound_queues::InboundQueueSnapshot
+pub fn rns_transport::inbound_queues::traffic_class(&[u8], core::option::Option<(&[u8; 64], usize)>) -> rns_transport::inbound_queues::TrafficClass
 pub mod rns_transport::ingress
 pub struct rns_transport::ingress::HeldAnnounce
 pub rns_transport::ingress::HeldAnnounce::destination_hash: [u8; 16]
@@ -780,6 +947,7 @@ pub rns_transport::ingress::HeldAnnounce::receiving_interface_id: u64
 pub struct rns_transport::ingress::IngressController
 impl rns_transport::ingress::IngressController
 pub fn rns_transport::ingress::IngressController::age(&self) -> f64
+pub fn rns_transport::ingress::IngressController::announce_and_path_request_bytes(&self) -> (u64, u64, u64, u64)
 pub fn rns_transport::ingress::IngressController::announces_received(&self) -> u64
 pub fn rns_transport::ingress::IngressController::announces_sent(&self) -> u64
 pub fn rns_transport::ingress::IngressController::burst_activated(&self) -> std::time::Instant
@@ -787,31 +955,41 @@ pub fn rns_transport::ingress::IngressController::burst_freq(&self) -> f64
 pub fn rns_transport::ingress::IngressController::burst_freq_new(&self) -> f64
 pub fn rns_transport::ingress::IngressController::disabled() -> Self
 pub fn rns_transport::ingress::IngressController::ec_pr_freq(&self) -> f64
+pub fn rns_transport::ingress::IngressController::exempt_announce_limit(&mut self)
 pub fn rns_transport::ingress::IngressController::held_count(&self) -> usize
 pub fn rns_transport::ingress::IngressController::held_release_at(&self) -> std::time::Instant
 pub fn rns_transport::ingress::IngressController::held_release_interval(&self) -> f64
 pub fn rns_transport::ingress::IngressController::hold_announce(&mut self, rns_transport::ingress::HeldAnnounce)
-pub fn rns_transport::ingress::IngressController::incoming_announce_frequency(&self) -> f64
-pub fn rns_transport::ingress::IngressController::incoming_pr_frequency(&self) -> f64
+pub fn rns_transport::ingress::IngressController::incoming_announce_frequency(&mut self) -> f64
+pub fn rns_transport::ingress::IngressController::incoming_pr_frequency(&mut self) -> f64
+pub fn rns_transport::ingress::IngressController::is_announce_limit_exempt(&self) -> bool
 pub fn rns_transport::ingress::IngressController::is_burst_active(&self) -> bool
 pub fn rns_transport::ingress::IngressController::is_egress_control_enabled(&self) -> bool
 pub fn rns_transport::ingress::IngressController::is_enabled(&self) -> bool
 pub fn rns_transport::ingress::IngressController::is_pr_burst_active(&self) -> bool
 pub fn rns_transport::ingress::IngressController::new() -> Self
-pub fn rns_transport::ingress::IngressController::outgoing_announce_frequency(&self) -> f64
-pub fn rns_transport::ingress::IngressController::outgoing_pr_frequency(&self) -> f64
+pub fn rns_transport::ingress::IngressController::outgoing_announce_frequency(&mut self) -> f64
+pub fn rns_transport::ingress::IngressController::outgoing_pr_frequency(&mut self, bool) -> f64
 pub fn rns_transport::ingress::IngressController::path_requests_received(&self) -> u64
 pub fn rns_transport::ingress::IngressController::path_requests_sent(&self) -> u64
 pub fn rns_transport::ingress::IngressController::pr_burst_activated(&self) -> std::time::Instant
 pub fn rns_transport::ingress::IngressController::pr_burst_freq(&self) -> f64
 pub fn rns_transport::ingress::IngressController::pr_burst_freq_new(&self) -> f64
 pub fn rns_transport::ingress::IngressController::received_announce(&mut self)
+pub fn rns_transport::ingress::IngressController::received_announce_bytes(&mut self, usize)
 pub fn rns_transport::ingress::IngressController::received_path_request(&mut self)
+pub fn rns_transport::ingress::IngressController::received_path_request_bytes(&mut self, usize)
 pub fn rns_transport::ingress::IngressController::sent_announce(&mut self)
+pub fn rns_transport::ingress::IngressController::sent_announce_bytes(&mut self, usize)
 pub fn rns_transport::ingress::IngressController::sent_path_request(&mut self)
+pub fn rns_transport::ingress::IngressController::sent_path_request_bytes(&mut self, usize)
 pub fn rns_transport::ingress::IngressController::should_egress_limit_pr(&mut self) -> bool
 pub fn rns_transport::ingress::IngressController::should_ingress_limit(&mut self) -> bool
 pub fn rns_transport::ingress::IngressController::should_ingress_limit_pr(&mut self) -> bool
+pub fn rns_transport::ingress::IngressController::spawned_received_announce(&mut self, usize)
+pub fn rns_transport::ingress::IngressController::spawned_received_path_request(&mut self, usize)
+pub fn rns_transport::ingress::IngressController::spawned_sent_announce(&mut self, usize)
+pub fn rns_transport::ingress::IngressController::spawned_sent_path_request(&mut self, usize)
 pub fn rns_transport::ingress::IngressController::try_release_held(&mut self) -> core::option::Option<rns_transport::ingress::HeldAnnounce>
 pub fn rns_transport::ingress::IngressController::try_with_overrides(&rns_transport::ingress::IngressOverrides) -> core::result::Result<Self, rns_transport::ingress::IngressOverrideError>
 pub fn rns_transport::ingress::IngressController::with_overrides(&rns_transport::ingress::IngressOverrides) -> Self
@@ -1034,6 +1212,11 @@ pub rns_transport::messages::InterfaceRole::SharedInstancePeer
 pub rns_transport::messages::InterfaceRole::SharedServer
 impl rns_transport::messages::InterfaceRole
 pub fn rns_transport::messages::InterfaceRole::as_str(self) -> &'static str
+pub enum rns_transport::messages::InterfaceStatValue
+pub rns_transport::messages::InterfaceStatValue::Float(f64)
+pub rns_transport::messages::InterfaceStatValue::Int(i64)
+pub rns_transport::messages::InterfaceStatValue::None
+pub rns_transport::messages::InterfaceStatValue::Str(alloc::string::String)
 pub enum rns_transport::messages::LinkEndpointBindResult
 pub rns_transport::messages::LinkEndpointBindResult::AlreadyBound
 pub rns_transport::messages::LinkEndpointBindResult::Bound
@@ -1072,6 +1255,8 @@ pub rns_transport::messages::OutboundDispatchResult::Sent
 pub enum rns_transport::messages::ReceiptUpdate
 pub rns_transport::messages::ReceiptUpdate::Culled
 pub rns_transport::messages::ReceiptUpdate::Delivered
+pub rns_transport::messages::ReceiptUpdate::Delivered::metrics: rns_transport::link_messages::PacketMetrics
+pub rns_transport::messages::ReceiptUpdate::Delivered::proof_hash: core::option::Option<[u8; 32]>
 pub rns_transport::messages::ReceiptUpdate::Delivered::rtt: core::time::Duration
 pub rns_transport::messages::ReceiptUpdate::Failed
 pub rns_transport::messages::ReceiptUpdate::Sent
@@ -1185,10 +1370,17 @@ pub rns_transport::messages::TransportMessage::SendPacket::request: rns_transpor
 pub rns_transport::messages::TransportMessage::SendPacket::result_tx: tokio::sync::oneshot::Sender<rns_transport::messages::OutboundDispatchResult>
 pub rns_transport::messages::TransportMessage::SetBlackholeSources
 pub rns_transport::messages::TransportMessage::SetBlackholeSources::sources: alloc::vec::Vec<[u8; 16]>
+pub rns_transport::messages::TransportMessage::SetFilterPolicy
+pub rns_transport::messages::TransportMessage::SetFilterPolicy::policy: rns_transport::destination_filter::FilterPolicy
+pub rns_transport::messages::TransportMessage::SetLocalDestinationKey
+pub rns_transport::messages::TransportMessage::SetLocalDestinationKey::hash: [u8; 16]
+pub rns_transport::messages::TransportMessage::SetLocalDestinationKey::public_key: [u8; 64]
 pub rns_transport::messages::TransportMessage::SetReceiptTimeout
 pub rns_transport::messages::TransportMessage::SetReceiptTimeout::result_tx: tokio::sync::oneshot::Sender<bool>
 pub rns_transport::messages::TransportMessage::SetReceiptTimeout::timeout: core::time::Duration
 pub rns_transport::messages::TransportMessage::SetReceiptTimeout::truncated_hash: [u8; 16]
+pub rns_transport::messages::TransportMessage::SetStampPolicy
+pub rns_transport::messages::TransportMessage::SetStampPolicy::policy: rns_transport::stamps::StampPolicy
 pub rns_transport::messages::TransportMessage::SetStoragePaths
 pub rns_transport::messages::TransportMessage::SetStoragePaths::storage_dir: std::path::PathBuf
 pub rns_transport::messages::TransportMessage::SetTransportEnabled
@@ -1212,6 +1404,7 @@ pub fn rns_transport::messages::TransportMessage::fmt(&self, &mut core::fmt::For
 pub enum rns_transport::messages::TransportQuery
 pub rns_transport::messages::TransportQuery::ApplyBlackholeManifest
 pub rns_transport::messages::TransportQuery::ApplyBlackholeManifest::payload: alloc::vec::Vec<u8>
+pub rns_transport::messages::TransportQuery::ApplyBlackholeManifest::publisher: [u8; 16]
 pub rns_transport::messages::TransportQuery::BlackholeIdentity
 pub rns_transport::messages::TransportQuery::BlackholeIdentity::hash: [u8; 16]
 pub rns_transport::messages::TransportQuery::BlackholeIdentity::reason: rns_transport::blackhole::BlackholeReason
@@ -1234,6 +1427,7 @@ pub rns_transport::messages::TransportQuery::FilterBlackholedDests
 pub rns_transport::messages::TransportQuery::FilterBlackholedDests::dests: alloc::vec::Vec<[u8; 16]>
 pub rns_transport::messages::TransportQuery::FirstHopTimeout
 pub rns_transport::messages::TransportQuery::FirstHopTimeout::dest: [u8; 16]
+pub rns_transport::messages::TransportQuery::GetActiveLinkCount
 pub rns_transport::messages::TransportQuery::GetBlackholedIdentities
 pub rns_transport::messages::TransportQuery::GetInterfaceStats
 pub rns_transport::messages::TransportQuery::GetLinkCount
@@ -1258,6 +1452,7 @@ pub rns_transport::messages::TransportQuery::GetPathState::dest: [u8; 16]
 pub rns_transport::messages::TransportQuery::GetPathTable
 pub rns_transport::messages::TransportQuery::GetRateTable
 pub rns_transport::messages::TransportQuery::GetRecentAnnounces
+pub rns_transport::messages::TransportQuery::GetTrafficTotals
 pub rns_transport::messages::TransportQuery::HaltInterface
 pub rns_transport::messages::TransportQuery::HaltInterface::id: rns_transport::messages::InterfaceId
 pub rns_transport::messages::TransportQuery::HasPath
@@ -1271,6 +1466,10 @@ pub rns_transport::messages::TransportQuery::PathIsUnresponsive::dest: [u8; 16]
 pub rns_transport::messages::TransportQuery::PurgeUnverifiedBlackholes
 pub rns_transport::messages::TransportQuery::RecallDestination
 pub rns_transport::messages::TransportQuery::RecallDestination::dest: [u8; 16]
+pub rns_transport::messages::TransportQuery::RecallLinkCost
+pub rns_transport::messages::TransportQuery::RecallLinkCost::dest: [u8; 16]
+pub rns_transport::messages::TransportQuery::RecallStampValue
+pub rns_transport::messages::TransportQuery::RecallStampValue::dest: [u8; 16]
 pub rns_transport::messages::TransportQuery::RemotePath
 pub rns_transport::messages::TransportQuery::RemotePath::command: alloc::string::String
 pub rns_transport::messages::TransportQuery::RemotePath::destination: core::option::Option<[u8; 16]>
@@ -1288,6 +1487,8 @@ pub rns_transport::messages::TransportQuery::RetainIdentity::identity_hash: [u8;
 pub rns_transport::messages::TransportQuery::SetPathState
 pub rns_transport::messages::TransportQuery::SetPathState::dest: [u8; 16]
 pub rns_transport::messages::TransportQuery::SetPathState::state: rns_transport::constants::PathState
+pub rns_transport::messages::TransportQuery::SetRequiredOnly
+pub rns_transport::messages::TransportQuery::SetRequiredOnly::enabled: bool
 pub rns_transport::messages::TransportQuery::SuppressCurrentPathInterface
 pub rns_transport::messages::TransportQuery::SuppressCurrentPathInterface::dest: [u8; 16]
 pub rns_transport::messages::TransportQuery::SuppressCurrentPathInterface::duration: f64
@@ -1299,8 +1500,16 @@ pub rns_transport::messages::TransportQuery::UnblackholeIdentity
 pub rns_transport::messages::TransportQuery::UnblackholeIdentity::hash: [u8; 16]
 pub rns_transport::messages::TransportQuery::UnretainDestination
 pub rns_transport::messages::TransportQuery::UnretainDestination::dest: [u8; 16]
+pub rns_transport::messages::TransportQuery::UnwantsAllDestinationTypes
+pub rns_transport::messages::TransportQuery::UnwantsAllDestinationTypes::requester: alloc::vec::Vec<u8>
+pub rns_transport::messages::TransportQuery::UnwantsDestinationType
+pub rns_transport::messages::TransportQuery::UnwantsDestinationType::full_name: alloc::string::String
+pub rns_transport::messages::TransportQuery::UnwantsDestinationType::requester: alloc::vec::Vec<u8>
 pub rns_transport::messages::TransportQuery::UseDestination
 pub rns_transport::messages::TransportQuery::UseDestination::dest: [u8; 16]
+pub rns_transport::messages::TransportQuery::WantsDestinationType
+pub rns_transport::messages::TransportQuery::WantsDestinationType::full_name: alloc::string::String
+pub rns_transport::messages::TransportQuery::WantsDestinationType::requester: alloc::vec::Vec<u8>
 pub enum rns_transport::messages::TransportQueryResponse
 pub rns_transport::messages::TransportQueryResponse::Announces(alloc::vec::Vec<rns_transport::messages::AnnounceRpcEntry>)
 pub rns_transport::messages::TransportQueryResponse::BlackholeList(alloc::vec::Vec<rns_transport::messages::BlackholeRpcEntry>)
@@ -1313,11 +1522,13 @@ pub rns_transport::messages::TransportQueryResponse::HashResult(core::option::Op
 pub rns_transport::messages::TransportQueryResponse::IntResult(i64)
 pub rns_transport::messages::TransportQueryResponse::InterfaceStats(alloc::vec::Vec<rns_transport::messages::InterfaceStatRpcEntry>)
 pub rns_transport::messages::TransportQueryResponse::Ok
+pub rns_transport::messages::TransportQueryResponse::OptBoolResult(core::option::Option<bool>)
 pub rns_transport::messages::TransportQueryResponse::PathStateResult(rns_transport::constants::PathState)
 pub rns_transport::messages::TransportQueryResponse::PathTable(alloc::vec::Vec<rns_transport::messages::PathTableRpcEntry>)
 pub rns_transport::messages::TransportQueryResponse::RateTable(alloc::vec::Vec<rns_transport::messages::RateTableRpcEntry>)
 pub rns_transport::messages::TransportQueryResponse::RecalledDestination(core::option::Option<rns_transport::messages::RecalledDestinationRpcEntry>)
 pub rns_transport::messages::TransportQueryResponse::StringResult(core::option::Option<alloc::string::String>)
+pub rns_transport::messages::TransportQueryResponse::TrafficTotals(rns_transport::messages::TrafficTotalsRpcEntry)
 pub struct rns_transport::messages::AnnounceHandlerEvent
 pub rns_transport::messages::AnnounceHandlerEvent::announce_packet_hash: [u8; 32]
 pub rns_transport::messages::AnnounceHandlerEvent::app_data: core::option::Option<alloc::vec::Vec<u8>>
@@ -1359,6 +1570,7 @@ pub rns_transport::messages::InboundPacket::raw: bytes::bytes::Bytes
 pub rns_transport::messages::InboundPacket::rssi: core::option::Option<f32>
 pub rns_transport::messages::InboundPacket::snr: core::option::Option<f32>
 pub struct rns_transport::messages::InterfaceEntry
+pub rns_transport::messages::InterfaceEntry::accepted: bool
 pub rns_transport::messages::InterfaceEntry::announce_allowed_at: f64
 pub rns_transport::messages::InterfaceEntry::announce_cap: f64
 pub rns_transport::messages::InterfaceEntry::announce_queue: alloc::vec::Vec<rns_transport::messages::QueuedAnnounce>
@@ -1368,6 +1580,7 @@ pub rns_transport::messages::InterfaceEntry::announce_rate_target: core::option:
 pub rns_transport::messages::InterfaceEntry::announces_from_internal: bool
 pub rns_transport::messages::InterfaceEntry::announces_to_internal: core::option::Option<bool>
 pub rns_transport::messages::InterfaceEntry::bitrate: u64
+pub rns_transport::messages::InterfaceEntry::destination_cost: core::option::Option<f64>
 pub rns_transport::messages::InterfaceEntry::direction: rns_transport::constants::InterfaceDirection
 pub rns_transport::messages::InterfaceEntry::gravity: i64
 pub rns_transport::messages::InterfaceEntry::ifac_key: core::option::Option<rns_identity::ifac::IfacKey>
@@ -1384,6 +1597,7 @@ pub rns_transport::messages::InterfaceEntry::owner: rns_transport::interface_own
 pub rns_transport::messages::InterfaceEntry::packet_capacity: rns_transport::interface_ownership::InterfacePacketCapacity
 pub rns_transport::messages::InterfaceEntry::packet_filter_hits: u64
 pub rns_transport::messages::InterfaceEntry::parent_id: core::option::Option<rns_transport::messages::InterfaceId>
+pub rns_transport::messages::InterfaceEntry::pr_cost: core::option::Option<f64>
 pub rns_transport::messages::InterfaceEntry::protocol_violations: u64
 pub rns_transport::messages::InterfaceEntry::recursive_prs: bool
 pub rns_transport::messages::InterfaceEntry::role: rns_transport::messages::InterfaceRole
@@ -1406,13 +1620,30 @@ pub fn rns_transport::messages::InterfaceEntry::with_packet_capacity(self, rns_t
 pub fn rns_transport::messages::InterfaceEntry::with_role(self, rns_transport::messages::InterfaceRole) -> Self
 impl core::fmt::Debug for rns_transport::messages::InterfaceEntry
 pub fn rns_transport::messages::InterfaceEntry::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_transport::messages::InterfaceIdentity
+pub rns_transport::messages::InterfaceIdentity::class_name: alloc::string::String
+pub rns_transport::messages::InterfaceIdentity::name: alloc::string::String
+pub rns_transport::messages::InterfaceIdentity::short_name: alloc::string::String
+impl rns_transport::messages::InterfaceIdentity
+pub fn rns_transport::messages::InterfaceIdentity::bracketed(&str, &str) -> Self
+pub fn rns_transport::messages::InterfaceIdentity::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub struct rns_transport::messages::InterfaceInspectionSnapshot
 pub rns_transport::messages::InterfaceInspectionSnapshot::active_clients: core::option::Option<u64>
 pub rns_transport::messages::InterfaceInspectionSnapshot::blocked_ips: core::option::Option<u64>
+pub rns_transport::messages::InterfaceInspectionSnapshot::i2p_b32: core::option::Option<alloc::string::String>
+pub rns_transport::messages::InterfaceInspectionSnapshot::i2p_connectable: core::option::Option<bool>
+pub rns_transport::messages::InterfaceInspectionSnapshot::i2p_tunnel_state: core::option::Option<u8>
+pub rns_transport::messages::InterfaceInspectionSnapshot::peers: core::option::Option<u64>
+pub rns_transport::messages::InterfaceInspectionSnapshot::radio: alloc::vec::Vec<(&'static str, rns_transport::messages::InterfaceStatValue)>
+pub rns_transport::messages::InterfaceInspectionSnapshot::tx_buffered: u64
+pub rns_transport::messages::InterfaceInspectionSnapshot::tx_stalled: bool
 pub struct rns_transport::messages::InterfaceInspectionSource
 impl rns_transport::messages::InterfaceInspectionSource
+pub fn rns_transport::messages::InterfaceInspectionSource::identified(rns_transport::messages::InterfaceIdentity) -> Self
+pub fn rns_transport::messages::InterfaceInspectionSource::identity(&self) -> core::option::Option<&rns_transport::messages::InterfaceIdentity>
 pub fn rns_transport::messages::InterfaceInspectionSource::new<F>(F) -> Self where F: core::ops::function::Fn() -> rns_transport::messages::InterfaceInspectionSnapshot + core::marker::Send + core::marker::Sync + 'static
 pub fn rns_transport::messages::InterfaceInspectionSource::snapshot(&self) -> rns_transport::messages::InterfaceInspectionSnapshot
+pub fn rns_transport::messages::InterfaceInspectionSource::with_identity(self, rns_transport::messages::InterfaceIdentity) -> Self
 impl core::fmt::Debug for rns_transport::messages::InterfaceInspectionSource
 pub fn rns_transport::messages::InterfaceInspectionSource::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct rns_transport::messages::InterfaceOwner
@@ -1448,6 +1679,8 @@ pub rns_transport::messages::InterfaceStatRpcEntry::announce_queue: core::option
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_rate_grace: core::option::Option<u32>
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_rate_penalty: core::option::Option<f64>
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_rate_target: core::option::Option<f64>
+pub rns_transport::messages::InterfaceStatRpcEntry::announce_rx_bytes: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::announce_tx_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::announces_received: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::announces_sent: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::announces_to_internal: core::option::Option<bool>
@@ -1455,10 +1688,15 @@ pub rns_transport::messages::InterfaceStatRpcEntry::bitrate: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::blocked_ips: core::option::Option<u64>
 pub rns_transport::messages::InterfaceStatRpcEntry::burst_activated: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::burst_active: bool
+pub rns_transport::messages::InterfaceStatRpcEntry::burst_count: core::option::Option<u64>
 pub rns_transport::messages::InterfaceStatRpcEntry::clients: core::option::Option<u64>
 pub rns_transport::messages::InterfaceStatRpcEntry::gravity: i64
 pub rns_transport::messages::InterfaceStatRpcEntry::held_announces: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::i2p_b32: core::option::Option<alloc::string::String>
+pub rns_transport::messages::InterfaceStatRpcEntry::i2p_connectable: core::option::Option<bool>
+pub rns_transport::messages::InterfaceStatRpcEntry::i2p_tunnel_state: core::option::Option<u8>
 pub rns_transport::messages::InterfaceStatRpcEntry::id: rns_transport::messages::InterfaceId
+pub rns_transport::messages::InterfaceStatRpcEntry::identity: core::option::Option<rns_transport::messages::InterfaceIdentity>
 pub rns_transport::messages::InterfaceStatRpcEntry::ifac_size: usize
 pub rns_transport::messages::InterfaceStatRpcEntry::ifac_violations: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::incoming_announce_frequency: f64
@@ -1471,18 +1709,29 @@ pub rns_transport::messages::InterfaceStatRpcEntry::outgoing_announce_frequency:
 pub rns_transport::messages::InterfaceStatRpcEntry::outgoing_pr_frequency: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::packet_filter_hits: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::parent_id: core::option::Option<rns_transport::messages::InterfaceId>
+pub rns_transport::messages::InterfaceStatRpcEntry::path_request_rx_bytes: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::path_request_tx_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::path_requests_received: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::path_requests_sent: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::peers: core::option::Option<u64>
 pub rns_transport::messages::InterfaceStatRpcEntry::pr_burst_activated: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::pr_burst_active: bool
+pub rns_transport::messages::InterfaceStatRpcEntry::pr_burst_count: core::option::Option<u64>
 pub rns_transport::messages::InterfaceStatRpcEntry::protocol_violations: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::radio: alloc::vec::Vec<(&'static str, rns_transport::messages::InterfaceStatValue)>
 pub rns_transport::messages::InterfaceStatRpcEntry::role: alloc::string::String
+pub rns_transport::messages::InterfaceStatRpcEntry::rssi: core::option::Option<f64>
 pub rns_transport::messages::InterfaceStatRpcEntry::rx_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::rx_rate: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::signal_quality: core::option::Option<f64>
+pub rns_transport::messages::InterfaceStatRpcEntry::snr: core::option::Option<f64>
+pub rns_transport::messages::InterfaceStatRpcEntry::speeds: core::option::Option<[f64; 6]>
+pub rns_transport::messages::InterfaceStatRpcEntry::tx_buffered: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::tx_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::tx_dropped_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::tx_drops: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::tx_rate: u64
+pub rns_transport::messages::InterfaceStatRpcEntry::tx_stalled: bool
 pub struct rns_transport::messages::InterfaceTransportSender
 impl rns_transport::interface_ownership::InterfaceTransportSender
 pub fn rns_transport::interface_ownership::InterfaceTransportSender::actor_sender(&self) -> tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>
@@ -1522,7 +1771,10 @@ pub rns_transport::messages::PathTableRpcEntry::interface: alloc::string::String
 pub rns_transport::messages::PathTableRpcEntry::interface_id: rns_transport::messages::InterfaceId
 pub rns_transport::messages::PathTableRpcEntry::interface_mode: rns_transport::constants::InterfaceMode
 pub rns_transport::messages::PathTableRpcEntry::interface_role: rns_transport::messages::InterfaceRole
+pub rns_transport::messages::PathTableRpcEntry::lr_cost: core::option::Option<f64>
 pub rns_transport::messages::PathTableRpcEntry::timestamp: f64
+pub rns_transport::messages::PathTableRpcEntry::used: f64
+pub rns_transport::messages::PathTableRpcEntry::value: core::option::Option<f64>
 pub rns_transport::messages::PathTableRpcEntry::via: core::option::Option<[u8; 16]>
 pub struct rns_transport::messages::QueuedAnnounce
 pub rns_transport::messages::QueuedAnnounce::destination_hash: [u8; 16]
@@ -1554,6 +1806,36 @@ pub rns_transport::messages::TrackedReceiptRegistration::timeout: core::option::
 pub rns_transport::messages::TrackedReceiptRegistration::truncated_hash: [u8; 16]
 impl core::fmt::Debug for rns_transport::messages::TrackedReceiptRegistration
 pub fn rns_transport::messages::TrackedReceiptRegistration::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct rns_transport::messages::TrafficTotalsRpcEntry
+pub rns_transport::messages::TrafficTotalsRpcEntry::active_link_count: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::announce_rx_packets: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::announce_tx_packets: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::arxb: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::arxf: f64
+pub rns_transport::messages::TrafficTotalsRpcEntry::arxs: f64
+pub rns_transport::messages::TrafficTotalsRpcEntry::atxb: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::atxf: f64
+pub rns_transport::messages::TrafficTotalsRpcEntry::atxs: f64
+pub rns_transport::messages::TrafficTotalsRpcEntry::link_count: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::measured: bool
+pub rns_transport::messages::TrafficTotalsRpcEntry::path_count: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::pr_rx_packets: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::pr_tx_packets: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::prxb: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::prxf: f64
+pub rns_transport::messages::TrafficTotalsRpcEntry::prxs: f64
+pub rns_transport::messages::TrafficTotalsRpcEntry::ptxb: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::ptxf: f64
+pub rns_transport::messages::TrafficTotalsRpcEntry::ptxs: f64
+pub rns_transport::messages::TrafficTotalsRpcEntry::rx_packets: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::rxb: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::rxpps: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::rxs: f64
+pub rns_transport::messages::TrafficTotalsRpcEntry::tx_packets: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::txb: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::txpps: u64
+pub rns_transport::messages::TrafficTotalsRpcEntry::txs: f64
+pub rns_transport::messages::TrafficTotalsRpcEntry::unused_path_count: u64
 pub fn rns_transport::messages::msg_variant_name(&rns_transport::messages::TransportMessage) -> &'static str
 pub type rns_transport::messages::InterfaceId = u64
 pub mod rns_transport::path_discovery
@@ -1610,15 +1892,17 @@ pub rns_transport::path_table::PathEntry::next_hop: core::option::Option<[u8; 16
 pub rns_transport::path_table::PathEntry::packet_hash: core::option::Option<[u8; 32]>
 pub rns_transport::path_table::PathEntry::random_blobs: alloc::collections::vec_deque::VecDeque<[u8; 10]>
 pub rns_transport::path_table::PathEntry::timestamp: f64
+pub rns_transport::path_table::PathEntry::used: f64
 impl rns_transport::path_table::PathEntry
 pub fn rns_transport::path_table::PathEntry::add_random_blob(&mut self, [u8; 10])
 pub fn rns_transport::path_table::PathEntry::blobs_for_persist(&self) -> alloc::vec::Vec<[u8; 10]>
 pub fn rns_transport::path_table::PathEntry::has_random_blob(&self, &[u8; 10]) -> bool
 pub fn rns_transport::path_table::PathEntry::is_expired(&self) -> bool
+pub fn rns_transport::path_table::PathEntry::mark_used(&mut self)
 pub fn rns_transport::path_table::PathEntry::new(core::option::Option<[u8; 16]>, u8, rns_transport::messages::InterfaceId, rns_transport::constants::InterfaceMode) -> Self
-pub fn rns_transport::path_table::PathEntry::touch(&mut self)
 pub struct rns_transport::path_table::PathTable
 impl rns_transport::path_table::PathTable
+pub fn rns_transport::path_table::PathTable::cull(&mut self, f64, f64, bool, impl core::ops::function::Fn(rns_transport::messages::InterfaceId) -> core::option::Option<u64>) -> (usize, core::option::Option<usize>)
 pub fn rns_transport::path_table::PathTable::cull_dead_interfaces(&mut self, &std::collections::hash::set::HashSet<rns_transport::messages::InterfaceId>) -> usize
 pub fn rns_transport::path_table::PathTable::cull_expired(&mut self) -> usize
 pub fn rns_transport::path_table::PathTable::cull_expired_batch(&mut self, usize) -> usize
@@ -1637,6 +1921,7 @@ pub fn rns_transport::path_table::PathTable::is_empty(&self) -> bool
 pub fn rns_transport::path_table::PathTable::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&rns_wire::types::DestHash, &rns_transport::path_table::PathEntry)>
 pub fn rns_transport::path_table::PathTable::iter_live(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&rns_wire::types::DestHash, &rns_transport::path_table::PathEntry)>
 pub fn rns_transport::path_table::PathTable::len(&self) -> usize
+pub fn rns_transport::path_table::PathTable::mark_responsive(&mut self, &[u8; 16], rns_transport::constants::InterfaceMode) -> bool
 pub fn rns_transport::path_table::PathTable::new() -> Self
 pub fn rns_transport::path_table::PathTable::remove(&mut self, &[u8; 16]) -> core::option::Option<rns_transport::path_table::PathEntry>
 pub fn rns_transport::path_table::PathTable::set_state(&mut self, impl core::convert::Into<rns_wire::types::DestHash>, rns_transport::constants::PathState)
@@ -1672,12 +1957,15 @@ pub rns_transport::persistence::PersistedAnnounceEntry::destination_hash: alloc:
 pub rns_transport::persistence::PersistedAnnounceEntry::hops: u8
 pub rns_transport::persistence::PersistedAnnounceEntry::is_path_response: bool
 pub rns_transport::persistence::PersistedAnnounceEntry::last_used: core::option::Option<f64>
+pub rns_transport::persistence::PersistedAnnounceEntry::lr_cost: core::option::Option<f64>
 pub rns_transport::persistence::PersistedAnnounceEntry::name_hash: alloc::vec::Vec<u8>
 pub rns_transport::persistence::PersistedAnnounceEntry::packet_hash: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::persistence::PersistedAnnounceEntry::public_key: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::persistence::PersistedAnnounceEntry::ratchet: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::persistence::PersistedAnnounceEntry::ratchet_received: core::option::Option<f64>
 pub rns_transport::persistence::PersistedAnnounceEntry::retained: bool
+pub rns_transport::persistence::PersistedAnnounceEntry::stamp: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_transport::persistence::PersistedAnnounceEntry::stamp_value: f64
 pub rns_transport::persistence::PersistedAnnounceEntry::timestamp: f64
 pub struct rns_transport::persistence::PersistedBlackholeEntry
 pub rns_transport::persistence::PersistedBlackholeEntry::created: f64
@@ -1705,6 +1993,7 @@ pub rns_transport::persistence::PersistedPathEntry::next_hop: core::option::Opti
 pub rns_transport::persistence::PersistedPathEntry::packet_hash: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::persistence::PersistedPathEntry::random_blobs: alloc::vec::Vec<alloc::vec::Vec<u8>>
 pub rns_transport::persistence::PersistedPathEntry::timestamp: f64
+pub rns_transport::persistence::PersistedPathEntry::used: core::option::Option<f64>
 pub struct rns_transport::persistence::PersistedPathTable
 pub rns_transport::persistence::PersistedPathTable::entries: alloc::vec::Vec<rns_transport::persistence::PersistedPathEntry>
 pub rns_transport::persistence::PersistedPathTable::version: u32
@@ -1726,6 +2015,7 @@ pub rns_transport::persistence::PersistedTunnelPath::next_hop: core::option::Opt
 pub rns_transport::persistence::PersistedTunnelPath::packet_hash: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::persistence::PersistedTunnelPath::random_blobs: alloc::vec::Vec<alloc::vec::Vec<u8>>
 pub rns_transport::persistence::PersistedTunnelPath::timestamp: f64
+pub rns_transport::persistence::PersistedTunnelPath::used: core::option::Option<f64>
 pub struct rns_transport::persistence::PersistedTunnelTable
 pub rns_transport::persistence::PersistedTunnelTable::entries: alloc::vec::Vec<rns_transport::persistence::PersistedTunnelEntry>
 pub rns_transport::persistence::PersistedTunnelTable::version: u32
@@ -1751,6 +2041,7 @@ pub rns_transport::persistence::PythonDestinationEntry::packet_hash: [u8; 32]
 pub rns_transport::persistence::PythonDestinationEntry::random_blobs: alloc::vec::Vec<[u8; 10]>
 pub rns_transport::persistence::PythonDestinationEntry::received_from: [u8; 16]
 pub rns_transport::persistence::PythonDestinationEntry::timestamp: f64
+pub rns_transport::persistence::PythonDestinationEntry::used: core::option::Option<f64>
 pub struct rns_transport::persistence::PythonTunnelEntry
 pub rns_transport::persistence::PythonTunnelEntry::expires: f64
 pub rns_transport::persistence::PythonTunnelEntry::interface_hash: core::option::Option<[u8; 32]>
@@ -1765,6 +2056,7 @@ pub rns_transport::persistence::PythonTunnelPath::packet_hash: [u8; 32]
 pub rns_transport::persistence::PythonTunnelPath::random_blobs: alloc::vec::Vec<[u8; 10]>
 pub rns_transport::persistence::PythonTunnelPath::received_from: [u8; 16]
 pub rns_transport::persistence::PythonTunnelPath::timestamp: f64
+pub rns_transport::persistence::PythonTunnelPath::used: core::option::Option<f64>
 pub struct rns_transport::persistence::RawHashlistLoad
 pub rns_transport::persistence::RawHashlistLoad::duplicate_count: usize
 pub rns_transport::persistence::RawHashlistLoad::hashes: alloc::vec::Vec<[u8; 32]>
@@ -1784,10 +2076,12 @@ pub fn rns_transport::persistence::load_python_tunnel_table(&std::path::Path) ->
 pub fn rns_transport::persistence::load_tunnel_table(&std::path::Path) -> core::result::Result<alloc::vec::Vec<rns_transport::persistence::PersistedTunnelEntry>, rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::migrate_legacy_announce_entries(alloc::vec::Vec<rns_transport::persistence::LegacyPersistedAnnounceEntryV5>, &std::path::Path) -> alloc::vec::Vec<rns_transport::persistence::PersistedAnnounceEntry>
 pub fn rns_transport::persistence::save_announce_cache<'a, I>(I, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError> where I: core::iter::traits::collect::IntoIterator<Item = &'a rns_transport::actor::RecentAnnounce>
+pub fn rns_transport::persistence::save_blackhole_source_file([u8; 16], &[u8], &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_blackhole_table(&rns_transport::blackhole::BlackholeTable, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_hashlist(&rns_transport::hashlist::PacketHashlist, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_hashlist_legacy(&rns_transport::hashlist::PacketHashlist, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_hashlist_raw(&rns_transport::hashlist::PacketHashlist, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
+pub fn rns_transport::persistence::save_local_blackhole_file(&rns_transport::blackhole::BlackholeTable, [u8; 16], &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_path_table(&rns_transport::path_table::PathTable, &std::collections::hash::map::HashMap<u64, alloc::string::String>, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_python_blackhole_files(&rns_transport::blackhole::BlackholeTable, [u8; 16], &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_python_destination_table(&rns_transport::path_table::PathTable, &std::collections::hash::map::HashMap<u64, alloc::string::String>, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
@@ -1795,32 +2089,61 @@ pub fn rns_transport::persistence::save_python_tunnel_table(&rns_transport::tunn
 pub fn rns_transport::persistence::save_raw_hashes(&[[u8; 32]], &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_tunnel_table(&rns_transport::tunnel::TunnelTable, &std::collections::hash::map::HashMap<u64, alloc::string::String>, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::sweep_announce_cache(&std::path::Path, &std::collections::hash::set::HashSet<[u8; 32]>, core::time::Duration) -> (usize, usize)
+pub fn rns_transport::persistence::write_python_cached_announce(&std::path::Path, &[u8; 32], &[u8], core::option::Option<&str>) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::write_python_cached_announce_if_absent(&std::path::Path, &[u8; 32], &[u8], core::option::Option<&str>) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
+pub mod rns_transport::pr_stamper
+pub enum rns_transport::pr_stamper::PathRequestTarget
+pub rns_transport::pr_stamper::PathRequestTarget::AllExcept(core::option::Option<rns_transport::messages::InterfaceId>)
+pub rns_transport::pr_stamper::PathRequestTarget::Interface(rns_transport::messages::InterfaceId)
+pub struct rns_transport::pr_stamper::PathRequestStampJob
+pub rns_transport::pr_stamper::PathRequestStampJob::destination_hash: [u8; 16]
+pub rns_transport::pr_stamper::PathRequestStampJob::recursive: bool
+pub rns_transport::pr_stamper::PathRequestStampJob::tag: alloc::vec::Vec<u8>
+pub rns_transport::pr_stamper::PathRequestStampJob::target: rns_transport::pr_stamper::PathRequestTarget
+pub rns_transport::pr_stamper::PathRequestStampJob::timeout: f64
+pub rns_transport::pr_stamper::PathRequestStampJob::value: f64
+impl rns_transport::pr_stamper::PathRequestStampJob
+pub fn rns_transport::pr_stamper::PathRequestStampJob::material(&self) -> alloc::vec::Vec<u8>
+pub struct rns_transport::pr_stamper::PathRequestStampResult
+pub rns_transport::pr_stamper::PathRequestStampResult::job: rns_transport::pr_stamper::PathRequestStampJob
+pub rns_transport::pr_stamper::PathRequestStampResult::stamp: core::option::Option<rns_transport::pr_stamper::PathRequestStamp>
+pub struct rns_transport::pr_stamper::PathRequestStamper
+impl rns_transport::pr_stamper::PathRequestStamper
+pub fn rns_transport::pr_stamper::PathRequestStamper::cache_len(&self) -> usize
+pub fn rns_transport::pr_stamper::PathRequestStamper::cached(&self, &[u8; 16], &[u8]) -> core::option::Option<rns_transport::pr_stamper::PathRequestStamp>
+pub fn rns_transport::pr_stamper::PathRequestStamper::enqueue(&mut self, rns_transport::pr_stamper::PathRequestStampJob) -> core::result::Result<(), rns_transport::pr_stamper::QueueFull>
+pub fn rns_transport::pr_stamper::PathRequestStamper::new() -> Self
+pub async fn rns_transport::pr_stamper::PathRequestStamper::next_result(&mut self) -> core::option::Option<rns_transport::pr_stamper::PathRequestStampResult>
+impl core::default::Default for rns_transport::pr_stamper::PathRequestStamper
+pub fn rns_transport::pr_stamper::PathRequestStamper::default() -> Self
+impl core::fmt::Debug for rns_transport::pr_stamper::PathRequestStamper
+pub fn rns_transport::pr_stamper::PathRequestStamper::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for rns_transport::pr_stamper::PathRequestStamper
+pub fn rns_transport::pr_stamper::PathRequestStamper::drop(&mut self)
+pub struct rns_transport::pr_stamper::QueueFull
+pub const rns_transport::pr_stamper::PR_STAMP_CACHE_MAX: usize
+pub fn rns_transport::pr_stamper::pr_stamp_material(&[u8; 16], &[u8]) -> alloc::vec::Vec<u8>
+pub type rns_transport::pr_stamper::PathRequestStamp = [u8; 14]
 pub mod rns_transport::rate_limit
 pub struct rns_transport::rate_limit::RateEntry
 pub rns_transport::rate_limit::RateEntry::blocked_until: f64
 pub rns_transport::rate_limit::RateEntry::last: f64
-pub rns_transport::rate_limit::RateEntry::rate: f64
 pub rns_transport::rate_limit::RateEntry::timestamps: alloc::vec::Vec<f64>
 pub rns_transport::rate_limit::RateEntry::violations: u32
+impl rns_transport::rate_limit::RateEntry
+pub fn rns_transport::rate_limit::RateEntry::rate(&self) -> f64
 pub struct rns_transport::rate_limit::RateTable
 impl rns_transport::rate_limit::RateTable
 pub fn rns_transport::rate_limit::RateTable::check_interface_rate(&mut self, impl core::convert::Into<rns_wire::types::DestHash>, f64, u32, f64) -> bool
-pub fn rns_transport::rate_limit::RateTable::cull(&mut self, f64)
-pub fn rns_transport::rate_limit::RateTable::get_rate(&self, &[u8; 16]) -> f64
+pub fn rns_transport::rate_limit::RateTable::cull(&mut self, f64, f64) -> usize
 pub fn rns_transport::rate_limit::RateTable::is_blocked(&self, &[u8; 16]) -> bool
 pub fn rns_transport::rate_limit::RateTable::is_empty(&self) -> bool
 pub fn rns_transport::rate_limit::RateTable::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&rns_wire::types::DestHash, &rns_transport::rate_limit::RateEntry)>
 pub fn rns_transport::rate_limit::RateTable::last_announce(&self, &[u8; 16]) -> core::option::Option<f64>
 pub fn rns_transport::rate_limit::RateTable::len(&self) -> usize
 pub fn rns_transport::rate_limit::RateTable::new() -> Self
-pub fn rns_transport::rate_limit::RateTable::record(&mut self, impl core::convert::Into<rns_wire::types::DestHash>) -> f64
 impl core::default::Default for rns_transport::rate_limit::RateTable
 pub fn rns_transport::rate_limit::RateTable::default() -> Self
-pub const rns_transport::rate_limit::RATE_PENALTY_BASE: f64
-pub const rns_transport::rate_limit::RATE_PENALTY_MAX: f64
-pub const rns_transport::rate_limit::RATE_VIOLATIONS_BEFORE_PENALTY: u32
-pub const rns_transport::rate_limit::RATE_VIOLATION_THRESHOLD: f64
 pub mod rns_transport::reverse_table
 pub struct rns_transport::reverse_table::ReverseEntry
 pub rns_transport::reverse_table::ReverseEntry::outbound_interface: core::option::Option<rns_transport::messages::InterfaceId>
@@ -1841,6 +2164,37 @@ pub fn rns_transport::reverse_table::ReverseTable::new() -> Self
 pub fn rns_transport::reverse_table::ReverseTable::remove(&mut self, &[u8; 16]) -> core::option::Option<rns_transport::reverse_table::ReverseEntry>
 impl core::default::Default for rns_transport::reverse_table::ReverseTable
 pub fn rns_transport::reverse_table::ReverseTable::default() -> Self
+pub mod rns_transport::stamps
+pub use rns_transport::stamps::LINK_COST_CAP
+pub use rns_transport::stamps::STAMP_COST_CAP
+pub struct rns_transport::stamps::StampPolicy
+pub rns_transport::stamps::StampPolicy::always_stamp_lrs: bool
+pub rns_transport::stamps::StampPolicy::destination_cost: f64
+pub rns_transport::stamps::StampPolicy::destination_value: f64
+pub rns_transport::stamps::StampPolicy::lr_cost: f64
+pub rns_transport::stamps::StampPolicy::lr_stamp_timeout: f64
+pub rns_transport::stamps::StampPolicy::lr_stamps_enforced: bool
+pub rns_transport::stamps::StampPolicy::pr_cost: f64
+pub rns_transport::stamps::StampPolicy::pr_stamp_timeout: f64
+pub rns_transport::stamps::StampPolicy::pr_value: f64
+pub rns_transport::stamps::StampPolicy::stamp_destinations: bool
+pub rns_transport::stamps::StampPolicy::stamp_lrs: bool
+pub rns_transport::stamps::StampPolicy::stamp_prs: bool
+pub rns_transport::stamps::StampPolicy::stamps_enabled: bool
+pub rns_transport::stamps::StampPolicy::stamps_enforced: bool
+impl rns_transport::stamps::StampPolicy
+pub fn rns_transport::stamps::StampPolicy::clamp_cost(f64) -> f64
+pub fn rns_transport::stamps::StampPolicy::clamp_link_cost(f64) -> f64
+pub fn rns_transport::stamps::StampPolicy::clamp_timeout(f64) -> f64
+pub fn rns_transport::stamps::StampPolicy::enable_stamping(&mut self)
+pub fn rns_transport::stamps::StampPolicy::enforce(&mut self)
+pub fn rns_transport::stamps::StampPolicy::interface_destination_cost(&self, core::option::Option<f64>) -> f64
+pub fn rns_transport::stamps::StampPolicy::interface_pr_cost(&self, core::option::Option<f64>) -> f64
+impl core::default::Default for rns_transport::stamps::StampPolicy
+pub fn rns_transport::stamps::StampPolicy::default() -> Self
+pub const rns_transport::stamps::STAMPER_AN_QUEUE_LENGTH: usize
+pub const rns_transport::stamps::STAMPER_PR_QUEUE_LENGTH: usize
+pub const rns_transport::stamps::STAMP_TIMEOUT_FLOOR: f64
 pub mod rns_transport::traffic
 pub struct rns_transport::traffic::InterfaceTraffic
 pub rns_transport::traffic::InterfaceTraffic::rx_bytes: u64
@@ -1872,6 +2226,7 @@ pub rns_transport::tunnel::TunnelPath::next_hop: core::option::Option<[u8; 16]>
 pub rns_transport::tunnel::TunnelPath::packet_hash: core::option::Option<[u8; 32]>
 pub rns_transport::tunnel::TunnelPath::random_blobs: alloc::vec::Vec<[u8; 10]>
 pub rns_transport::tunnel::TunnelPath::timestamp: f64
+pub rns_transport::tunnel::TunnelPath::used: f64
 pub struct rns_transport::tunnel::TunnelSynthesisData
 pub rns_transport::tunnel::TunnelSynthesisData::interface_hash: [u8; 32]
 pub rns_transport::tunnel::TunnelSynthesisData::public_key: [u8; 64]
@@ -1903,6 +2258,7 @@ pub fn rns_transport::tunnel::TunnelTable::default() -> Self
 pub fn rns_transport::tunnel::build_tunnel_synthesis_packet(&rns_identity::identity::Identity, [u8; 32]) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn rns_transport::tunnel::handle_tunnel(&mut rns_transport::tunnel::TunnelTable, [u8; 32], rns_transport::messages::InterfaceId)
 pub fn rns_transport::tunnel::interface_hash(&str) -> [u8; 32]
+pub macro rns_transport::notice!
 pub enum rns_transport::InterfaceCapacityError
 pub rns_transport::InterfaceCapacityError::Empty
 pub rns_transport::InterfaceCapacityError::IfacExceedsWire

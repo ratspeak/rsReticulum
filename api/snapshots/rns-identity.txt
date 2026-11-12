@@ -8,6 +8,10 @@ pub rns_identity::announce::AnnounceError::InvalidWireTime(u64)
 pub rns_identity::announce::AnnounceError::NoPrivateKey
 pub rns_identity::announce::AnnounceError::SignatureInvalid
 pub rns_identity::announce::AnnounceError::TooShort(usize)
+pub enum rns_identity::announce::AnnounceExtParse<'a>
+pub rns_identity::announce::AnnounceExtParse::Absent
+pub rns_identity::announce::AnnounceExtParse::Present(rns_identity::announce::AnnounceExt<'a>)
+pub rns_identity::announce::AnnounceExtParse::Unknown
 pub struct rns_identity::announce::AnnounceData
 pub rns_identity::announce::AnnounceData::app_data: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_identity::announce::AnnounceData::name_hash: [u8; 10]
@@ -15,6 +19,8 @@ pub rns_identity::announce::AnnounceData::public_key: [u8; 64]
 pub rns_identity::announce::AnnounceData::random_hash: [u8; 10]
 pub rns_identity::announce::AnnounceData::ratchet: core::option::Option<[u8; 32]>
 pub rns_identity::announce::AnnounceData::signature: [u8; 64]
+impl rns_identity::announce::AnnounceData
+pub fn rns_identity::announce::AnnounceData::check_stamp(&self, &[u8; 16], f64) -> rns_identity::announce::AnnounceStampCheck
 impl rns_identity::announce::AnnounceData
 pub fn rns_identity::announce::AnnounceData::create(&rns_identity::identity::Identity, &str, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>) -> core::result::Result<Self, rns_identity::announce::AnnounceError>
 pub fn rns_identity::announce::AnnounceData::create_at(&rns_identity::identity::Identity, &str, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, u64) -> core::result::Result<Self, rns_identity::announce::AnnounceError>
@@ -24,7 +30,32 @@ pub fn rns_identity::announce::AnnounceData::validate(&self, &[u8; 16]) -> core:
 pub fn rns_identity::announce::AnnounceData::validate_destination_binding(&self, &[u8; 16], &rns_identity::identity::Identity, core::option::Option<&[u8; 64]>) -> core::result::Result<(), rns_identity::announce::AnnounceError>
 pub fn rns_identity::announce::AnnounceData::validate_with_known_key(&self, &[u8; 16], core::option::Option<&[u8; 64]>) -> core::result::Result<rns_identity::identity::Identity, rns_identity::announce::AnnounceError>
 pub fn rns_identity::announce::AnnounceData::verify_signature(&self, &[u8; 16]) -> core::result::Result<rns_identity::identity::Identity, rns_identity::announce::AnnounceError>
+pub struct rns_identity::announce::AnnounceExt<'a>
+pub rns_identity::announce::AnnounceExt::flags: u8
+pub rns_identity::announce::AnnounceExt::lr_cost: f64
+pub rns_identity::announce::AnnounceExt::stamp: &'a [u8; 14]
+pub struct rns_identity::announce::AnnounceStampCheck
+pub rns_identity::announce::AnnounceStampCheck::lr_cost: core::option::Option<f64>
+pub rns_identity::announce::AnnounceStampCheck::stamp: core::option::Option<[u8; 14]>
+pub rns_identity::announce::AnnounceStampCheck::stamped: bool
+pub rns_identity::announce::AnnounceStampCheck::validated: bool
+pub rns_identity::announce::AnnounceStampCheck::value: core::option::Option<f64>
+impl rns_identity::announce::AnnounceStampCheck
+pub fn rns_identity::announce::AnnounceStampCheck::app_data<'a>(&self, core::option::Option<&'a [u8]>) -> core::option::Option<&'a [u8]>
+pub struct rns_identity::announce::AnnounceStampExt
+pub rns_identity::announce::AnnounceStampExt::lr_cost: f64
+pub rns_identity::announce::AnnounceStampExt::stamp: [u8; 14]
+impl rns_identity::announce::AnnounceStampExt
+pub fn rns_identity::announce::AnnounceStampExt::encode(&self) -> core::result::Result<[u8; 18], rns_identity::stamps::StampError>
+pub const rns_identity::announce::ANNOUNCE_EXT_FLAGS: u8
+pub const rns_identity::announce::ANNOUNCE_EXT_HEADER_LENGTH: usize
+pub const rns_identity::announce::ANNOUNCE_EXT_LENGTH: usize
+pub const rns_identity::announce::ANNOUNCE_EXT_MARKER: u8
 pub const rns_identity::announce::ANNOUNCE_TIME_MAX: u64
+pub const rns_identity::announce::DESTINATION_STAMP_MATERIAL_LENGTH: usize
+pub fn rns_identity::announce::destination_stamp_material(&[u8; 16], &[u8; 64], &[u8; 10]) -> [u8; 90]
+pub fn rns_identity::announce::generate_destination_stamp(&[u8; 16], &[u8; 64], &[u8; 10], f64, &rns_identity::stamps::StampControl) -> core::result::Result<core::option::Option<([u8; 14], f64)>, rns_identity::stamps::StampError>
+pub fn rns_identity::announce::parse_announce_ext(core::option::Option<&[u8]>) -> rns_identity::announce::AnnounceExtParse<'_>
 pub mod rns_identity::announce_state
 pub struct rns_identity::announce_state::RatchetControlState
 impl rns_identity::announce_state::RatchetControlState
@@ -60,6 +91,7 @@ pub rns_identity::destination::DestinationError::Identity(rns_identity::identity
 pub rns_identity::destination::DestinationError::IdentityMismatch
 pub rns_identity::destination::DestinationError::InvalidAnnounceTime(f64)
 pub rns_identity::destination::DestinationError::InvalidGroupKeyLength(usize)
+pub rns_identity::destination::DestinationError::InvalidLinkCost(f64)
 pub rns_identity::destination::DestinationError::InvalidNameComponent(alloc::string::String)
 pub rns_identity::destination::DestinationError::MissingIdentity
 pub rns_identity::destination::DestinationError::NotGroup
@@ -111,6 +143,8 @@ pub const rns_identity::destination::Destination::RATCHET_INTERVAL: u64
 pub fn rns_identity::destination::Destination::accepts_links(&self) -> bool
 pub fn rns_identity::destination::Destination::announce_packet(&mut self, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, bool, core::option::Option<&[u8]>, f64) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
 pub fn rns_identity::destination::Destination::announce_packet_at(&mut self, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, bool, core::option::Option<&[u8]>, rns_identity::destination::AnnounceTime) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::announce_packet_with_ext_at(&mut self, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, bool, core::option::Option<&[u8]>, rns_identity::destination::AnnounceTime, core::option::Option<&rns_identity::announce::AnnounceStampExt>) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::announce_stamp_ext(&self, f64) -> core::option::Option<rns_identity::announce::AnnounceStampExt>
 pub fn rns_identity::destination::Destination::app_and_aspects_from_name(&str) -> (&str, alloc::vec::Vec<&str>)
 pub fn rns_identity::destination::Destination::auto_identity(&self) -> core::option::Option<&rns_identity::identity::Identity>
 pub fn rns_identity::destination::Destination::cached_path_response_packet(&mut self, &[u8], f64) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, rns_identity::destination::DestinationError>
@@ -119,10 +153,13 @@ pub fn rns_identity::destination::Destination::clear_default_app_data(&mut self)
 pub fn rns_identity::destination::Destination::compute_hash(&[u8; 10], core::option::Option<&[u8; 16]>) -> [u8; 16]
 pub fn rns_identity::destination::Destination::create_announce(&mut self, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, core::option::Option<&[u8]>, f64) -> core::result::Result<(alloc::vec::Vec<u8>, bool), rns_identity::destination::DestinationError>
 pub fn rns_identity::destination::Destination::create_announce_at(&mut self, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, core::option::Option<&[u8]>, rns_identity::destination::AnnounceTime) -> core::result::Result<(alloc::vec::Vec<u8>, bool), rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::create_announce_with_ext_at(&mut self, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, core::option::Option<&[u8]>, rns_identity::destination::AnnounceTime, core::option::Option<&rns_identity::announce::AnnounceStampExt>) -> core::result::Result<(alloc::vec::Vec<u8>, bool), rns_identity::destination::DestinationError>
 pub fn rns_identity::destination::Destination::decrypt(&self, &[u8], &rns_identity::identity::Identity) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
 pub fn rns_identity::destination::Destination::decrypt_with_ratchet_id(&self, &[u8], &rns_identity::identity::Identity, core::option::Option<&[[u8; 32]]>) -> core::result::Result<rns_identity::identity::DecryptionResult, rns_identity::destination::DestinationError>
 pub fn rns_identity::destination::Destination::decrypt_with_ratchets(&self, &[u8], &rns_identity::identity::Identity, core::option::Option<&[[u8; 32]]>) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
 pub fn rns_identity::destination::Destination::deregister_request_handler(&mut self, &str) -> bool
+pub fn rns_identity::destination::Destination::destination_stamp(&self) -> core::option::Option<([u8; 14], f64)>
+pub fn rns_identity::destination::Destination::destination_stamp_meets(&self, f64) -> bool
 pub fn rns_identity::destination::Destination::disable_ratchets(&mut self)
 pub fn rns_identity::destination::Destination::enable_ratchets(&mut self, bool)
 pub fn rns_identity::destination::Destination::encrypt(&self, &[u8], &rns_identity::identity::Identity, core::option::Option<&[u8; 32]>) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::destination::DestinationError>
@@ -135,6 +172,7 @@ pub fn rns_identity::destination::Destination::hash_from_name_and_identity(&str,
 pub fn rns_identity::destination::Destination::hex_hash(&self) -> alloc::string::String
 pub fn rns_identity::destination::Destination::hexhash(&self) -> alloc::string::String
 pub fn rns_identity::destination::Destination::incoming_link_request(&mut self, [u8; 16]) -> bool
+pub fn rns_identity::destination::Destination::link_cost(&self, f64) -> f64
 pub fn rns_identity::destination::Destination::link_count(&self) -> usize
 pub fn rns_identity::destination::Destination::load_group_key(&mut self, &[u8]) -> core::result::Result<(), rns_identity::destination::DestinationError>
 pub fn rns_identity::destination::Destination::new(core::option::Option<&rns_identity::identity::Identity>, rns_identity::destination::Direction, rns_identity::destination::DestType, &str) -> core::result::Result<Self, rns_identity::destination::DestinationError>
@@ -151,7 +189,9 @@ pub fn rns_identity::destination::Destination::remove_link(&mut self, &[u8; 16])
 pub fn rns_identity::destination::Destination::resolve_app_data(&self) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn rns_identity::destination::Destination::set_accepts_links(&mut self, bool)
 pub fn rns_identity::destination::Destination::set_default_app_data(&mut self, rns_identity::destination::DefaultAppData)
+pub fn rns_identity::destination::Destination::set_destination_stamp(&mut self, [u8; 14], f64)
 pub fn rns_identity::destination::Destination::set_group_key(&mut self, alloc::vec::Vec<u8>)
+pub fn rns_identity::destination::Destination::set_link_cost(&mut self, f64)
 pub fn rns_identity::destination::Destination::set_link_established_callback(&mut self, rns_identity::destination::LinkEstablishedCallback)
 pub fn rns_identity::destination::Destination::set_local_ratchet(&mut self, [u8; 32])
 pub fn rns_identity::destination::Destination::set_only_validate_signature(&mut self, bool)
@@ -159,9 +199,12 @@ pub fn rns_identity::destination::Destination::set_packet_callback(&mut self, rn
 pub fn rns_identity::destination::Destination::set_proof_requested_callback(&mut self, rns_identity::destination::ProofRequestedCallback)
 pub fn rns_identity::destination::Destination::set_proof_strategy(&mut self, rns_identity::destination::ProofStrategy)
 pub fn rns_identity::destination::Destination::set_remote_ratchet(&mut self, [u8; 32])
+pub fn rns_identity::destination::Destination::set_value(&mut self, f64, f64)
 pub fn rns_identity::destination::Destination::should_prove(&self, &[u8]) -> bool
 pub fn rns_identity::destination::Destination::sign(&self, &[u8], &rns_identity::identity::Identity) -> core::result::Result<[u8; 64], rns_identity::destination::DestinationError>
+pub fn rns_identity::destination::Destination::stamp_material(&self, &[u8; 64]) -> [u8; 90]
 pub fn rns_identity::destination::Destination::take_auto_identity(&mut self) -> core::option::Option<rns_identity::identity::Identity>
+pub fn rns_identity::destination::Destination::target_value(&self, f64) -> f64
 impl core::fmt::Display for rns_identity::destination::Destination
 pub fn rns_identity::destination::Destination::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct rns_identity::destination::DestinationPacketOptions
@@ -181,8 +224,13 @@ pub rns_identity::destination::RequestHandler::allow: rns_identity::destination:
 pub rns_identity::destination::RequestHandler::allowed_list: alloc::vec::Vec<[u8; 16]>
 pub rns_identity::destination::RequestHandler::auto_compress: bool
 pub rns_identity::destination::RequestHandler::path: alloc::string::String
+pub const rns_identity::destination::DESTINATION_STAMP_EXTENSION: &str
 pub const rns_identity::destination::GROUP_KEY_LENGTH: usize
 pub const rns_identity::destination::PR_TAG_WINDOW: f64
+pub const rns_identity::destination::STAMP_FILE_VERSION: u64
+pub fn rns_identity::destination::destination_stamp_path(&std::path::Path, &[u8; 16]) -> std::path::PathBuf
+pub fn rns_identity::destination::load_destination_stamp(&std::path::Path, &[u8; 16], &[u8], f64) -> core::option::Option<([u8; 14], f64)>
+pub fn rns_identity::destination::store_destination_stamp(&std::path::Path, &[u8; 16], &[u8; 14], f64) -> core::io::error::Result<()>
 pub type rns_identity::destination::LinkEstablishedCallback = alloc::boxed::Box<(dyn core::ops::function::Fn([u8; 16]) + core::marker::Send + core::marker::Sync)>
 pub type rns_identity::destination::PacketCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&[u8], &[u8]) + core::marker::Send + core::marker::Sync)>
 pub type rns_identity::destination::ProofRequestedCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&[u8]) -> bool + core::marker::Send + core::marker::Sync)>
@@ -190,6 +238,7 @@ pub mod rns_identity::identity
 pub enum rns_identity::identity::IdentityError
 pub rns_identity::identity::IdentityError::DecryptionFailed
 pub rns_identity::identity::IdentityError::Ed25519(rns_crypto::ed25519::Ed25519Error)
+pub rns_identity::identity::IdentityError::EncryptionFailed
 pub rns_identity::identity::IdentityError::InvalidPrivateKeyLength(usize)
 pub rns_identity::identity::IdentityError::InvalidPublicKeyLength(usize)
 pub rns_identity::identity::IdentityError::Io(core::io::error::Error)
@@ -215,11 +264,13 @@ pub fn rns_identity::identity::Identity::from_public_key(&[u8]) -> core::result:
 pub fn rns_identity::identity::Identity::get_private_key(&self) -> core::option::Option<zeroize::Zeroizing<[u8; 64]>>
 pub fn rns_identity::identity::Identity::get_public_key(&self) -> [u8; 64]
 pub fn rns_identity::identity::Identity::get_signing_key(&self) -> core::option::Option<rns_crypto::ed25519::Ed25519PrivateKey>
+pub fn rns_identity::identity::Identity::get_value(&self) -> f64
 pub fn rns_identity::identity::Identity::has_backend(&self) -> bool
 pub fn rns_identity::identity::Identity::has_private_key(&self) -> bool
 pub fn rns_identity::identity::Identity::hexhash(&self) -> alloc::string::String
 pub fn rns_identity::identity::Identity::lock(&self)
 pub fn rns_identity::identity::Identity::new() -> Self
+pub fn rns_identity::identity::Identity::new_with_value(f64, &rns_identity::stamps::StampControl) -> core::result::Result<core::option::Option<Self>, rns_identity::stamps::StampError>
 pub fn rns_identity::identity::Identity::prove(&self, &[u8], bool) -> core::result::Result<alloc::vec::Vec<u8>, rns_identity::identity::IdentityError>
 pub fn rns_identity::identity::Identity::pub_to_file(&self, &std::path::Path) -> core::result::Result<(), rns_identity::identity::IdentityError>
 pub fn rns_identity::identity::Identity::ratchet_id(&[u8; 32]) -> [u8; 10]
@@ -433,3 +484,54 @@ pub fn rns_identity::ratchet::clean_received_ratchets_dir(&std::path::Path) -> u
 pub fn rns_identity::ratchet::get_ratchet_id(&[u8; 32]) -> alloc::vec::Vec<u8>
 pub fn rns_identity::ratchet::purge_expired_ratchets_in_memory<K: core::cmp::Eq + core::hash::Hash>(&mut std::collections::hash::map::HashMap<K, rns_identity::ratchet::ReceivedRatchet>) -> usize
 pub fn rns_identity::ratchet::ratchet_public_bytes(&[u8; 32]) -> [u8; 32]
+pub mod rns_identity::stamps
+pub enum rns_identity::stamps::StampError
+pub rns_identity::stamps::StampError::FpOutOfRange(u16)
+pub rns_identity::stamps::StampError::InvalidCost(f64)
+pub rns_identity::stamps::StampError::NonFiniteCost
+pub struct rns_identity::stamps::StampControl
+pub rns_identity::stamps::StampControl::cancel: alloc::sync::Arc<core::sync::atomic::AtomicBool>
+pub rns_identity::stamps::StampControl::deadline: core::option::Option<std::time::Instant>
+pub rns_identity::stamps::StampControl::threads: core::num::nonzero::NonZeroUsize
+impl core::default::Default for rns_identity::stamps::StampControl
+pub fn rns_identity::stamps::StampControl::default() -> Self
+pub struct rns_identity::stamps::StampTarget(_)
+impl rns_identity::stamps::StampTarget
+pub fn rns_identity::stamps::StampTarget::accepts(&self, &[u8; 32]) -> bool
+pub fn rns_identity::stamps::StampTarget::to_be_bytes(&self) -> [u8; 33]
+pub struct rns_identity::stamps::StampedKey
+pub rns_identity::stamps::StampedKey::private: rns_crypto::x25519::X25519PrivateKey
+pub rns_identity::stamps::StampedKey::public: [u8; 32]
+pub rns_identity::stamps::StampedKey::value: f64
+pub const rns_identity::stamps::COST_FP: u32
+pub const rns_identity::stamps::COST_FP_BITS: u32
+pub const rns_identity::stamps::LINK_COST_CAP: f64
+pub const rns_identity::stamps::MANTISSA_BITS: u32
+pub const rns_identity::stamps::MAX_VALUE_FP: u32
+pub const rns_identity::stamps::NETWORK_STAMP_SIZE: usize
+pub const rns_identity::stamps::PRM_DIGEST: &str
+pub const rns_identity::stamps::STAMP_COST_CAP: f64
+pub const rns_identity::stamps::STAMP_COST_CAP_FP: u16
+pub const rns_identity::stamps::STAMP_SIZE: usize
+pub const rns_identity::stamps::STOP_CHECK_INTERVAL: u32
+pub const rns_identity::stamps::TAB: [u64; 256]
+pub const rns_identity::stamps::TAB_DIGEST: &str
+pub const rns_identity::stamps::WORKBLOCK_EXPAND_CHUNK: usize
+pub const rns_identity::stamps::WORKBLOCK_EXPAND_ROUNDS: usize
+pub fn rns_identity::stamps::cost_from_bytes([u8; 2]) -> f64
+pub fn rns_identity::stamps::cost_from_fp(u32) -> f64
+pub fn rns_identity::stamps::cost_to_bytes(f64) -> core::result::Result<[u8; 2], rns_identity::stamps::StampError>
+pub fn rns_identity::stamps::cost_to_fp(f64) -> core::result::Result<u16, rns_identity::stamps::StampError>
+pub fn rns_identity::stamps::fp_from_bytes([u8; 2]) -> u16
+pub fn rns_identity::stamps::fp_to_bytes(u16) -> [u8; 2]
+pub fn rns_identity::stamps::generate_stamp(&[u8], f64, usize, usize, &rns_identity::stamps::StampControl) -> core::result::Result<core::option::Option<(alloc::vec::Vec<u8>, f64)>, rns_identity::stamps::StampError>
+pub fn rns_identity::stamps::generate_stamped_key(&[u8], f64, &rns_identity::stamps::StampControl) -> core::result::Result<core::option::Option<rns_identity::stamps::StampedKey>, rns_identity::stamps::StampError>
+pub fn rns_identity::stamps::quantize_cost(f64) -> core::result::Result<f64, rns_identity::stamps::StampError>
+pub fn rns_identity::stamps::stamp_valid(&[u8], f64, &[u8]) -> core::result::Result<bool, rns_identity::stamps::StampError>
+pub fn rns_identity::stamps::stamp_valid_fp(&[u8], u16, &[u8]) -> core::result::Result<bool, rns_identity::stamps::StampError>
+pub fn rns_identity::stamps::stamp_value(&[u8], &[u8]) -> f64
+pub fn rns_identity::stamps::stamp_value_fp(&[u8], &[u8]) -> u32
+pub fn rns_identity::stamps::stamp_value_fp_from_hash(&[u8; 32]) -> u32
+pub fn rns_identity::stamps::stamp_workblock(&[u8], usize) -> alloc::vec::Vec<u8>
+pub fn rns_identity::stamps::target_from_cost(f64) -> core::result::Result<rns_identity::stamps::StampTarget, rns_identity::stamps::StampError>
+pub fn rns_identity::stamps::target_from_fp(u16) -> core::result::Result<rns_identity::stamps::StampTarget, rns_identity::stamps::StampError>
