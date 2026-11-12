@@ -81,6 +81,12 @@ fn deferred(
             let hash = request.remote_identity.as_ref().map(|id| id.hash);
             let (outcome, tmpdir) = match handler(&repositories, hash.as_ref(), &request.value) {
                 None => (RequestOutcome::Drop, None),
+                // An over-limit reply would be dropped and leave the client waiting.
+                Some(Reply::Bytes(bytes)) if bytes.capacity() > responder.response_byte_limit() => {
+                    let mut reply = vec![rns_git::server::RES_REMOTE_FAIL];
+                    reply.extend_from_slice(b"Reply too large for this node");
+                    (RequestOutcome::ReplyBytes(reply), None)
+                }
                 Some(Reply::Bytes(bytes)) => (RequestOutcome::ReplyBytes(bytes), None),
                 Some(Reply::File {
                     file,
