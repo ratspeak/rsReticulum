@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 pub use crate::deferred_request::{
-    DeferredRequestResponder, DeferredResponseError, DeferredResponseOutcome,
+    DeferredAdmission, DeferredRequestResponder, DeferredResponseError, DeferredResponseOutcome,
 };
 use crate::inbound_link_packet::{
     APPLICATION_PACKET_LIFETIME, Decision, PacketDispatch, PacketEpoch, PendingInboundPacket,
@@ -672,7 +672,7 @@ pub enum LinkManagerCommand {
         allow: AllowPolicy,
         allowed_list: Vec<[u8; 16]>,
         auto_compress: AutoCompress,
-        response_byte_limit: usize,
+        admission: DeferredAdmission,
         handler: DeferredRequestHandler,
         result_tx: Option<oneshot::Sender<bool>>,
     },
@@ -921,7 +921,7 @@ type DeferredRequestHandler =
 enum RegisteredHandler {
     Immediate(DestinationRequestHandler),
     Deferred {
-        response_byte_limit: usize,
+        admission: DeferredAdmission,
         handler: DeferredRequestHandler,
     },
 }
@@ -2640,16 +2640,16 @@ impl LinkManager {
                 allow,
                 allowed_list,
                 auto_compress,
-                response_byte_limit,
+                admission,
                 handler,
                 result_tx,
             } => {
-                let result = self.register_deferred_request_handler(
+                let result = self.register_deferred_request_handler_with(
                     &path,
                     allow,
                     Some(allowed_list),
                     auto_compress,
-                    response_byte_limit,
+                    admission,
                     handler,
                 );
                 if let Some(tx) = result_tx {
@@ -6518,10 +6518,7 @@ impl LinkManager {
                     RegisteredHandler::Immediate(handler) => {
                         run_request_handler(link_id, request_id, || handler(request))
                     }
-                    RegisteredHandler::Deferred {
-                        response_byte_limit,
-                        handler,
-                    } => {
+                    RegisteredHandler::Deferred { admission, handler } => {
                         let Some(generation) =
                             self.active_endpoint_generations.get(&link_id).copied()
                         else {
@@ -6538,28 +6535,43 @@ impl LinkManager {
                             .active_links
                             .get(&link_id)
                             .and_then(|a| a.interface_owner);
-                        let Some((responder, response)) = crate::deferred_request::reserve(
+                        match crate::deferred_request::reserve(
                             request.data.capacity(),
-                            *response_byte_limit,
+                            admission,
                             self.deferred_request_notify.clone(),
-                        ) else {
-                            return;
-                        };
-                        self.pending_deferred_requests.push(PendingDeferredRequest {
-                            link_id,
-                            request_id,
-                            path_hash,
-                            generation,
-                            owner,
-                            auto_compress: response_auto_compress,
-                            response,
-                        });
-                        // A panicking handler drops its responder, which closes the request.
-                        let _ = run_request_handler(link_id, request_id, || {
-                            handler(request, responder);
-                            RequestOutcome::Drop
-                        });
-                        return;
+                        ) {
+                            Ok((responder, response)) => {
+                                self.pending_deferred_requests.push(PendingDeferredRequest {
+                                    link_id,
+                                    request_id,
+                                    path_hash,
+                                    generation,
+                                    owner,
+                                    auto_compress: response_auto_compress,
+                                    response,
+                                });
+                                // A panicking handler drops its responder, which closes the request.
+                                let _ = run_request_handler(link_id, request_id, || {
+                                    handler(request, responder);
+                                    RequestOutcome::Drop
+                                });
+                                return;
+                            }
+                            Err(refusal) => {
+                                tracing::debug!(
+                                    link_id = hex::encode(link_id),
+                                    request_id = hex::encode(request_id),
+                                    path = %registered.path,
+                                    ?refusal,
+                                    "deferred request refused by admission"
+                                );
+                                // A refusal reply is small and owns no budget.
+                                match admission.refusal_reply(refusal) {
+                                    Some(reply) => RequestOutcome::ReplyBytes(reply.to_vec()),
+                                    None => return,
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -7168,6 +7180,9 @@ impl LinkManager {
     /// for a zero or greater-than-64-MiB response limit. At most four process-wide jobs or
     /// Resources share 256 MiB of conservative reservations. This is an admission
     /// budget, not a limit on arbitrary worker allocations or side effects.
+    /// A refused request is dropped with no response; see
+    /// [`Self::register_deferred_request_handler_with`] to declare accounting
+    /// and refusal replies.
     pub fn register_deferred_request_handler<F>(
         &mut self,
         path: &str,
@@ -7180,11 +7195,33 @@ impl LinkManager {
     where
         F: Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static,
     {
-        if self.endpoint_dispatch.is_none()
-            || path.is_empty()
-            || response_byte_limit == 0
-            || response_byte_limit > crate::deferred_request::MAX_RESPONSE
-        {
+        self.register_deferred_request_handler_with(
+            path,
+            allow,
+            allowed_list,
+            auto_compress,
+            DeferredAdmission::new(response_byte_limit),
+            handler,
+        )
+    }
+
+    /// [`Self::register_deferred_request_handler`] with declared admission
+    /// accounting and optional refusal replies. Registration also fails for a
+    /// zero copy count or a refusal reply over
+    /// [`crate::deferred_request::MAX_REFUSAL_REPLY`] bytes.
+    pub fn register_deferred_request_handler_with<F>(
+        &mut self,
+        path: &str,
+        allow: AllowPolicy,
+        allowed_list: Option<Vec<[u8; 16]>>,
+        auto_compress: impl Into<AutoCompress>,
+        admission: DeferredAdmission,
+        handler: F,
+    ) -> bool
+    where
+        F: Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static,
+    {
+        if self.endpoint_dispatch.is_none() || path.is_empty() || !admission.is_valid() {
             return false;
         }
         let allowed_list = allowed_list.unwrap_or_default();
@@ -7205,7 +7242,7 @@ impl LinkManager {
                 allowed_list,
                 auto_compress,
                 handler: RegisteredHandler::Deferred {
-                    response_byte_limit,
+                    admission,
                     handler: Box::new(handler),
                 },
             },
@@ -11449,6 +11486,93 @@ mod tests {
         let mut raw = header.pack();
         raw.extend_from_slice(part);
         raw
+    }
+
+    #[tokio::test]
+    async fn refused_deferred_request_answers_with_the_declared_reply() {
+        let (mut sender, receiver) = handshaken_link_pair();
+        let link_id = receiver.link_id;
+        let (mut actor, _actor_tx) = rns_transport::actor::TransportActor::new();
+        let (driver_tx, _driver_rx) = mpsc::channel(16);
+        actor.interfaces.insert(
+            1,
+            rns_transport::messages::InterfaceEntry::new(
+                "deferred refusal test".into(),
+                rns_transport::constants::InterfaceMode::Full,
+                rns_transport::constants::InterfaceDirection::bidirectional(),
+                1_000_000,
+                500,
+                driver_tx,
+            ),
+        );
+        let interface_owner = Some(actor.interfaces[&1].owner.id());
+        let dispatch = actor.link_endpoint_dispatch_handle();
+        let _actor_task = tokio::spawn(actor.run());
+        let (transport_tx, mut transport_rx) = mpsc::channel(32);
+        let (_event_tx, event_rx) = mpsc::channel(8);
+        let mut manager = LinkManager::new(transport_tx, event_rx, [0x92; 16], None);
+        manager.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver,
+                _interface_id: 1,
+                interface_owner,
+                endpoint_authority: None,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        manager.set_link_endpoint_dispatch_handle(dispatch.clone());
+        own_test_endpoint(&mut manager, link_id);
+        let authority = dispatch
+            .try_bind(
+                manager.owned_endpoint_bindings[&link_id].binding,
+                manager.endpoint_lifecycle_tx.clone(),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        manager.endpoint_dispatch_tokens.insert(link_id, authority);
+        manager.active_endpoint_generations.insert(link_id, 7);
+        let called = Arc::new(AtomicBool::new(false));
+        let handler_called = called.clone();
+        // Default accounting charges sixteen copies of the request, so a 17 MiB
+        // request can never fit the 256 MiB budget.
+        assert!(
+            manager.register_deferred_request_handler_with(
+                "/push",
+                AllowPolicy::AllowAll,
+                None,
+                false,
+                DeferredAdmission::new(4096)
+                    .busy_reply(b"\xffbusy".to_vec())
+                    .too_large_reply(b"\xfftoo large".to_vec()),
+                move |_, _| handler_called.store(true, Ordering::SeqCst),
+            )
+        );
+        let path = truncated_hash(b"/push");
+        manager.handle_parsed_request(
+            link_id,
+            [1; 16],
+            path,
+            0.0,
+            rmpv::Value::Binary(vec![0u8; 17 * 1024 * 1024]),
+        );
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(manager.pending_deferred_requests.is_empty());
+        let TransportMessage::Outbound(packet) = next_transport_message(&mut transport_rx).unwrap()
+        else {
+            panic!("refusal response packet")
+        };
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+        let (request, response) = sender.handle_response(&packet.raw[offset..]).unwrap();
+        assert_eq!(request, [1; 16]);
+        assert_eq!(response, b"\xfftoo large");
     }
 
     #[tokio::test]

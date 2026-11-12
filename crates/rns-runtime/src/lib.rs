@@ -42,7 +42,9 @@ pub mod prelude {
         RegisteredDestination, ResourceAcceptPolicy,
     };
     pub use crate::lifecycle::ShutdownSignal;
-    pub use crate::link_manager::{DestinationAnnounceOptions, DestinationRequest, RequestOutcome};
+    pub use crate::link_manager::{
+        DeferredAdmission, DestinationAnnounceOptions, DestinationRequest, RequestOutcome,
+    };
     pub use crate::link_session::{
         LinkSession, LinkSessionChannelError, LinkSessionChannelHandle, LinkSessionCloseReason,
         LinkSessionError, LinkSessionEvent, LinkSessionHandle, LinkSessionResourceError,

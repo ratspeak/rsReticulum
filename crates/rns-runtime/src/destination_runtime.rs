@@ -20,11 +20,11 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::link_manager::{
-    ChannelSendError, ChannelSendReceipt, DeferredRequestResponder, DestinationAnnounceOptions,
-    DestinationControlError, DestinationRequest, LinkChannelMessage, LinkManager,
-    LinkManagerCommand, LinkPacketProof, LinkPacketSendReceipt, LinkPayloadSendReceipt,
-    LinkResourceEvent, LinkResourceProof, LinkResourceSendReceipt, LinkSendError, RequestOutcome,
-    ResourceCompletion,
+    ChannelSendError, ChannelSendReceipt, DeferredAdmission, DeferredRequestResponder,
+    DestinationAnnounceOptions, DestinationControlError, DestinationRequest, LinkChannelMessage,
+    LinkManager, LinkManagerCommand, LinkPacketProof, LinkPacketSendReceipt,
+    LinkPayloadSendReceipt, LinkResourceEvent, LinkResourceProof, LinkResourceSendReceipt,
+    LinkSendError, RequestOutcome, ResourceCompletion,
 };
 
 const DEFAULT_EVENT_CAPACITY: usize = 128;
@@ -339,6 +339,32 @@ impl DestinationHandle {
     where
         F: Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static,
     {
+        self.register_deferred_request_handler_with(
+            path,
+            allow,
+            allowed_list,
+            auto_compress,
+            DeferredAdmission::new(response_byte_limit),
+            handler,
+        )
+        .await
+    }
+
+    /// [`Self::register_deferred_request_handler`] with declared admission
+    /// accounting and refusal replies. See
+    /// [`LinkManager::register_deferred_request_handler_with`].
+    pub async fn register_deferred_request_handler_with<F>(
+        &self,
+        path: impl Into<String>,
+        allow: AllowPolicy,
+        allowed_list: Vec<[u8; 16]>,
+        auto_compress: impl Into<crate::resource_source::AutoCompress>,
+        admission: DeferredAdmission,
+        handler: F,
+    ) -> Result<bool, DestinationRuntimeError>
+    where
+        F: Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static,
+    {
         let (result_tx, result_rx) = oneshot::channel();
         self.command_tx
             .send(LinkManagerCommand::RegisterDeferredRequestHandler {
@@ -346,7 +372,7 @@ impl DestinationHandle {
                 allow,
                 allowed_list,
                 auto_compress: auto_compress.into(),
-                response_byte_limit,
+                admission,
                 handler: Box::new(handler),
                 result_tx: Some(result_tx),
             })

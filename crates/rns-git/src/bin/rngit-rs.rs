@@ -21,7 +21,8 @@ use rns_runtime::config::ConfigError;
 use rns_runtime::destination_runtime::DestinationRuntimeOptions;
 use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
 use rns_runtime::link_manager::{
-    DeferredRequestResponder, DestinationAnnounceOptions, DestinationRequest, RequestOutcome,
+    DeferredAdmission, DeferredRequestResponder, DestinationAnnounceOptions, DestinationRequest,
+    RequestOutcome,
 };
 use rns_tools::{LogLevel, RS_RETICULUM_VERSION};
 
@@ -29,6 +30,21 @@ const JOBS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Ceiling for a deferred reply held in memory: status bytes or file metadata.
 const REPLY_LIMIT: usize = 64 * 1024;
+
+/// Admission for the git handlers: the manager's three copies of the request
+/// (payload, value, byte view) and a status-byte or file-backed reply; a refused
+/// job answers with `RES_REMOTE_FAIL` and a reason the remote helper prints.
+fn admission() -> DeferredAdmission {
+    let refusal = |message: &str| {
+        let mut reply = vec![rns_git::server::RES_REMOTE_FAIL];
+        reply.extend_from_slice(message.as_bytes());
+        reply
+    };
+    DeferredAdmission::new(REPLY_LIMIT)
+        .request_copies(3)
+        .busy_reply(refusal("Node busy, try again later"))
+        .too_large_reply(refusal("Request too large for this node"))
+}
 
 /// Bundle directories kept until their Link closes (`link.temporary_directories`).
 type LinkTempDirs = Arc<Mutex<HashMap<[u8; 16], Vec<tempfile::TempDir>>>>;
@@ -526,12 +542,12 @@ async fn main() {
     ] {
         let ok = registered
             .handle
-            .register_deferred_request_handler(
+            .register_deferred_request_handler_with(
                 path,
                 AllowPolicy::AllowAll,
                 Vec::new(),
                 true,
-                REPLY_LIMIT,
+                admission(),
                 deferred(repositories.clone(), tempdirs.clone(), handler),
             )
             .await;
