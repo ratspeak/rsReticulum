@@ -1658,6 +1658,7 @@ dependencies = [
  "rns-runtime",
  "rns-tools",
  "rns-transport",
+ "rns-wire",
  "serde_json",
  "tempfile",
  "tokio",

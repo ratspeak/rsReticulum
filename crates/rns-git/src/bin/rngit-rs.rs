@@ -1,26 +1,83 @@
 //! `rngit-rs`: the Reticulum Git repository node (`RNS/Utilities/rngit/server.py@1.6.0`).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use rns_git::server::config::{
     NodeConfig, load_or_create_identity, read_or_create_config, resolve_config_dir,
 };
-use rns_git::server::handlers::handle_list;
+use rns_git::server::handlers::{
+    Reply, handle_create, handle_delete, handle_fetch, handle_list, handle_push,
+};
 use rns_git::server::layout::{Repositories, git_available};
-use rns_git::server::{APP_NAME, PATH_LIST};
+use rns_git::server::{APP_NAME, PATH_CREATE, PATH_DELETE, PATH_FETCH, PATH_LIST, PATH_PUSH};
 use rns_identity::destination::{AllowPolicy, Destination};
 use rns_identity::identity::Identity;
 use rns_runtime::config::ConfigError;
 use rns_runtime::destination_runtime::DestinationRuntimeOptions;
 use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
-use rns_runtime::link_manager::{DestinationAnnounceOptions, RequestOutcome};
+use rns_runtime::link_manager::{
+    DeferredRequestResponder, DestinationAnnounceOptions, DestinationRequest, RequestOutcome,
+};
 use rns_tools::{LogLevel, RS_RETICULUM_VERSION};
 
 const JOBS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Ceiling for a deferred reply held in memory: status bytes or file metadata.
+const REPLY_LIMIT: usize = 64 * 1024;
+
+/// Bundle directories kept until their Link closes (`link.temporary_directories`).
+type LinkTempDirs = Arc<Mutex<HashMap<[u8; 16], Vec<tempfile::TempDir>>>>;
+
+type Handler = fn(&RwLock<Repositories>, Option<&[u8; 16]>, &rmpv::Value) -> Option<Reply>;
+
+/// Run a git handler on the blocking pool and answer through the responder.
+fn deferred(
+    repositories: Arc<RwLock<Repositories>>,
+    tempdirs: LinkTempDirs,
+    handler: Handler,
+) -> impl Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static {
+    move |request, responder| {
+        let repositories = repositories.clone();
+        let tempdirs = tempdirs.clone();
+        tokio::task::spawn_blocking(move || {
+            let hash = request.remote_identity.as_ref().map(|id| id.hash);
+            let (outcome, tmpdir) = match handler(&repositories, hash.as_ref(), &request.value) {
+                None => (RequestOutcome::Drop, None),
+                Some(Reply::Bytes(bytes)) => (RequestOutcome::ReplyBytes(bytes), None),
+                Some(Reply::File {
+                    file,
+                    metadata,
+                    tmpdir,
+                }) => (
+                    RequestOutcome::ReplyFile {
+                        source: Box::new(file),
+                        metadata: Some(metadata),
+                    },
+                    Some(tmpdir),
+                ),
+            };
+            let sent = responder.respond(outcome).is_ok();
+            if let Some(tmpdir) = tmpdir.filter(|_| sent) {
+                tracing::debug!(
+                    "Created {} for link <{}>",
+                    tmpdir.path().display(),
+                    hex::encode(request.link_id)
+                );
+                tempdirs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(request.link_id)
+                    .or_default()
+                    .push(tmpdir);
+            }
+        });
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -47,6 +104,190 @@ struct Args {
     quiet: u8,
     #[arg(long)]
     version: bool,
+}
+
+#[derive(Parser)]
+#[command(
+    name = "rngit-rs create",
+    about = "Reticulum Git Repository Creation",
+    disable_version_flag = true
+)]
+struct CreateArgs {
+    /// path to alternative config directory
+    #[arg(long)]
+    config: Option<String>,
+    /// path to alternative Reticulum config directory
+    #[arg(long)]
+    rnsconfig: Option<String>,
+    /// path to identity
+    #[arg(short = 'i', long, value_name = "PATH")]
+    identity: Option<String>,
+    /// URL of repository to create
+    repository: String,
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    #[arg(short = 'q', long, action = clap::ArgAction::Count)]
+    quiet: u8,
+    #[arg(long)]
+    version: bool,
+}
+
+/// `ReticulumGitClient.abort` (`server.py:402-403`).
+async fn abort(handle: &rns_runtime::reticulum::ReticulumHandle, message: &str) -> ! {
+    println!("{message}");
+    rns_tools::exit(handle, 1).await
+}
+
+/// `rngit create` (`server.py:85-87`, `create_repository` `server.py:569-604`).
+async fn create(args: CreateArgs) {
+    use rns_git::server::client::{ClientConfig, client_config_dir, create_outcome};
+    use rns_git::server::{IDX_REPOSITORY, PATH_CREATE};
+    use std::io::Write;
+
+    let configdir = client_config_dir(non_empty(args.config).map(PathBuf::from).as_deref());
+    let rnsconfig = non_empty(args.rnsconfig);
+    let rns_dir = rns_runtime::platform::resolve_config_dir(rnsconfig.as_deref());
+    let configured = rns_runtime::config::Config::from_file(&rns_dir.join("config"))
+        .ok()
+        .and_then(|c| c.section("logging")?.get_int("loglevel"));
+    let level = rns_tools::Utility::Rnir.loglevel(configured, args.verbose, args.quiet, false);
+    rns_tools::init_tracing(
+        level,
+        rns_tools::config_log_timestamps(&rns_dir),
+        true,
+        std::io::stdout,
+    );
+    let handle = match rns_runtime::reticulum::init(
+        rnsconfig.as_deref(),
+        None,
+        ShutdownSignal::new(),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("failed to start reticulum: {e}");
+            std::process::exit(1);
+        }
+    };
+    handle.wants_destination_type(APP_NAME).await;
+    if let Err(e) = std::fs::create_dir_all(&configdir) {
+        abort(
+            &handle,
+            &format!("Could not create {}: {e}", configdir.display()),
+        )
+        .await;
+    }
+    let identity_path = non_empty(args.identity)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| configdir.join("client_identity"));
+    let identity = if identity_path.is_file() {
+        Identity::from_file(&identity_path).ok()
+    } else {
+        let id = Identity::new();
+        id.to_file(&identity_path).ok().map(|_| id)
+    };
+    let Some(identity) = identity else {
+        abort(&handle, "Could not initialize client identity").await;
+    };
+    let config = match ClientConfig::load_or_create(&configdir) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(
+                "Could not parse the configuration at {}",
+                configdir.join("client_config").display()
+            );
+            tracing::error!("Check your configuration file for errors! ({e})");
+            rns_tools::exit(&handle, 255).await;
+        }
+    };
+    if let Some(level) = config.loglevel {
+        tracing::debug!("Client log level {level}");
+    }
+
+    let remote = args.repository;
+    let destination = match config.parse_remote_destination_url(&remote) {
+        Ok(hash) => hash,
+        Err(message) => abort(&handle, &message).await,
+    };
+    let Ok(destination) = <[u8; 16]>::try_from(destination.as_slice()) else {
+        abort(&handle, "Invalid destination hash length").await;
+    };
+    print!("Requesting path... ");
+    let _ = std::io::stdout().flush();
+    let path_timeout = rns_tools::medium_path_timeout(&handle).await.max(15.0);
+    if handle
+        .await_path(destination, Duration::from_secs_f64(path_timeout))
+        .await
+        .is_err()
+    {
+        println!();
+        abort(
+            &handle,
+            &format!("Could not resolve path to {}", prettyhex(&destination)),
+        )
+        .await;
+    }
+    print!("\rPath resolved      ");
+    print!("\rEstablishing link... ");
+    let _ = std::io::stdout().flush();
+    let hops = handle.hops_to(destination).await.unwrap_or(1);
+    let first_hop = handle
+        .first_hop_timeout(destination)
+        .await
+        .map_or(rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT, |d| {
+            d.as_secs_f64()
+        });
+    let establishment =
+        first_hop + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT * f64::from(hops.max(1));
+    let options = rns_runtime::reticulum::LinkConnectOptions {
+        path_timeout: Duration::from_secs_f64(path_timeout),
+        establishment_timeout: Some(Duration::from_secs_f64(establishment.max(15.0))),
+        client_label: "rngit".to_string(),
+        identify: true,
+        ..Default::default()
+    };
+    let session = match handle.connect_link(destination, identity, options).await {
+        Ok(session) => session,
+        Err(_) => abort(&handle, "Link establishment failed").await,
+    };
+    print!("\rLink established     ");
+    print!("\r                       \r");
+    let _ = std::io::stdout().flush();
+    let outcome = match config.parse_remote_url(&remote) {
+        Err(message) => Err(message),
+        Ok((_, group, repo)) => {
+            let repo_path = format!("{group}/{repo}");
+            let request = rmpv::Value::Map(vec![(
+                rmpv::Value::from(IDX_REPOSITORY),
+                rmpv::Value::from(repo_path.as_str()),
+            )]);
+            let options = rns_runtime::link_session::RequestOptions {
+                timeout: Some(Duration::from_secs(120)),
+                ..Default::default()
+            };
+            match session
+                .handle
+                .request_with_options(PATH_CREATE, request, options)
+                .await
+            {
+                Ok(response) if matches!(response.value, rmpv::Value::Binary(_)) => {
+                    create_outcome(&repo_path, Some(&response.data))
+                }
+                Ok(_) => create_outcome(&repo_path, None),
+                Err(_) => Err("Request failed or timed out".to_string()),
+            }
+        }
+    };
+    session.handle.close().await;
+    match outcome {
+        Ok(message) => {
+            println!("{message}");
+            rns_tools::exit(&handle, 0).await;
+        }
+        Err(message) => abort(&handle, &message).await,
+    }
 }
 
 /// `RNS.LOG_MAXSIZE` (`RNS/__init__.py:74`).
@@ -95,6 +336,15 @@ async fn main() {
     let mut argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("node") {
         argv.remove(1);
+    } else if argv.get(1).map(String::as_str) == Some("create") {
+        argv.remove(1);
+        let args = CreateArgs::parse_from(argv);
+        if args.version {
+            println!("rngit-rs {RS_RETICULUM_VERSION}");
+            return;
+        }
+        create(args).await;
+        return;
     }
     let args = Args::parse_from(argv);
     if args.version {
@@ -219,15 +469,19 @@ async fn main() {
     tracing::info!(target: rns_tools::NOTICE_TARGET, "Starting Reticulum Git Node...");
 
     let repositories = match Repositories::load(&config) {
-        Ok(repositories) => Arc::new(repositories),
+        Ok(repositories) => Arc::new(RwLock::new(repositories)),
         Err(e) => {
             tracing::error!("Could not load repositories: {e:?}");
             rns_tools::exit(&handle, 1).await;
         }
     };
 
-    let registered = match handle
-        .register_destination(identity, APP_NAME, DestinationRuntimeOptions::default())
+    let options = DestinationRuntimeOptions {
+        endpoint_dispatch: Some(handle.link_endpoint_dispatch_handle()),
+        ..DestinationRuntimeOptions::default()
+    };
+    let mut registered = match handle
+        .register_destination(identity, APP_NAME, options)
         .await
     {
         Ok(registered) => registered,
@@ -247,7 +501,8 @@ async fn main() {
             move |request| {
                 let hash = request.remote_identity.as_ref().map(|id| id.hash);
                 tracing::debug!("List request from remote {:?}", hash.map(hex::encode));
-                match handle_list(&list_repos, hash.as_ref(), &request.value) {
+                let repos = list_repos.read().unwrap_or_else(|e| e.into_inner());
+                match handle_list(&repos, hash.as_ref(), &request.value) {
                     Some(reply) => RequestOutcome::ReplyBytes(reply),
                     None => RequestOutcome::Drop,
                 }
@@ -257,6 +512,33 @@ async fn main() {
     if !matches!(ok, Ok(true)) {
         tracing::error!("Could not register the {PATH_LIST} handler");
         rns_tools::exit(&handle, 1).await;
+    }
+    let tempdirs: LinkTempDirs = Arc::default();
+    let fetch: Handler = handle_fetch;
+    let push: Handler = |r, i, d| handle_push(r, i, d).map(Reply::Bytes);
+    let delete: Handler = |r, i, d| handle_delete(r, i, d).map(Reply::Bytes);
+    let create: Handler = |r, i, d| handle_create(r, i, d).map(Reply::Bytes);
+    for (path, handler) in [
+        (PATH_FETCH, fetch),
+        (PATH_PUSH, push),
+        (PATH_CREATE, create),
+        (PATH_DELETE, delete),
+    ] {
+        let ok = registered
+            .handle
+            .register_deferred_request_handler(
+                path,
+                AllowPolicy::AllowAll,
+                Vec::new(),
+                true,
+                REPLY_LIMIT,
+                deferred(repositories.clone(), tempdirs.clone(), handler),
+            )
+            .await;
+        if !matches!(ok, Ok(true)) {
+            tracing::error!("Could not register the {path} handler");
+            rns_tools::exit(&handle, 1).await;
+        }
     }
     tracing::info!(
         target: rns_tools::NOTICE_TARGET,
@@ -271,6 +553,16 @@ async fn main() {
         tokio::select! {
             _ = interrupt.wait() => break,
             _ = tokio::time::sleep(JOBS_INTERVAL) => {}
+            Some(link_id) = registered.events.links_closed.recv() => {
+                let removed = tempdirs.lock().unwrap_or_else(|e| e.into_inner()).remove(&link_id);
+                for tmpdir in removed.into_iter().flatten() {
+                    let name = tmpdir.path().display().to_string();
+                    match tmpdir.close() {
+                        Ok(()) => tracing::debug!("Cleaned up {name}"),
+                        Err(e) => tracing::error!("Error while cleaning temporary directory: {e}"),
+                    }
+                }
+            }
         }
         let due = last_announce
             .is_none_or(|last| last.elapsed().as_secs_f64() > announce_interval as f64);

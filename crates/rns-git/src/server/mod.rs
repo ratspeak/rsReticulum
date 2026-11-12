@@ -1,5 +1,6 @@
 //! The rngit repository node (`RNS/Utilities/rngit/server.py@1.6.0`).
 
+pub mod client;
 pub mod config;
 pub mod handlers;
 pub mod layout;

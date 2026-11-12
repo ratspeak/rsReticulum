@@ -20,10 +20,11 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::link_manager::{
-    ChannelSendError, ChannelSendReceipt, DestinationAnnounceOptions, DestinationControlError,
-    DestinationRequest, LinkChannelMessage, LinkManager, LinkManagerCommand, LinkPacketProof,
-    LinkPacketSendReceipt, LinkPayloadSendReceipt, LinkResourceEvent, LinkResourceProof,
-    LinkResourceSendReceipt, LinkSendError, RequestOutcome, ResourceCompletion,
+    ChannelSendError, ChannelSendReceipt, DeferredRequestResponder, DestinationAnnounceOptions,
+    DestinationControlError, DestinationRequest, LinkChannelMessage, LinkManager,
+    LinkManagerCommand, LinkPacketProof, LinkPacketSendReceipt, LinkPayloadSendReceipt,
+    LinkResourceEvent, LinkResourceProof, LinkResourceSendReceipt, LinkSendError, RequestOutcome,
+    ResourceCompletion,
 };
 
 const DEFAULT_EVENT_CAPACITY: usize = 128;
@@ -55,6 +56,11 @@ pub struct DestinationRuntimeOptions {
     /// destination reassembles in memory; `None` accepts any size. See
     /// [`rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT`].
     pub inbound_reassembly_limit: Option<usize>,
+    /// Exact endpoint dispatch from the same runtime
+    /// (`ReticulumHandle::link_endpoint_dispatch_handle`). Deferred request
+    /// handlers require it.
+    pub endpoint_dispatch:
+        Option<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle>,
 }
 
 impl Default for DestinationRuntimeOptions {
@@ -73,6 +79,7 @@ impl Default for DestinationRuntimeOptions {
             inbound_reassembly_limit: Some(
                 rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT,
             ),
+            endpoint_dispatch: None,
         }
     }
 }
@@ -316,6 +323,40 @@ impl DestinationHandle {
             .map_err(|_| DestinationRuntimeError::ManagerUnavailable)
     }
 
+    /// Register a handler that hands its responder to a worker, so slow work
+    /// never runs on the manager task. See
+    /// [`LinkManager::register_deferred_request_handler`]; registration fails
+    /// without `DestinationRuntimeOptions::endpoint_dispatch`.
+    pub async fn register_deferred_request_handler<F>(
+        &self,
+        path: impl Into<String>,
+        allow: AllowPolicy,
+        allowed_list: Vec<[u8; 16]>,
+        auto_compress: impl Into<crate::resource_source::AutoCompress>,
+        response_byte_limit: usize,
+        handler: F,
+    ) -> Result<bool, DestinationRuntimeError>
+    where
+        F: Fn(DestinationRequest, DeferredRequestResponder) + Send + 'static,
+    {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkManagerCommand::RegisterDeferredRequestHandler {
+                path: path.into(),
+                allow,
+                allowed_list,
+                auto_compress: auto_compress.into(),
+                response_byte_limit,
+                handler: Box::new(handler),
+                result_tx: Some(result_tx),
+            })
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)?;
+        result_rx
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)
+    }
+
     /// Destination.set_max_request_size: REQUEST packets larger than `limit`
     /// bytes are ignored and larger request Resources are rejected. `None`
     /// accepts any size.
@@ -537,6 +578,9 @@ impl RegisteredDestination {
         }
         manager.set_resource_strategy(options.resource_strategy);
         manager.set_inbound_reassembly_limit(options.inbound_reassembly_limit);
+        if let Some(dispatch) = options.endpoint_dispatch.clone() {
+            manager.set_link_endpoint_dispatch_handle(dispatch);
+        }
         manager.set_use_implicit_proof(true);
         if let Some(policy) = options.resource_accept.clone() {
             manager.set_resource_accept_handler(move |link_id, adv| (policy.0)(link_id, adv));
@@ -782,6 +826,119 @@ mod tests {
             transport_rx.recv().await,
             Some(TransportMessage::DeregisterDestination { hash }) if hash == destination_hash
         ));
+    }
+
+    #[tokio::test]
+    async fn deferred_request_handler_answers_from_a_worker_thread() {
+        let (actor, transport_tx) = TransportActor::new();
+        let dispatch = actor.link_endpoint_dispatch_handle();
+        let actor_task = tokio::spawn(actor.run());
+        let server_identity = Identity::new();
+        let server_public_key = server_identity.get_public_key();
+
+        let without = RegisteredDestination::register(
+            transport_tx.clone(),
+            server_identity.clone(),
+            "example.runtime.deferred",
+            DestinationRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let refused = without
+            .handle
+            .register_deferred_request_handler(
+                "/slow",
+                AllowPolicy::AllowAll,
+                Vec::new(),
+                false,
+                4096,
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+        assert!(!refused, "deferred handlers need exact endpoint dispatch");
+        without.close().await.unwrap();
+
+        let registration = RegisteredDestination::register(
+            transport_tx.clone(),
+            server_identity,
+            "example.runtime.deferred",
+            DestinationRuntimeOptions {
+                endpoint_dispatch: Some(dispatch),
+                ..DestinationRuntimeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let registered = registration
+            .handle
+            .register_deferred_request_handler(
+                "/slow",
+                AllowPolicy::AllowAll,
+                Vec::new(),
+                false,
+                4096,
+                |request, responder| {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(200));
+                        let mut reply = b"done:".to_vec();
+                        reply.extend_from_slice(&request.data);
+                        let _ = responder.respond(RequestOutcome::ReplyBytes(reply));
+                    });
+                },
+            )
+            .await
+            .unwrap();
+        assert!(registered);
+        registration
+            .handle
+            .register_request_handler("/fast", AllowPolicy::AllowAll, Vec::new(), false, |_| {
+                RequestOutcome::ReplyBytes(b"fast".to_vec())
+            })
+            .await
+            .unwrap();
+
+        let session = tokio::time::timeout(
+            Duration::from_secs(3),
+            LinkSession::connect(
+                transport_tx.clone(),
+                Identity::new(),
+                LinkSessionConfig {
+                    destination_hash: registration.handle.destination_hash(),
+                    remote_public_key: server_public_key,
+                    hops: 1,
+                    establishment_timeout: Duration::from_secs(2),
+                    client_label: "test.deferred".into(),
+                    identify: true,
+                    track_phy_stats: false,
+                    proof_strategy: rns_identity::destination::ProofStrategy::ProveNone,
+                    resource_dir: None,
+                    inbound_reassembly_limit: None,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let timeout = Some(Duration::from_secs(5));
+        let (slow, fast) = tokio::join!(session.handle.request("/slow", b"x", timeout), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let reply = session.handle.request("/fast", b"", timeout).await;
+            (reply, std::time::Instant::now())
+        });
+        let slow_done = std::time::Instant::now();
+        assert_eq!(slow.unwrap().data, b"done:x");
+        let (fast, fast_done) = fast;
+        assert_eq!(fast.unwrap().data, b"fast");
+        assert!(
+            fast_done < slow_done,
+            "the manager must keep answering while a deferred worker runs"
+        );
+
+        session.handle.close().await;
+        registration.close().await.unwrap();
+        transport_tx.send(TransportMessage::Shutdown).await.unwrap();
+        actor_task.await.unwrap();
     }
 
     #[tokio::test]

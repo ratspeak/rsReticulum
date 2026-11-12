@@ -665,6 +665,17 @@ pub enum LinkManagerCommand {
         handler: DestinationRequestHandler,
         result_tx: Option<oneshot::Sender<bool>>,
     },
+    /// Register or replace a deferred per-path handler.
+    /// See [`LinkManager::register_deferred_request_handler`].
+    RegisterDeferredRequestHandler {
+        path: String,
+        allow: AllowPolicy,
+        allowed_list: Vec<[u8; 16]>,
+        auto_compress: AutoCompress,
+        response_byte_limit: usize,
+        handler: DeferredRequestHandler,
+        result_tx: Option<oneshot::Sender<bool>>,
+    },
     /// Set or clear Destination.max_request_size.
     SetMaxRequestSize {
         limit: Option<usize>,
@@ -2617,6 +2628,28 @@ impl LinkManager {
                     allow,
                     allowed_list,
                     auto_compress,
+                    handler,
+                );
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(result);
+                }
+                true
+            }
+            LinkManagerCommand::RegisterDeferredRequestHandler {
+                path,
+                allow,
+                allowed_list,
+                auto_compress,
+                response_byte_limit,
+                handler,
+                result_tx,
+            } => {
+                let result = self.register_deferred_request_handler(
+                    &path,
+                    allow,
+                    Some(allowed_list),
+                    auto_compress,
+                    response_byte_limit,
                     handler,
                 );
                 if let Some(tx) = result_tx {
