@@ -97,7 +97,7 @@ def validate_metadata(
 ) -> list[dict[str, object]]:
     require_keys(
         config, {"schemaVersion", "tool", "baseline", "compatibilityFloor", "packages"},
-        "metadata", {"approvedBreakingChanges"},
+        "metadata", {"approvedBreakingChanges", "newPackages"},
     )
     if config["schemaVersion"] != 2:
         fail("unsupported api-stability schema")
@@ -113,6 +113,11 @@ def validate_metadata(
     if "approvedBreakingChanges" in config:
         require_keys(config["approvedBreakingChanges"],
                      {"releaseLine", "migrationGuide", "removed"}, "approved break")
+    new_packages = config.get("newPackages", [])
+    if (not isinstance(new_packages, list)
+            or not all(isinstance(item, str) and item for item in new_packages)
+            or new_packages != sorted(set(new_packages))):
+        fail("newPackages must be a sorted list of unique package names")
 
     tool = config.get("tool")
     if not isinstance(tool, dict):
