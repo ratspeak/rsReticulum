@@ -254,6 +254,7 @@ pub trait AnnounceCacheStore: Send {
 /// In-memory store with the same semantics as the SQLite stores. Used when a
 /// transport runs without a storage directory.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct MemoryStore {
     known: HashMap<DestHash, KnownDestinationRow>,
     ratchets: HashMap<DestHash, RatchetRow>,

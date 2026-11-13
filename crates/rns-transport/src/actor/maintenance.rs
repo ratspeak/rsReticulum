@@ -36,11 +36,8 @@ impl TransportActor {
             self.save_routing_state_async();
         }
 
-        if self.storage_dir.is_some()
-            && self.known_destinations_dirty
-            && now - self.last_known_destinations_flush >= KD_FLUSH_INTERVAL
-        {
-            self.flush_known_destinations_async();
+        if now - self.last_known_destinations_flush >= KD_FLUSH_INTERVAL {
+            self.flush_known_destinations();
         }
 
         if now - self.last_tables_cull >= TABLES_CULL_INTERVAL {
@@ -664,9 +661,9 @@ impl TransportActor {
         if !to_drop.is_empty() {
             for hash in &to_drop {
                 self.recent_announces.remove(hash);
+                self.kd.pending.mark_deleted(*hash);
             }
             self.state_dirty = true;
-            self.known_destinations_dirty = true;
             pathing!(
                 removed = to_drop.len(),
                 remaining = self.recent_announces.len(),
@@ -675,22 +672,26 @@ impl TransportActor {
             );
         }
 
-        // Identity.py: expire remembered ratchets past RATCHET_EXPIRY.
+        // Identity.clean_known_destinations: expire stored ratchets, evict them
+        // from memory, then flush.
+        let cutoff = now - rns_wire::constants::RATCHET_EXPIRY as f64;
         let mut expired = 0usize;
         for announce in self.recent_announces.values_mut() {
-            if announce.ratchet.is_some() && announce.live_ratchet(now).is_none() {
+            if announce.ratchet.is_some() && announce.ratchet_received.unwrap_or(now) < cutoff {
                 announce.ratchet = None;
                 announce.ratchet_received = None;
                 expired += 1;
             }
         }
         if expired > 0 {
-            self.state_dirty = true;
-            self.known_destinations_dirty = true;
             debug!(
                 expired,
-                "known-destinations cleanup expired remembered ratchets"
+                "known-destinations cleanup evicted expired ratchets"
             );
+        }
+        if !self.shared_instance_client_mode {
+            self.kd.expire_ratchets(cutoff);
+            self.flush_known_destinations();
         }
     }
 

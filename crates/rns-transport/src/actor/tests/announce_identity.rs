@@ -180,7 +180,7 @@ fn a_ratchetless_announce_keeps_the_remembered_ratchet() {
     let ratchet = [0x5A; 32];
     let (first, dest) = announce_at(&identity, "ratchet.keep", Some(&ratchet), now - 10);
     inbound(&mut actor, &first);
-    assert_eq!(actor.recent_announces[&dest].ratchet, Some(ratchet));
+    assert_eq!(actor.recall_ratchet(&dest, now as f64), Some(ratchet));
 
     let (second, _) = announce_at(&identity, "ratchet.keep", None, now);
     inbound(&mut actor, &second);
@@ -193,7 +193,7 @@ fn a_ratchetless_announce_keeps_the_remembered_ratchet() {
         )),
         "the second announce updated the path"
     );
-    assert_eq!(actor.recent_announces[&dest].ratchet, Some(ratchet));
+    assert_eq!(actor.recall_ratchet(&dest, now as f64), Some(ratchet));
 }
 
 fn recalled_ratchet(actor: &mut TransportActor, dest: [u8; 16]) -> Option<[u8; 32]> {

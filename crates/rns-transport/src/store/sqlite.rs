@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Statement, params};
+use tracing::warn;
 
 use super::{
     ANNOUNCE_CACHE_USER_VERSION, AnnounceCacheStore, AnnounceRow, ApplyReport, CHUNK_ROWS,
@@ -111,26 +112,37 @@ fn uri_path(path: &Path) -> Result<String, StoreError> {
 
 /// Opens read-write and writes the schema at `supported`. `user_version` is read
 /// before any pragma or write, and again inside the write lock, so a newer file is
-/// refused and keeps its bytes. `pragmas` run before the transaction because
-/// `auto_vacuum` is ignored inside one.
+/// refused and keeps its bytes, unless `rebuild` names the statement that clears
+/// its tables (`KnownDestinationsStore.__create_schema` drops `known_destinations`).
+/// `pragmas` run before the transaction because `auto_vacuum` is ignored inside one.
 fn open_rw_checked(
     path: &Path,
     supported: i64,
     pragmas: &str,
     schema: &str,
+    rebuild: Option<&str>,
 ) -> Result<Connection, StoreError> {
     let conn = with_busy_timeout(db(Connection::open(path))?)?;
-    let check = |conn: &Connection| -> Result<(), StoreError> {
-        let found: i64 = db(conn.pragma_query_value(None, "user_version", |r| r.get(0)))?;
-        if found > supported {
-            return Err(StoreError::NewerVersion { found, supported });
-        }
-        Ok(())
+    let version = |conn: &Connection| -> Result<i64, StoreError> {
+        db(conn.pragma_query_value(None, "user_version", |r| r.get(0)))
     };
-    check(&conn)?;
+    let found = version(&conn)?;
+    if found > supported && rebuild.is_none() {
+        return Err(StoreError::NewerVersion { found, supported });
+    }
     db(conn.execute_batch(pragmas))?;
     db(conn.execute_batch("BEGIN IMMEDIATE"))?;
-    let result = check(&conn).and_then(|()| {
+    let result = version(&conn).and_then(|found| {
+        if found > supported {
+            let Some(drop_sql) = rebuild else {
+                return Err(StoreError::NewerVersion { found, supported });
+            };
+            warn!(
+                found,
+                supported, "pre-release known destinations database, rebuilding its table"
+            );
+            db(conn.execute_batch(drop_sql))?;
+        }
         db(conn.execute_batch(schema))?;
         db(conn.execute_batch(&format!("PRAGMA user_version = {supported}")))
     });
@@ -247,14 +259,15 @@ pub struct SqliteKnownDestinations {
 }
 
 impl SqliteKnownDestinations {
-    /// Opens or creates the file for reading and writing. A file whose `user_version`
-    /// is newer than this crate knows is refused and not modified.
+    /// Opens or creates the file for reading and writing. A file from a pre-release
+    /// build (`user_version` above 0) has its `known_destinations` table rebuilt empty.
     pub fn open_rw(path: &Path) -> Result<Self, StoreError> {
         let conn = open_rw_checked(
             path,
             KNOWN_DESTINATIONS_USER_VERSION,
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=8388608;",
             KD_SCHEMA,
+            Some("DROP TABLE IF EXISTS known_destinations"),
         )?;
         Ok(Self {
             conn,
@@ -284,8 +297,15 @@ impl KnownDestinationStore for SqliteKnownDestinations {
             "SELECT destination_hash, last_heard, packet_hash, public_key, app_data, used, stamp, stamp_value, lr_cost FROM known_destinations",
         ))?;
         let mut rows = db(stmt.query([]))?;
+        let mut skipped = 0usize;
         while let Some(row) = db(rows.next())? {
-            f(decode_known(row)?);
+            match decode_known(row) {
+                Ok(decoded) => f(decoded),
+                Err(_) => skipped += 1,
+            }
+        }
+        if skipped > 0 {
+            warn!(skipped, "skipped undecodable known destination rows");
         }
         Ok(())
     }
@@ -451,6 +471,7 @@ impl SqliteAnnounceCache {
             ANNOUNCE_CACHE_USER_VERSION,
             "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=8388608;",
             ANNOUNCE_SCHEMA,
+            None,
         )?;
         Ok(Self { conn })
     }
@@ -529,22 +550,48 @@ mod tests {
     }
 
     #[test]
-    fn newer_user_version_is_refused_and_file_unchanged() {
-        let path = temp_db("newer");
+    fn newer_announce_cache_version_is_refused_and_file_unchanged() {
+        let path = temp_db("newer-announce");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("PRAGMA user_version = 7; CREATE TABLE known_destinations (x);")
+            conn.execute_batch("PRAGMA user_version = 7; CREATE TABLE cached_announces (x);")
                 .unwrap();
         }
         let before = std::fs::read(&path).unwrap();
         assert!(matches!(
-            SqliteKnownDestinations::open_rw(&path),
+            SqliteAnnounceCache::open_rw(&path),
             Err(StoreError::NewerVersion {
                 found: 7,
-                supported: 0
+                supported: 1
             })
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn newer_known_destinations_version_is_rebuilt_keeping_ratchets() {
+        let path = temp_db("newer-kd");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 7; CREATE TABLE known_destinations (x); CREATE TABLE ratchets (destination_hash BLOB PRIMARY KEY, ratchet BLOB NOT NULL, received REAL NOT NULL); INSERT INTO ratchets VALUES (x'01', x'02', 3.0);",
+            )
+            .unwrap();
+        }
+        let mut store = SqliteKnownDestinations::open_rw(&path).unwrap();
+        let mut rows = Vec::new();
+        store.load_all(&mut |r| rows.push(r)).unwrap();
+        assert!(rows.is_empty());
+        let version: i64 = Connection::open(&path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, KNOWN_DESTINATIONS_USER_VERSION);
+        let kept: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM ratchets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
     }
 
     #[test]

@@ -37,6 +37,7 @@ mod path_request_admission;
 mod persistence;
 mod recursive_discovery;
 mod rpc;
+mod store_worker;
 pub use options::TransportActorOptions;
 use rpc::InterfaceEvent;
 
@@ -292,9 +293,9 @@ pub struct TransportActor {
     /// set it; queued/synchronous save paths can clear it before success is known.
     /// It is not a reliable comparison between memory and durable disk state.
     pub(crate) state_dirty: bool,
-    /// Known-destination metadata changed since the last `announce_cache.msgpack`
-    /// flush (Python `Identity._kd_mark_dirty`).
-    known_destinations_dirty: bool,
+    /// Pending known-destination and ratchet writes, and the store they go to
+    /// (Python `Identity.known_destinations_store`).
+    kd: store_worker::KdState,
     /// Whether an asynchronous routing writer is in flight. The separate
     /// publication lock and generation counter coordinate queued and synchronous
     /// snapshots; this flag alone is not a cross-process writer lock.
@@ -380,17 +381,6 @@ pub struct RecentAnnounce {
 }
 
 impl RecentAnnounce {
-    /// Remember a ratchet carried by an announce. Re-receiving the same ratchet
-    /// keeps its first receive time (Identity.py, Storage.py).
-    pub(crate) fn remember_ratchet(&mut self, ratchet: Option<[u8; 32]>, now: f64) {
-        if let Some(ratchet) = ratchet
-            && self.ratchet != Some(ratchet)
-        {
-            self.ratchet = Some(ratchet);
-            self.ratchet_received = Some(now);
-        }
-    }
-
     /// The remembered ratchet, unless it is older than `RATCHET_EXPIRY`.
     pub(crate) fn live_ratchet(&self, now: f64) -> Option<[u8; 32]> {
         let received = self.ratchet_received.unwrap_or(now);
@@ -599,7 +589,7 @@ impl TransportActor {
             hashlist_load_attempted: false,
             last_state_save: 0.0,
             state_dirty: false,
-            known_destinations_dirty: false,
+            kd: store_worker::KdState::new(),
             routing_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             routing_save_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             routing_save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
@@ -650,8 +640,10 @@ impl TransportActor {
     /// legacy cache migrations. Repeated calls do not reset the actor to an empty
     /// state; this is not a storage-isolation or identity-switch operation.
     pub fn initialize_storage(&mut self, storage_dir: PathBuf) {
+        self.kd.attach_storage(&storage_dir);
         self.storage_dir = Some(storage_dir);
         self.load_state();
+        self.load_known_destinations();
         self.maybe_load_hashlist();
     }
 
@@ -695,6 +687,9 @@ impl TransportActor {
                 }
                 Some(result) = self.pr_stamper.next_result() => {
                     self.on_path_request_stamp_ready(result);
+                }
+                Some(result) = self.kd.results.recv() => {
+                    self.kd.handle(result);
                 }
                 _ = tick_interval.tick() => {
                     let is_fg = self.is_foreground.load(std::sync::atomic::Ordering::Relaxed);
@@ -1255,9 +1250,7 @@ impl TransportActor {
             }
             TransportMessage::SetStoragePaths { storage_dir } => {
                 debug!(path = %storage_dir.display(), "setting storage paths");
-                self.storage_dir = Some(storage_dir);
-                self.load_state();
-                self.maybe_load_hashlist();
+                self.initialize_storage(storage_dir);
             }
             TransportMessage::RegisterReceipt {
                 truncated_hash,
@@ -1673,7 +1666,7 @@ impl TransportActor {
         if let Some(entry) = self.recent_announces.get_mut(dest_hash) {
             entry.retained = true;
             self.state_dirty = true;
-            self.known_destinations_dirty = true;
+            self.kd.pending.mark_dirty(*dest_hash);
             true
         } else {
             false
@@ -1692,11 +1685,11 @@ impl TransportActor {
             if &computed_id_hash == identity_hash {
                 entry.retained = true;
                 retained = true;
+                self.kd.pending.mark_dirty(entry.dest_hash);
             }
         }
         if retained {
             self.state_dirty = true;
-            self.known_destinations_dirty = true;
         }
         retained
     }
@@ -1711,7 +1704,7 @@ impl TransportActor {
         {
             entry.last_used = Some(now_f64());
             self.state_dirty = true;
-            self.known_destinations_dirty = true;
+            self.kd.pending.mark_dirty(*dest_hash);
             true
         } else {
             false
@@ -1724,7 +1717,7 @@ impl TransportActor {
             entry.retained = false;
             entry.last_used = Some(now_f64());
             self.state_dirty = true;
-            self.known_destinations_dirty = true;
+            self.kd.pending.mark_dirty(*dest_hash);
             true
         } else {
             false

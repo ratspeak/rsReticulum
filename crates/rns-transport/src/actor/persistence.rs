@@ -108,19 +108,8 @@ pub(super) struct RoutingSnapshot {
     pub path_table: crate::path_table::PathTable,
     pub tunnel_table: crate::tunnel::TunnelTable,
     pub blackhole_table: crate::blackhole::BlackholeTable,
-    pub recent_announces: Vec<RecentAnnounce>,
     pub interface_names: std::collections::HashMap<u64, String>,
     pub transport_identity_hash: Option<[u8; 16]>,
-}
-
-/// Persist known-destination metadata (`announce_cache.msgpack`).
-pub(super) fn write_announce_metadata(dir: &std::path::Path, announces: &[RecentAnnounce]) {
-    let announce_path = dir.join("announce_cache.msgpack");
-    if let Err(e) = crate::persistence::save_announce_cache(announces.iter(), &announce_path) {
-        trace!("failed to save announce cache: {}", e);
-    } else {
-        debug!("saved announce cache ({} entries)", announces.len());
-    }
 }
 
 /// Persist a routing snapshot. Runs on the blocking pool for periodic saves
@@ -170,8 +159,6 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
         }
     }
 
-    write_announce_metadata(dir, &snapshot.recent_announces);
-
     // Per-announce Python cache files are written event-driven at receive
     // (`cache_announce_to_disk`), not re-serialized here every cycle.
 
@@ -198,7 +185,6 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
 
     debug!(
         paths = snapshot.path_table.len(),
-        announces = snapshot.recent_announces.len(),
         tunnels = snapshot.tunnel_table.len(),
         blackhole = snapshot.blackhole_table.len(),
         "flushed routing state"
@@ -269,7 +255,6 @@ impl TransportActor {
             path_table: self.path_table.clone(),
             tunnel_table: self.tunnel_table.clone(),
             blackhole_table: self.blackhole_table.clone(),
-            recent_announces: self.recent_announces.values().cloned().collect(),
             // Accepted clients' names recur across restarts for other peers.
             interface_names: self
                 .interfaces
@@ -281,51 +266,15 @@ impl TransportActor {
         }
     }
 
-    /// Flush known-destination metadata (`announce_cache.msgpack`) on the
-    /// `KD_FLUSH_INTERVAL` cadence, off-actor and behind the routing writer's
-    /// in-flight guard. The routing tables keep their own periodic save.
-    pub(super) fn flush_known_destinations_async(&mut self) {
-        if self.shared_instance_client_mode {
-            self.known_destinations_dirty = false;
-            self.last_known_destinations_flush = now();
-            return;
-        }
-        let Some(dir) = self.storage_dir.clone() else {
-            return;
-        };
-        if self
-            .routing_save_in_flight
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-        self.routing_save_in_flight
-            .store(true, std::sync::atomic::Ordering::Release);
-        let announces: Vec<RecentAnnounce> = self.recent_announces.values().cloned().collect();
-        // A newer synchronous snapshot bumps the generation and supersedes this one.
-        let generation = self
-            .routing_save_generation
-            .load(std::sync::atomic::Ordering::Acquire);
-        let latest_generation = self.routing_save_generation.clone();
-        let write_lock = self.routing_save_lock.clone();
-        let in_flight = self.routing_save_in_flight.clone();
-        let write = move || {
-            let _guard = write_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if latest_generation.load(std::sync::atomic::Ordering::Acquire) == generation {
-                write_announce_metadata(&dir, &announces);
-            }
-            in_flight.store(false, std::sync::atomic::Ordering::Release);
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn_blocking(write);
-            }
-            Err(_) => write(),
-        }
-        self.known_destinations_dirty = false;
+    /// `Identity.flush_known_destinations`: hand the pending marks to the store
+    /// worker without waiting. Shared-instance clients write nothing.
+    pub(super) fn flush_known_destinations(&mut self) {
         self.last_known_destinations_flush = now();
+        if self.shared_instance_client_mode {
+            self.kd.pending = store_worker::KdPending::default();
+            return;
+        }
+        self.kd.flush(&self.recent_announces);
     }
 
     /// Full persist of routing state, known destinations and the hashlist
@@ -339,6 +288,7 @@ impl TransportActor {
             return;
         }
         self.save_state_async();
+        self.flush_known_destinations();
         self.last_data_persist = now();
     }
 
@@ -404,7 +354,6 @@ impl TransportActor {
             }
         }
         self.state_dirty = false;
-        self.known_destinations_dirty = false;
         self.last_state_save = now();
     }
 
@@ -524,7 +473,6 @@ impl TransportActor {
             write_routing_snapshot(&dir, &snapshot);
         }
         self.state_dirty = false;
-        self.known_destinations_dirty = false;
         self.last_state_save = now();
     }
 
@@ -598,6 +546,9 @@ impl TransportActor {
             crate::messages::LinkEndpointTerminalReason::TransportShutdown,
         );
         self.save_state();
+        // Identity.exit_handler: drain, apply, close.
+        let write = !self.shared_instance_client_mode;
+        self.kd.shutdown(&self.recent_announces, write);
     }
 
     fn owns_persistent_hashlist(&self) -> bool {
@@ -971,103 +922,44 @@ impl TransportActor {
                 }
             }
         }
+    }
 
-        // announce_cache — no interface dependency, bind directly.
-        let announce_path = dir.join("announce_cache.msgpack");
-        if announce_path.exists() {
-            let loaded = match crate::persistence::load_announce_cache(&announce_path) {
-                Ok(entries) => Some(entries),
-                Err(v6_err) => {
-                    // Pre-v6 caches carried raw announce bytes inline. Migrate
-                    // them into per-packet disk cache files once, then proceed
-                    // with the slim v6 metadata shape.
-                    match crate::persistence::load_announce_cache_legacy_v5(&announce_path) {
-                        Ok(legacy) => {
-                            let announce_cache_dir = dir.join("cache").join("announces");
-                            let migrated = crate::persistence::migrate_legacy_announce_entries(
-                                legacy,
-                                &announce_cache_dir,
-                            );
-                            debug!(
-                                count = migrated.len(),
-                                "migrated legacy announce cache to disk-backed v6"
-                            );
-                            Some(migrated)
-                        }
-                        Err(_) => {
-                            trace!("failed to load announce cache: {}", v6_err);
-                            None
-                        }
-                    }
-                }
-            };
-            if let Some(entries) = loaded {
-                let count = entries.len();
-                // Python loads every known destination; cleaning decides retention.
-                for ae in entries {
-                    if ae.destination_hash.len() == 16 {
-                        let mut hash = [0u8; 16];
-                        hash.copy_from_slice(&ae.destination_hash);
-                        let public_key = ae.public_key.and_then(|k| {
-                            if k.len() == 64 {
-                                let mut arr = [0u8; 64];
-                                arr.copy_from_slice(&k);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        });
-                        let ratchet = ae.ratchet.and_then(|r| {
-                            if r.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(&r);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        });
-                        let name_hash = if ae.name_hash.len() == 10 {
-                            let mut nh = [0u8; 10];
-                            nh.copy_from_slice(&ae.name_hash);
-                            nh
-                        } else {
-                            [0u8; 10]
-                        };
-                        let packet_hash = ae.packet_hash.and_then(|h| {
-                            if h.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(&h);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        });
-                        self.recent_announces
-                            .entry(hash)
-                            .or_insert_with(|| RecentAnnounce {
-                                dest_hash: hash,
-                                hops: ae.hops,
-                                app_data: ae.app_data,
-                                timestamp: ae.timestamp,
-                                public_key,
-                                // Entries saved without a receive time count from load.
-                                ratchet_received: ratchet
-                                    .map(|_| ae.ratchet_received.unwrap_or_else(now)),
-                                ratchet,
-                                packet_hash,
-                                is_path_response: ae.is_path_response,
-                                retained: ae.retained,
-                                last_used: ae.last_used,
-                                name_hash,
-                                stamp: ae.stamp.and_then(|stamp| stamp.try_into().ok()),
-                                stamp_value: ae.stamp_value,
-                                lr_cost: ae.lr_cost,
-                            });
-                    }
-                }
-                debug!(count, "loaded announce cache entries from disk");
-            }
+    /// Fill the known-destination table from `known_destinations.db`, importing the
+    /// legacy files first when present (`Identity.load_known_destinations`).
+    /// Ratchets stay in the store and are read on demand.
+    pub(super) fn load_known_destinations(&mut self) {
+        if self.storage_dir.is_none() {
+            return;
         }
+        let rows = self.kd.load_at_start(now());
+        let count = rows.len();
+        for row in rows {
+            #[cfg(feature = "sqlite-store")]
+            {
+                let loaded = store_worker::recent_from_row(row);
+                match self.recent_announces.entry(loaded.dest_hash) {
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        // Keep what the cached packet gave (hops, name hash, ratchet).
+                        let e = o.get_mut();
+                        e.app_data = loaded.app_data;
+                        e.timestamp = loaded.timestamp;
+                        e.public_key = loaded.public_key;
+                        e.packet_hash = loaded.packet_hash.or(e.packet_hash);
+                        e.retained = loaded.retained;
+                        e.last_used = loaded.last_used;
+                        e.stamp = loaded.stamp;
+                        e.stamp_value = loaded.stamp_value;
+                        e.lr_cost = loaded.lr_cost;
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(loaded);
+                    }
+                }
+            }
+            #[cfg(not(feature = "sqlite-store"))]
+            let _ = row;
+        }
+        debug!(count, "loaded known destinations from storage");
     }
 
     /// Write `blackhole/local` now, as upstream does on every local change
@@ -1530,7 +1422,7 @@ mod async_save_tests {
         actor
     }
 
-    /// Changed known-destination metadata reaches disk on the 10 s cadence
+    /// Pending known-destination marks are handed to the store on the 10 s cadence,
     /// without waiting for the routing tables' periodic save.
     #[test]
     fn known_destinations_flush_on_their_own_cadence() {
@@ -1558,19 +1450,19 @@ mod async_save_tests {
         );
         let now = crate::now_f64();
         actor.last_state_save = now;
-        actor.last_known_destinations_flush = now - KD_FLUSH_INTERVAL - 1.0;
-
+        actor.kd.pending.mark_dirty([0x11; 16]);
+        actor.last_known_destinations_flush = now;
         actor.on_tick();
         assert!(
-            !dir.join("announce_cache.msgpack").exists(),
-            "a routing-only change leaves known destinations unwritten"
+            !actor.kd.pending.is_empty(),
+            "marks wait until the flush interval has passed"
         );
-        actor.known_destinations_dirty = true;
+        actor.last_known_destinations_flush = now - KD_FLUSH_INTERVAL - 1.0;
         actor.on_tick();
-
-        let announces =
-            crate::persistence::load_announce_cache(&dir.join("announce_cache.msgpack")).unwrap();
-        assert_eq!(announces.len(), 1);
+        assert!(
+            actor.kd.pending.is_empty(),
+            "the tick hands the marks to the store"
+        );
         assert!(
             !dir.join("path_table.msgpack").exists(),
             "routing tables wait for their own interval"

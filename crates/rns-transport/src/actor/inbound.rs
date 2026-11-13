@@ -695,11 +695,11 @@ impl TransportActor {
                 e.timestamp = now_f64();
                 e.public_key = announce_public_key;
                 e.app_data = announce_app_data.clone();
-                e.remember_ratchet(announce_ratchet, now_f64());
                 e.stamp = validated.stamp;
                 e.stamp_value = announce_stamp_value;
                 e.lr_cost = validated.lr_cost;
-                self.known_destinations_dirty = true;
+                self.kd.pending.mark_dirty(header.destination_hash);
+                self.remember_received_ratchet(header.destination_hash, announce_ratchet);
             }
             std::collections::hash_map::Entry::Occupied(_) => {}
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -709,8 +709,8 @@ impl TransportActor {
                     app_data: announce_app_data.clone(),
                     timestamp: now_f64(),
                     public_key: announce_public_key,
-                    ratchet: announce_ratchet,
-                    ratchet_received: announce_ratchet.map(|_| now_f64()),
+                    ratchet: None,
+                    ratchet_received: None,
                     packet_hash: None,
                     is_path_response: header.context
                         == rns_wire::context::PacketContext::PathResponse,
@@ -722,7 +722,8 @@ impl TransportActor {
                     lr_cost: validated.lr_cost,
                 });
                 self.state_dirty = true;
-                self.known_destinations_dirty = true;
+                self.kd.pending.mark_dirty(header.destination_hash);
+                self.remember_received_ratchet(header.destination_hash, announce_ratchet);
             }
         }
 
@@ -1000,10 +1001,10 @@ impl TransportActor {
         self.cache_announce_to_disk(&announce_packet_hash, raw, interface_id);
         if let Some(e) = self.recent_announces.get_mut(&header.destination_hash) {
             e.hops = header.hops;
-            e.remember_ratchet(announce_ratchet, now_f64());
             e.packet_hash = Some(announce_packet_hash);
             e.is_path_response = is_path_response;
-            self.known_destinations_dirty = true;
+            self.kd.pending.mark_dirty(header.destination_hash);
+            self.remember_received_ratchet(header.destination_hash, announce_ratchet);
         }
         let app_data_for_handlers = announce_app_data;
 

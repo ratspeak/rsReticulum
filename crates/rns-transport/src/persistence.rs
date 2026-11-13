@@ -1054,8 +1054,9 @@ pub struct PersistedAnnounceEntry {
 
 /// Version-5 on-disk entry shape with raw announce bytes inline, accepted by
 /// [`load_announce_cache_legacy_v5`] for migration to separate packet files.
+#[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
 #[derive(Debug, Clone, Deserialize)]
-pub struct LegacyPersistedAnnounceEntryV5 {
+pub(crate) struct LegacyPersistedAnnounceEntryV5 {
     pub destination_hash: Vec<u8>,
     pub hops: u8,
     pub app_data: Option<Vec<u8>>,
@@ -1084,9 +1085,9 @@ impl PersistedAnnounceCache {
     pub const LEGACY_RAW_VERSION: u32 = 5;
 }
 
-/// Save version-6 announce metadata without raw packet bytes. Entries are
-/// copied as supplied, without filtering expiry or validating their hashes.
-pub fn save_announce_cache<'a, I>(announces: I, path: &Path) -> Result<(), PersistenceError>
+/// Save version-6 announce metadata; only tests write this file now.
+#[cfg(test)]
+pub(crate) fn save_announce_cache<'a, I>(announces: I, path: &Path) -> Result<(), PersistenceError>
 where
     I: IntoIterator<Item = &'a crate::actor::RecentAnnounce>,
 {
@@ -1122,7 +1123,9 @@ where
 /// Decode version-6 announce metadata. Other versions are rejected; this does
 /// not fall back to the legacy reader or validate field lengths, signatures,
 /// expiry or the referenced packet files.
-pub fn load_announce_cache(path: &Path) -> Result<Vec<PersistedAnnounceEntry>, PersistenceError> {
+pub(crate) fn load_announce_cache(
+    path: &Path,
+) -> Result<Vec<PersistedAnnounceEntry>, PersistenceError> {
     let data = std::fs::read(path).map_err(PersistenceError::Io)?;
     let persisted: PersistedAnnounceCache =
         rmp_serde::from_slice(&data).map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
@@ -1140,7 +1143,7 @@ pub fn load_announce_cache(path: &Path) -> Result<Vec<PersistedAnnounceEntry>, P
 /// Decode a version-5 announce cache with inline raw bytes. This reader rejects
 /// other versions and does not validate the embedded packets. Call
 /// [`migrate_legacy_announce_entries`] explicitly to create separate cache files.
-pub fn load_announce_cache_legacy_v5(
+pub(crate) fn load_announce_cache_legacy_v5(
     path: &Path,
 ) -> Result<Vec<LegacyPersistedAnnounceEntryV5>, PersistenceError> {
     let data = std::fs::read(path).map_err(PersistenceError::Io)?;
@@ -1164,7 +1167,8 @@ pub fn load_announce_cache_legacy_v5(
 /// bytes, or a failed cache write, leave `packet_hash = None`. Cache-write
 /// errors are not returned, and an existing cache file is not checked. All
 /// other stored metadata is retained, with `last_used` unset.
-pub fn migrate_legacy_announce_entries(
+#[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
+pub(crate) fn migrate_legacy_announce_entries(
     legacy: Vec<LegacyPersistedAnnounceEntryV5>,
     announce_cache_dir: &Path,
 ) -> Vec<PersistedAnnounceEntry> {

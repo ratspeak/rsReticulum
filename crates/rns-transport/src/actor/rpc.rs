@@ -233,12 +233,13 @@ impl TransportActor {
             }
             TransportQuery::RecallDestination { dest } => {
                 let now = crate::actor::now_f64();
+                let ratchet = self.recall_ratchet(&dest, now);
                 let recalled = self.recent_announces.get(&dest).and_then(|entry| {
                     Some(RecalledDestinationRpcEntry {
                         dest_hash: entry.dest_hash,
                         public_key: entry.public_key?,
                         app_data: entry.app_data.clone(),
-                        ratchet: entry.live_ratchet(now),
+                        ratchet,
                         hops: entry.hops,
                         timestamp: entry.timestamp,
                     })
@@ -365,9 +366,11 @@ impl TransportActor {
             }
             TransportQuery::DropRecentAnnounces => {
                 let cleared = self.recent_announces.len();
-                self.recent_announces.clear();
+                for (dest, _) in self.recent_announces.drain() {
+                    self.kd.pending.mark_deleted(dest);
+                }
                 self.state_dirty = true;
-                self.known_destinations_dirty = true;
+                self.flush_known_destinations();
                 self.save_routing_state();
                 TransportQueryResponse::IntResult(cleared as i64)
             }
