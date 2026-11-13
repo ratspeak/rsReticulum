@@ -10,8 +10,8 @@ use rmpv::Value;
 use rns_wire::constants::RATCHET_EXPIRY;
 
 use super::{
-    AnnounceCacheStore, AnnounceRow, DestHash, KdBatch, KnownDestinationRow, KnownDestinationStore,
-    PacketHash, Ratchet, RatchetRow, RejectedTable, StoreError,
+    AnnounceCacheStore, AnnounceFacts, AnnounceRow, DestHash, KdBatch, KnownDestinationRow,
+    KnownDestinationStore, PacketHash, Ratchet, RatchetRow, RejectedTable, StoreError,
 };
 use crate::persistence::{self, PersistenceError};
 
@@ -333,6 +333,7 @@ pub fn import_rust_announce_cache(
         row.stamp = e.stamp;
         row.stamp_value = e.stamp_value;
         row.lr_cost = e.lr_cost;
+        row.announce_facts = e.facts;
         let ratchet = e
             .ratchet
             .map(|r| RatchetRow::new(e.dest, r, e.ratchet_received.unwrap_or(now)));
@@ -355,11 +356,19 @@ struct RustEntry {
     lr_cost: Option<f64>,
     ratchet: Option<Ratchet>,
     ratchet_received: Option<f64>,
+    facts: Option<AnnounceFacts>,
+}
+
+/// The cache stored a zero name hash for an entry whose announce it no longer had.
+fn stored_facts(hops: u8, name_hash: &[u8], path_response: bool) -> Option<AnnounceFacts> {
+    let name_hash: [u8; 10] = name_hash.try_into().ok()?;
+    (name_hash != [0u8; 10]).then(|| AnnounceFacts::new(hops, name_hash, path_response))
 }
 
 impl RustEntry {
     fn from_v6(e: persistence::PersistedAnnounceEntry) -> Option<Self> {
         Some(Self {
+            facts: stored_facts(e.hops, &e.name_hash, e.is_path_response),
             dest: <DestHash>::try_from(e.destination_hash).ok()?,
             timestamp: e.timestamp,
             public_key: e.public_key.and_then(|k| k.try_into().ok()),
@@ -376,14 +385,23 @@ impl RustEntry {
     }
 
     fn from_v5(e: persistence::LegacyPersistedAnnounceEntryV5) -> Option<Self> {
+        // The inline announce is written out as a legacy file under this hash.
+        let header = rns_wire::header::PacketHeader::unpack(&e.raw_packet)
+            .ok()
+            .map(|(header, _)| header);
+        let path_response = header
+            .as_ref()
+            .is_some_and(|h| h.context == rns_wire::context::PacketContext::PathResponse);
         Some(Self {
+            facts: stored_facts(e.hops, &e.name_hash, path_response),
             dest: <DestHash>::try_from(e.destination_hash).ok()?,
             timestamp: e.timestamp,
             public_key: e.public_key.and_then(|k| k.try_into().ok()),
             app_data: e.app_data,
             retained: e.retained,
             last_used: None,
-            packet_hash: None,
+            packet_hash: header
+                .map(|h| rns_wire::hash::packet_hash(&e.raw_packet, h.flags.header_type)),
             stamp: None,
             stamp_value: 0.0,
             lr_cost: None,

@@ -1,6 +1,21 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+/// Who owns the storage directory an actor is given (Reticulum.py
+/// `is_shared_instance` / `is_standalone_instance` against
+/// `is_connected_to_shared_instance`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum StorageRole {
+    /// This process owns the directory: it imports legacy files, restores
+    /// paths, and writes.
+    #[default]
+    Owner,
+    /// A shared instance owns the directory. This process loads the known
+    /// destinations read-only once and writes nothing.
+    SharedInstanceClient,
+}
+
 /// Settings an actor takes at construction and keeps for its lifetime.
 /// `Default` is a foreground actor with a per-boot identity policy and no
 /// hop offset.

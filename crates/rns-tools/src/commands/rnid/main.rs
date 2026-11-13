@@ -694,9 +694,12 @@ async fn ensure_reticulum<'a>(
     Ok(ctx.handle.as_ref().expect("started"))
 }
 
-/// Known `(destination hash, public key)` pairs visible to this process: the
-/// runtime's restored and live announce table, the announce packets a running
-/// instance has cached in storage, and a legacy Python `known_destinations`.
+/// Known `(destination hash, public key)` pairs visible to this process. The
+/// transport's table is `known_destinations.db`, which it loaded at start,
+/// read-only when this process is the client of a shared instance, as
+/// upstream's `rnid` gets it from `Identity.load_known_destinations`. The files
+/// from before the database are read only while they still exist: an owner
+/// imports them at start.
 async fn known_identities(args: &Args, handle: &ReticulumHandle) -> Result<Vec<Known>, String> {
     let mut known = legacy_known_destinations(args)?;
     if let Some(TransportQueryResponse::Announces(announces)) = handle

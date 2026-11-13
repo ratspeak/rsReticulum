@@ -248,6 +248,8 @@ fn persisted_tunnels_load_unbound_even_when_their_interface_returns() {
     let mut reader = hub();
     reader.handle_message(TransportMessage::SetStoragePaths {
         storage_dir: dir.clone(),
+        role: crate::actor::StorageRole::Owner,
+        done: None,
     });
     assert!(
         reader.tunnel_table.get(&tunnel_id).is_some(),
@@ -308,6 +310,8 @@ fn tunnels_without_an_interface_survive_a_reload() {
     let mut reader = hub();
     reader.handle_message(TransportMessage::SetStoragePaths {
         storage_dir: dir.clone(),
+        role: crate::actor::StorageRole::Owner,
+        done: None,
     });
     assert!(
         carries(&reader, &tunnel_id, &dest),
@@ -350,6 +354,8 @@ fn legacy_sidecar_tunnels_without_an_interface_survive_a_reload() {
     let mut reader = hub();
     reader.handle_message(TransportMessage::SetStoragePaths {
         storage_dir: dir.clone(),
+        role: crate::actor::StorageRole::Owner,
+        done: None,
     });
     assert!(
         reader.tunnel_table.get(&tunnel_id).is_some(),

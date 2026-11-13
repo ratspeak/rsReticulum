@@ -38,7 +38,7 @@ mod persistence;
 mod recursive_discovery;
 mod rpc;
 mod store_worker;
-pub use options::TransportActorOptions;
+pub use options::{StorageRole, TransportActorOptions};
 use rpc::InterfaceEvent;
 
 // In-process Links need two distinguishable ingress edges even though both
@@ -279,6 +279,8 @@ pub struct TransportActor {
     /// Trusted persistence root. Prefer `initialize_storage` to assigning this
     /// field when saved state must also be loaded.
     pub(crate) storage_dir: Option<PathBuf>,
+    /// Who owns `storage_dir`; fixed when storage is initialised.
+    pub(crate) storage_role: StorageRole,
     /// One-shot guard for lazy packet-hashlist restore. The hashlist is only
     /// authoritative on an enabled transport node that is not a shared
     /// instance client, so startup cannot load it before those roles are
@@ -375,6 +377,9 @@ pub struct RecentAnnounce {
     pub stamp_value: f64,
     /// Announced link-request cost, recorded only with a valid stamp.
     pub lr_cost: Option<f64>,
+    /// False for an entry restored from a row that carries no announce facts:
+    /// `hops`, `name_hash`, and `is_path_response` are then unknown, not zero.
+    pub facts_known: bool,
 }
 
 impl RecentAnnounce {
@@ -583,6 +588,7 @@ impl TransportActor {
             is_shared_instance: false,
             shared_instance_client_mode: false,
             storage_dir: None,
+            storage_role: StorageRole::Owner,
             hashlist_load_attempted: false,
             last_state_save: 0.0,
             state_dirty: false,
@@ -633,12 +639,32 @@ impl TransportActor {
     /// Read/parse failures are logged instead of returned, and loading may write
     /// legacy cache migrations. Repeated calls do not reset the actor to an empty
     /// state; this is not a storage-isolation or identity-switch operation.
+    ///
+    /// The actor owns the directory: this is the start for an actor without a
+    /// runtime. Use [`Self::initialize_storage_as`] when a shared instance may
+    /// own it.
     pub fn initialize_storage(&mut self, storage_dir: PathBuf) {
+        self.initialize_storage_as(storage_dir, StorageRole::Owner);
+    }
+
+    /// [`Self::initialize_storage`] for a known role, in upstream's order
+    /// (Reticulum.py starts the local interface, then
+    /// `Identity.load_known_destinations`, then `Transport.start`). An owner
+    /// imports the legacy files, then restores its paths. A shared-instance
+    /// client loads the known destinations read-only and restores nothing.
+    pub fn initialize_storage_as(&mut self, storage_dir: PathBuf, role: StorageRole) {
         self.kd.attach_storage(&storage_dir);
         self.storage_dir = Some(storage_dir);
+        self.storage_role = role;
+        let rows = self.kd.start(role == StorageRole::Owner, now_f64());
         self.load_state();
-        self.load_known_destinations();
+        self.merge_known_destinations(rows);
         self.maybe_load_hashlist();
+    }
+
+    /// True when a shared instance owns the storage directory.
+    pub(crate) fn storage_client(&self) -> bool {
+        self.shared_instance_client_mode || self.storage_role == StorageRole::SharedInstanceClient
     }
 
     /// Consume the actor and service ordinary commands, dedicated control lanes
@@ -1231,7 +1257,8 @@ impl TransportActor {
                 // name, immediately so later queries see them. Accepted
                 // clients' names recur across restarts for other peers.
                 if !accepted_child {
-                    self.drain_pending_for_interface(id, &iface_name);
+                    let upstream_name = self.interfaces[&id].upstream_name().to_string();
+                    self.drain_pending_for_interface(id, &iface_name, &upstream_name);
                 }
                 // Python interface registration does not trigger announce
                 // retransmission. Cached/path-response announces stay queued
@@ -1242,9 +1269,16 @@ impl TransportActor {
                 debug!(id, "deregistering interface");
                 self.deregister_interface(id);
             }
-            TransportMessage::SetStoragePaths { storage_dir } => {
-                debug!(path = %storage_dir.display(), "setting storage paths");
-                self.initialize_storage(storage_dir);
+            TransportMessage::SetStoragePaths {
+                storage_dir,
+                role,
+                done,
+            } => {
+                debug!(path = %storage_dir.display(), ?role, "setting storage paths");
+                self.initialize_storage_as(storage_dir, role);
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
             }
             TransportMessage::RegisterReceipt {
                 truncated_hash,
@@ -3273,6 +3307,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
 
@@ -3359,6 +3394,7 @@ mod tests {
                     stamp: None,
                     stamp_value: 0.0,
                     lr_cost: None,
+                    facts_known: true,
                 },
             );
         }
@@ -3456,6 +3492,7 @@ mod tests {
                     stamp: None,
                     stamp_value: 0.0,
                     lr_cost: None,
+                    facts_known: true,
                 },
             );
         }
@@ -3481,6 +3518,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
         let mut target_path =
@@ -6302,6 +6340,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
 
@@ -6356,6 +6395,7 @@ mod tests {
                     stamp: None,
                     stamp_value: 0.0,
                     lr_cost: None,
+                    facts_known: true,
                 },
             );
         }
@@ -8526,6 +8566,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
         actor.blackhole_table.add_with_reason(
@@ -9238,6 +9279,7 @@ mod tests {
             stamp: None,
             stamp_value: 0.0,
             lr_cost: None,
+            facts_known: true,
         }];
 
         let dir = std::env::temp_dir().join("reticulum_rs_test_announce_cache");
@@ -9440,6 +9482,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A table names its interface by the hash of upstream's `str(interface)`
+    /// (Transport.py `find_interface_from_hash`); one an earlier version of
+    /// this crate wrote hashes the registered name. Both bind, by the hash
+    /// alone or by the name kept with the cached announce, and what is saved
+    /// afterwards carries upstream's hash.
+    #[cfg(feature = "sqlite-store")]
+    #[test]
+    fn a_restored_path_binds_by_upstreams_interface_string_or_the_registered_name() {
+        const UPSTREAM: &str = "TCPInterface[uplink/127.0.0.1:4242]";
+        for (saved_as, cached_reference) in [
+            (UPSTREAM, Some(UPSTREAM)),
+            (UPSTREAM, None),
+            ("uplink", Some("uplink")),
+            ("uplink", None),
+        ] {
+            let dir = unique_temp_dir("rebind-upstream-name");
+            let now = now_f64();
+            let mut path = crate::path_table::PathEntry::new(None, 1, 7, InterfaceMode::Gateway);
+            path.timestamp = now;
+            path.expires = now + 3600.0;
+            path.packet_hash = Some([0x11; 32]);
+            let mut table = crate::path_table::PathTable::new();
+            table.insert([0xCA; 16], path);
+            let names = std::collections::HashMap::from([(7u64, saved_as.to_string())]);
+            let table_path = dir.join("destination_table");
+            crate::persistence::save_python_destination_table(&table, &names, &table_path).unwrap();
+            crate::store::seed_cached_announce(&dir, &[0x11; 32], &[0xFE; 42], cached_reference)
+                .unwrap();
+
+            let (mut actor, _tx) = TransportActor::new();
+            actor.initialize_storage(dir.clone());
+            assert_eq!(actor.pending_path_entries.len(), 1);
+            let (mut entry, _rx) = make_test_interface("uplink");
+            entry.inspection = Some(crate::messages::InterfaceInspectionSource::identified(
+                crate::messages::InterfaceIdentity::new(UPSTREAM, "uplink", "TCPClientInterface"),
+            ));
+            actor.handle_message(TransportMessage::RegisterInterface { id: 42, entry });
+            assert!(
+                actor.path_table.has_path(&[0xCA; 16]),
+                "saved as {saved_as}, cached with {cached_reference:?}"
+            );
+
+            actor.save_state();
+            let saved = crate::persistence::load_python_destination_table(&table_path).unwrap();
+            assert_eq!(
+                saved[0].interface_hash,
+                crate::persistence::interface_hash_from_name(UPSTREAM)
+            );
+            actor.on_shutdown();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     #[test]
     fn shared_connection_restored_discards_local_routing_state() {
         let (mut actor, _tx) = TransportActor::new();
@@ -9487,6 +9582,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
 
@@ -9750,6 +9846,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
 
@@ -11461,6 +11558,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
 
@@ -12099,6 +12197,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
 
@@ -12189,6 +12288,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
 
@@ -12278,6 +12378,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
 
@@ -12424,6 +12525,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
 
@@ -13159,6 +13261,7 @@ mod tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
     }

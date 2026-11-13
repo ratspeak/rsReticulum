@@ -218,6 +218,7 @@ impl TransportActor {
                             name_hash: a.name_hash,
                             is_path_response,
                             retained: a.retained,
+                            facts_known: a.facts_known,
                         }
                     })
                     .collect();
@@ -242,6 +243,7 @@ impl TransportActor {
                         ratchet,
                         hops: entry.hops,
                         timestamp: entry.timestamp,
+                        hops_known: entry.facts_known,
                     })
                 });
                 // Identity.py: fall back to a registered local destination.
@@ -254,6 +256,7 @@ impl TransportActor {
                             ratchet: None,
                             hops: 0,
                             timestamp: now_f64(),
+                            hops_known: true,
                         }
                     })
                 });

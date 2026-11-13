@@ -45,6 +45,7 @@ use rns_identity::destination::{
     Direction,
 };
 use rns_identity::identity::Identity;
+use rns_transport::actor::StorageRole;
 use rns_transport::await_path::{AwaitPathError, await_path};
 use rns_transport::constants::ANNOUNCE_CAP;
 use rns_transport::constants::DESTINATION_TIMEOUT;
@@ -1565,12 +1566,14 @@ impl ReticulumHandle {
         )
         .await?;
         let recalled = recalled_destination_from_rpc(recalled)?;
-        let (establishment_timeout, hops) = match options.establishment_timeout {
-            Some(timeout) => (timeout, recalled.hops),
+        // Link.py takes the hop count from `Transport.hops_to`, the path, never
+        // from the remembered announce, whose hop count may be older or unknown.
+        let hops = self.hops_to(destination_hash).await?;
+        let establishment_timeout = match options.establishment_timeout {
+            Some(timeout) => timeout,
             None => {
-                let hops = self.hops_to(destination_hash).await?;
                 let first_hop_timeout = self.first_hop_timeout(destination_hash).await?;
-                (link_establishment_timeout(first_hop_timeout, hops)?, hops)
+                link_establishment_timeout(first_hop_timeout, hops)?
             }
         };
 
@@ -3106,6 +3109,34 @@ fn shared_tcp_port_is_free(port: u16) -> bool {
 }
 
 /// Reticulum.py: an unreachable shared instance leaves this process standalone.
+/// Starts the transport's storage once this process knows whether it owns its
+/// directory or is the client of a shared instance. Reticulum.py binds or
+/// connects the local interface before `Identity.load_known_destinations` and
+/// `Transport.start`; the first call here does the same, before the local
+/// interface is registered with the transport.
+struct TransportStorageStart<'a> {
+    transport_tx: &'a mpsc::Sender<TransportMessage>,
+    storage_dir: &'a Path,
+    started: bool,
+}
+
+impl TransportStorageStart<'_> {
+    async fn start(&mut self, role: StorageRole) {
+        if std::mem::replace(&mut self.started, true) {
+            return;
+        }
+        let (done, loaded) = tokio::sync::oneshot::channel();
+        let message = TransportMessage::SetStoragePaths {
+            storage_dir: self.storage_dir.to_path_buf(),
+            role,
+            done: Some(done),
+        };
+        if self.transport_tx.send(message).await.is_ok() {
+            let _ = loaded.await;
+        }
+    }
+}
+
 fn shared_instance_unreachable(error: &dyn std::fmt::Display) -> InstanceMode {
     tracing::error!("Local shared instance appears to be running, but it could not be connected");
     tracing::error!("The contained exception was: {error}");
@@ -3885,7 +3916,6 @@ pub async fn init_with_policy(
     let path_recovery = actor.path_recovery_handle();
     let link_endpoint_dispatch = actor.link_endpoint_dispatch_handle();
     let announce_dispatch = actor.announce_dispatch_handle();
-    actor.initialize_storage(paths.storage_dir.clone());
 
     let transport_completion = Arc::new(TransportCompletion::default());
     let id_gen = Arc::new(AtomicU64::new(1));
@@ -4005,6 +4035,11 @@ pub async fn init_with_policy(
     });
     let mut shared_instance_status = None;
     let interface_manager = Arc::new(OnceLock::new());
+    let mut storage = TransportStorageStart {
+        transport_tx: &transport_tx,
+        storage_dir: &paths.storage_dir,
+        started: false,
+    };
     let configured_policy = matches!(policy, InstancePolicy::Configured);
     let mut would_own_shared_instance = false;
     let instance_mode = if matches!(
@@ -4028,6 +4063,7 @@ pub async fn init_with_policy(
                     shutdown.clone(),
                 )
                 .await?;
+                storage.start(StorageRole::SharedInstanceClient).await;
                 let mode = adopt_shared_instance_client(
                     client,
                     &transport_tx,
@@ -4063,6 +4099,7 @@ pub async fn init_with_policy(
             )
             .await
             .map_err(|_| SharedInstanceError::PacketBindFailed)?;
+            storage.start(StorageRole::Owner).await;
             apply_forced_shared_instance_bitrate(&mut server, rc.force_shared_instance_bitrate);
             register_interface_handle_with_role_and_spawn_permit(
                 &transport_tx,
@@ -4118,6 +4155,7 @@ pub async fn init_with_policy(
                 .await
                 {
                     Ok(client_handle) => {
+                        storage.start(StorageRole::SharedInstanceClient).await;
                         adopt_shared_instance_client(
                             client_handle,
                             &transport_tx,
@@ -4153,6 +4191,9 @@ pub async fn init_with_policy(
                 .await
                 {
                     Ok(server_handle) => {
+                        if !options.require_shared_instance {
+                            storage.start(StorageRole::Owner).await;
+                        }
                         let mut server_handle = server_handle;
                         apply_forced_shared_instance_bitrate(
                             &mut server_handle,
@@ -4193,6 +4234,7 @@ pub async fn init_with_policy(
                             .await
                             {
                                 Ok(client_handle) => {
+                                    storage.start(StorageRole::SharedInstanceClient).await;
                                     adopt_shared_instance_client(
                                         client_handle,
                                         &transport_tx,
@@ -4260,6 +4302,7 @@ pub async fn init_with_policy(
                 .await
                 {
                     Ok(client_handle) => {
+                        storage.start(StorageRole::SharedInstanceClient).await;
                         adopt_shared_instance_client(
                             client_handle,
                             &transport_tx,
@@ -4293,6 +4336,9 @@ pub async fn init_with_policy(
                 .await
                 {
                     Ok(server_handle) => {
+                        if !options.require_shared_instance {
+                            storage.start(StorageRole::Owner).await;
+                        }
                         let mut server_handle = server_handle;
                         apply_forced_shared_instance_bitrate(
                             &mut server_handle,
@@ -4333,6 +4379,7 @@ pub async fn init_with_policy(
                         .await
                         {
                             Ok(client_handle) => {
+                                storage.start(StorageRole::SharedInstanceClient).await;
                                 adopt_shared_instance_client(
                                     client_handle,
                                     &transport_tx,
@@ -4373,6 +4420,8 @@ pub async fn init_with_policy(
         shutdown_coordinator.start_and_wait().await;
         return Err(ReticulumError::RequiredSharedInstanceUnavailable.into());
     }
+    // A standalone instance, and one whose shared socket could not be used, owns its directory.
+    storage.start(StorageRole::Owner).await;
 
     if instance_mode == InstanceMode::Client {
         if rc.enable_transport
@@ -13806,6 +13855,19 @@ loglevel = 7
                     entry
                 })))
                 .expect("recall response receiver");
+
+            let TransportMessage::Rpc { query, response_tx } =
+                transport_rx.recv().await.expect("hop query")
+            else {
+                panic!("expected transport RPC");
+            };
+            assert!(matches!(
+                query,
+                TransportQuery::HopsTo { dest } if dest == destination_hash
+            ));
+            response_tx
+                .send(TransportQueryResponse::IntResult(3))
+                .expect("hop response");
         });
 
         let mut handle = dummy_handle();
@@ -13824,7 +13886,7 @@ loglevel = 7
             .unwrap();
         assert_eq!(config.destination_hash, destination_hash);
         assert_eq!(config.remote_public_key, remote_public_key);
-        assert_eq!(config.hops, 7);
+        assert_eq!(config.hops, 3, "the path's hops, not the announce's");
         assert_eq!(config.establishment_timeout, Duration::ZERO);
         assert_eq!(config.client_label, "example.client");
         assert!(config.track_phy_stats);

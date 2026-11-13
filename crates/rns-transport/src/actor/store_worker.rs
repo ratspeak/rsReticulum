@@ -5,7 +5,9 @@
 //! cached announces through its own read-only connections.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "sqlite-store")]
+use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -16,7 +18,7 @@ use tracing::{debug, error, trace, warn};
 use super::RecentAnnounce;
 use crate::constants::{ANNOUNCE_CACHE_FLUSH_INTERVAL, ANNOUNCE_CACHE_MAX_PENDING};
 use crate::store::{
-    AnnounceCacheStore, AnnounceRow, ApplyReport, CachedAnnounce, DestHash, KdBatch,
+    AnnounceCacheStore, AnnounceFacts, AnnounceRow, ApplyReport, CachedAnnounce, DestHash, KdBatch,
     KnownDestinationRow, KnownDestinationStore, MemoryStore, PacketHash, Ratchet, RatchetRow,
     RejectedTable, StoreError,
 };
@@ -54,11 +56,18 @@ enum StoreJob {
     AnnounceClean {
         keep: HashSet<PacketHash>,
     },
-    #[cfg(feature = "sqlite-store")]
-    Load {
+    Start {
+        owner: bool,
         now: f64,
-        reply: std_mpsc::Sender<Result<Vec<KnownDestinationRow>, StoreError>>,
+        reply: std_mpsc::Sender<Started>,
     },
+}
+
+/// What the start-up job found.
+struct Started {
+    rows: Vec<KnownDestinationRow>,
+    /// The announce cache is in its database; false keeps it in the actor's memory.
+    announces_stored: bool,
 }
 
 /// Outcome of one job, delivered to the actor.
@@ -150,8 +159,7 @@ fn run(
     jobs: std_mpsc::Receiver<StoreJob>,
     results: tokio_mpsc::UnboundedSender<StoreResult>,
 ) {
-    // Opened on the first write, so a process that only reads never creates or
-    // writes the file.
+    // An owner opens both stores at start-up. A client never sends a write.
     let mut slot: Option<Box<dyn KnownDestinationStore>> = None;
     let mut announces = AnnounceSlot::default();
     while let Ok(job) = jobs.recv() {
@@ -162,7 +170,7 @@ fn run(
                 reply,
             } => {
                 let is_known = |h: &DestHash| known.contains(h);
-                let store = writable(&mut slot, &source);
+                let store = writable(&mut slot, &mut announces, &source);
                 let result = match store.apply(&batch, &is_known) {
                     Ok(report) => StoreResult::Applied { report },
                     Err(error) => StoreResult::Failed { batch, error },
@@ -177,7 +185,7 @@ fn run(
                 }
             }
             StoreJob::ExpireRatchets { cutoff } => {
-                let store = writable(&mut slot, &source);
+                let store = writable(&mut slot, &mut announces, &source);
                 let result = match store.expire_ratchets(cutoff) {
                     Ok(removed) => StoreResult::Expired {
                         removed: removed.len(),
@@ -213,56 +221,128 @@ fn run(
                     }
                 }
             }
-            #[cfg(feature = "sqlite-store")]
-            StoreJob::Load { now, reply } => {
-                let out = match &source {
-                    StoreSource::Memory => Vec::new(),
-                    StoreSource::Sqlite { known, .. } => load_at_start(known, now),
+            StoreJob::Start { owner, now, reply } => {
+                let started = if owner {
+                    start_owner(&mut slot, &mut announces, &source, now)
+                } else {
+                    Started {
+                        rows: load_for_client(&source),
+                        announces_stored: false,
+                    }
                 };
-                let _ = reply.send(Ok(out));
+                let _ = reply.send(started);
             }
         }
     }
 }
 
-/// The writable store for the worker. The first write opens the file and runs any
-/// pending legacy import; if the file cannot be opened the session continues on a
-/// `MemoryStore`, logged once.
+/// Owner start-up, in upstream's order: `Identity.load_known_destinations`
+/// opens the database, imports the legacy files, and loads every row; then
+/// `Transport.init_announce_cache` opens the announce cache and imports its
+/// legacy files, which by then include the announces a version 5 Rust cache
+/// carried inline.
+fn start_owner(
+    slot: &mut Option<Box<dyn KnownDestinationStore>>,
+    announces: &mut AnnounceSlot,
+    source: &StoreSource,
+    now: f64,
+) -> Started {
+    let (mut store, durable) = open_known(source, now);
+    let rows = if durable {
+        read_rows(store.as_mut()).unwrap_or_else(|e| {
+            error!("could not load known destinations: {e}; continuing with an empty table");
+            Vec::new()
+        })
+    } else {
+        rows_without_database(source, now)
+    };
+    *slot = Some(store);
+    let announces_stored = announces.writable(source).is_some();
+    Started {
+        rows,
+        announces_stored,
+    }
+}
+
+/// A shared-instance client reads the owner's database once, read-only, and
+/// nothing else (`Identity.load_known_destinations`, shared-instance branch).
+fn load_for_client(source: &StoreSource) -> Vec<KnownDestinationRow> {
+    match source {
+        StoreSource::Memory => Vec::new(),
+        #[cfg(feature = "sqlite-store")]
+        StoreSource::Sqlite { known, .. } => {
+            // Upstream logs an error for a missing file too; a client whose
+            // directory is not the owner's has none, and that is not a fault.
+            if !known.is_file() {
+                debug!("no known destinations database to load as a shared-instance client");
+                return Vec::new();
+            }
+            let read = SqliteKnownDestinations::open_ro(known)
+                .and_then(|mut reader| read_rows(&mut reader));
+            read.unwrap_or_else(|e| {
+                error!(
+                    "could not load known destinations from the shared instance's database: {e}; continuing with an empty table"
+                );
+                Vec::new()
+            })
+        }
+    }
+}
+
+/// The rows for a session whose database could not be opened for writing:
+/// what a read-only connection still gives, with the legacy files staged over
+/// it and left in place (upstream's `load_known_destinations_legacy`).
+fn rows_without_database(source: &StoreSource, now: f64) -> Vec<KnownDestinationRow> {
+    #[cfg(not(feature = "sqlite-store"))]
+    let _ = now;
+    match source {
+        StoreSource::Memory => Vec::new(),
+        #[cfg(feature = "sqlite-store")]
+        StoreSource::Sqlite { known, .. } => read_and_stage(known, now),
+    }
+}
+
+/// Opens the known-destinations store and imports the legacy files. If the file
+/// cannot be opened the session continues on a `MemoryStore`, logged once; the
+/// flag says whether the store is the database.
+fn open_known(source: &StoreSource, now: f64) -> (Box<dyn KnownDestinationStore>, bool) {
+    #[cfg(not(feature = "sqlite-store"))]
+    let _ = now;
+    match source {
+        StoreSource::Memory => (Box::new(MemoryStore::new()), false),
+        #[cfg(feature = "sqlite-store")]
+        StoreSource::Sqlite { known: path, .. } => match SqliteKnownDestinations::open_rw(path) {
+            Ok(mut store) => {
+                import_known_sources(&LegacyFiles::beside(path), now, &mut store, true);
+                (Box::new(store), true)
+            }
+            Err(e) => {
+                error!(
+                    path = %path.display(),
+                    "could not open the known destinations database, keeping entries in memory for this session: {e}; remove the known_destinations.db* files or update to recover"
+                );
+                (Box::new(MemoryStore::new()), false)
+            }
+        },
+    }
+}
+
+/// The writable store. An owner's start-up has opened it; an actor whose storage
+/// was only attached opens it at its first write, imports included.
 fn writable<'a>(
     slot: &'a mut Option<Box<dyn KnownDestinationStore>>,
+    announces: &mut AnnounceSlot,
     source: &StoreSource,
 ) -> &'a mut dyn KnownDestinationStore {
     if slot.is_none() {
-        let store: Box<dyn KnownDestinationStore> = match source {
-            StoreSource::Memory => Box::new(MemoryStore::new()),
-            #[cfg(feature = "sqlite-store")]
-            StoreSource::Sqlite { known: path, .. } => match SqliteKnownDestinations::open_rw(path)
-            {
-                Ok(mut store) => {
-                    import_known_sources(
-                        &LegacyFiles::beside(path),
-                        crate::now_f64(),
-                        &mut store,
-                        true,
-                    );
-                    Box::new(store)
-                }
-                Err(e) => {
-                    error!(
-                        path = %path.display(),
-                        "could not open the known destinations database, keeping entries in memory for this session: {e}; remove the known_destinations.db* files or update to recover"
-                    );
-                    Box::new(MemoryStore::new())
-                }
-            },
-        };
-        *slot = Some(store);
+        *slot = Some(open_known(source, crate::now_f64()).0);
+        // A version 5 Rust cache has just written its inline announces out as
+        // legacy files; an announce cache that is already open takes them now.
+        announces.import_legacy(source);
     }
     slot.as_deref_mut().expect("store opened above")
 }
 
-// Used by the import, which needs the SQLite store.
-#[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
 fn read_rows(
     store: &mut dyn KnownDestinationStore,
 ) -> Result<Vec<KnownDestinationRow>, StoreError> {
@@ -271,6 +351,7 @@ fn read_rows(
     Ok(rows)
 }
 
+#[cfg(feature = "sqlite-store")]
 fn has_entries(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
 }
@@ -378,12 +459,10 @@ fn import_known_sources(
     }
 }
 
-/// Startup read (Python `Identity.load_known_destinations`). Rows already in the
-/// database come through a read-only connection; legacy rows are staged over them in
-/// memory. Nothing is written or renamed here: the first write imports the sources,
-/// so a shared-instance client that never writes leaves its directory alone.
+/// Rows already in the database, through a read-only connection, with the legacy
+/// rows staged over them in memory. Nothing is written or renamed.
 #[cfg(feature = "sqlite-store")]
-fn load_at_start(path: &Path, now: f64) -> Vec<KnownDestinationRow> {
+fn read_and_stage(path: &Path, now: f64) -> Vec<KnownDestinationRow> {
     let mut rows: HashMap<DestHash, KnownDestinationRow> = HashMap::new();
     if path.is_file() {
         let read = SqliteKnownDestinations::open_ro(path).and_then(|mut reader| {
@@ -629,9 +708,6 @@ pub(super) struct KdState {
     pub(super) results: tokio_mpsc::UnboundedReceiver<StoreResult>,
     /// Cached announces not yet known to be stored.
     announces: AnnouncePending,
-    /// `storage/cache/announces` while it may still hold files from before the
-    /// database; a fetch that misses everywhere else reads the file there.
-    legacy_announce_dir: Option<PathBuf>,
     #[cfg(feature = "sqlite-store")]
     db_path: Option<PathBuf>,
     #[cfg(feature = "sqlite-store")]
@@ -656,7 +732,6 @@ impl KdState {
                 in_memory: true,
                 ..AnnouncePending::default()
             },
-            legacy_announce_dir: None,
             #[cfg(feature = "sqlite-store")]
             db_path: None,
             #[cfg(feature = "sqlite-store")]
@@ -672,15 +747,13 @@ impl KdState {
     /// opened here; each file is opened by the worker when a job needs it.
     pub(super) fn attach_storage(&mut self, dir: &Path) {
         self.close(Instant::now() + EXIT_FLUSH_DEADLINE);
-        let cache_dir = dir.join("cache");
-        self.legacy_announce_dir = Some(cache_dir.join("announces"));
         self.announces = AnnouncePending::default();
         #[cfg(feature = "sqlite-store")]
         {
             let path = dir.join("known_destinations.db");
             self.reader = None;
             self.db_path = Some(path.clone());
-            let announces = cache_dir.join("announces.db");
+            let announces = dir.join("cache").join("announces.db");
             self.announce_reader = None;
             self.announce_db_path = Some(announces.clone());
             self.source = Some(StoreSource::Sqlite {
@@ -690,6 +763,7 @@ impl KdState {
         }
         #[cfg(not(feature = "sqlite-store"))]
         {
+            let _ = dir;
             self.announces.in_memory = true;
             self.source = Some(StoreSource::Memory);
         }
@@ -707,27 +781,33 @@ impl KdState {
         }
     }
 
-    /// Startup: runs the legacy imports and loads every stored row. Called from
-    /// `initialize_storage`, before the actor loop starts.
-    #[cfg(feature = "sqlite-store")]
-    pub(super) fn load_at_start(&mut self, now: f64) -> Vec<KnownDestinationRow> {
+    /// Start-up, before the actor serves anything: an owner opens both stores,
+    /// imports the legacy files, and loads every row; a client reads the rows
+    /// read-only. Waits for the worker, which does the file work.
+    pub(super) fn start(&mut self, owner: bool, now: f64) -> Vec<KnownDestinationRow> {
         let (tx, rx) = std_mpsc::channel();
-        if self.submit(StoreJob::Load { now, reply: tx }).is_err() {
-            return Vec::new();
-        }
-        match rx.recv() {
-            Ok(Ok(rows)) => rows,
-            Ok(Err(e)) => {
-                error!("could not load known destinations: {e}; continuing with an empty table");
+        let job = StoreJob::Start {
+            owner,
+            now,
+            reply: tx,
+        };
+        let started = match self.submit(job) {
+            Ok(()) => rx.recv().ok(),
+            Err(_) => None,
+        };
+        match started {
+            Some(started) => {
+                if owner && !started.announces_stored {
+                    self.announces.in_memory = true;
+                }
+                started.rows
+            }
+            None => {
+                error!("the store worker is not running; continuing without stored state");
+                self.announces.in_memory = true;
                 Vec::new()
             }
-            Err(_) => Vec::new(),
         }
-    }
-
-    #[cfg(not(feature = "sqlite-store"))]
-    pub(super) fn load_at_start(&mut self, _now: f64) -> Vec<KnownDestinationRow> {
-        Vec::new()
     }
 
     /// Queues the pending marks as one batch without waiting for the store.
@@ -761,16 +841,6 @@ impl KdState {
             return;
         }
         self.shutdown_announces(deadline);
-        // An empty batch still opens the writable store, which runs any pending legacy import.
-        let (tx, rx) = std_mpsc::channel();
-        let open = StoreJob::Apply {
-            batch: KdBatch::default(),
-            known: HashSet::new(),
-            reply: Some(tx),
-        };
-        if self.submit(open).is_ok() {
-            let _ = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-        }
         // A failed batch is restored; a few rounds drain what can be written.
         for _ in 0..3 {
             self.drain_results();
@@ -828,9 +898,8 @@ impl KdState {
     }
 
     /// A cached announce (`AnnounceCache.fetch`): the row the actor still holds,
-    /// then the stored row, then a file from before the database. A shared-instance
-    /// client passes `allow_db = false` and never opens the database; like
-    /// upstream's `Transport.get_cached_packet` it still reads a legacy file.
+    /// then the stored row. A shared-instance client passes `allow_db = false`
+    /// and never opens the database.
     pub(super) fn fetch_announce(
         &mut self,
         packet_hash: &PacketHash,
@@ -839,13 +908,11 @@ impl KdState {
         if let Some(row) = self.announces.get(packet_hash) {
             return Some((row.raw.clone(), row.interface_reference.clone()));
         }
-        let stored = if allow_db {
-            self.fetch_stored_announce(packet_hash)
-        } else {
+        if !allow_db {
             self.close_announce_reader();
-            None
-        };
-        stored.or_else(|| self.fetch_legacy_announce(packet_hash))
+            return None;
+        }
+        self.fetch_stored_announce(packet_hash)
     }
 
     #[cfg(feature = "sqlite-store")]
@@ -876,25 +943,6 @@ impl KdState {
         #[cfg(feature = "sqlite-store")]
         {
             self.announce_reader = None;
-        }
-    }
-
-    /// Reads `storage/cache/announces/<hash>`, written before the database held the
-    /// cache and not yet imported. Looked at only while that directory holds files.
-    fn fetch_legacy_announce(&mut self, packet_hash: &PacketHash) -> Option<CachedAnnounce> {
-        let dir = self.legacy_announce_dir.as_ref()?;
-        match crate::persistence::load_python_cached_announce(dir, packet_hash) {
-            Ok(Some(cached)) => Some((cached.raw_packet, cached.interface_reference)),
-            Ok(None) => {
-                if !has_entries(dir) {
-                    self.legacy_announce_dir = None;
-                }
-                None
-            }
-            Err(e) => {
-                trace!("could not read legacy cached announce: {e}");
-                None
-            }
         }
     }
 
@@ -954,7 +1002,7 @@ impl KdState {
     }
 
     /// A shared-instance client has no announce cache: drops every announce the
-    /// actor holds and the read connection a restore at start-up may have opened.
+    /// actor holds and any read connection.
     pub(super) fn discard_announces(&mut self) {
         self.announces.rows.clear();
         self.announces.in_flight.clear();
@@ -989,11 +1037,10 @@ impl KdState {
     }
 
     /// Exit (`Transport.exit_handler`): writes the pending announces and waits for
-    /// the answer until `deadline`. The job also opens the database when nothing
-    /// is pending, which imports any legacy files.
+    /// the answer until `deadline`.
     fn shutdown_announces(&mut self, deadline: Instant) {
         self.drain_results();
-        if self.announces.in_memory {
+        if self.announces.in_memory || self.announces.rows.is_empty() {
             return;
         }
         let (tx, rx) = std_mpsc::channel();
@@ -1130,6 +1177,35 @@ impl AnnounceSlot {
             None => None,
         }
     }
+
+    /// Imports legacy announce files into a store that is already open.
+    fn import_legacy(&mut self, source: &StoreSource) {
+        if let Some(store) = self.store.as_mut() {
+            import_legacy_announces(store.as_mut(), source);
+        }
+    }
+}
+
+/// `Transport.init_announce_cache`: imports `storage/cache/announces` when it holds files.
+fn import_legacy_announces(store: &mut dyn AnnounceCacheStore, source: &StoreSource) {
+    #[cfg(not(feature = "sqlite-store"))]
+    let _ = store;
+    match source {
+        StoreSource::Memory => {}
+        #[cfg(feature = "sqlite-store")]
+        StoreSource::Sqlite {
+            announces: path, ..
+        } => {
+            let legacy_dir = path.with_file_name("announces");
+            if !has_entries(&legacy_dir) {
+                return;
+            }
+            match legacy::import_python_announce_cache(&legacy_dir, crate::now_f64(), store) {
+                Ok(imported) => debug!(rows = imported.imported(), "imported announce files"),
+                Err(e) => error!("could not import announce files: {e}"),
+            }
+        }
+    }
 }
 
 /// Opens `announces.db`, creating `storage/cache` first as `Reticulum.__init__` does.
@@ -1149,20 +1225,7 @@ fn open_announce_store(source: &StoreSource) -> Option<Box<dyn AnnounceCacheStor
             announces: path, ..
         } => match open_announce_db(path) {
             Ok(mut store) => {
-                // Transport.init_announce_cache: only a directory that holds files.
-                let legacy_dir = path.with_file_name("announces");
-                if has_entries(&legacy_dir) {
-                    match legacy::import_python_announce_cache(
-                        &legacy_dir,
-                        crate::now_f64(),
-                        &mut store,
-                    ) {
-                        Ok(imported) => {
-                            debug!(rows = imported.imported(), "imported announce files");
-                        }
-                        Err(e) => error!("could not import announce files: {e}"),
-                    }
-                }
+                import_legacy_announces(&mut store, source);
                 Some(Box::new(store))
             }
             Err(e) => {
@@ -1191,29 +1254,34 @@ fn known_destination_row(entry: &RecentAnnounce) -> Option<KnownDestinationRow> 
     row.stamp = entry.stamp.map(|s| s.to_vec());
     row.stamp_value = entry.stamp_value;
     row.lr_cost = entry.lr_cost;
+    row.announce_facts = entry
+        .facts_known
+        .then(|| AnnounceFacts::new(entry.hops, entry.name_hash, entry.is_path_response));
     Some(row)
 }
 
-/// A table row as the actor holds it. Hops and the name hash are not stored
-/// upstream either, so they start empty.
-#[cfg(feature = "sqlite-store")]
+/// A table row as the actor holds it. Upstream's table has no column for the
+/// hops, the name hash, or the path-response flag: without this crate's side
+/// row they are unknown.
 pub(super) fn recent_from_row(row: KnownDestinationRow) -> RecentAnnounce {
+    let facts = row.announce_facts;
     RecentAnnounce {
         dest_hash: row.destination_hash,
-        hops: 0,
+        hops: facts.map_or(0, |f| f.hops),
         app_data: row.app_data,
         timestamp: row.last_heard,
         public_key: Some(row.public_key),
         ratchet: None,
         ratchet_received: None,
         packet_hash: row.packet_hash,
-        is_path_response: false,
+        is_path_response: facts.is_some_and(|f| f.path_response),
         retained: row.used == -1.0,
         last_used: (row.used > 0.0).then_some(row.used),
-        name_hash: [0u8; 10],
+        name_hash: facts.map_or([0u8; 10], |f| f.name_hash),
         stamp: row.stamp.and_then(|s| s.try_into().ok()),
         stamp_value: row.stamp_value,
         lr_cost: row.lr_cost,
+        facts_known: facts.is_some(),
     }
 }
 
@@ -1292,6 +1360,7 @@ mod tests {
             stamp: None,
             stamp_value: 0.0,
             lr_cost: Some(3.0),
+            facts_known: true,
         }
     }
 
@@ -1344,12 +1413,13 @@ mod tests {
     fn known_destinations_and_ratchets_survive_a_restart() {
         let dir = temp_dir();
         let mut actor = actor_on(&dir);
-        actor
-            .recent_announces
-            .insert([3; 16], entry([3; 16], Some(1000.0), false));
-        actor
-            .recent_announces
-            .insert([4; 16], entry([4; 16], None, true));
+        let mut with_facts = entry([3; 16], Some(1000.0), false);
+        with_facts.name_hash = [7; 10];
+        with_facts.is_path_response = true;
+        actor.recent_announces.insert([3; 16], with_facts);
+        let mut without_facts = entry([4; 16], None, true);
+        without_facts.facts_known = false;
+        actor.recent_announces.insert([4; 16], without_facts);
         actor.kd.pending.mark_dirty([3; 16]);
         actor.kd.pending.mark_dirty([4; 16]);
         actor.remember_received_ratchet([3; 16], Some([9; 32]));
@@ -1363,7 +1433,19 @@ mod tests {
         assert_eq!(a.last_used, Some(1000.0));
         assert_eq!(a.lr_cost, Some(3.0));
         assert_eq!(a.ratchet, None, "ratchets are not loaded at start-up");
+        assert!(
+            a.facts_known,
+            "the side row restores what upstream's row cannot"
+        );
+        assert_eq!(
+            (a.hops, a.name_hash, a.is_path_response),
+            (2, [7; 10], true)
+        );
         assert!(restarted.recent_announces[&[4; 16]].retained);
+        assert!(
+            !restarted.recent_announces[&[4; 16]].facts_known,
+            "an entry stored without facts comes back with them unknown"
+        );
         let now = crate::now_f64();
         assert_eq!(restarted.recall_ratchet(&[3; 16], now), Some([9; 32]));
         assert_eq!(
@@ -1423,13 +1505,12 @@ mod tests {
         crate::persistence::save_announce_cache([&legacy], &path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
 
-        // The first write runs the import, then renames the source.
+        // Start-up runs the import, then renames the source.
         let mut actor = actor_on(&dir);
-        assert!(path.exists(), "a start-up read does not import");
-        actor.kd.pending.mark_dirty([7; 16]);
-        actor.on_shutdown();
         assert!(!path.exists());
         assert!(dir.join("announce_cache.msgpack.imported").exists());
+        assert!(actor.recent_announces[&[7; 16]].retained);
+        actor.on_shutdown();
 
         let mut restarted = actor_on(&dir);
         assert!(restarted.recent_announces[&[7; 16]].retained);
@@ -1443,7 +1524,6 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let mut again = actor_on(&dir);
         assert_eq!(again.recent_announces.len(), 1);
-        again.kd.pending.mark_dirty([7; 16]);
         again.on_shutdown();
         assert!(!path.exists());
         let again = actor_on(&dir);
@@ -1567,10 +1647,11 @@ mod tests {
             .store_announce(hash, &[2; 40], Some("second".into()));
         let latest = Some((vec![2; 40], Some("second".to_string())));
         assert_eq!(actor.kd.fetch_announce(&hash, true), latest);
-        assert!(
-            !announces_db(&dir).exists(),
-            "nothing is written before a flush"
-        );
+        let stored = SqliteAnnounceCache::open_ro(&announces_db(&dir))
+            .unwrap()
+            .fetch(&hash)
+            .unwrap();
+        assert_eq!(stored, None, "nothing is written before a flush");
 
         actor.kd.flush_announces_due(crate::now_f64());
         assert_eq!(
@@ -1653,18 +1734,17 @@ mod tests {
     /// opened for writing, and checks the cache works from memory.
     fn runs_from_memory(dir: &Path) {
         let mut actor = actor_on(dir);
+        assert!(actor.kd.announces.in_memory, "found at start-up");
         let (kept, dropped) = ([0x31; 32], [0x32; 32]);
         actor.kd.store_announce(kept, &[1; 40], Some("if0".into()));
         actor.kd.flush_announces_due(crate::now_f64());
-        settle(&mut actor);
-        assert!(actor.kd.announces.in_memory);
         assert_eq!(
             actor.kd.fetch_announce(&kept, true),
             Some((vec![1; 40], Some("if0".to_string()))),
             "an announce cached this session is still served"
         );
 
-        // Later flushes send nothing, so nothing can fail again.
+        // Flushes send nothing, so nothing can fail again.
         actor.kd.store_announce(dropped, &[2; 40], None);
         actor
             .kd
@@ -1727,45 +1807,150 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_announce_file_is_served_before_its_import_and_stored_by_the_first_write() {
+    fn an_owner_imports_legacy_announce_files_at_start() {
         let dir = temp_dir();
         let legacy = [0x41; 32];
         write_legacy_announce(&dir, &legacy, &[9; 40]);
         let mut actor = actor_on(&dir);
-        let cached = Some((vec![9; 40], Some("legacy0".to_string())));
-        assert_eq!(actor.kd.fetch_announce(&legacy, true), cached);
-        assert!(!announces_db(&dir).exists(), "a fetch writes nothing");
-        assert!(legacy_file(&dir, &legacy).exists());
-
-        actor.kd.store_announce([0x42; 32], &[1; 40], None);
-        actor.kd.flush_announces_due(crate::now_f64());
-        settle(&mut actor);
         assert!(
             !legacy_file(&dir, &legacy).exists(),
-            "the first write imports the file and removes it"
+            "start-up imports the file and removes it"
         );
-        assert_eq!(actor.kd.fetch_announce(&legacy, true), cached);
-        assert_eq!(actor.kd.fetch_announce(&[0x43; 32], true), None);
-        assert!(
-            actor.kd.legacy_announce_dir.is_none(),
-            "an empty legacy directory is not looked at again"
+        assert_eq!(
+            actor.kd.fetch_announce(&legacy, true),
+            Some((vec![9; 40], Some("legacy0".to_string())))
         );
         actor.on_shutdown();
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn exit_imports_legacy_announce_files_when_nothing_was_cached() {
-        let dir = temp_dir();
-        let legacy = [0x44; 32];
-        write_legacy_announce(&dir, &legacy, &[9; 40]);
-        let mut actor = actor_on(&dir);
-        actor.on_shutdown();
-        assert!(!legacy_file(&dir, &legacy).exists());
-        let mut restarted = actor_on(&dir);
-        assert!(restarted.kd.fetch_announce(&legacy, true).is_some());
+    /// A version 5 Rust cache carries its announces inline. They are written
+    /// out as legacy files by the known-destinations import and must reach the
+    /// announce database in the same session.
+    fn write_v5_cache(dir: &Path) -> (DestHash, PacketHash, Vec<u8>) {
+        let identity = rns_identity::identity::Identity::new();
+        let mut destination = rns_identity::destination::Destination::new(
+            Some(&identity),
+            rns_identity::destination::Direction::In,
+            rns_identity::destination::DestType::Single,
+            "store.v5",
+        )
+        .unwrap();
+        let raw = destination
+            .announce_packet(&identity, None, None, false, None, crate::now_f64())
+            .unwrap();
+        let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        let announce = rns_identity::announce::AnnounceData::unpack(&raw[offset..], false).unwrap();
+        let entry = rmpv::Value::Map(vec![
+            (
+                "destination_hash".into(),
+                rmpv::Value::Binary(destination.hash.to_vec()),
+            ),
+            ("hops".into(), 3.into()),
+            ("app_data".into(), rmpv::Value::Nil),
+            (
+                "timestamp".into(),
+                rmpv::Value::F64(crate::now_f64() - 30.0),
+            ),
+            (
+                "public_key".into(),
+                rmpv::Value::Binary(announce.public_key.to_vec()),
+            ),
+            ("ratchet".into(), rmpv::Value::Nil),
+            ("raw_packet".into(), rmpv::Value::Binary(raw.clone())),
+            ("retained".into(), true.into()),
+            (
+                "name_hash".into(),
+                rmpv::Value::Binary(announce.name_hash.to_vec()),
+            ),
+        ]);
+        let cache = rmpv::Value::Map(vec![
+            ("entries".into(), rmpv::Value::Array(vec![entry])),
+            ("version".into(), 5.into()),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &cache).unwrap();
+        std::fs::write(dir.join("announce_cache.msgpack"), bytes).unwrap();
+        (destination.hash, packet_hash, raw)
+    }
+
+    fn assert_v5_announce_is_stored(dir: &Path, dest: DestHash, hash: PacketHash, raw: &[u8]) {
+        assert!(dir.join("announce_cache.msgpack.imported").exists());
+        assert!(
+            !legacy_file(dir, &hash).exists(),
+            "the announce file is imported, not left behind"
+        );
+        let mut restarted = actor_on(dir);
+        assert_eq!(
+            restarted.kd.fetch_announce(&hash, true),
+            Some((raw.to_vec(), None))
+        );
+        let known = &restarted.recent_announces[&dest];
+        assert_eq!(known.packet_hash, Some(hash));
+        assert!(known.facts_known && known.hops == 3);
         restarted.on_shutdown();
+    }
+
+    #[test]
+    fn a_version_5_cache_reaches_the_announce_database_at_start() {
+        let dir = temp_dir();
+        let (dest, hash, raw) = write_v5_cache(&dir);
+        let mut actor = actor_on(&dir);
+        assert_eq!(
+            actor.kd.fetch_announce(&hash, true),
+            Some((raw.clone(), None)),
+            "stored in the session that imported the cache"
+        );
+        actor.on_shutdown();
+        assert_v5_announce_is_stored(&dir, dest, hash, &raw);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_version_5_cache_imported_after_the_announce_database_opened_still_reaches_it() {
+        let dir = temp_dir();
+        let (dest, hash, raw) = write_v5_cache(&dir);
+        // Storage attached without a start: the announce database opens first,
+        // at its first write, and the known-destinations import follows.
+        let (mut actor, _tx) = TransportActor::new();
+        actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
+        actor.kd.store_announce([0x45; 32], &[1; 40], None);
+        actor.kd.flush_announces_due(crate::now_f64());
+        settle(&mut actor);
+        assert!(dir.join("announce_cache.msgpack").exists());
+        actor
+            .recent_announces
+            .insert([9; 16], entry([9; 16], None, false));
+        actor.kd.pending.mark_dirty([9; 16]);
+        actor.flush_known_destinations();
+        settle(&mut actor);
+        assert_eq!(
+            actor.kd.fetch_announce(&hash, true),
+            Some((raw.clone(), None))
+        );
+        actor.on_shutdown();
+        assert_v5_announce_is_stored(&dir, dest, hash, &raw);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn listing(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn client_on(dir: &Path) -> TransportActor {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.initialize_storage_as(
+            dir.to_path_buf(),
+            crate::actor::StorageRole::SharedInstanceClient,
+        );
+        actor
     }
 
     #[test]
@@ -1774,54 +1959,85 @@ mod tests {
         let (stored, legacy) = ([0x51; 32], [0x52; 32]);
         crate::store::seed_cached_announce(&dir, &stored, &[1; 40], None).unwrap();
         write_legacy_announce(&dir, &legacy, &[9; 40]);
-        let listing = |dir: &Path| {
-            let mut names: Vec<_> = std::fs::read_dir(dir.join("cache"))
-                .unwrap()
-                .map(|e| e.unwrap().file_name())
-                .collect();
-            names.sort();
-            names
-        };
+        let before = (listing(&dir), listing(&dir.join("cache")));
 
-        // Before the actor knows it is a client, a restore may read the database.
-        let mut actor = actor_on(&dir);
-        assert!(actor.cached_announce(&stored).is_some());
-        assert!(actor.kd.announce_reader.is_some());
-        let before = listing(&dir);
-
-        actor.shared_instance_client_mode = true;
+        let mut actor = client_on(&dir);
         actor.cache_announce(&[0x53; 32], &[2; 40], 0);
         actor.flush_cached_announces(crate::now_f64());
-        assert!(
-            actor.kd.announce_reader.is_none(),
-            "a client closes the read connection"
-        );
         actor.clean_announce_cache();
         assert!(actor.kd.announces.rows.is_empty());
         assert!(!actor.kd.announce_clean_in_flight());
         assert!(
-            actor.cached_announce(&stored).is_none(),
-            "a client does not read the database"
+            actor.cached_announce(&stored).is_none() && actor.cached_announce(&legacy).is_none(),
+            "a client has no announce cache"
         );
         assert!(actor.kd.announce_reader.is_none());
-        assert!(
-            actor.cached_announce(&legacy).is_some(),
-            "a client reads a legacy file, as upstream's does"
-        );
         actor.on_shutdown();
         assert!(
             legacy_file(&dir, &legacy).exists(),
             "a client imports nothing"
         );
-        assert_eq!(listing(&dir), before, "a client creates nothing");
+        assert_eq!(
+            (listing(&dir), listing(&dir.join("cache"))),
+            before,
+            "a client opens and creates nothing"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_shared_instance_client_loads_the_owners_rows_and_restores_no_paths() {
+        let dir = temp_dir();
+        let mut owner = actor_on(&dir);
+        owner
+            .recent_announces
+            .insert([3; 16], entry([3; 16], Some(1000.0), false));
+        owner.kd.pending.mark_dirty([3; 16]);
+        let now = crate::now_f64();
+        let mut path =
+            crate::path_table::PathEntry::new(None, 1, 7, crate::constants::InterfaceMode::Full);
+        path.timestamp = now;
+        path.expires = now + 3600.0;
+        path.packet_hash = Some([3; 32]);
+        let mut table = crate::path_table::PathTable::new();
+        table.insert([3; 16], path);
+        let names = HashMap::from([(7u64, "uplink".to_string())]);
+        crate::persistence::save_python_destination_table(
+            &table,
+            &names,
+            &dir.join("destination_table"),
+        )
+        .unwrap();
+        owner
+            .kd
+            .store_announce([3; 32], &[0xFE; 42], Some("uplink".into()));
+        owner.on_shutdown();
+
+        let mut client = client_on(&dir);
+        let known = &client.recent_announces[&[3; 16]];
+        assert_eq!(known.public_key, Some([3; 64]));
+        assert_eq!(known.last_used, Some(1000.0));
+        assert!(
+            client.pending_path_entries.is_empty(),
+            "a client restores no paths and reads no cached announce"
+        );
+        assert!(client.kd.announce_reader.is_none());
+        // What a client learns stays in memory.
+        client
+            .recent_announces
+            .insert([4; 16], entry([4; 16], None, false));
+        client.kd.pending.mark_dirty([4; 16]);
+        client.flush_known_destinations();
+        client.on_shutdown();
+        let restarted = actor_on(&dir);
+        assert!(!restarted.recent_announces.contains_key(&[4; 16]));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_shared_instance_client_writes_nothing() {
         let dir = temp_dir();
-        let mut actor = actor_on(&dir);
-        actor.shared_instance_client_mode = true;
+        let mut actor = client_on(&dir);
         actor
             .recent_announces
             .insert([8; 16], entry([8; 16], None, false));

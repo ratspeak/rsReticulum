@@ -720,6 +720,7 @@ impl TransportActor {
                     stamp: validated.stamp,
                     stamp_value: announce_stamp_value,
                     lr_cost: validated.lr_cost,
+                    facts_known: true,
                 });
                 self.state_dirty = true;
                 self.kd.pending.mark_dirty(header.destination_hash);

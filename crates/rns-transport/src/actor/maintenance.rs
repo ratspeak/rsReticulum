@@ -686,7 +686,7 @@ impl TransportActor {
                 "known-destinations cleanup evicted expired ratchets"
             );
         }
-        if !self.shared_instance_client_mode {
+        if !self.storage_client() {
             self.kd.expire_ratchets(cutoff);
             self.flush_known_destinations();
         }
@@ -743,6 +743,7 @@ mod cleanup_tests {
             stamp: None,
             stamp_value: 0.0,
             lr_cost: None,
+            facts_known: true,
         };
         actor.recent_announces.insert(entry.dest_hash, entry);
     }

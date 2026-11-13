@@ -30,6 +30,7 @@ fn recent_announce_from_cached_packet(
         stamp: None,
         stamp_value: 0.0,
         lr_cost: None,
+        facts_known: false,
     };
 
     if let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(&raw_packet)
@@ -56,6 +57,7 @@ fn recent_announce_from_cached_packet(
             recent.ratchet = announce.ratchet;
             recent.ratchet_received = announce.ratchet.map(|_| timestamp);
             recent.name_hash = announce.name_hash;
+            recent.facts_known = true;
         }
     }
 
@@ -165,7 +167,7 @@ impl TransportActor {
         &mut self,
         packet_hash: &[u8; 32],
     ) -> Option<crate::persistence::PythonCachedAnnounce> {
-        let allow_db = !self.shared_instance_client_mode;
+        let allow_db = !self.storage_client();
         let (raw_packet, interface_reference) = self.kd.fetch_announce(packet_hash, allow_db)?;
         Some(crate::persistence::PythonCachedAnnounce {
             raw_packet,
@@ -183,13 +185,14 @@ impl TransportActor {
         raw: &[u8],
         interface_id: InterfaceId,
     ) {
-        if self.shared_instance_client_mode || self.storage_dir.is_none() {
+        if self.storage_client() || self.storage_dir.is_none() {
             return;
         }
+        // Transport.cache stores `str(packet.receiving_interface)`.
         let interface_name = self
             .interfaces
             .get(&interface_id)
-            .map(|entry| entry.name.clone());
+            .map(|entry| entry.upstream_name().to_string());
         self.kd.store_announce(*packet_hash, raw, interface_name);
     }
 
@@ -203,7 +206,7 @@ impl TransportActor {
                 .interfaces
                 .iter()
                 .filter(|(_, entry)| !entry.accepted)
-                .map(|(&id, entry)| (id, entry.name.clone()))
+                .map(|(&id, entry)| (id, entry.upstream_name().to_string()))
                 .collect(),
             transport_identity_hash: self.transport_identity_hash,
         }
@@ -213,7 +216,7 @@ impl TransportActor {
     /// worker without waiting. Shared-instance clients write nothing.
     pub(super) fn flush_known_destinations(&mut self) {
         self.last_known_destinations_flush = now();
-        if self.shared_instance_client_mode {
+        if self.storage_client() {
             self.kd.pending = store_worker::KdPending::default();
             return;
         }
@@ -248,7 +251,7 @@ impl TransportActor {
     /// in flight keeps `state_dirty` set so the next tick retries — two
     /// writers would race on the shared `<file>.tmp` names.
     pub(super) fn save_routing_state_async(&mut self) {
-        if self.shared_instance_client_mode {
+        if self.storage_client() {
             trace!("skipping routing-state save in shared-instance client mode");
             self.state_dirty = false;
             self.last_state_save = now();
@@ -306,7 +309,7 @@ impl TransportActor {
         if self.storage_dir.is_none() {
             return;
         }
-        if self.shared_instance_client_mode {
+        if self.storage_client() {
             self.kd.discard_announces();
             return;
         }
@@ -320,7 +323,7 @@ impl TransportActor {
     /// registers, and the announce must still be there then.
     pub(super) fn clean_announce_cache(&mut self) {
         // Transport.clean_cache: never on a shared-instance client, never two at once.
-        if self.shared_instance_client_mode || self.storage_dir.is_none() {
+        if self.storage_client() || self.storage_dir.is_none() {
             return;
         }
         if self.kd.announce_clean_in_flight() {
@@ -375,7 +378,7 @@ impl TransportActor {
     /// Synchronous: used by shutdown / falling-edge / RPC-forced saves where
     /// completion must be guaranteed before proceeding.
     pub(super) fn save_routing_state(&mut self) {
-        if self.shared_instance_client_mode {
+        if self.storage_client() {
             trace!("skipping routing-state save in shared-instance client mode");
             self.state_dirty = false;
             self.last_state_save = now();
@@ -467,12 +470,12 @@ impl TransportActor {
         );
         self.save_state();
         // Transport.exit_handler, then Identity.exit_handler: flush, apply, close.
-        let write = !self.shared_instance_client_mode;
+        let write = !self.storage_client();
         self.kd.shutdown(&self.recent_announces, write);
     }
 
     fn owns_persistent_hashlist(&self) -> bool {
-        self.is_transport_enabled && !self.shared_instance_client_mode
+        self.is_transport_enabled && !self.storage_client()
     }
 
     /// Restore the canonical packet hashlist once both storage and the
@@ -577,10 +580,14 @@ impl TransportActor {
         // Python defers the first announce-cache clean (Transport.py).
         self.last_announce_cache_sweep = now_ts + ANNOUNCE_CACHE_SWEEP_DEFER;
 
+        // Transport.start restores paths and tunnels only on an instance that
+        // is not connected to a shared instance.
+        let owner = !self.storage_client();
+
         // Python destination_table — canonical interop shape. Defer interface
         // hash remap until matching interfaces register.
         let destination_table_path = dir.join("destination_table");
-        let loaded_python_destination_table = if destination_table_path.exists() {
+        let loaded_python_destination_table = if owner && destination_table_path.exists() {
             match crate::persistence::load_python_destination_table(&destination_table_path) {
                 Ok(entries) => {
                     let total = entries.len();
@@ -653,7 +660,7 @@ impl TransportActor {
 
         // path_table — legacy Rust sidecar fallback, defer remap.
         let path_table_path = dir.join("path_table.msgpack");
-        if !loaded_python_destination_table && path_table_path.exists() {
+        if owner && !loaded_python_destination_table && path_table_path.exists() {
             match crate::persistence::load_path_table(&path_table_path) {
                 Ok(entries) => {
                     let total = entries.len();
@@ -724,7 +731,7 @@ impl TransportActor {
         // its cached announce is present, and every tunnel loads unbound
         // until a synthesis rebinds it (Transport.py).
         let python_tunnels_path = dir.join("tunnels");
-        let loaded_python_tunnel_table = if python_tunnels_path.exists() {
+        let loaded_python_tunnel_table = if owner && python_tunnels_path.exists() {
             match crate::persistence::load_python_tunnel_table(&python_tunnels_path) {
                 Ok(entries) => {
                     let total = entries.len();
@@ -804,7 +811,7 @@ impl TransportActor {
 
         // tunnel_table — legacy Rust sidecar fallback.
         let tunnel_path = dir.join("tunnel_table.msgpack");
-        if !loaded_python_tunnel_table && tunnel_path.exists() {
+        if owner && !loaded_python_tunnel_table && tunnel_path.exists() {
             match crate::persistence::load_tunnel_table(&tunnel_path) {
                 Ok(entries) => {
                     let total = entries.len();
@@ -828,40 +835,34 @@ impl TransportActor {
         }
     }
 
-    /// Fill the known-destination table from `known_destinations.db`, importing the
-    /// legacy files first when present (`Identity.load_known_destinations`).
-    /// Ratchets stay in the store and are read on demand.
-    pub(super) fn load_known_destinations(&mut self) {
-        if self.storage_dir.is_none() {
-            return;
-        }
-        let rows = self.kd.load_at_start(now());
+    /// Fill the known-destination table with the rows loaded at start-up
+    /// (`Identity.load_known_destinations`). Ratchets stay in the store and are
+    /// read on demand.
+    pub(super) fn merge_known_destinations(
+        &mut self,
+        rows: Vec<crate::store::KnownDestinationRow>,
+    ) {
         let count = rows.len();
         for row in rows {
-            #[cfg(feature = "sqlite-store")]
-            {
-                let loaded = store_worker::recent_from_row(row);
-                match self.recent_announces.entry(loaded.dest_hash) {
-                    std::collections::hash_map::Entry::Occupied(mut o) => {
-                        // Keep what the cached packet gave (hops, name hash, ratchet).
-                        let e = o.get_mut();
-                        e.app_data = loaded.app_data;
-                        e.timestamp = loaded.timestamp;
-                        e.public_key = loaded.public_key;
-                        e.packet_hash = loaded.packet_hash.or(e.packet_hash);
-                        e.retained = loaded.retained;
-                        e.last_used = loaded.last_used;
-                        e.stamp = loaded.stamp;
-                        e.stamp_value = loaded.stamp_value;
-                        e.lr_cost = loaded.lr_cost;
-                    }
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(loaded);
-                    }
+            let loaded = store_worker::recent_from_row(row);
+            match self.recent_announces.entry(loaded.dest_hash) {
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    // Keep what the cached packet gave (hops, name hash, ratchet).
+                    let e = o.get_mut();
+                    e.app_data = loaded.app_data;
+                    e.timestamp = loaded.timestamp;
+                    e.public_key = loaded.public_key;
+                    e.packet_hash = loaded.packet_hash.or(e.packet_hash);
+                    e.retained = loaded.retained;
+                    e.last_used = loaded.last_used;
+                    e.stamp = loaded.stamp;
+                    e.stamp_value = loaded.stamp_value;
+                    e.lr_cost = loaded.lr_cost;
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(loaded);
                 }
             }
-            #[cfg(not(feature = "sqlite-store"))]
-            let _ = row;
         }
         debug!(count, "loaded known destinations from storage");
     }
@@ -869,7 +870,7 @@ impl TransportActor {
     /// Write `blackhole/local` now, as upstream does on every local change
     /// (Transport.py).
     pub(super) fn persist_local_blackhole(&mut self) {
-        if self.shared_instance_client_mode {
+        if self.storage_client() {
             return;
         }
         let (Some(dir), Some(local_identity_hash)) =
@@ -892,7 +893,7 @@ impl TransportActor {
 
     /// Store a publisher's fetched `/list` reply as its blackhole file.
     pub(super) fn persist_blackhole_source(&mut self, publisher: [u8; 16], payload: &[u8]) {
-        if self.shared_instance_client_mode {
+        if self.storage_client() {
             return;
         }
         let Some(dir) = self.storage_dir.as_ref() else {
@@ -1005,14 +1006,31 @@ impl TransportActor {
     /// Drain pending path entries whose interface name or hash matches the
     /// just-registered interface. Bound to `RegisterInterface` so each entry
     /// rebinds to whatever `interface_id` the runtime allocated this boot.
-    pub(super) fn drain_pending_for_interface(&mut self, id: InterfaceId, name: &str) {
+    ///
+    /// A table names its interface by the hash of upstream's `str(interface)`
+    /// (`Transport.find_interface_from_hash`); one written before this crate
+    /// did the same hashes the registered name. Both are accepted.
+    pub(super) fn drain_pending_for_interface(
+        &mut self,
+        id: InterfaceId,
+        name: &str,
+        upstream_name: &str,
+    ) {
         if !self.pending_path_entries.is_empty() {
             let mut promoted = 0usize;
+            let hashes = [
+                crate::persistence::interface_hash_from_name(upstream_name),
+                crate::persistence::interface_hash_from_name(name),
+            ];
             self.pending_path_entries.retain(|pe| {
-                let name_matches = pe.interface_name.as_deref() == Some(name);
-                let hash_matches = pe.interface_hash.as_deref().is_some_and(|hash| {
-                    hash == crate::persistence::interface_hash_from_name(name).as_slice()
-                });
+                let name_matches = pe
+                    .interface_name
+                    .as_deref()
+                    .is_some_and(|saved| saved == upstream_name || saved == name);
+                let hash_matches = pe
+                    .interface_hash
+                    .as_deref()
+                    .is_some_and(|hash| hashes.iter().any(|h| h.as_slice() == hash));
                 if !name_matches && !hash_matches {
                     return true;
                 }
@@ -1191,6 +1209,7 @@ mod announce_clean_tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
         actor
@@ -1266,8 +1285,9 @@ mod announce_clean_tests {
         assert!(!actor.kd.announce_clean_in_flight());
     }
 
-    /// Only legacy files and a persisted path: the path is restored at start,
-    /// before anything is written.
+    /// Only legacy files and a persisted path: start-up imports the file, then
+    /// restores the path from the database (`Transport.init_announce_cache`
+    /// runs before the path table is loaded).
     #[test]
     fn a_path_whose_announce_is_a_legacy_file_is_restored_at_start() {
         let storage = temp_storage("legacy-restore");
@@ -1308,11 +1328,11 @@ mod announce_clean_tests {
             actor.pending_path_entries[0].interface_name.as_deref(),
             Some("Border_TCP")
         );
+        assert!(storage.join("cache").join("announces.db").is_file());
         assert!(
-            !storage.join("cache").join("announces.db").exists(),
-            "start-up writes nothing"
+            !legacy_dir.join(hex::encode(packet_hash)).exists(),
+            "the file was imported before the restore"
         );
-        assert!(legacy_dir.join(hex::encode(packet_hash)).exists());
 
         actor.on_shutdown();
         let _ = std::fs::remove_dir_all(&storage);
@@ -1394,6 +1414,7 @@ mod async_save_tests {
                 stamp: None,
                 stamp_value: 0.0,
                 lr_cost: None,
+                facts_known: true,
             },
         );
         let now = crate::now_f64();

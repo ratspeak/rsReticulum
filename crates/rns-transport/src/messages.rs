@@ -420,6 +420,16 @@ pub struct InterfaceEntry {
 }
 
 impl InterfaceEntry {
+    /// Upstream's `str(interface)` where the driver supplies it, else the
+    /// registered name. Persisted tables name an interface by its hash
+    /// (`Interface.get_hash`).
+    pub(crate) fn upstream_name(&self) -> &str {
+        self.inspection
+            .as_ref()
+            .and_then(InterfaceInspectionSource::identity)
+            .map_or(self.name.as_str(), |identity| identity.name.as_str())
+    }
+
     /// Minimal entry with defaults for everything optional. Use the
     /// chainable `with_*` methods to fill in IFAC, rate limits, and
     /// driver-shared counters.
@@ -795,10 +805,14 @@ pub enum TransportMessage {
     DeregisterInterface {
         id: InterfaceId,
     },
-    /// Set trusted local storage and synchronously load saved state. File errors
-    /// are logged, not returned; initialization may also migrate legacy cache data.
+    /// Set trusted local storage and synchronously load saved state, once the
+    /// sender knows whether this process owns the directory. File errors are
+    /// logged, not returned; an owner also imports legacy files. `done` is
+    /// signalled when the load has finished.
     SetStoragePaths {
         storage_dir: std::path::PathBuf,
+        role: crate::actor::StorageRole,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
     },
     /// Change forwarding mode and identity/persistence policy. Disabling transport
     /// also cancels pending background announce and recursive-discovery work.
@@ -1387,6 +1401,10 @@ pub struct AnnounceRpcEntry {
     /// Pinned via `RetainDestination`; the maintenance sweep skips the
     /// entry regardless of age while this is `true`.
     pub retained: bool,
+    /// False for an entry restored from storage that does not carry them:
+    /// `hops`, `name_hash`, and `is_path_response` are then unknown, and hold
+    /// zero and `false` only as placeholders.
+    pub facts_known: bool,
 }
 
 /// Identity-bearing metadata returned by [`TransportQuery::RecallDestination`].
@@ -1398,8 +1416,12 @@ pub struct RecalledDestinationRpcEntry {
     pub public_key: [u8; 64],
     pub app_data: Option<Vec<u8>>,
     pub ratchet: Option<[u8; 32]>,
+    /// Hops of the last announce; zero as a placeholder when `hops_known` is
+    /// false. The hops of the current path are `TransportQuery::HopsTo`.
     pub hops: u8,
     pub timestamp: f64,
+    /// False for an entry restored from storage that does not carry `hops`.
+    pub hops_known: bool,
 }
 
 /// Blackhole-table snapshot. Times and TTL are seconds; source attribution
@@ -1575,9 +1597,12 @@ impl std::fmt::Debug for TransportMessage {
                 .debug_struct("DeregisterInterface")
                 .field("id", id)
                 .finish(),
-            Self::SetStoragePaths { storage_dir } => f
+            Self::SetStoragePaths {
+                storage_dir, role, ..
+            } => f
                 .debug_struct("SetStoragePaths")
                 .field("storage_dir", storage_dir)
+                .field("role", role)
                 .finish(),
             Self::SetTransportEnabled { enabled } => f
                 .debug_struct("SetTransportEnabled")
@@ -1677,6 +1702,7 @@ impl Default for RecalledDestinationRpcEntry {
             ratchet: None,
             hops: 0,
             timestamp: 0.0,
+            hops_known: false,
         }
     }
 }

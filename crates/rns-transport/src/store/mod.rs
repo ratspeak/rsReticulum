@@ -30,6 +30,31 @@ pub const ANNOUNCE_CACHE_USER_VERSION: i64 = 1;
 #[cfg(feature = "sqlite-store")]
 pub(crate) const CHUNK_ROWS: usize = 4096;
 
+/// What the last announce told this node that upstream's `known_destinations`
+/// table has no column for. Kept in a table of this crate's own,
+/// `rs_announce_facts`, in the same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AnnounceFacts {
+    /// Hop count the announce arrived with.
+    pub hops: u8,
+    /// Ten-byte name hash from the announce.
+    pub name_hash: [u8; 10],
+    /// Whether the announce arrived as a path response.
+    pub path_response: bool,
+}
+
+impl AnnounceFacts {
+    /// The facts of one announce.
+    pub fn new(hops: u8, name_hash: [u8; 10], path_response: bool) -> Self {
+        Self {
+            hops,
+            name_hash,
+            path_response,
+        }
+    }
+}
+
 /// One `known_destinations` row.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -52,6 +77,9 @@ pub struct KnownDestinationRow {
     pub stamp_value: f64,
     /// Link-request cost, if the announce advertised one.
     pub lr_cost: Option<f64>,
+    /// `None` when unknown: the row was written by upstream, or upstream has
+    /// replaced it since this crate wrote it.
+    pub announce_facts: Option<AnnounceFacts>,
 }
 
 impl KnownDestinationRow {
@@ -67,6 +95,7 @@ impl KnownDestinationRow {
             stamp: None,
             stamp_value: 0.0,
             lr_cost: None,
+            announce_facts: None,
         }
     }
 }

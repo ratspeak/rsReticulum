@@ -10,9 +10,10 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Statement, p
 use tracing::warn;
 
 use super::{
-    ANNOUNCE_CACHE_USER_VERSION, AnnounceCacheStore, AnnounceRow, ApplyReport, CHUNK_ROWS,
-    CachedAnnounce, DestHash, KNOWN_DESTINATIONS_USER_VERSION, KdBatch, KnownDestinationRow,
-    KnownDestinationStore, PacketHash, Ratchet, RatchetRow, RejectedTable, Rejection, StoreError,
+    ANNOUNCE_CACHE_USER_VERSION, AnnounceCacheStore, AnnounceFacts, AnnounceRow, ApplyReport,
+    CHUNK_ROWS, CachedAnnounce, DestHash, KNOWN_DESTINATIONS_USER_VERSION, KdBatch,
+    KnownDestinationRow, KnownDestinationStore, PacketHash, Ratchet, RatchetRow, RejectedTable,
+    Rejection, StoreError,
 };
 
 const KD_SCHEMA: &str = "
@@ -30,7 +31,22 @@ CREATE TABLE IF NOT EXISTS known_destinations (
 CREATE TABLE IF NOT EXISTS ratchets (
     destination_hash BLOB PRIMARY KEY,
     ratchet          BLOB NOT NULL,
-    received         REAL NOT NULL);";
+    received         REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rs_announce_facts (
+    destination_hash BLOB PRIMARY KEY,
+    last_heard       REAL NOT NULL,
+    hops             INTEGER NOT NULL,
+    name_hash        BLOB NOT NULL,
+    path_response    INTEGER NOT NULL);";
+
+// `rs_announce_facts` is this crate's own table; upstream neither reads nor
+// drops it. A row counts only while `last_heard` equals its destination's, so
+// one upstream has replaced or deleted since reads as unknown.
+const FACTS_UPSERT_SQL: &str = "INSERT INTO rs_announce_facts VALUES (?,?,?,?,?) ON CONFLICT(destination_hash) DO UPDATE SET last_heard=excluded.last_heard, hops=excluded.hops, name_hash=excluded.name_hash, path_response=excluded.path_response";
+const FACTS_DELETE_SQL: &str = "DELETE FROM rs_announce_facts WHERE destination_hash=?";
+const FACTS_PRUNE_SQL: &str = "DELETE FROM rs_announce_facts WHERE NOT EXISTS (SELECT 1 FROM known_destinations k WHERE k.destination_hash = rs_announce_facts.destination_hash AND k.last_heard = rs_announce_facts.last_heard)";
+const KD_SELECT_SQL: &str = "SELECT destination_hash, last_heard, packet_hash, public_key, app_data, used, stamp, stamp_value, lr_cost FROM known_destinations";
+const KD_SELECT_WITH_FACTS_SQL: &str = "SELECT k.destination_hash, k.last_heard, k.packet_hash, k.public_key, k.app_data, k.used, k.stamp, k.stamp_value, k.lr_cost, f.hops, f.name_hash, f.path_response FROM known_destinations k LEFT JOIN rs_announce_facts f ON f.destination_hash = k.destination_hash AND f.last_heard = k.last_heard";
 
 const KD_UPSERT_SQL: &str = "INSERT INTO known_destinations (destination_hash, last_heard, packet_hash, public_key, app_data, used, stamp, stamp_value, lr_cost, identity_hash) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(destination_hash) DO UPDATE SET last_heard=excluded.last_heard, packet_hash=excluded.packet_hash, public_key=excluded.public_key, app_data=excluded.app_data, used=excluded.used, stamp=excluded.stamp, stamp_value=excluded.stamp_value, lr_cost=excluded.lr_cost, identity_hash=excluded.identity_hash";
 const KD_DELETE_SQL: &str = "DELETE FROM known_destinations WHERE destination_hash=?";
@@ -227,6 +243,18 @@ fn write_chunked<T>(
     Ok((rows.len() - rejected.len(), rejected))
 }
 
+/// The side-table columns of a joined row; any that is missing or malformed reads as unknown.
+fn decode_facts(row: &rusqlite::Row<'_>) -> Option<AnnounceFacts> {
+    let hops: Option<i64> = row.get(9).ok()?;
+    let name_hash: Option<Vec<u8>> = row.get(10).ok()?;
+    let path_response: Option<i64> = row.get(11).ok()?;
+    Some(AnnounceFacts::new(
+        u8::try_from(hops?).ok()?,
+        name_hash?.try_into().ok()?,
+        path_response? != 0,
+    ))
+}
+
 fn decode_known(row: &rusqlite::Row<'_>) -> Result<KnownDestinationRow, StoreError> {
     const T: &str = "known_destinations";
     let destination_hash = fixed::<16>(db(row.get(0))?, T)?;
@@ -248,6 +276,7 @@ fn decode_known(row: &rusqlite::Row<'_>) -> Result<KnownDestinationRow, StoreErr
         stamp,
         stamp_value: stamp_value.unwrap_or(0.0),
         lr_cost,
+        announce_facts: None,
     })
 }
 
@@ -269,6 +298,8 @@ impl SqliteKnownDestinations {
             KD_SCHEMA,
             Some("DROP TABLE IF EXISTS known_destinations"),
         )?;
+        // Side rows whose destination upstream deleted or replaced meanwhile.
+        db(conn.execute(FACTS_PRUNE_SQL, []))?;
         Ok(Self {
             conn,
             read_only: false,
@@ -293,14 +324,27 @@ impl SqliteKnownDestinations {
 
 impl KnownDestinationStore for SqliteKnownDestinations {
     fn load_all(&mut self, f: &mut dyn FnMut(KnownDestinationRow)) -> Result<(), StoreError> {
-        let mut stmt = db(self.conn.prepare(
-            "SELECT destination_hash, last_heard, packet_hash, public_key, app_data, used, stamp, stamp_value, lr_cost FROM known_destinations",
+        // A file upstream created has no side table.
+        let has_facts: bool = db(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='rs_announce_facts')",
+            [],
+            |r| r.get(0),
         ))?;
+        let mut stmt = db(self.conn.prepare(if has_facts {
+            KD_SELECT_WITH_FACTS_SQL
+        } else {
+            KD_SELECT_SQL
+        }))?;
         let mut rows = db(stmt.query([]))?;
         let mut skipped = 0usize;
         while let Some(row) = db(rows.next())? {
             match decode_known(row) {
-                Ok(decoded) => f(decoded),
+                Ok(mut decoded) => {
+                    if has_facts {
+                        decoded.announce_facts = decode_facts(row);
+                    }
+                    f(decoded)
+                }
                 Err(_) => skipped += 1,
             }
         }
@@ -371,6 +415,32 @@ impl KnownDestinationStore for SqliteKnownDestinations {
                     ])
                 },
             )?;
+            // The side row goes in the row's own transaction, and goes with it.
+            {
+                let refused: HashSet<DestHash> =
+                    rejected.iter().map(|r| r.destination_hash).collect();
+                let mut upsert = db(conn.prepare(FACTS_UPSERT_SQL))?;
+                let mut delete = db(conn.prepare(FACTS_DELETE_SQL))?;
+                for r in &batch.upserts {
+                    match r.announce_facts {
+                        Some(facts) if !refused.contains(&r.destination_hash) => {
+                            db(upsert.execute(params![
+                                r.destination_hash.as_slice(),
+                                r.last_heard,
+                                facts.hops,
+                                facts.name_hash.as_slice(),
+                                facts.path_response,
+                            ]))?;
+                        }
+                        _ => {
+                            db(delete.execute(params![r.destination_hash.as_slice()]))?;
+                        }
+                    }
+                }
+                for h in &kd_deletes {
+                    db(delete.execute(params![h.as_slice()]))?;
+                }
+            }
             let (kd_deleted, kd_rej) = write_chunked(
                 conn,
                 KD_DELETE_SQL,
