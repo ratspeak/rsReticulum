@@ -8728,6 +8728,18 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
+    /// Returns once the actor has handled everything already in its mailbox.
+    async fn actor_settled(tx: &mpsc::Sender<TransportMessage>) {
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(TransportMessage::Rpc {
+            query: TransportQuery::GetLinkCount,
+            response_tx,
+        })
+        .await
+        .unwrap();
+        response_rx.await.unwrap();
+    }
+
     const TEST_CHANNEL_MSG_TYPE: u16 = 0x1234;
 
     /// Keep legacy packet-shape assertions focused on their protocol payload
@@ -11493,22 +11505,24 @@ mod tests {
     async fn refused_deferred_request_answers_with_the_declared_reply() {
         let (mut sender, receiver) = handshaken_link_pair();
         let link_id = receiver.link_id;
-        let (mut actor, _actor_tx) = rns_transport::actor::TransportActor::new();
+        let (actor, actor_tx) = rns_transport::actor::TransportActor::new();
         let (driver_tx, _driver_rx) = mpsc::channel(16);
-        actor.interfaces.insert(
-            1,
-            rns_transport::messages::InterfaceEntry::new(
-                "deferred refusal test".into(),
-                rns_transport::constants::InterfaceMode::Full,
-                rns_transport::constants::InterfaceDirection::bidirectional(),
-                1_000_000,
-                500,
-                driver_tx,
-            ),
+        let entry = rns_transport::messages::InterfaceEntry::new(
+            "deferred refusal test".into(),
+            rns_transport::constants::InterfaceMode::Full,
+            rns_transport::constants::InterfaceDirection::bidirectional(),
+            1_000_000,
+            500,
+            driver_tx,
         );
-        let interface_owner = Some(actor.interfaces[&1].owner.id());
+        let entry_owner = entry.owner.clone();
+        actor_tx
+            .try_send(TransportMessage::RegisterInterface { id: 1, entry })
+            .unwrap();
+        let interface_owner = Some(entry_owner.id());
         let dispatch = actor.link_endpoint_dispatch_handle();
         let _actor_task = tokio::spawn(actor.run());
+        actor_settled(&actor_tx).await;
         let (transport_tx, mut transport_rx) = mpsc::channel(32);
         let (_event_tx, event_rx) = mpsc::channel(8);
         let mut manager = LinkManager::new(transport_tx, event_rx, [0x92; 16], None);
@@ -11580,22 +11594,24 @@ mod tests {
     async fn deferred_requests_keep_owner_and_resource_reservations() {
         let (mut sender, receiver) = handshaken_link_pair();
         let link_id = receiver.link_id;
-        let (mut actor, actor_tx) = rns_transport::actor::TransportActor::new();
+        let (actor, actor_tx) = rns_transport::actor::TransportActor::new();
         let (driver_tx, _driver_rx) = mpsc::channel(16);
-        actor.interfaces.insert(
-            1,
-            rns_transport::messages::InterfaceEntry::new(
-                "deferred test".into(),
-                rns_transport::constants::InterfaceMode::Full,
-                rns_transport::constants::InterfaceDirection::bidirectional(),
-                1_000_000,
-                500,
-                driver_tx,
-            ),
+        let entry = rns_transport::messages::InterfaceEntry::new(
+            "deferred test".into(),
+            rns_transport::constants::InterfaceMode::Full,
+            rns_transport::constants::InterfaceDirection::bidirectional(),
+            1_000_000,
+            500,
+            driver_tx,
         );
-        let interface_owner = Some(actor.interfaces[&1].owner.id());
+        let entry_owner = entry.owner.clone();
+        actor_tx
+            .try_send(TransportMessage::RegisterInterface { id: 1, entry })
+            .unwrap();
+        let interface_owner = Some(entry_owner.id());
         let dispatch = actor.link_endpoint_dispatch_handle();
         let actor_task = tokio::spawn(actor.run());
+        actor_settled(&actor_tx).await;
         let (transport_tx, mut transport_rx) = mpsc::channel(32);
         let (_event_tx, event_rx) = mpsc::channel(8);
         let mut manager = LinkManager::new(transport_tx, event_rx, [0x91; 16], None);
@@ -13234,23 +13250,25 @@ mod tests {
         let (initiator, mut responder) = handshaken_link_pair();
         responder.rtt = Some(Duration::from_millis(1));
         let link_id = responder.link_id;
-        let (mut actor, transport_tx) = TransportActor::new();
+        let (actor, transport_tx) = TransportActor::new();
         let (driver_tx, mut driver_rx) = mpsc::channel(1);
         driver_tx.try_send(Bytes::from_static(b"occupied")).unwrap();
-        actor.interfaces.insert(
-            7,
-            InterfaceEntry::new(
-                "bounded runtime test driver".to_string(),
-                InterfaceMode::Full,
-                InterfaceDirection::bidirectional(),
-                3_515,
-                500,
-                driver_tx,
-            ),
+        let entry = InterfaceEntry::new(
+            "bounded runtime test driver".to_string(),
+            InterfaceMode::Full,
+            InterfaceDirection::bidirectional(),
+            3_515,
+            500,
+            driver_tx,
         );
-        let interface_owner = actor.interfaces.get(&7).unwrap().owner.id();
+        let entry_owner = entry.owner.clone();
+        transport_tx
+            .try_send(TransportMessage::RegisterInterface { id: 7, entry })
+            .unwrap();
+        let interface_owner = entry_owner.id();
         let dispatch = actor.link_endpoint_dispatch_handle();
         let actor_task = tokio::spawn(actor.run());
+        actor_settled(&transport_tx).await;
         let (_, event_rx) = mpsc::channel(16);
         let mut manager = LinkManager::new(transport_tx.clone(), event_rx, [0xCA; 16], None);
         manager.set_link_endpoint_dispatch_handle(dispatch.clone());
@@ -13319,9 +13337,7 @@ mod tests {
         }
         assert_eq!(driver_rx.recv().await.unwrap(), b"occupied"[..]);
         transport_tx
-            .send(TransportMessage::Tick(TimerTick {
-                timestamp: unix_now(),
-            }))
+            .send(TransportMessage::Tick(TimerTick))
             .await
             .unwrap();
         if mode != 0 {
@@ -13575,7 +13591,7 @@ mod tests {
         let key = Ed25519PrivateKey::generate();
         let (initiator, request) = Link::new_initiator(destination, 1);
         let id = initiator.link_id;
-        let (mut actor, tx) = TransportActor::new();
+        let (actor, tx) = TransportActor::new();
         let (driver_tx, mut driver_rx) = mpsc::channel(8);
         let replacement = InterfaceEntry::new(
             "replacement".into(),
@@ -13586,9 +13602,14 @@ mod tests {
             driver_tx,
         );
         assert_ne!(old_owner.id(), replacement.owner.id());
-        actor.interfaces.insert(7, replacement);
+        tx.try_send(TransportMessage::RegisterInterface {
+            id: 7,
+            entry: replacement,
+        })
+        .unwrap();
         let dispatch = actor.link_endpoint_dispatch_handle();
         let actor_task = tokio::spawn(actor.run());
+        actor_settled(&tx).await;
         let (_events, events_rx) = mpsc::channel(8);
         let mut manager = LinkManager::new(tx.clone(), events_rx, destination, Some(key));
         manager.set_link_endpoint_dispatch_handle(dispatch);
@@ -13665,23 +13686,24 @@ mod tests {
         use std::time::Duration;
         let (sender, receiver, key) = handshaken_link_pair_with_identity();
         let id = receiver.link_id;
-        let (mut actor, tx) = TransportActor::new();
+        let (actor, tx) = TransportActor::new();
         let (driver_tx, mut driver_rx) = mpsc::channel(1);
         driver_tx.try_send(Bytes::from_static(b"occupied")).unwrap();
-        actor.interfaces.insert(
-            7,
-            InterfaceEntry::new(
-                "receipt test".into(),
-                InterfaceMode::Full,
-                InterfaceDirection::bidirectional(),
-                1000000,
-                500,
-                driver_tx,
-            ),
+        let entry = InterfaceEntry::new(
+            "receipt test".into(),
+            InterfaceMode::Full,
+            InterfaceDirection::bidirectional(),
+            1000000,
+            500,
+            driver_tx,
         );
-        let interface_owner = Some(actor.interfaces[&7].owner.id());
+        let entry_owner = entry.owner.clone();
+        tx.try_send(TransportMessage::RegisterInterface { id: 7, entry })
+            .unwrap();
+        let interface_owner = Some(entry_owner.id());
         let dispatch = actor.link_endpoint_dispatch_handle();
         let task = tokio::spawn(actor.run());
+        actor_settled(&tx).await;
         let (_events_tx, events_rx) = mpsc::channel(16);
         let mut manager = LinkManager::new(tx.clone(), events_rx, [6; 16], Some(key));
         manager.set_link_endpoint_dispatch_handle(dispatch.clone());
@@ -13752,11 +13774,7 @@ mod tests {
                 assert_eq!(outcome.await.unwrap(), LinkPacketReceiptOutcome::Closed);
                 assert_eq!(manager.active_links.contains_key(&id), mode == 8);
                 assert_eq!(driver_rx.recv().await.unwrap(), b"occupied"[..]);
-                tx.send(TransportMessage::Tick(TimerTick {
-                    timestamp: unix_now(),
-                }))
-                .await
-                .unwrap();
+                tx.send(TransportMessage::Tick(TimerTick)).await.unwrap();
                 if mode == 7 {
                     let wire = tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
                         .await
@@ -13827,11 +13845,7 @@ mod tests {
                 );
             }
             assert_eq!(driver_rx.recv().await.unwrap(), b"occupied"[..]);
-            tx.send(TransportMessage::Tick(TimerTick {
-                timestamp: unix_now(),
-            }))
-            .await
-            .unwrap();
+            tx.send(TransportMessage::Tick(TimerTick)).await.unwrap();
             if mode == 2 {
                 assert!(
                     tokio::time::timeout(Duration::from_millis(50), driver_rx.recv())

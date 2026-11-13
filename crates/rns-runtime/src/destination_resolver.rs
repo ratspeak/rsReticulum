@@ -170,14 +170,14 @@ mod tests {
     use super::*;
 
     fn recalled(destination_hash: [u8; 16], public_key: [u8; 64]) -> RecalledDestinationRpcEntry {
-        RecalledDestinationRpcEntry {
-            dest_hash: destination_hash,
-            public_key,
-            app_data: None,
-            ratchet: None,
-            hops: 2,
-            timestamp: 1.0,
-        }
+        let mut entry = RecalledDestinationRpcEntry::default();
+        entry.dest_hash = destination_hash;
+        entry.public_key = public_key;
+        entry.app_data = None;
+        entry.ratchet = None;
+        entry.hops = 2;
+        entry.timestamp = 1.0;
+        entry
     }
 
     #[tokio::test]

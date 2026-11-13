@@ -335,12 +335,10 @@ pub enum LinkEndpointUnbindResult {
     RoleMismatch,
 }
 
-/// Explicit maintenance trigger. The actor ignores `timestamp` and reads its
-/// own current time. `TransportActor::run` also schedules maintenance internally.
+/// Explicit maintenance trigger; the actor reads its own current time.
+/// `TransportActor::run` also schedules maintenance internally.
 #[derive(Debug)]
-pub struct TimerTick {
-    pub timestamp: f64,
-}
+pub struct TimerTick;
 
 /// Registration metadata, capacity policy and TX sender for one interface.
 /// Public fields and builder methods store caller values; they do not start a
@@ -1187,6 +1185,7 @@ pub enum TransportQuery {
 /// Local actor results. `Ok` confirms handling only; individual operations
 /// define their own admission, cache and persistence limits.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum TransportQueryResponse {
     PathTable(Vec<PathTableRpcEntry>),
     InterfaceStats(Vec<InterfaceStatRpcEntry>),
@@ -1215,6 +1214,7 @@ pub enum TransportQueryResponse {
 /// Snapshot of a cached route. Times are Unix seconds; returned interface
 /// metadata can use fallback values if the interface is no longer registered.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PathTableRpcEntry {
     pub hash: [u8; 16],
     pub timestamp: f64,
@@ -1319,6 +1319,7 @@ pub struct InterfaceStatRpcEntry {
 /// non-shared-instance interfaces; speeds are bits per second and frequencies
 /// per second over the last second.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
 pub struct TrafficTotalsRpcEntry {
     /// False until a traffic count has measured an interface; Python then
     /// still reports its integer zero speeds.
@@ -1355,7 +1356,8 @@ pub struct TrafficTotalsRpcEntry {
 
 /// Announce-rate state: rate is announces per second; timestamps, `last` and
 /// `blocked_until` are Unix seconds. A zero deadline means no active penalty.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RateTableRpcEntry {
     pub hash: [u8; 16],
     pub rate: f64,
@@ -1367,7 +1369,8 @@ pub struct RateTableRpcEntry {
 
 /// Cached announce metadata, possibly restored from trusted local storage.
 /// This snapshot does not freshly verify a signature or establish a live path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct AnnounceRpcEntry {
     pub dest_hash: [u8; 16],
     pub hops: u8,
@@ -1389,6 +1392,7 @@ pub struct AnnounceRpcEntry {
 /// Identity-bearing metadata returned by [`TransportQuery::RecallDestination`].
 /// It is trusted cache content, not a fresh signature or reachability result.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RecalledDestinationRpcEntry {
     pub dest_hash: [u8; 16],
     pub public_key: [u8; 64],
@@ -1400,7 +1404,8 @@ pub struct RecalledDestinationRpcEntry {
 
 /// Blackhole-table snapshot. Times and TTL are seconds; source attribution
 /// can come from stored metadata or the local transport identity fallback.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct BlackholeRpcEntry {
     pub identity_hash: [u8; 16],
     pub source: Option<[u8; 16]>,
@@ -1640,6 +1645,38 @@ impl std::fmt::Debug for TransportMessage {
                 f.debug_struct("AwaitPath").field("dest", dest).finish()
             }
             Self::Shutdown => write!(f, "Shutdown"),
+        }
+    }
+}
+
+impl Default for PathTableRpcEntry {
+    fn default() -> Self {
+        Self {
+            hash: [0; 16],
+            timestamp: 0.0,
+            via: None,
+            hops: 0,
+            expires: 0.0,
+            value: None,
+            used: 0.0,
+            lr_cost: None,
+            interface: String::new(),
+            interface_id: 0,
+            interface_mode: InterfaceMode::Full,
+            interface_role: InterfaceRole::Normal,
+        }
+    }
+}
+
+impl Default for RecalledDestinationRpcEntry {
+    fn default() -> Self {
+        Self {
+            dest_hash: [0; 16],
+            public_key: [0; 64],
+            app_data: None,
+            ratchet: None,
+            hops: 0,
+            timestamp: 0.0,
         }
     }
 }

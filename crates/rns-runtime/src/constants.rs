@@ -5,19 +5,7 @@ pub const JOB_INTERVAL: u64 = 300;
 pub const CLEAN_INTERVAL: u64 = 900;
 pub const PERSIST_INTERVAL: u64 = 43200;
 
-/// Minimum spacing between externally-requested persists.
-pub const GRACIOUS_PERSIST_INTERVAL: u64 = 300;
-
 pub const RESOURCE_CACHE: u64 = 86400;
-pub const QUEUED_ANNOUNCE_LIFE: u64 = rns_transport::constants::QUEUED_ANNOUNCE_LIFE as u64;
-
-/// Announce bandwidth cap as a fraction of interface bitrate (2%).
-///
-/// Python exposes/configures this as `2` percent, then stores `0.02` on live
-/// interfaces. Runtime registration must hand the transport actor the stored
-/// fraction, because queue spacing is calculated as `tx_time / announce_cap`.
-pub const ANNOUNCE_CAP: f64 = 0.02;
-
 pub const MINIMUM_BITRATE: u64 = 5;
 pub const IFAC_MIN_SIZE: usize = 1;
 pub const LOG_MAXSIZE: u64 = 5_242_880;

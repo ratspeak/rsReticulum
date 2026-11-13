@@ -94,14 +94,16 @@ pub const MONITOR_INTERVAL_SECS: u64 = 5;
 /// helpers do not implement a detachment monitor.
 pub const DETACH_THRESHOLD_TICKS: u64 = 12;
 
-/// Default blackhole subscriber initial wait, in seconds.
-pub const BLACKHOLE_INITIAL_WAIT_SECS: u64 = 20;
-/// Default blackhole subscriber sweep interval, in seconds.
-pub const BLACKHOLE_JOB_INTERVAL_SECS: u64 = 60;
-/// Default per-source blackhole update interval, in seconds.
-pub const BLACKHOLE_UPDATE_INTERVAL_SECS: u64 = 60 * 60;
-/// Default blackhole source-query timeout budget, in seconds.
-pub const BLACKHOLE_SOURCE_TIMEOUT_SECS: u64 = 25;
+/// Runtime delay before the first blackhole subscriber sweep (20 seconds).
+pub const BLACKHOLE_INITIAL_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Blackhole subscriber scheduling interval (60 seconds), after processing
+/// the current sweep's sources; request time can extend the observed interval.
+pub const BLACKHOLE_JOB_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Default minimum elapsed time after a source's last successful update
+/// (one hour). `SubscriberState::with_update_interval` overrides it.
+pub const BLACKHOLE_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Timeout budget the runtime gives each blackhole `/list` query (25 seconds).
+pub const BLACKHOLE_SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Numeric MessagePack map keys for discovery info. These are wire identifiers;
 /// renumbering them changes the protocol.

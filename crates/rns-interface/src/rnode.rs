@@ -9276,9 +9276,7 @@ mod tests {
         yield_to_rnode_tasks().await;
         for _ in 0..1000 {
             actor_control
-                .send(TransportMessage::Tick(rns_transport::messages::TimerTick {
-                    timestamp: rns_transport::now_f64(),
-                }))
+                .send(TransportMessage::Tick(rns_transport::messages::TimerTick))
                 .await
                 .unwrap();
             tokio::time::advance(Duration::from_secs(134)).await;

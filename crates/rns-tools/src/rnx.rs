@@ -2,6 +2,7 @@
 //! result arrays, command execution on the listener and result rendering on
 //! the client.
 
+use crate::format::py_round;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -455,11 +456,6 @@ pub fn render(
 /// `exit()` passes it to the OS, or 240 without one.
 pub fn mirrored_exit_code(retcode: Option<i64>) -> i32 {
     retcode.map_or(240, |code| (code & 0xff) as i32)
-}
-
-/// Python `round(x, digits)`.
-pub fn py_round(x: f64, digits: usize) -> f64 {
-    format!("{x:.digits$}").parse().unwrap_or(x)
 }
 
 /// Python `str(float)` for values without exponent notation.

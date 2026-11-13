@@ -1838,13 +1838,14 @@ listener.close()
     /// The sequence and results of an upstream 1.6.0 live run, without filters.
     #[tokio::test]
     async fn destination_type_requests_follow_upstream_bookkeeping() {
-        let (mut actor, tx) = rns_transport::actor::TransportActor::new();
-        actor
-            .destination_filter
-            .apply_policy(&rns_transport::destination_filter::FilterPolicy {
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        tx.try_send(TransportMessage::SetFilterPolicy {
+            policy: rns_transport::destination_filter::FilterPolicy {
                 ignored_types: vec!["blocked.type".into()],
                 ..Default::default()
-            });
+            },
+        })
+        .unwrap();
         tokio::spawn(actor.run());
         let backend = RpcBackend::new(tx, None);
         let requester = vec![0x11; 16];

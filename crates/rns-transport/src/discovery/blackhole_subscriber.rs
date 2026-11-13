@@ -9,20 +9,7 @@ use std::time::Duration;
 
 use rns_wire::types::IdentityHash;
 
-/// Runtime delay before the first subscriber sweep (20 seconds).
-pub const INITIAL_WAIT: Duration = Duration::from_secs(20);
-
-/// Runtime scheduling interval (60 seconds), after processing the current
-/// sweep's sources; request time can extend the observed interval.
-pub const JOB_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Default minimum elapsed time after a source's last successful update
-/// (one hour). [`SubscriberState::with_update_interval`] overrides it.
-pub const UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-/// Timeout budget supplied by the runtime to each blackhole `/list` query
-/// (25 seconds). This state machine itself does not enforce timeouts.
-pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(25);
+use super::constants::BLACKHOLE_UPDATE_INTERVAL as UPDATE_INTERVAL;
 
 /// In-memory per-source update cursors. Cloning copies the cursors and interval;
 /// clones do not share subsequent updates. Use finite Unix-second timestamps

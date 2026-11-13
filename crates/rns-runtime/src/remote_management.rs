@@ -453,30 +453,36 @@ mod tests {
                         }
                         TransportQuery::GetLinkCount => TransportQueryResponse::IntResult(3),
                         TransportQuery::GetPathTable => {
-                            let entries = vec![PathTableRpcEntry {
-                                hash: [0x11; 16],
-                                timestamp: 1_700_000_000.0,
-                                via: Some([0x22; 16]),
-                                hops: 2,
-                                expires: 1_700_100_000.0,
-                                value: None,
-                                used: 0.0,
-                                lr_cost: None,
-                                interface: "MockIf".to_string(),
-                                interface_id: 1,
-                                interface_mode: rns_transport::constants::InterfaceMode::Full,
-                                interface_role: rns_transport::messages::InterfaceRole::Normal,
+                            let entries = vec![{
+                                let mut entry = PathTableRpcEntry::default();
+                                entry.hash = [0x11; 16];
+                                entry.timestamp = 1_700_000_000.0;
+                                entry.via = Some([0x22; 16]);
+                                entry.hops = 2;
+                                entry.expires = 1_700_100_000.0;
+                                entry.value = None;
+                                entry.used = 0.0;
+                                entry.lr_cost = None;
+                                entry.interface = "MockIf".to_string();
+                                entry.interface_id = 1;
+                                entry.interface_mode =
+                                    rns_transport::constants::InterfaceMode::Full;
+                                entry.interface_role =
+                                    rns_transport::messages::InterfaceRole::Normal;
+                                entry
                             }];
                             TransportQueryResponse::PathTable(entries)
                         }
                         TransportQuery::GetRateTable => {
-                            let entries = vec![RateTableRpcEntry {
-                                hash: [0x33; 16],
-                                rate: 1.25,
-                                last: 1_700_000_000.0,
-                                rate_violations: 2,
-                                blocked_until: 0.0,
-                                timestamps: vec![1_700_000_000.0],
+                            let entries = vec![{
+                                let mut entry = RateTableRpcEntry::default();
+                                entry.hash = [0x33; 16];
+                                entry.rate = 1.25;
+                                entry.last = 1_700_000_000.0;
+                                entry.rate_violations = 2;
+                                entry.blocked_until = 0.0;
+                                entry.timestamps = vec![1_700_000_000.0];
+                                entry
                             }];
                             TransportQueryResponse::RateTable(entries)
                         }

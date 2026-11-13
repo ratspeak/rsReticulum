@@ -67,7 +67,7 @@ pub(crate) fn scheduled_actor_with_backlog(
         constants::{InterfaceDirection, InterfaceMode},
         messages::{InterfaceEntry, QueuedAnnounce},
     };
-    let (mut actor, control) = TransportActor::new();
+    let (actor, control) = TransportActor::new();
     let bitrate = if count > 1 { u64::MAX } else { 500 };
     let mut entry = InterfaceEntry::new(
         "radio with no name heuristic".into(),
@@ -112,8 +112,18 @@ pub(crate) fn scheduled_actor_with_backlog(
             hops: 1,
             raw,
         });
-        actor.local_destinations.insert(dest);
+        control
+            .try_send(
+                rns_transport::messages::TransportMessage::RegisterDestination {
+                    hash: dest,
+                    app_name: app,
+                    delivery_tx: None,
+                },
+            )
+            .unwrap();
     }
-    actor.interfaces.insert(1, entry);
+    control
+        .try_send(rns_transport::messages::TransportMessage::RegisterInterface { id: 1, entry })
+        .unwrap();
     (tokio::spawn(actor.run()), control, first)
 }

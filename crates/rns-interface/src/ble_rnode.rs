@@ -7983,9 +7983,7 @@ mod tests {
         let ready = AtomicBool::new(false);
         for _ in 0..1000 {
             control
-                .send(TransportMessage::Tick(rns_transport::messages::TimerTick {
-                    timestamp: rns_transport::now_f64(),
-                }))
+                .send(TransportMessage::Tick(rns_transport::messages::TimerTick))
                 .await
                 .unwrap();
             tokio::time::advance(Duration::from_secs(134)).await;

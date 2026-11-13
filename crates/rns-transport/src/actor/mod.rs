@@ -30,12 +30,14 @@ mod announce_admission;
 mod inbound;
 mod link_endpoint;
 mod maintenance;
+mod options;
 mod outbound;
 mod path_recovery;
 mod path_request_admission;
 mod persistence;
 mod recursive_discovery;
 mod rpc;
+pub use options::TransportActorOptions;
 use rpc::InterfaceEvent;
 
 // In-process Links need two distinguishable ingress edges even though both
@@ -141,9 +143,9 @@ pub struct TransportActor {
     pub(crate) receipt_updates:
         HashMap<[u8; 16], tokio::sync::watch::Sender<crate::messages::ReceiptUpdate>>,
 
-    pub interfaces: HashMap<InterfaceId, InterfaceEntry>,
+    pub(crate) interfaces: HashMap<InterfaceId, InterfaceEntry>,
 
-    pub local_destinations: HashSet<[u8; 16]>,
+    pub(crate) local_destinations: HashSet<[u8; 16]>,
     /// Public keys of registered local destinations, for recall.
     pub(crate) local_destination_keys: HashMap<[u8; 16], [u8; 64]>,
     pub(crate) destination_channels:
@@ -223,35 +225,35 @@ pub struct TransportActor {
     last_rate_cull: f64,
     last_held_announce_check: f64,
 
-    pub is_transport_enabled: bool,
+    pub(crate) is_transport_enabled: bool,
     /// Hash used for wire-facing transport identifiers and local next-hop
     /// answers. Derived from the internal or ephemeral hash by identity policy;
     /// it is not itself a signing key.
-    pub transport_identity_hash: Option<[u8; 16]>,
+    pub(crate) transport_identity_hash: Option<[u8; 16]>,
     /// Configured internal identity hash supplied by `SetTransportIdentity`.
     /// Identity policy uses it directly when forwarding or static identity is
     /// enabled. This actor does not derive RPC keys from it or retain a private key.
-    pub internal_identity_hash: Option<[u8; 16]>,
+    pub(crate) internal_identity_hash: Option<[u8; 16]>,
     /// Optional ephemeral hash used when forwarding and static identity are
     /// disabled. Policy lazily generates it once per actor if not pre-seeded.
     /// The runtime can supply a hash from an identity it owns; this field alone
     /// contains no key and makes no claim about other services' identity choices.
-    pub ephemeral_identity_hash: Option<[u8; 16]>,
+    pub(crate) ephemeral_identity_hash: Option<[u8; 16]>,
     /// Use the configured internal hash even when forwarding is disabled.
     /// Default false; configure before identity policy is applied by
     /// `SetTransportIdentity` or `SetTransportEnabled`.
-    pub static_transport_identity: bool,
+    pub(crate) static_transport_identity: bool,
     /// Replacement hop byte for eligible locally originated egress; zero disables
     /// it. The actor stores this byte without choosing or validating a random
     /// range. Not every packet or interface is eligible for replacement.
-    pub local_hops_delta: u8,
+    pub(crate) local_hops_delta: u8,
     /// Allowed external source hashes for on-disk blackhole loading. Changing
     /// this vector alone does not reload or purge the table.
     pub(crate) blackhole_sources: Vec<[u8; 16]>,
     /// Network stamp policy from configuration and constructor switches.
-    pub stamp_policy: crate::stamps::StampPolicy,
+    pub(crate) stamp_policy: crate::stamps::StampPolicy,
     /// Destination-type announce filter from `[filter]` and application requests.
-    pub destination_filter: crate::destination_filter::DestinationTypeFilter,
+    pub(crate) destination_filter: crate::destination_filter::DestinationTypeFilter,
     /// Python `Transport.HOP_LIMITER`: inbound packets with this many wire hops
     /// or more are dropped.
     pub(crate) hop_limiter: u8,
@@ -275,7 +277,7 @@ pub struct TransportActor {
 
     /// Trusted persistence root. Prefer `initialize_storage` to assigning this
     /// field when saved state must also be loaded.
-    pub storage_dir: Option<PathBuf>,
+    pub(crate) storage_dir: Option<PathBuf>,
     /// One-shot guard for lazy packet-hashlist restore. The hashlist is only
     /// authoritative on an enabled transport node that is not a shared
     /// instance client, so startup cannot load it before those roles are
@@ -333,7 +335,7 @@ pub struct TransportActor {
     /// requests asynchronous persistence and a rising edge resets maintenance
     /// checks. Only the `mobile-throttle` feature changes the background tick
     /// period to 2 seconds; neither transition guarantees completed disk writes.
-    pub is_foreground: Arc<AtomicBool>,
+    pub(crate) is_foreground: Arc<AtomicBool>,
 }
 
 /// Cached announce metadata used by diagnostics and path/identity lookups.
@@ -478,6 +480,22 @@ impl TransportActor {
         hashlist_cap: usize,
         queue_lengths: crate::inbound_queues::InboundQueueLengths,
     ) -> (Self, mpsc::Sender<TransportMessage>) {
+        Self::new_with_options(
+            channel_cap,
+            hashlist_cap,
+            queue_lengths,
+            TransportActorOptions::default(),
+        )
+    }
+
+    /// As [`Self::new_with_queues`], with the settings that cannot change
+    /// once the actor exists.
+    pub fn new_with_options(
+        channel_cap: usize,
+        hashlist_cap: usize,
+        queue_lengths: crate::inbound_queues::InboundQueueLengths,
+        options: TransportActorOptions,
+    ) -> (Self, mpsc::Sender<TransportMessage>) {
         let (tx, rx) = mpsc::channel(channel_cap);
         let (inbound_queues, inbound_rx) = crate::inbound_queues::InboundQueues::new(queue_lengths);
         let (announce_dispatch_tx, announce_dispatch_rx) =
@@ -565,9 +583,9 @@ impl TransportActor {
             is_transport_enabled: false,
             transport_identity_hash: None,
             internal_identity_hash: None,
-            ephemeral_identity_hash: None,
-            static_transport_identity: false,
-            local_hops_delta: 0,
+            ephemeral_identity_hash: options.ephemeral_identity_hash,
+            static_transport_identity: options.static_transport_identity,
+            local_hops_delta: options.local_hops_delta,
             blackhole_sources: Vec::new(),
             stamp_policy: crate::stamps::StampPolicy::default(),
             destination_filter: Default::default(),
@@ -596,7 +614,9 @@ impl TransportActor {
             channel_drops: 0,
             announce_handlers: Vec::new(),
             next_announce_handler_id: 0,
-            is_foreground: Arc::new(AtomicBool::new(true)),
+            is_foreground: options
+                .is_foreground
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
         };
 
         (actor, tx)
@@ -2555,6 +2575,7 @@ mod tests {
     mod announce_identity;
     mod bitrate_timing;
     mod discovery_api;
+    mod discovery_public_api;
     mod held_announces;
     mod inbound_queues;
     mod interface_stats;

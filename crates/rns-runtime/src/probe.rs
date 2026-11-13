@@ -593,27 +593,31 @@ mod tests {
     #[test]
     fn find_public_key_returns_match() {
         let entries = vec![
-            AnnounceRpcEntry {
-                dest_hash: [0xAA; 16],
-                hops: 0,
-                app_data: None,
-                timestamp: 0.0,
-                public_key: Some([0x11; 64]),
-                ratchet: None,
-                name_hash: [0; 10],
-                is_path_response: false,
-                retained: false,
+            {
+                let mut entry = AnnounceRpcEntry::default();
+                entry.dest_hash = [0xAA; 16];
+                entry.hops = 0;
+                entry.app_data = None;
+                entry.timestamp = 0.0;
+                entry.public_key = Some([0x11; 64]);
+                entry.ratchet = None;
+                entry.name_hash = [0; 10];
+                entry.is_path_response = false;
+                entry.retained = false;
+                entry
             },
-            AnnounceRpcEntry {
-                dest_hash: [0xBB; 16],
-                hops: 1,
-                app_data: None,
-                timestamp: 0.0,
-                public_key: Some([0x22; 64]),
-                ratchet: None,
-                name_hash: [0; 10],
-                is_path_response: false,
-                retained: false,
+            {
+                let mut entry = AnnounceRpcEntry::default();
+                entry.dest_hash = [0xBB; 16];
+                entry.hops = 1;
+                entry.app_data = None;
+                entry.timestamp = 0.0;
+                entry.public_key = Some([0x22; 64]);
+                entry.ratchet = None;
+                entry.name_hash = [0; 10];
+                entry.is_path_response = false;
+                entry.retained = false;
+                entry
             },
         ];
         assert_eq!(find_public_key(&entries, &[0xBB; 16]), Some([0x22; 64]));

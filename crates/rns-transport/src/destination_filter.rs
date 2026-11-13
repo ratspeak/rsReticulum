@@ -43,14 +43,14 @@ impl FilterPolicy {
 
 /// Where an announce arrived from, for the required-only exemptions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnnounceSource {
+pub(crate) enum AnnounceSource {
     LocalClient,
     SharedInstance,
     Other,
 }
 
 #[derive(Debug, Default)]
-pub struct DestinationTypeFilter {
+pub(crate) struct DestinationTypeFilter {
     blocked: HashSet<NameHash>,
     allowed: HashSet<NameHash>,
     client: HashMap<NameHash, HashSet<Vec<u8>>>,
@@ -69,10 +69,6 @@ impl DestinationTypeFilter {
         for name in &policy.allowed_types {
             self.allow(name);
         }
-    }
-
-    pub fn required_only(&self) -> bool {
-        self.required_only
     }
 
     pub fn set_required_only(&mut self, enabled: bool) {
@@ -131,6 +127,7 @@ impl DestinationTypeFilter {
         true
     }
 
+    #[cfg(test)]
     pub fn is_wanted(&self, hash: &NameHash) -> bool {
         self.client.contains_key(hash)
     }

@@ -25,6 +25,8 @@ pub struct ValidatedAnnounce {
     /// Truncated hash of `public_key`, kept so a cache hit needs no key decoding.
     pub identity_hash: [u8; 16],
     pub app_data: Option<Vec<u8>>,
+    // Upstream keeps it in the validation result; nothing reads it here yet.
+    #[allow(dead_code)]
     pub ratchet: Option<[u8; 32]>,
     pub stamp: Option<[u8; NETWORK_STAMP_SIZE]>,
     pub stamp_value: Option<f64>,
@@ -136,10 +138,12 @@ impl AnnounceValidationCache {
         self.invalid_order.clear();
     }
 
+    #[cfg(test)]
     pub fn valid_len(&self) -> usize {
         self.valid.len()
     }
 
+    #[cfg(test)]
     pub fn invalid_len(&self) -> usize {
         self.invalid.len()
     }

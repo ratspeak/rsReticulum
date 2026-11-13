@@ -46,10 +46,14 @@ use rns_identity::destination::{
 };
 use rns_identity::identity::Identity;
 use rns_transport::await_path::{AwaitPathError, await_path};
+use rns_transport::constants::ANNOUNCE_CAP;
 use rns_transport::constants::DESTINATION_TIMEOUT;
+use rns_transport::discovery::constants::{
+    BLACKHOLE_INITIAL_WAIT, BLACKHOLE_JOB_INTERVAL, BLACKHOLE_SOURCE_TIMEOUT,
+    BLACKHOLE_UPDATE_INTERVAL,
+};
 use rns_transport::discovery::{
-    Announcer, BLACKHOLE_INITIAL_WAIT, BLACKHOLE_JOB_INTERVAL, BLACKHOLE_SOURCE_TIMEOUT,
-    BLACKHOLE_UPDATE_INTERVAL, BlackholeSubscriberState, DiscoveredInterface, DiscoveryDecryptor,
+    Announcer, BlackholeSubscriberState, DiscoveredInterface, DiscoveryDecryptor,
     DiscoveryInterfaceConfig, DiscoveryStamper, DiscoveryStore, ReceiverConfig,
 };
 use rns_transport::messages::{
@@ -2812,19 +2816,21 @@ fn rpc_response_to_transport_response(
             let entries = entries
                 .into_iter()
                 .filter_map(|entry| {
-                    Some(PathTableRpcEntry {
-                        hash: vec_to_16(&entry.hash)?,
-                        timestamp: entry.timestamp,
-                        via: entry.via.as_deref().and_then(vec_to_16),
-                        hops: entry.hops,
-                        expires: entry.expires,
-                        value: entry.value,
-                        used: entry.used,
-                        lr_cost: entry.lr_cost,
-                        interface: entry.interface,
-                        interface_id: 0,
-                        interface_mode: rns_transport::constants::InterfaceMode::Full,
-                        interface_role: rns_transport::messages::InterfaceRole::Normal,
+                    Some({
+                        let mut out = PathTableRpcEntry::default();
+                        out.hash = vec_to_16(&entry.hash)?;
+                        out.timestamp = entry.timestamp;
+                        out.via = entry.via.as_deref().and_then(vec_to_16);
+                        out.hops = entry.hops;
+                        out.expires = entry.expires;
+                        out.value = entry.value;
+                        out.used = entry.used;
+                        out.lr_cost = entry.lr_cost;
+                        out.interface = entry.interface;
+                        out.interface_id = 0;
+                        out.interface_mode = rns_transport::constants::InterfaceMode::Full;
+                        out.interface_role = rns_transport::messages::InterfaceRole::Normal;
+                        out
                     })
                 })
                 .collect();
@@ -2890,13 +2896,15 @@ fn rpc_response_to_transport_response(
             let entries = entries
                 .into_iter()
                 .filter_map(|entry| {
-                    Some(RateTableRpcEntry {
-                        hash: vec_to_16(&entry.hash)?,
-                        rate: entry.rate,
-                        last: entry.last,
-                        rate_violations: entry.rate_violations,
-                        blocked_until: entry.blocked_until,
-                        timestamps: entry.timestamps,
+                    Some({
+                        let mut out = RateTableRpcEntry::default();
+                        out.hash = vec_to_16(&entry.hash)?;
+                        out.rate = entry.rate;
+                        out.last = entry.last;
+                        out.rate_violations = entry.rate_violations;
+                        out.blocked_until = entry.blocked_until;
+                        out.timestamps = entry.timestamps;
+                        out
                     })
                 })
                 .collect();
@@ -2915,22 +2923,24 @@ fn rpc_response_to_transport_response(
             let entries = entries
                 .into_iter()
                 .filter_map(|entry| {
-                    Some(BlackholeRpcEntry {
-                        identity_hash: vec_to_16(&entry.identity_hash)?,
-                        source: entry.source.as_deref().and_then(vec_to_16),
-                        created: now,
-                        ttl: entry.until.map(|until| (until - now).max(0.0)),
-                        reason: entry
+                    Some({
+                        let mut out = BlackholeRpcEntry::default();
+                        out.identity_hash = vec_to_16(&entry.identity_hash)?;
+                        out.source = entry.source.as_deref().and_then(vec_to_16);
+                        out.created = now;
+                        out.ttl = entry.until.map(|until| (until - now).max(0.0));
+                        out.reason = entry
                             .reason
                             .as_deref()
                             .map(rns_transport::blackhole::BlackholeReason::parse)
-                            .unwrap_or_default(),
-                        reason_label: entry.reason,
+                            .unwrap_or_default();
+                        out.reason_label = entry.reason;
                         // Verification is computed against the *local* actor's
                         // recent_announces, which a remote-RPC bridge cannot
                         // see. Default to false; the local-actor path sets it
                         // correctly.
-                        verified: false,
+                        out.verified = false;
+                        out
                     })
                 })
                 .collect();
@@ -3242,12 +3252,13 @@ impl Default for ReticulumConfig {
             autoconnect_interface_mode: None,
             autoconnect_interface_gravity: None,
             autoconnect_announces_to_internal: None,
-            discover_interfaces_required_value: rns_transport::discovery::DEFAULT_STAMP_VALUE,
+            discover_interfaces_required_value:
+                rns_transport::discovery::constants::DEFAULT_STAMP_VALUE,
             interface_discovery_sources: Vec::new(),
             blackhole_sources: Vec::new(),
             publish_blackhole: false,
             blackhole_update_interval:
-                rns_transport::discovery::blackhole_subscriber::UPDATE_INTERVAL.as_secs_f64(),
+                rns_transport::discovery::constants::BLACKHOLE_UPDATE_INTERVAL.as_secs_f64(),
             log_timestamps: true,
             bootstrap_configs: Vec::new(),
             stamps: rns_transport::stamps::StampPolicy::default(),
@@ -3645,7 +3656,7 @@ impl ReticulumConfig {
                 rc.discover_interfaces_required_value = if v > 0.0 {
                     v
                 } else {
-                    rns_transport::discovery::DEFAULT_STAMP_VALUE
+                    rns_transport::discovery::constants::DEFAULT_STAMP_VALUE
                 };
             }
             rc.interface_discovery_sources = parse_hash16_list(
@@ -3841,33 +3852,35 @@ pub async fn init_with_policy(
         InstancePolicy::SharedClient(credentials) => credentials.apply(&mut rc),
     }
 
-    let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new_with_queues(
+    let ephemeral_transport_identity =
+        uses_ephemeral_transport_identity(&rc).then(rns_identity::identity::Identity::new);
+    let mut actor_options = rns_transport::actor::TransportActorOptions::default();
+    actor_options.is_foreground = Some(is_foreground.clone());
+    // Python 1.3.8 Transport.py: non-transport nodes get a fresh
+    // per-boot wire-facing transport identity unless static_transport_identity
+    // is set. Pre-seed the actor's hash so runtime-side wire consumers
+    // (discovery announcer, blackhole publisher/subscriber) share the value.
+    actor_options.static_transport_identity = rc.static_transport_identity;
+    actor_options.ephemeral_identity_hash = ephemeral_transport_identity
+        .as_ref()
+        .map(|identity| identity.hash);
+    // Python 1.3.8 Transport.py: one random 2..=7 delta per boot;
+    // should_apply_delta gates actual application.
+    if rc.local_hops_delta {
+        actor_options.local_hops_delta = generate_local_hops_delta();
+    }
+    let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new_with_options(
         4096,
         rns_transport::constants::HASHLIST_MAXSIZE,
         rc.inbound_queue_lengths,
+        actor_options,
     );
     let inbound_queues = actor.inbound_queues();
     let persistence_trigger = actor.persistence_trigger();
     let path_recovery = actor.path_recovery_handle();
     let link_endpoint_dispatch = actor.link_endpoint_dispatch_handle();
     let announce_dispatch = actor.announce_dispatch_handle();
-    actor.is_foreground = is_foreground.clone();
     actor.initialize_storage(paths.storage_dir.clone());
-    // Python 1.3.8 Transport.py: non-transport nodes get a fresh
-    // per-boot wire-facing transport identity unless static_transport_identity
-    // is set. Pre-seed the actor's hash so runtime-side wire consumers
-    // (discovery announcer, blackhole publisher/subscriber) share the value.
-    actor.static_transport_identity = rc.static_transport_identity;
-    // Python 1.3.8 Transport.py: one random 2..=7 delta per boot;
-    // should_apply_delta gates actual application.
-    if rc.local_hops_delta {
-        actor.local_hops_delta = generate_local_hops_delta();
-    }
-    let ephemeral_transport_identity =
-        uses_ephemeral_transport_identity(&rc).then(rns_identity::identity::Identity::new);
-    if let Some(ephemeral) = &ephemeral_transport_identity {
-        actor.ephemeral_identity_hash = Some(ephemeral.hash);
-    }
 
     let transport_completion = Arc::new(TransportCompletion::default());
     let id_gen = Arc::new(AtomicU64::new(1));
@@ -7483,7 +7496,7 @@ async fn start_on_network_discovery(handle: ReticulumHandle) {
             };
             let subscription = handle
                 .subscribe_announces_with_capacity(
-                    Some(rns_transport::discovery::DISCOVERY_ASPECT_FILTER.to_string()),
+                    Some(rns_transport::discovery::constants::DISCOVERY_ASPECT_FILTER.to_string()),
                     false,
                     128,
                 )
@@ -7591,7 +7604,7 @@ async fn run_discovery_publisher(
         _ = handle.shutdown.wait() => return,
         registration = handle.register_destination(
             (**announce_identity).clone(),
-            rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
+            rns_transport::discovery::constants::DISCOVERY_ASPECT_FILTER,
             crate::destination_runtime::DestinationRuntimeOptions {
                 accepts_links: false,
                 ..Default::default()
@@ -7628,7 +7641,7 @@ async fn run_discovery_publisher(
         Some(announce_identity),
         rns_identity::destination::Direction::In,
         rns_identity::destination::DestType::Single,
-        rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
+        rns_transport::discovery::constants::DISCOVERY_ASPECT_FILTER,
     ) {
         Ok(destination) => destination,
         Err(error) => {
@@ -7642,7 +7655,7 @@ async fn run_discovery_publisher(
     // Python's last_discovery_announce and job sleep (Discovery.py).
     let mut last_announce: HashMap<u64, tokio::time::Instant> = HashMap::new();
     let mut next_prepare = tokio::time::Instant::now()
-        + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
+        + Duration::from_secs(rns_transport::discovery::constants::ANNOUNCE_JOB_INTERVAL_SECS);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -7673,7 +7686,9 @@ async fn run_discovery_publisher(
                 Ok((mut returned, prepared)) => {
                     // Python sleeps a full job interval after each pass's work.
                     next_prepare = now
-                        + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
+                        + Duration::from_secs(
+                            rns_transport::discovery::constants::ANNOUNCE_JOB_INTERVAL_SECS,
+                        );
                     // The job saw these as unsent; they must not go out again.
                     let mut committed = Vec::new();
                     for (prepared, at) in deferred_commits.drain(..) {
@@ -7738,8 +7753,10 @@ async fn run_discovery_publisher(
             }
         }
         if now >= next_prepare && announcer.is_some() {
-            next_prepare =
-                now + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
+            next_prepare = now
+                + Duration::from_secs(
+                    rns_transport::discovery::constants::ANNOUNCE_JOB_INTERVAL_SECS,
+                );
             // Python announces only the most overdue due interface per pass.
             let selected = locals
                 .iter()
@@ -7769,7 +7786,9 @@ async fn run_discovery_publisher(
                     resolved = resolve_discovery_inputs(config, local.location_cmd.as_deref()) => resolved,
                 };
                 next_prepare = tokio::time::Instant::now()
-                    + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
+                    + Duration::from_secs(
+                        rns_transport::discovery::constants::ANNOUNCE_JOB_INTERVAL_SECS,
+                    );
                 if let (Some(mut config), Some(mut owned)) = (resolved, announcer.take()) {
                     for other in &locals {
                         if other.id != local.id && registered.contains_key(&other.id) {
@@ -7897,7 +7916,9 @@ async fn run_discovery_publisher(
                 Err(error) => {
                     tracing::warn!(%error, "failed to build discovery announce");
                     publication.retry_at = now
-                        + Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
+                        + Duration::from_secs(
+                            rns_transport::discovery::constants::ANNOUNCE_JOB_INTERVAL_SECS,
+                        );
                 }
             }
         }
@@ -8320,7 +8341,7 @@ async fn spawn_discovered_backbone_client(
 /// stay down, forget ones detached elsewhere, trade bootstrap interfaces for
 /// online auto-connected ones and refill free slots.
 async fn run_autoconnect_monitor(handle: ReticulumHandle) {
-    let interval = Duration::from_secs(rns_transport::discovery::MONITOR_INTERVAL_SECS);
+    let interval = Duration::from_secs(rns_transport::discovery::constants::MONITOR_INTERVAL_SECS);
     loop {
         tokio::select! {
             _ = handle.shutdown.wait() => break,
@@ -8335,7 +8356,8 @@ async fn run_autoconnect_monitor(handle: ReticulumHandle) {
 
 async fn autoconnect_monitor_tick(handle: &ReticulumHandle) {
     // Upstream DETACH_THRESHOLD is in seconds (Discovery.py).
-    let threshold = Duration::from_secs(rns_transport::discovery::DETACH_THRESHOLD_TICKS);
+    let threshold =
+        Duration::from_secs(rns_transport::discovery::constants::DETACH_THRESHOLD_TICKS);
     let limit = handle.config.autoconnect_discovered_interfaces;
     let registered: std::collections::HashSet<u64> = handle
         .interface_controls
@@ -8734,7 +8756,7 @@ async fn start_blackhole_publisher(
     let signing_key = identity
         .get_signing_key()
         .ok_or_else(|| "No signing key available for blackhole publisher".to_string())?;
-    let app_name = rns_transport::discovery::BLACKHOLE_ASPECT_FILTER;
+    let app_name = rns_transport::discovery::constants::BLACKHOLE_ASPECT_FILTER;
     let dest_hash = rns_identity::destination::Destination::hash_from_name_and_identity(
         app_name,
         Some(&identity.hash),
@@ -8937,7 +8959,7 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
                 let source_hash = source.into_bytes();
                 let destination_hash =
                     rns_identity::destination::Destination::hash_from_name_and_identity(
-                        rns_transport::discovery::BLACKHOLE_ASPECT_FILTER,
+                        rns_transport::discovery::constants::BLACKHOLE_ASPECT_FILTER,
                         Some(&source_hash),
                     );
                 // Discovery.py: without a path, retry on the next job
@@ -8960,7 +8982,7 @@ async fn start_blackhole_subscriber(handle: ReticulumHandle) {
                 match client
                     .query(
                         source_hash,
-                        rns_transport::discovery::BLACKHOLE_ASPECT_FILTER,
+                        rns_transport::discovery::constants::BLACKHOLE_ASPECT_FILTER,
                         "/list",
                         Vec::new(),
                         8,
@@ -13243,16 +13265,16 @@ loglevel = 7
                 TransportQuery::RecallDestination { dest } if dest == destination_hash
             ));
             response_tx
-                .send(TransportQueryResponse::RecalledDestination(Some(
-                    RecalledDestinationRpcEntry {
-                        dest_hash: destination_hash,
-                        public_key,
-                        app_data: Some(b"display name".to_vec()),
-                        ratchet: Some([0xA5; 32]),
-                        hops: 4,
-                        timestamp,
-                    },
-                )))
+                .send(TransportQueryResponse::RecalledDestination(Some({
+                    let mut entry = RecalledDestinationRpcEntry::default();
+                    entry.dest_hash = destination_hash;
+                    entry.public_key = public_key;
+                    entry.app_data = Some(b"display name".to_vec());
+                    entry.ratchet = Some([0xA5; 32]);
+                    entry.hops = 4;
+                    entry.timestamp = timestamp;
+                    entry
+                })))
                 .expect("recall response receiver");
             for expected in ["stamp value", "link cost"] {
                 let TransportMessage::Rpc { query, response_tx } =
@@ -13344,16 +13366,16 @@ loglevel = 7
                 TransportQuery::RecallDestination { dest } if dest == destination_hash
             ));
             response_tx
-                .send(TransportQueryResponse::RecalledDestination(Some(
-                    RecalledDestinationRpcEntry {
-                        dest_hash: destination_hash,
-                        public_key,
-                        app_data: None,
-                        ratchet: None,
-                        hops: 1,
-                        timestamp: 1.0,
-                    },
-                )))
+                .send(TransportQueryResponse::RecalledDestination(Some({
+                    let mut entry = RecalledDestinationRpcEntry::default();
+                    entry.dest_hash = destination_hash;
+                    entry.public_key = public_key;
+                    entry.app_data = None;
+                    entry.ratchet = None;
+                    entry.hops = 1;
+                    entry.timestamp = 1.0;
+                    entry
+                })))
                 .unwrap();
 
             let TransportMessage::SendPacket {
@@ -13453,16 +13475,16 @@ loglevel = 7
                     TransportQuery::RecallDestination { dest } if dest == destination_hash
                 ));
                 response_tx
-                    .send(TransportQueryResponse::RecalledDestination(Some(
-                        RecalledDestinationRpcEntry {
-                            dest_hash: destination_hash,
-                            public_key,
-                            app_data: None,
-                            ratchet: None,
-                            hops: 1,
-                            timestamp: 1.0,
-                        },
-                    )))
+                    .send(TransportQueryResponse::RecalledDestination(Some({
+                        let mut entry = RecalledDestinationRpcEntry::default();
+                        entry.dest_hash = destination_hash;
+                        entry.public_key = public_key;
+                        entry.app_data = None;
+                        entry.ratchet = None;
+                        entry.hops = 1;
+                        entry.timestamp = 1.0;
+                        entry
+                    })))
                     .unwrap();
 
                 let TransportMessage::SendPacket {
@@ -13535,16 +13557,16 @@ loglevel = 7
                 panic!("expected recall query");
             };
             response_tx
-                .send(TransportQueryResponse::RecalledDestination(Some(
-                    RecalledDestinationRpcEntry {
-                        dest_hash: destination_hash,
-                        public_key,
-                        app_data: None,
-                        ratchet: None,
-                        hops: 1,
-                        timestamp: 1.0,
-                    },
-                )))
+                .send(TransportQueryResponse::RecalledDestination(Some({
+                    let mut entry = RecalledDestinationRpcEntry::default();
+                    entry.dest_hash = destination_hash;
+                    entry.public_key = public_key;
+                    entry.app_data = None;
+                    entry.ratchet = None;
+                    entry.hops = 1;
+                    entry.timestamp = 1.0;
+                    entry
+                })))
                 .unwrap();
             let TransportMessage::SendPacket { result_tx, .. } =
                 transport_rx.recv().await.expect("packet send")
@@ -13589,16 +13611,16 @@ loglevel = 7
                 TransportQuery::RecallDestination { dest } if dest == destination_hash
             ));
             response_tx
-                .send(TransportQueryResponse::RecalledDestination(Some(
-                    RecalledDestinationRpcEntry {
-                        dest_hash: destination_hash,
-                        public_key: remote_public_key,
-                        app_data: None,
-                        ratchet: None,
-                        hops: 7,
-                        timestamp: 1_700_000_000.0,
-                    },
-                )))
+                .send(TransportQueryResponse::RecalledDestination(Some({
+                    let mut entry = RecalledDestinationRpcEntry::default();
+                    entry.dest_hash = destination_hash;
+                    entry.public_key = remote_public_key;
+                    entry.app_data = None;
+                    entry.ratchet = None;
+                    entry.hops = 7;
+                    entry.timestamp = 1_700_000_000.0;
+                    entry
+                })))
                 .expect("recall response receiver");
         });
 
@@ -13657,16 +13679,16 @@ loglevel = 7
                 panic!("expected transport RPC");
             };
             response_tx
-                .send(TransportQueryResponse::RecalledDestination(Some(
-                    RecalledDestinationRpcEntry {
-                        dest_hash: destination_hash,
-                        public_key: remote_public_key,
-                        app_data: None,
-                        ratchet: None,
-                        hops: 7,
-                        timestamp: 1_700_000_001.0,
-                    },
-                )))
+                .send(TransportQueryResponse::RecalledDestination(Some({
+                    let mut entry = RecalledDestinationRpcEntry::default();
+                    entry.dest_hash = destination_hash;
+                    entry.public_key = remote_public_key;
+                    entry.app_data = None;
+                    entry.ratchet = None;
+                    entry.hops = 7;
+                    entry.timestamp = 1_700_000_001.0;
+                    entry
+                })))
                 .expect("second recall response");
 
             let TransportMessage::Rpc { query, response_tx } =
@@ -13754,16 +13776,16 @@ loglevel = 7
                 panic!("expected transport RPC");
             };
             response_tx
-                .send(TransportQueryResponse::RecalledDestination(Some(
-                    RecalledDestinationRpcEntry {
-                        dest_hash: destination_hash,
-                        public_key: remote_public_key,
-                        app_data: None,
-                        ratchet: None,
-                        hops: 2,
-                        timestamp: 1_700_000_002.0,
-                    },
-                )))
+                .send(TransportQueryResponse::RecalledDestination(Some({
+                    let mut entry = RecalledDestinationRpcEntry::default();
+                    entry.dest_hash = destination_hash;
+                    entry.public_key = remote_public_key;
+                    entry.app_data = None;
+                    entry.ratchet = None;
+                    entry.hops = 2;
+                    entry.timestamp = 1_700_000_002.0;
+                    entry
+                })))
                 .expect("recall response receiver");
         });
 
@@ -13791,33 +13813,37 @@ loglevel = 7
                 TransportQueryResponse::FloatResult(Some(1_000.0)),
                 TransportQueryResponse::IntResult(1_024),
                 TransportQueryResponse::PathTable(vec![
-                    rns_transport::messages::PathTableRpcEntry {
-                        hash: [0x61; 16],
-                        timestamp: 1.0,
-                        via: None,
-                        hops: 2,
-                        expires: 2.0,
-                        value: None,
-                        used: 0.0,
-                        lr_cost: None,
-                        interface: "short".to_string(),
-                        interface_id: 1,
-                        interface_mode: rns_transport::constants::InterfaceMode::Full,
-                        interface_role: rns_transport::messages::InterfaceRole::Normal,
+                    {
+                        let mut entry = rns_transport::messages::PathTableRpcEntry::default();
+                        entry.hash = [0x61; 16];
+                        entry.timestamp = 1.0;
+                        entry.via = None;
+                        entry.hops = 2;
+                        entry.expires = 2.0;
+                        entry.value = None;
+                        entry.used = 0.0;
+                        entry.lr_cost = None;
+                        entry.interface = "short".to_string();
+                        entry.interface_id = 1;
+                        entry.interface_mode = rns_transport::constants::InterfaceMode::Full;
+                        entry.interface_role = rns_transport::messages::InterfaceRole::Normal;
+                        entry
                     },
-                    rns_transport::messages::PathTableRpcEntry {
-                        hash: [0x62; 16],
-                        timestamp: 1.0,
-                        via: None,
-                        hops: 8,
-                        expires: 2.0,
-                        value: None,
-                        used: 0.0,
-                        lr_cost: None,
-                        interface: "long".to_string(),
-                        interface_id: 2,
-                        interface_mode: rns_transport::constants::InterfaceMode::Gateway,
-                        interface_role: rns_transport::messages::InterfaceRole::Normal,
+                    {
+                        let mut entry = rns_transport::messages::PathTableRpcEntry::default();
+                        entry.hash = [0x62; 16];
+                        entry.timestamp = 1.0;
+                        entry.via = None;
+                        entry.hops = 8;
+                        entry.expires = 2.0;
+                        entry.value = None;
+                        entry.used = 0.0;
+                        entry.lr_cost = None;
+                        entry.interface = "long".to_string();
+                        entry.interface_id = 2;
+                        entry.interface_mode = rns_transport::constants::InterfaceMode::Gateway;
+                        entry.interface_role = rns_transport::messages::InterfaceRole::Normal;
+                        entry
                     },
                 ]),
             ] {
@@ -14111,20 +14137,19 @@ loglevel = 7
         let interface_name = "authoritative-link".to_string();
         let missing_mtu_interface_name = "python-interface-without-mtu".to_string();
         let ambiguous_interface_name = "duplicate-name".to_string();
-        let master_path = rns_transport::messages::PathTableRpcEntry {
-            hash: destination_hash,
-            timestamp: 1.0,
-            via: Some([0x54; 16]),
-            hops: 6,
-            expires: 2.0,
-            value: None,
-            used: 0.0,
-            lr_cost: None,
-            interface: interface_name.clone(),
-            interface_id: 81,
-            interface_mode: rns_transport::constants::InterfaceMode::Full,
-            interface_role: rns_transport::messages::InterfaceRole::Normal,
-        };
+        let mut master_path = rns_transport::messages::PathTableRpcEntry::default();
+        master_path.hash = destination_hash;
+        master_path.timestamp = 1.0;
+        master_path.via = Some([0x54; 16]);
+        master_path.hops = 6;
+        master_path.expires = 2.0;
+        master_path.value = None;
+        master_path.used = 0.0;
+        master_path.lr_cost = None;
+        master_path.interface = interface_name.clone();
+        master_path.interface_id = 81;
+        master_path.interface_mode = rns_transport::constants::InterfaceMode::Full;
+        master_path.interface_role = rns_transport::messages::InterfaceRole::Normal;
         let mut master_interface = rns_transport::messages::InterfaceStatRpcEntry::default();
         master_interface.id = 81;
         master_interface.name = interface_name.clone();
@@ -14340,8 +14365,18 @@ loglevel = 7
 
     fn discovery_actor() -> (ReticulumHandle, tokio::task::JoinHandle<()>) {
         let mut handle = dummy_handle();
-        let (mut actor, tx) = rns_transport::actor::TransportActor::new();
-        actor.transport_identity_hash = Some(handle.transport_identity.hash);
+        let mut options = rns_transport::actor::TransportActorOptions::default();
+        options.static_transport_identity = true;
+        let (actor, tx) = rns_transport::actor::TransportActor::new_with_options(
+            4096,
+            rns_transport::constants::HASHLIST_MAXSIZE,
+            Default::default(),
+            options,
+        );
+        tx.try_send(TransportMessage::SetTransportIdentity {
+            identity_hash: handle.transport_identity.hash,
+        })
+        .unwrap();
         handle.transport_tx = tx;
         handle.announce_dispatch = actor.announce_dispatch_handle();
         (handle, tokio::spawn(actor.run()))
@@ -14423,7 +14458,7 @@ loglevel = 7
                 .hash
         );
         let blob = announce.app_data.unwrap();
-        let body = if blob[0] & rns_transport::discovery::FLAG_ENCRYPTED != 0 {
+        let body = if blob[0] & rns_transport::discovery::constants::FLAG_ENCRYPTED != 0 {
             handle
                 .network_identity
                 .as_ref()
@@ -15282,7 +15317,7 @@ loglevel = 7
         assert_eq!(rc.autoconnect_discovered_interfaces, 0);
         assert_eq!(
             rc.discover_interfaces_required_value,
-            rns_transport::discovery::DEFAULT_STAMP_VALUE
+            rns_transport::discovery::constants::DEFAULT_STAMP_VALUE
         );
         assert_eq!(rc.network_identity_path, None);
         assert!(rc.interface_discovery_sources.is_empty());

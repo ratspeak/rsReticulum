@@ -36,7 +36,7 @@ pub use tracing as __tracing;
 
 pub mod actor;
 pub mod announce;
-pub mod announce_validation;
+pub(crate) mod announce_validation;
 pub mod await_path;
 pub mod blackhole;
 pub mod constants;

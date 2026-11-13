@@ -50,7 +50,7 @@ pub const PATH_SLOW_BITRATE: u64 = 25_000;
 pub const PATH_SLOW_LINGER_FACTOR: f64 = 10.0;
 
 /// Interval between never-used pool checks (Transport.py).
-pub const PATH_POOL_CHECK_INTERVAL: f64 = 5.0 * 60.0;
+pub(crate) const PATH_POOL_CHECK_INTERVAL: f64 = 5.0 * 60.0;
 
 /// Reverse table entry timeout (8 minutes).
 pub const REVERSE_TIMEOUT: u64 = 480;
@@ -67,7 +67,7 @@ pub const MAX_RATE_TIMESTAMPS: usize = 16;
 pub const RATE_TABLE_RETAIN: f64 = 3600.0;
 
 /// Announce rate table cull interval (seconds).
-pub const RATE_TABLE_CULL_INTERVAL: f64 = 5.0;
+pub(crate) const RATE_TABLE_CULL_INTERVAL: f64 = 5.0;
 
 /// Random blobs saved to disk per destination.
 pub const PERSIST_RANDOM_BLOBS: usize = 32;
@@ -87,7 +87,7 @@ pub const PATH_REQUEST_GATE_TIMEOUT: f64 = 45.0;
 
 /// Deadline for path request and cached path response driver admission
 /// retries (seconds). Rust-internal; upstream has no admission queue.
-pub const PR_ADMISSION_DEADLINE: f64 = 120.0;
+pub(crate) const PR_ADMISSION_DEADLINE: f64 = 120.0;
 
 /// Maximum queued automatic discovery path requests after failed link setup.
 pub const MAX_QUEUED_DISCOVERY_PRS: usize = 32;
@@ -160,15 +160,15 @@ pub const ANNOUNCE_CACHE_SWEEP_INTERVAL: f64 = 300.0;
 
 /// Deferral added to the first announce-cache sweep after storage init
 /// (Python `cache_last_cleaned = time.time() + 60`).
-pub const ANNOUNCE_CACHE_SWEEP_DEFER: f64 = 60.0;
+pub(crate) const ANNOUNCE_CACHE_SWEEP_DEFER: f64 = 60.0;
 
 /// Interval in seconds between known-destination cleaning passes, the first
 /// one interval after the actor starts (Python `known_destinations_interval`).
-pub const KNOWN_DESTINATIONS_INTERVAL: f64 = 300.0;
+pub(crate) const KNOWN_DESTINATIONS_INTERVAL: f64 = 300.0;
 
 /// Interval in seconds between flushes of changed known-destination metadata
 /// (Python `kd_flush_interval`).
-pub const KD_FLUSH_INTERVAL: f64 = 10.0;
+pub(crate) const KD_FLUSH_INTERVAL: f64 = 10.0;
 
 /// Minimum spacing in seconds between a full persist and one requested by a
 /// local client disconnecting (Python `GRACIOUS_PERSIST_INTERVAL`).
@@ -281,7 +281,7 @@ pub const MAX_QUEUED_ANNOUNCES: usize = 4096;
 
 /// Queued announces one interface may send in one maintenance tick; bounds
 /// actor work on fast links.
-pub const MAX_ANNOUNCE_DRAIN_PER_TICK: usize = 256;
+pub(crate) const MAX_ANNOUNCE_DRAIN_PER_TICK: usize = 256;
 
 /// Grace period in seconds after the first interface registration before
 /// startup-gated in-memory cache cleanup becomes eligible.

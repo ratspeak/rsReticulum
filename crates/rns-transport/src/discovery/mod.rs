@@ -27,12 +27,7 @@ pub use blackhole_manifest::{
     BlackholeManifestEntry, ManifestError, apply_manifest, build_manifest, decode_manifest,
     decode_published_manifest,
 };
-pub use blackhole_subscriber::{
-    INITIAL_WAIT as BLACKHOLE_INITIAL_WAIT, JOB_INTERVAL as BLACKHOLE_JOB_INTERVAL,
-    SOURCE_TIMEOUT as BLACKHOLE_SOURCE_TIMEOUT, SubscriberState as BlackholeSubscriberState,
-    UPDATE_INTERVAL as BLACKHOLE_UPDATE_INTERVAL,
-};
-pub use constants::*;
+pub use blackhole_subscriber::SubscriberState as BlackholeSubscriberState;
 pub use receiver::{DiscoveryDecryptor, Outcome, Reason, ReceiverConfig};
 pub use stamper::{DiscoveryStamper, NullStamper, RnsDiscoveryStamper};
 pub use storage::{DiscoveredInterface, DiscoveryStatus, DiscoveryStore, discovery_hash};
