@@ -5,9 +5,9 @@
 //! ## Dual-service GATT
 //!
 //! ### Ratspeak (primary)
-//! - Service: `a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d`
-//! - RX:      `…4c5e` (peer writes here)
-//! - TX:      `…4c5f` (peer subscribes to notifications)
+//! - Service: `13370001-c7cb-4de2-98de-5d87fa06443d`
+//! - RX:      `13370002-…` (peer writes here)
+//! - TX:      `13370003-…` (peer subscribes to notifications)
 //!
 //! ### Columba (cross-app compat)
 //! - Service: `37145b00-442d-4a94-917f-8f42c5da28e3`
@@ -48,10 +48,10 @@ use crate::traits::{
 use rns_transport::messages::TransportMessage;
 
 // Peer writes RX, we notify TX. ID chars are legacy — no longer registered.
-pub const RATSPEAK_SERVICE_UUID: Uuid = Uuid::from_u128(0xa1b2c3d4_e5f6_4a5b_8c9d_0e1f2a3b4c5d);
-pub const RATSPEAK_RX_UUID: Uuid = Uuid::from_u128(0xa1b2c3d4_e5f6_4a5b_8c9d_0e1f2a3b4c5e);
-pub const RATSPEAK_TX_UUID: Uuid = Uuid::from_u128(0xa1b2c3d4_e5f6_4a5b_8c9d_0e1f2a3b4c5f);
-pub const RATSPEAK_ID_UUID: Uuid = Uuid::from_u128(0xa1b2c3d4_e5f6_4a5b_8c9d_0e1f2a3b4c60);
+pub const RATSPEAK_SERVICE_UUID: Uuid = Uuid::from_u128(0x13370001_c7cb_4de2_98de_5d87fa06443d);
+pub const RATSPEAK_RX_UUID: Uuid = Uuid::from_u128(0x13370002_c7cb_4de2_98de_5d87fa06443d);
+pub const RATSPEAK_TX_UUID: Uuid = Uuid::from_u128(0x13370003_c7cb_4de2_98de_5d87fa06443d);
+pub const RATSPEAK_ID_UUID: Uuid = Uuid::from_u128(0x13370004_c7cb_4de2_98de_5d87fa06443d);
 
 // Same shape with different UUIDs.
 pub const COLUMBA_SERVICE_UUID: Uuid = Uuid::from_u128(0x37145b00_442d_4a94_917f_8f42c5da28e3);

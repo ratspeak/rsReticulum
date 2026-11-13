@@ -424,7 +424,7 @@ mod tests {
     // ---- Protocol classification ----
 
     fn ratspeak_uuid() -> Uuid {
-        Uuid::from_u128(0xa1b2c3d4_e5f6_4a5b_8c9d_0e1f2a3b4c5d)
+        Uuid::from_u128(0x13370001_c7cb_4de2_98de_5d87fa06443d)
     }
     fn columba_uuid() -> Uuid {
         Uuid::from_u128(0x37145b00_442d_4a94_917f_8f42c5da28e3)
