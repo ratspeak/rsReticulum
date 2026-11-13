@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rns_identity::identity::Identity;
 use rns_runtime::config::{Config, ConfigError, ConfigSection};
@@ -12,12 +13,31 @@ use super::perms::{ALL_TGTS, resolve_identity_alias};
 use super::py_len;
 
 /// The file upstream writes when the config directory has none
-/// (`__default_rngit_config__`, `server.py`).
+/// (`__default_rngit_config__`, `server.py`), plus the fetch limit keys.
 pub const DEFAULT_CONFIG: &str = include_str!("default_config.txt");
 
 pub const DEFAULT_NODE_NAME: &str = "Anonymous Git Node";
 const LOG_NONE: i64 = -1;
 const LOG_EXTREME: i64 = 8;
+
+/// Bounds on the `git fetch` of a fork, mirror, or sync, which upstream runs
+/// unbounded (`_handle_remote_clone`, `__sync_mirror`, `__sync_fork`, `server.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchLimits {
+    /// `fetch_time_limit`, minutes in the config file.
+    pub time: Duration,
+    /// `fetch_size_limit`, megabytes in the config file: the bytes a fetch may add on disk.
+    pub size: u64,
+}
+
+impl Default for FetchLimits {
+    fn default() -> Self {
+        Self {
+            time: Duration::from_secs(30 * 60),
+            size: 1024 * 1024 * 1024,
+        }
+    }
+}
 
 /// What `__apply_config` takes from the config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +56,7 @@ pub struct NodeConfig {
     pub stats_ignored: Vec<Vec<u8>>,
     pub stats_push_ignored: Vec<Vec<u8>>,
     pub blocked_identities: Vec<Vec<u8>>,
+    pub fetch_limits: FetchLimits,
     /// `[repositories]` group name to the configured path, before `~` expansion.
     pub repositories: BTreeMap<String, String>,
     /// `[access]` group name to its permission statements.
@@ -55,6 +76,7 @@ impl Default for NodeConfig {
             stats_ignored: Vec::new(),
             stats_push_ignored: Vec::new(),
             blocked_identities: Vec::new(),
+            fetch_limits: FetchLimits::default(),
             repositories: BTreeMap::new(),
             access: BTreeMap::new(),
         }
@@ -74,6 +96,15 @@ fn as_int(section: &ConfigSection, name: &str, key: &str) -> Result<i64, ConfigE
     section
         .get_int(key)
         .ok_or_else(|| invalid(name, key, "not an integer"))
+}
+
+/// A fetch limit: there is no unlimited value, so anything below 1 counts as 1.
+fn as_limit(section: &ConfigSection, name: &str, key: &str) -> Result<u64, ConfigError> {
+    let value = as_int(section, name, key)?;
+    if value < 1 {
+        tracing::warn!("{key} = {value} in configuration file is below 1, using 1");
+    }
+    Ok(value.max(1) as u64)
 }
 
 /// ConfigObj `as_bool`, which raises on anything but its boolean words.
@@ -128,6 +159,14 @@ impl NodeConfig {
             }
             if section.has("record_stats") {
                 node.record_stats = as_bool(section, name, "record_stats")?;
+            }
+            if section.has("fetch_time_limit") {
+                let minutes = as_limit(section, name, "fetch_time_limit")?;
+                node.fetch_limits.time = Duration::from_secs(minutes.saturating_mul(60));
+            }
+            if section.has("fetch_size_limit") {
+                let megabytes = as_limit(section, name, "fetch_size_limit")?;
+                node.fetch_limits.size = megabytes.saturating_mul(1024 * 1024);
             }
             for (key, target) in [
                 ("stats_ignore_identities", &mut node.stats_ignored),

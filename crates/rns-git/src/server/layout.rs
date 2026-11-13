@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::config::{NodeConfig, expand_user};
+use super::config::{FetchLimits, NodeConfig, expand_user};
 use super::perms::{AllowedError, Perm, Permissions, load_allowed_permissions};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +37,7 @@ pub struct Repositories {
     pub groups: BTreeMap<String, Group>,
     pub aliases: BTreeMap<String, String>,
     pub blocked: Vec<Vec<u8>>,
+    pub fetch_limits: FetchLimits,
 }
 
 /// A `git` call in `cwd` with output captured; `None` when it cannot run
@@ -80,6 +81,7 @@ impl Repositories {
             groups: BTreeMap::new(),
             aliases: config.aliases.clone(),
             blocked: config.blocked_identities.clone(),
+            fetch_limits: config.fetch_limits,
         };
         for (name, raw_path) in &config.repositories {
             let path = expand_user(raw_path);

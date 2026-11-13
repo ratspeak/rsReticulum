@@ -34,6 +34,14 @@ announce_interval = 360
 
 # blocked_identities = d7db22f63b453c23bb0688dde565b7c1
 
+# Longest a fork, mirror, or sync fetch may run, in minutes.
+
+# fetch_time_limit = 30
+
+# Most a fork, mirror, or sync fetch may add on disk, in megabytes.
+
+# fetch_size_limit = 1024
+
 [repositories]
 
 # You can define multiple repository groups, each with a path

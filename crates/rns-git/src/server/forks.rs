@@ -1,6 +1,8 @@
 //! `/git/fork`, `/git/mirror`, `/git/sync` and the periodic mirror job
 //! (`server.py`).
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmpv::Value;
 
+use super::config::FetchLimits;
 use super::handlers::{
     REPO_CREATE_PERMS_TEMPLATE, get, identity_text, log_request, status, truthy,
 };
@@ -26,6 +29,19 @@ pub const SYNC_CHECK_INTERVAL: u64 = 15 * 60;
 
 /// `ls-remote` is the only git call upstream bounds (`server.py`).
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Git has no fetch size cap, so the repository is measured as the fetch runs:
+/// once a second, which bounds the overshoot to a second of transfer for one
+/// directory walk.
+const SIZE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a stopped fetch gets to drop its lock files before it is killed.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Process groups of the fetches in flight.
+static FETCHES: Mutex<Vec<nix::libc::pid_t>> = Mutex::new(Vec::new());
 
 /// What a clone handler makes: a fork or a mirror.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +113,171 @@ fn git_with_timeout(
 
 fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn signal_group(pgid: nix::libc::pid_t, signal: nix::libc::c_int) {
+    // SAFETY: killpg takes two integers and touches no memory of this process.
+    unsafe { nix::libc::killpg(pgid, signal) };
+}
+
+/// Stop the fetches in flight. They run in their own process groups, so a
+/// terminal interrupt of the node does not reach them.
+pub fn stop_fetches() {
+    for pgid in FETCHES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        signal_group(*pgid, nix::libc::SIGTERM);
+    }
+}
+
+/// A fetch's process group, listed in `FETCHES` while it runs.
+struct FetchGroup(nix::libc::pid_t);
+
+impl FetchGroup {
+    fn new(child: &std::process::Child) -> Self {
+        let pgid = child.id() as nix::libc::pid_t;
+        FETCHES.lock().unwrap_or_else(|e| e.into_inner()).push(pgid);
+        FetchGroup(pgid)
+    }
+
+    /// SIGTERM, so git removes its lock files, then SIGKILL for whatever is left.
+    fn stop(&self, child: &mut std::process::Child) {
+        signal_group(self.0, nix::libc::SIGTERM);
+        let deadline = Instant::now() + STOP_GRACE;
+        while Instant::now() < deadline && !matches!(child.try_wait(), Ok(Some(_))) {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        signal_group(self.0, nix::libc::SIGKILL);
+        let _ = child.wait();
+    }
+}
+
+impl Drop for FetchGroup {
+    fn drop(&mut self) {
+        FETCHES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|pgid| *pgid != self.0);
+    }
+}
+
+/// Bytes of the files under `path`; what vanishes during the walk counts as nothing.
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => pending.push(entry.path()),
+                Ok(meta) => total += meta.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
+fn pack_files(repo_path: &Path) -> HashSet<OsString> {
+    std::fs::read_dir(repo_path.join("objects/pack"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect()
+}
+
+/// Git leaves the pack it was receiving when stopped, and a mirror is retried
+/// at every sync check, so the packs this fetch left are removed.
+fn remove_partial_packs(repo_path: &Path, before: &HashSet<OsString>) {
+    for entry in std::fs::read_dir(repo_path.join("objects/pack"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("tmp_") && !before.contains(&name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// How a fetch under [`FetchLimits`] ended.
+enum Fetched {
+    Done,
+    /// Git's stderr.
+    Failed(String),
+    /// The limit it went over, which is already logged.
+    Stopped(String),
+}
+
+/// `git fetch <source> +refs/*:refs/*` in `repo_path`, stopped at a time or size limit.
+/// Differs from `_handle_remote_clone`, `__sync_mirror`, and `__sync_fork`
+/// (`server.py`), whose fetches have no time or size limit.
+fn fetch_all(
+    label: &str,
+    repo_path: &Path,
+    source: &str,
+    limits: FetchLimits,
+) -> std::io::Result<Fetched> {
+    use std::os::unix::process::CommandExt;
+    let packs_before = pack_files(repo_path);
+    let size_before = dir_size(repo_path);
+    let grown = || dir_size(repo_path).saturating_sub(size_before);
+    let mut child = Command::new("git")
+        .args(["fetch", source, "+refs/*:refs/*"])
+        .current_dir(repo_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        // Its own group, so the transport helpers it starts are stopped with it.
+        .process_group(0)
+        .spawn()?;
+    let group = FetchGroup::new(&child);
+    let mut stderr = child.stderr.take().expect("piped");
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let started = Instant::now();
+    let mut sampled = started;
+    let time_limit = || {
+        let minutes = limits.time.as_secs_f64() / 60.0;
+        format!("time limit of {minutes} minutes exceeded")
+    };
+    let size_limit = || {
+        let megabytes = limits.size as f64 / (1024.0 * 1024.0);
+        format!("size limit of {megabytes} megabytes exceeded")
+    };
+    let reason = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if !status.success() => {
+                return Ok(Fetched::Failed(lossy(&reader.join().unwrap_or_default())));
+            }
+            Ok(Some(_)) if grown() <= limits.size => return Ok(Fetched::Done),
+            // The fetch finished between two samples.
+            Ok(Some(_)) => break size_limit(),
+            Ok(None) => {}
+            Err(e) => {
+                group.stop(&mut child);
+                return Err(e);
+            }
+        }
+        let over = if started.elapsed() >= limits.time {
+            Some(time_limit())
+        } else if sampled.elapsed() >= SIZE_SAMPLE_INTERVAL {
+            sampled = Instant::now();
+            (grown() > limits.size).then(size_limit)
+        } else {
+            None
+        };
+        if let Some(reason) = over {
+            group.stop(&mut child);
+            remove_partial_packs(repo_path, &packs_before);
+            break reason;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    tracing::error!("Fetch from {source} for {label} failed: {reason}");
+    Ok(Fetched::Stopped(reason))
 }
 
 /// Python `int()` of a stripped string: sign, digits, single underscores between digits.
@@ -227,7 +408,13 @@ pub fn update_head_to_source_default(repo_path: &Path, source_url: &str) -> bool
 
 /// `__sync_mirror` / `__sync_fork` (`server.py`): fetch every ref
 /// from the source; a mirror also follows the source's HEAD.
-fn sync_upstream(kind: RepoType, label: &str, path: &Path, source: &str) -> bool {
+fn sync_upstream(
+    kind: RepoType,
+    label: &str,
+    path: &Path,
+    source: &str,
+    limits: FetchLimits,
+) -> bool {
     let what = match kind {
         RepoType::Mirror => "mirror",
         RepoType::Fork => "fork",
@@ -236,15 +423,13 @@ fn sync_upstream(kind: RepoType, label: &str, path: &Path, source: &str) -> bool
         tracing::error!("Could not determine upstream source for {what} {label}");
         return false;
     }
-    match git(Some(path), &["fetch", source, "+refs/*:refs/*"]) {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            tracing::error!(
-                "Failed to sync {what} {label} from {source}: {}",
-                lossy(&out.stderr)
-            );
+    match fetch_all(label, path, source, limits) {
+        Ok(Fetched::Done) => {}
+        Ok(Fetched::Failed(stderr)) => {
+            tracing::error!("Failed to sync {what} {label} from {source}: {stderr}");
             return false;
         }
+        Ok(Fetched::Stopped(_)) => return false,
         Err(e) => {
             tracing::error!("Error syncing {what} {label}: {e}");
             return false;
@@ -282,9 +467,9 @@ pub fn sync_mirrors(repos: &RwLock<Repositories>, mirror_interval: i64, sync_loc
     let Ok(_guard) = sync_lock.try_lock() else {
         return;
     };
-    let mirrors: Vec<(String, PathBuf, String)> = {
+    let (mirrors, limits): (Vec<(String, PathBuf, String)>, FetchLimits) = {
         let repos = repos.read().unwrap_or_else(|e| e.into_inner());
-        repos
+        let mirrors = repos
             .groups
             .values()
             .flat_map(|g| g.repositories.values())
@@ -292,12 +477,13 @@ pub fn sync_mirrors(repos: &RwLock<Repositories>, mirror_interval: i64, sync_loc
                 let source = r.mirror.clone().filter(|s| !s.is_empty())?;
                 Some((format!("{}/{}", r.group, r.name), r.path.clone(), source))
             })
-            .collect()
+            .collect();
+        (mirrors, repos.fetch_limits)
     };
     for (label, path, source) in mirrors {
         if now_secs() > mirror_synced(&path) + mirror_interval {
             tracing::info!("Syncing mirror {label}");
-            sync_upstream(RepoType::Mirror, &label, &path, &source);
+            sync_upstream(RepoType::Mirror, &label, &path, &source, limits);
         }
     }
 }
@@ -405,7 +591,7 @@ fn handle_remote_clone(
         return Some(status(RES_INVALID_REQ, "Invalid request"));
     };
 
-    let final_path = {
+    let (final_path, limits) = {
         let r = repos.read().unwrap_or_else(|e| e.into_inner());
         let Some(group_path) = r.groups.get(group).map(|g| g.path.clone()) else {
             return Some(status(RES_NOT_FOUND, "Not found"));
@@ -430,10 +616,19 @@ fn handle_remote_clone(
                 status(RES_NOT_FOUND, "Not found")
             });
         }
-        final_path
+        (final_path, r.fetch_limits)
     };
 
-    let reply = clone_into(repos, hash, group, repo, source_url, &final_path, repo_type);
+    let reply = clone_into(
+        repos,
+        hash,
+        group,
+        repo,
+        source_url,
+        &final_path,
+        repo_type,
+        limits,
+    );
     Some(reply.unwrap_or_else(|e| {
         tracing::error!(
             "Error while {}ing repository {group}/{repo}: {e}",
@@ -447,6 +642,7 @@ fn handle_remote_clone(
 }
 
 /// The `try` body of `_handle_remote_clone` (`server.py`).
+#[allow(clippy::too_many_arguments)]
 fn clone_into(
     repos: &RwLock<Repositories>,
     hash: &[u8; 16],
@@ -455,6 +651,7 @@ fn clone_into(
     source_url: &str,
     final_path: &Path,
     repo_type: RepoType,
+    limits: FetchLimits,
 ) -> Result<Vec<u8>, String> {
     let kind = repo_type.name();
     tracing::debug!(
@@ -485,14 +682,22 @@ fn clone_into(
         return Ok(status(RES_REMOTE_FAIL, "Failed to initialize repository"));
     }
     tracing::debug!("Fetching from {source_url}...");
-    let result = run(&["fetch", source_url, "+refs/*:refs/*"])?;
-    if !result.status.success() {
-        let stderr = lossy(&result.stderr);
-        tracing::error!("Failed to fetch from {source_url}: {stderr}");
-        return Ok(status(
-            RES_REMOTE_FAIL,
-            &format!("Failed to fetch from source: {stderr}"),
-        ));
+    let label = format!("{group}/{repo}");
+    match fetch_all(&label, &temp_path, source_url, limits).map_err(|e| e.to_string())? {
+        Fetched::Done => {}
+        Fetched::Failed(stderr) => {
+            tracing::error!("Failed to fetch from {source_url}: {stderr}");
+            return Ok(status(
+                RES_REMOTE_FAIL,
+                &format!("Failed to fetch from source: {stderr}"),
+            ));
+        }
+        Fetched::Stopped(reason) => {
+            return Ok(status(
+                RES_REMOTE_FAIL,
+                &format!("Failed to fetch from source: {reason}"),
+            ));
+        }
     }
     update_head_to_source_default(&temp_path, source_url);
 
@@ -606,24 +811,28 @@ pub fn handle_sync(
         let label = format!("{group}/{repo}");
         let mirror = repository.mirror.clone().filter(|s| !s.is_empty());
         let fork = repository.fork.clone().filter(|s| !s.is_empty());
-        (label, repository.path.clone(), mirror, fork)
+        (label, repository.path.clone(), mirror, fork, r.fetch_limits)
     };
-    let (label, path, mirror, fork) = target;
+    let (label, path, mirror, fork, limits) = target;
     if let Some(source) = mirror {
         tracing::info!("Syncing mirror {label}");
-        return Some(if sync_upstream(RepoType::Mirror, &label, &path, &source) {
-            vec![RES_OK]
-        } else {
-            status(RES_REMOTE_FAIL, "Mirror sync failed")
-        });
+        return Some(
+            if sync_upstream(RepoType::Mirror, &label, &path, &source, limits) {
+                vec![RES_OK]
+            } else {
+                status(RES_REMOTE_FAIL, "Mirror sync failed")
+            },
+        );
     }
     if let Some(source) = fork {
         tracing::info!("Syncing fork {label} with upstream");
-        return Some(if sync_upstream(RepoType::Fork, &label, &path, &source) {
-            vec![RES_OK]
-        } else {
-            status(RES_REMOTE_FAIL, "Fork sync failed")
-        });
+        return Some(
+            if sync_upstream(RepoType::Fork, &label, &path, &source, limits) {
+                vec![RES_OK]
+            } else {
+                status(RES_REMOTE_FAIL, "Fork sync failed")
+            },
+        );
     }
     Some(status(
         RES_INVALID_REQ,

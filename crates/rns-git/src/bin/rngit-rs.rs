@@ -13,7 +13,7 @@ use rns_git::server::config::{
     NodeConfig, load_or_create_identity, read_or_create_config, resolve_config_dir,
 };
 use rns_git::server::forks::{
-    SYNC_CHECK_INTERVAL, handle_fork, handle_mirror, handle_sync, sync_mirrors,
+    SYNC_CHECK_INTERVAL, handle_fork, handle_mirror, handle_sync, stop_fetches, sync_mirrors,
 };
 use rns_git::server::handlers::{
     Reply, handle_create, handle_delete, handle_fetch, handle_list, handle_push,
@@ -1438,5 +1438,6 @@ async fn main() {
         }
     }
     println!();
+    stop_fetches();
     rns_tools::exit(&handle, 0).await;
 }
