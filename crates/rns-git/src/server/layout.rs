@@ -206,8 +206,7 @@ impl Repositories {
         self.blocked.iter().any(|b| b.as_slice() == hash)
     }
 
-    /// `resolve_permission` (`server.py`), the only resolver that
-    /// checks the blocklist.
+    /// `resolve_permission` (`server.py`).
     pub fn resolve_permission(
         &self,
         hash: &[u8; 16],
@@ -227,11 +226,13 @@ impl Repositories {
         super::perms::resolve_repository(&g.permissions, &r.permissions, hash, perm)
     }
 
-    /// `resolve_group_permission` (`server.py`).
+    /// `resolve_group_permission` (`server.py`), which upstream runs without the block list.
     pub fn resolve_group_permission(&self, hash: &[u8; 16], group: &str, perm: Perm) -> bool {
-        self.groups
-            .get(group)
-            .is_some_and(|g| super::perms::resolve_group(&g.permissions, hash, perm))
+        !self.is_blocked(hash)
+            && self
+                .groups
+                .get(group)
+                .is_some_and(|g| super::perms::resolve_group(&g.permissions, hash, perm))
     }
 
     pub fn repository(&self, group: &str, repository: &str) -> Option<&Repository> {

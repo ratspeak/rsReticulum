@@ -149,7 +149,7 @@ fn allowed_path(work_path: &Path, doc_id: i128) -> PathBuf {
 
 /// `resolve_doc_permission` (`server.py`): the document's
 /// `.allowed` file decides first, then the repository and group as
-/// `resolve_permission` does, without the blocklist.
+/// `resolve_permission` does. Upstream runs it without the block list.
 pub fn resolve_doc_permission(
     repos: &Repositories,
     hash: &[u8; 16],
@@ -157,6 +157,9 @@ pub fn resolve_doc_permission(
     doc_id: i128,
     perm: Perm,
 ) -> bool {
+    if repos.is_blocked(hash) {
+        return false;
+    }
     let Some((group_name, repository_name)) = path else {
         return false;
     };
