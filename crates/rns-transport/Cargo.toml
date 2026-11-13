@@ -8,7 +8,9 @@ rust-version.workspace = true
 license-file.workspace = true
 
 [features]
-default = []
+default = ["sqlite-store"]
+# SQLite-backed known-destination, ratchet and announce-cache stores.
+sqlite-store = ["dep:rusqlite"]
 # When enabled, the transport actor tick slows from 250ms to 2s while the
 # shared `is_foreground` flag is false. Enabled only on mobile builds of the
 # Tauri wrapper — desktop leaves this off so nothing degrades when a window
@@ -29,6 +31,7 @@ serde = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 hex = { workspace = true }
+rusqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

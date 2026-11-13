@@ -63,6 +63,7 @@ pub mod pr_stamper;
 pub mod rate_limit;
 pub mod reverse_table;
 pub mod stamps;
+pub mod store;
 pub mod traffic;
 pub mod tunnel;
 
