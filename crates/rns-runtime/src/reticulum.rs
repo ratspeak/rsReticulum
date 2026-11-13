@@ -3965,20 +3965,8 @@ pub async fn init_with_policy(
     // Persistent transport identity (Python 1.3.8 Transport._identity /
     // internal_identity()): the actor keeps it for RPC-key parity and swaps
     // in the ephemeral hash itself when the policy applies.
-    let transport_identity_path = paths.storage_dir.join("transport_identity");
-    let transport_identity = match rns_identity::identity::Identity::from_file(
-        &transport_identity_path,
-    ) {
-        Ok(id) => id,
-        Err(_) => {
-            let id = rns_identity::identity::Identity::new();
-            if let Err(e) = id.to_file(&transport_identity_path) {
-                tracing::warn!(path = %transport_identity_path.display(), error = %e,
-                    "failed to persist transport identity — path request identity will change on restart");
-            }
-            id
-        }
-    };
+    let transport_identity =
+        load_or_create_transport_identity(&paths.storage_dir.join("transport_identity"));
     let _ = transport_tx.try_send(TransportMessage::SetTransportIdentity {
         identity_hash: transport_identity.hash,
     });
@@ -11000,6 +10988,47 @@ fn load_or_create_config(path: &Path) -> Result<(Config, bool), ReticulumError> 
     }
 }
 
+/// The persistent transport identity, created when absent. Creation is
+/// exclusive: a daemon and a tool starting together on a fresh directory must
+/// end with one identity, or the RPC key each derives from it differs.
+fn load_or_create_transport_identity(path: &Path) -> Identity {
+    if let Ok(identity) = Identity::from_file(path) {
+        return identity;
+    }
+    let identity = Identity::new();
+    let warn = |error: &dyn std::fmt::Display| {
+        tracing::warn!(path = %path.display(), %error,
+            "failed to persist transport identity — path request identity will change on restart");
+    };
+    if path.exists() {
+        // An unreadable file is replaced.
+        if let Err(e) = identity.to_file(path) {
+            warn(&e);
+        }
+        return identity;
+    }
+    // Unique per call, so two creators never share a staged file.
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+    let staged = path.with_extension(format!(
+        "new.{}.{}",
+        std::process::id(),
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ));
+    let created = match identity.to_file(&staged) {
+        // A hard link fails when the name exists, so only one creator wins.
+        Ok(()) => std::fs::hard_link(&staged, path),
+        Err(e) => Err(std::io::Error::other(e.to_string())),
+    };
+    let _ = std::fs::remove_file(&staged);
+    match created {
+        Ok(()) => identity,
+        Err(e) => Identity::from_file(path).unwrap_or_else(|_| {
+            warn(&e);
+            identity
+        }),
+    }
+}
+
 fn load_or_create_network_identity(path: &Path) -> Result<Arc<Identity>, ReticulumError> {
     let identity = if path.is_file() {
         Identity::from_file(path).map_err(|e| {
@@ -11167,6 +11196,27 @@ mod tests {
     mod interface_stats;
     mod manage_interfaces;
     mod tunnels;
+
+    #[test]
+    fn processes_starting_together_end_with_one_transport_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transport_identity");
+        let start = std::sync::Barrier::new(8);
+        let hashes: Vec<_> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        load_or_create_transport_identity(&path).hash
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        let stored = Identity::from_file(&path).unwrap().hash;
+        assert!(hashes.iter().all(|hash| *hash == stored), "{hashes:?}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     async fn wait_for_registry_len(registry: &InterfaceRegistry, expected: usize) {
         // An RNode registers only after its 2 s post-open settle.
