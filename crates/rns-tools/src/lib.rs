@@ -3,6 +3,8 @@
 pub mod format;
 pub mod hash;
 pub mod rnx;
+/// Not API: helpers shared by the tool binaries and `rns-git`.
+#[doc(hidden)]
 pub mod rsg;
 
 use std::time::Duration;
