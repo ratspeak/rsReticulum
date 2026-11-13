@@ -10,8 +10,7 @@ use rmpv::Value;
 /// `stats_job_interval` (`server.py`), seconds between writes of the file.
 pub const STATS_JOB_INTERVAL: u64 = 180;
 
-/// A node of the stats tree. Maps refer to children by index, so one child can
-/// sit under several keys, as Python objects do.
+/// A node of the stats tree; maps refer to children by index.
 #[derive(Debug, Clone)]
 enum Node {
     Map(Vec<(Value, usize)>),
@@ -19,17 +18,10 @@ enum Node {
 }
 
 /// The stats tree in an arena.
-///
-/// Upstream creates missing groups and repositories from the class attributes
-/// `STATS_INIT_GROUP` and `STATS_INIT_REPO` without copying them
-/// (`server.py`), so every group and repository first recorded in a
-/// process is the same object, and counts recorded under one show under all.
 #[derive(Debug)]
 struct Tree {
     nodes: Vec<Node>,
     root: usize,
-    init_group: usize,
-    init_repo: usize,
 }
 
 const REPO_METRICS: [&str; 5] = ["view", "fetch", "push", "download", "release_download"];
@@ -39,22 +31,30 @@ impl Tree {
         let mut tree = Tree {
             nodes: Vec::new(),
             root: 0,
-            init_group: 0,
-            init_repo: 0,
         };
         let front = tree.empty_map();
         let pages = tree.map_of(vec![("front", front)]);
         let groups = tree.empty_map();
         tree.root = tree.map_of(vec![("pages", pages), ("groups", groups)]);
-        let view = tree.empty_map();
-        let repositories = tree.empty_map();
-        tree.init_group = tree.map_of(vec![("view", view), ("repositories", repositories)]);
+        tree
+    }
+
+    /// A group's own counters. Differs from `STATS_INIT_GROUP` (`server.py`),
+    /// one object that upstream shares between every group it first records.
+    fn new_group(&mut self) -> usize {
+        let view = self.empty_map();
+        let repositories = self.empty_map();
+        self.map_of(vec![("view", view), ("repositories", repositories)])
+    }
+
+    /// A repository's own counters. Differs from `STATS_INIT_REPO` (`server.py`),
+    /// one object that upstream shares between every repository it first records.
+    fn new_repo(&mut self) -> usize {
         let metrics: Vec<(&str, usize)> = REPO_METRICS
             .iter()
-            .map(|name| (*name, tree.empty_map()))
+            .map(|name| (*name, self.empty_map()))
             .collect();
-        tree.init_repo = tree.map_of(metrics);
-        tree
+        self.map_of(metrics)
     }
 
     fn push(&mut self, node: Node) -> usize {
@@ -74,7 +74,7 @@ impl Tree {
         self.push(Node::Map(entries))
     }
 
-    /// The file's content replaces the root; the init objects stay fresh.
+    /// The file's content replaces the root.
     fn load(&mut self, value: &Value) {
         self.root = self.insert(value);
     }
@@ -188,12 +188,10 @@ impl Tree {
     }
 
     fn record(&mut self, gate: Gate, group: &str, repo: &str, day: &str) -> Result<(), String> {
-        let init_group = self.init_group;
-        let init_repo = self.init_repo;
         let pages = |t: &Self| t.index(t.root, "pages").and_then(|p| t.index(p, "front"));
         let group_node = |t: &mut Self| {
             let groups = t.index(t.root, "groups")?;
-            t.setdefault(groups, group, |_| init_group)
+            t.setdefault(groups, group, Self::new_group)
         };
         let counters = match gate {
             Gate::PageView => pages(self)?,
@@ -204,7 +202,7 @@ impl Tree {
             Gate::Repo(metric) => {
                 let g = group_node(self)?;
                 let repos = self.index(g, "repositories")?;
-                let r = self.setdefault(repos, repo, |_| init_repo)?;
+                let r = self.setdefault(repos, repo, Self::new_repo)?;
                 self.setdefault(r, metric, Self::empty_map)?
             }
         };
