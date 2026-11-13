@@ -1738,11 +1738,12 @@ listener.close()
                         interfaces
                             .iter()
                             .enumerate()
-                            .map(|(id, &(online, bitrate))| InterfaceStatRpcEntry {
-                                id: id as u64,
-                                online,
-                                bitrate,
-                                ..Default::default()
+                            .map(|(id, &(online, bitrate))| {
+                                let mut entry = InterfaceStatRpcEntry::default();
+                                entry.id = id as u64;
+                                entry.online = online;
+                                entry.bitrate = bitrate;
+                                entry
                             })
                             .collect(),
                     ),

@@ -2833,54 +2833,55 @@ fn rpc_response_to_transport_response(
         RpcResponse::InterfaceStats(entries) => {
             let entries = entries
                 .into_iter()
-                .map(|entry| InterfaceStatRpcEntry {
-                    id: entry.id,
-                    name: entry.name,
-                    rx_bytes: entry.rx_bytes,
-                    tx_bytes: entry.tx_bytes,
-                    rx_rate: entry.rx_rate,
-                    tx_rate: entry.tx_rate,
-                    online: entry.online,
-                    bitrate: entry.bitrate,
-                    mtu: entry.mtu,
-                    mode: entry.mode,
-                    role: entry.role,
-                    announce_queue: entry.announce_queue,
-                    held_announces: entry.held_announces,
-                    incoming_announce_frequency: entry.incoming_announce_frequency,
-                    outgoing_announce_frequency: entry.outgoing_announce_frequency,
-                    incoming_pr_frequency: entry.incoming_pr_frequency,
-                    outgoing_pr_frequency: entry.outgoing_pr_frequency,
-                    burst_active: entry.burst_active,
-                    burst_activated: entry.burst_activated,
-                    pr_burst_active: entry.pr_burst_active,
-                    pr_burst_activated: entry.pr_burst_activated,
-                    clients: entry.clients,
-                    blocked_ips: entry.blocked_ips,
-                    announce_rate_target: entry.announce_rate_target,
-                    announce_rate_grace: entry.announce_rate_grace,
-                    announce_rate_penalty: entry.announce_rate_penalty,
-                    announce_cap: entry.announce_cap,
-                    ifac_size: entry.ifac_size.unwrap_or(0),
-                    tx_drops: entry.tx_drops,
-                    tx_dropped_bytes: entry.tx_dropped_bytes,
-                    announces_received: entry.announces_received,
-                    announces_sent: entry.announces_sent,
-                    path_requests_received: entry.path_requests_received,
-                    path_requests_sent: entry.path_requests_sent,
-                    protocol_violations: entry.protocol_violations,
-                    ifac_violations: entry.ifac_violations,
-                    packet_filter_hits: entry.packet_filter_hits,
-                    gravity: entry.gravity,
-                    announces_to_internal: entry.announces_to_internal,
-                    parent_id: None,
-                    announce_rx_bytes: entry.announce_rx_bytes,
-                    announce_tx_bytes: entry.announce_tx_bytes,
-                    path_request_rx_bytes: entry.path_request_rx_bytes,
-                    path_request_tx_bytes: entry.path_request_tx_bytes,
-                    burst_count: entry.burst_count,
-                    pr_burst_count: entry.pr_burst_count,
-                    ..Default::default()
+                .map(|entry| {
+                    let mut stat = InterfaceStatRpcEntry::default();
+                    stat.id = entry.id;
+                    stat.name = entry.name;
+                    stat.rx_bytes = entry.rx_bytes;
+                    stat.tx_bytes = entry.tx_bytes;
+                    stat.rx_rate = entry.rx_rate;
+                    stat.tx_rate = entry.tx_rate;
+                    stat.online = entry.online;
+                    stat.bitrate = entry.bitrate;
+                    stat.mtu = entry.mtu;
+                    stat.mode = entry.mode;
+                    stat.role = entry.role;
+                    stat.announce_queue = entry.announce_queue;
+                    stat.held_announces = entry.held_announces;
+                    stat.incoming_announce_frequency = entry.incoming_announce_frequency;
+                    stat.outgoing_announce_frequency = entry.outgoing_announce_frequency;
+                    stat.incoming_pr_frequency = entry.incoming_pr_frequency;
+                    stat.outgoing_pr_frequency = entry.outgoing_pr_frequency;
+                    stat.burst_active = entry.burst_active;
+                    stat.burst_activated = entry.burst_activated;
+                    stat.pr_burst_active = entry.pr_burst_active;
+                    stat.pr_burst_activated = entry.pr_burst_activated;
+                    stat.clients = entry.clients;
+                    stat.blocked_ips = entry.blocked_ips;
+                    stat.announce_rate_target = entry.announce_rate_target;
+                    stat.announce_rate_grace = entry.announce_rate_grace;
+                    stat.announce_rate_penalty = entry.announce_rate_penalty;
+                    stat.announce_cap = entry.announce_cap;
+                    stat.ifac_size = entry.ifac_size.unwrap_or(0);
+                    stat.tx_drops = entry.tx_drops;
+                    stat.tx_dropped_bytes = entry.tx_dropped_bytes;
+                    stat.announces_received = entry.announces_received;
+                    stat.announces_sent = entry.announces_sent;
+                    stat.path_requests_received = entry.path_requests_received;
+                    stat.path_requests_sent = entry.path_requests_sent;
+                    stat.protocol_violations = entry.protocol_violations;
+                    stat.ifac_violations = entry.ifac_violations;
+                    stat.packet_filter_hits = entry.packet_filter_hits;
+                    stat.gravity = entry.gravity;
+                    stat.announces_to_internal = entry.announces_to_internal;
+                    stat.parent_id = None;
+                    stat.announce_rx_bytes = entry.announce_rx_bytes;
+                    stat.announce_tx_bytes = entry.announce_tx_bytes;
+                    stat.path_request_rx_bytes = entry.path_request_rx_bytes;
+                    stat.path_request_tx_bytes = entry.path_request_tx_bytes;
+                    stat.burst_count = entry.burst_count;
+                    stat.pr_burst_count = entry.pr_burst_count;
+                    stat
                 })
                 .collect();
             TransportQueryResponse::InterfaceStats(entries)
@@ -2992,6 +2993,7 @@ impl SharedInstanceType {
 
 /// Per-construction overrides for [`init_with_options`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InitOptions {
     /// Python `require_shared_instance`: fail startup rather than become the shared instance.
     pub require_shared_instance: bool,
@@ -3106,6 +3108,7 @@ fn socket_path_display(path: &str) -> String {
 pub use rns_transport::inbound_queues::InboundQueueLengths;
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 /// Parsed runtime settings. `Default` supplies values; `try_from_config`
 /// overlays supported keys. Editing this struct after initialization does
 /// not reconfigure already-running actors or interface tasks.
@@ -5803,61 +5806,42 @@ async fn prepare_interface_with_role_and_overrides(
             },
         );
     }
-    let entry = rns_transport::messages::InterfaceEntry {
-        owner: handle.owner.clone(),
-        packet_capacity: handle.packet_capacity,
-        name: handle.name.clone(),
-        mode: convert_mode(handle.mode),
-        role,
-        parent_id: handle.parent_id,
-        accepted: handle.parent_id.is_some(),
-        direction: rns_transport::constants::InterfaceDirection {
+    let mut entry = rns_transport::messages::InterfaceEntry::new(
+        handle.name.clone(),
+        convert_mode(handle.mode),
+        rns_transport::constants::InterfaceDirection {
             inbound: handle.direction.inbound,
             outbound: handle.direction.outbound,
         },
-        bitrate: handle.bitrate,
-        mtu: handle.mtu,
-        tx: handle.tx,
-        ifac_key,
-        ifac_size,
-        announce_cap: inherited
-            .as_ref()
-            .map_or(ANNOUNCE_CAP, |parent| parent.announce_cap),
-        announce_allowed_at: 0.0,
-        announce_rate_target: inherited
-            .as_ref()
-            .and_then(|parent| parent.announce_rate_target),
-        announce_rate_grace: inherited
-            .as_ref()
-            .and_then(|parent| parent.announce_rate_grace),
-        announce_rate_penalty: inherited
-            .as_ref()
-            .and_then(|parent| parent.announce_rate_penalty),
-        online: Some(online.clone()),
-        rxb: handle.rxb,
-        txb: handle.txb,
-        inspection: handle.inspection,
-        tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        tx_dropped_bytes: 0,
-        protocol_violations: 0,
-        ifac_violations: 0,
-        packet_filter_hits: 0,
-        ingress,
-        announce_queue: Vec::new(),
-        multipoint,
-        recursive_prs: inherited
-            .as_ref()
-            .is_some_and(|parent| parent.recursive_prs),
-        announces_from_internal: inherited
-            .as_ref()
-            .is_none_or(|parent| parent.announces_from_internal),
-        announces_to_internal: inherited
-            .as_ref()
-            .and_then(|parent| parent.announces_to_internal),
-        gravity: inherited.as_ref().map_or(0, |parent| parent.gravity),
-        destination_cost: child_stamp_costs.0,
-        pr_cost: child_stamp_costs.1,
-    };
+        handle.bitrate,
+        handle.mtu,
+        handle.tx,
+    );
+    entry.owner = handle.owner.clone();
+    entry.packet_capacity = handle.packet_capacity;
+    entry.role = role;
+    entry.parent_id = handle.parent_id;
+    entry.accepted = handle.parent_id.is_some();
+    entry.ifac_key = ifac_key;
+    entry.ifac_size = ifac_size;
+    entry.online = Some(online.clone());
+    entry.rxb = handle.rxb;
+    entry.txb = handle.txb;
+    entry.inspection = handle.inspection;
+    entry.ingress = ingress;
+    entry.multipoint = multipoint;
+    if let Some(parent) = inherited.as_ref() {
+        entry.announce_cap = parent.announce_cap;
+        entry.announce_rate_target = parent.announce_rate_target;
+        entry.announce_rate_grace = parent.announce_rate_grace;
+        entry.announce_rate_penalty = parent.announce_rate_penalty;
+        entry.recursive_prs = parent.recursive_prs;
+        entry.announces_from_internal = parent.announces_from_internal;
+        entry.announces_to_internal = parent.announces_to_internal;
+        entry.gravity = parent.gravity;
+    }
+    entry.destination_cost = child_stamp_costs.0;
+    entry.pr_cost = child_stamp_costs.1;
     Ok(PreparedInterfaceRegistration {
         transport_owner: handle.owner.clone(),
         id,
@@ -6162,44 +6146,34 @@ async fn prepare_interface_with_post_init(
                 }),
             },
         );
-    let entry = rns_transport::messages::InterfaceEntry {
-        owner: handle.owner.clone(),
-        packet_capacity: handle.packet_capacity,
-        name: handle.name.clone(),
-        mode: convert_mode(handle.mode),
-        role: rns_transport::messages::InterfaceRole::Normal,
-        parent_id: handle.parent_id,
-        accepted: false,
+    let mut entry = rns_transport::messages::InterfaceEntry::new(
+        handle.name.clone(),
+        convert_mode(handle.mode),
         direction,
         bitrate,
-        mtu: handle.mtu,
-        tx: handle.tx,
-        ifac_key,
-        ifac_size: post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
-        announce_cap,
-        announce_allowed_at: 0.0,
-        announce_rate_target,
-        announce_rate_grace: post_init.announce_rate_grace,
-        announce_rate_penalty,
-        online: Some(online.clone()),
-        rxb: handle.rxb,
-        txb: handle.txb,
-        inspection: handle.inspection,
-        tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        tx_dropped_bytes: 0,
-        protocol_violations: 0,
-        ifac_violations: 0,
-        packet_filter_hits: 0,
-        ingress,
-        announce_queue: Vec::new(),
-        multipoint: false,
-        recursive_prs: post_init.recursive_prs,
-        announces_from_internal: post_init.announces_from_internal,
-        announces_to_internal: post_init.announces_to_internal,
-        gravity: post_init.gravity.unwrap_or(0),
-        destination_cost: post_init.destination_cost,
-        pr_cost: post_init.pr_cost,
-    };
+        handle.mtu,
+        handle.tx,
+    );
+    entry.owner = handle.owner.clone();
+    entry.packet_capacity = handle.packet_capacity;
+    entry.parent_id = handle.parent_id;
+    entry.ifac_key = ifac_key;
+    entry.ifac_size = post_init.ifac_size.unwrap_or(post_init.default_ifac_size);
+    entry.announce_cap = announce_cap;
+    entry.announce_rate_target = announce_rate_target;
+    entry.announce_rate_grace = post_init.announce_rate_grace;
+    entry.announce_rate_penalty = announce_rate_penalty;
+    entry.online = Some(online.clone());
+    entry.rxb = handle.rxb;
+    entry.txb = handle.txb;
+    entry.inspection = handle.inspection;
+    entry.ingress = ingress;
+    entry.recursive_prs = post_init.recursive_prs;
+    entry.announces_from_internal = post_init.announces_from_internal;
+    entry.announces_to_internal = post_init.announces_to_internal;
+    entry.gravity = post_init.gravity.unwrap_or(0);
+    entry.destination_cost = post_init.destination_cost;
+    entry.pr_cost = post_init.pr_cost;
     Ok(PreparedInterfaceRegistration {
         transport_owner: handle.owner.clone(),
         id,
@@ -13967,38 +13941,36 @@ loglevel = 7
     #[tokio::test]
     async fn typed_interface_stats_normalize_totals_and_optional_metadata() {
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(1);
-        let first = rns_transport::messages::InterfaceStatRpcEntry {
-            id: 1,
-            name: "one".to_string(),
-            rx_bytes: 10,
-            tx_bytes: 20,
-            rx_rate: 2,
-            tx_rate: 3,
-            online: true,
-            bitrate: 115_200,
-            mtu: 500,
-            mode: "Full".to_string(),
-            role: "normal".to_string(),
-            announce_queue: Some(0),
-            held_announces: 0,
-            incoming_announce_frequency: 0.0,
-            outgoing_announce_frequency: 0.0,
-            incoming_pr_frequency: 0.0,
-            outgoing_pr_frequency: 0.0,
-            burst_active: false,
-            burst_activated: 0.0,
-            pr_burst_active: false,
-            pr_burst_activated: 0.0,
-            clients: None,
-            blocked_ips: None,
-            announce_rate_target: None,
-            announce_rate_grace: None,
-            announce_rate_penalty: None,
-            announce_cap: 0.02,
-            ifac_size: 0,
-            tx_drops: 0,
-            ..Default::default()
-        };
+        let mut first = rns_transport::messages::InterfaceStatRpcEntry::default();
+        first.id = 1;
+        first.name = "one".to_string();
+        first.rx_bytes = 10;
+        first.tx_bytes = 20;
+        first.rx_rate = 2;
+        first.tx_rate = 3;
+        first.online = true;
+        first.bitrate = 115_200;
+        first.mtu = 500;
+        first.mode = "Full".to_string();
+        first.role = "normal".to_string();
+        first.announce_queue = Some(0);
+        first.held_announces = 0;
+        first.incoming_announce_frequency = 0.0;
+        first.outgoing_announce_frequency = 0.0;
+        first.incoming_pr_frequency = 0.0;
+        first.outgoing_pr_frequency = 0.0;
+        first.burst_active = false;
+        first.burst_activated = 0.0;
+        first.pr_burst_active = false;
+        first.pr_burst_activated = 0.0;
+        first.clients = None;
+        first.blocked_ips = None;
+        first.announce_rate_target = None;
+        first.announce_rate_grace = None;
+        first.announce_rate_penalty = None;
+        first.announce_cap = 0.02;
+        first.ifac_size = 0;
+        first.tx_drops = 0;
         let mut second = first.clone();
         second.id = 2;
         second.name = "two".to_string();
@@ -14153,38 +14125,36 @@ loglevel = 7
             interface_mode: rns_transport::constants::InterfaceMode::Full,
             interface_role: rns_transport::messages::InterfaceRole::Normal,
         };
-        let master_interface = rns_transport::messages::InterfaceStatRpcEntry {
-            id: 81,
-            name: interface_name.clone(),
-            rx_bytes: 0,
-            tx_bytes: 0,
-            rx_rate: 0,
-            tx_rate: 0,
-            online: true,
-            bitrate: 128_000,
-            mtu: 1_200,
-            mode: "Full".to_string(),
-            role: "normal".to_string(),
-            announce_queue: Some(0),
-            held_announces: 0,
-            incoming_announce_frequency: 0.0,
-            outgoing_announce_frequency: 0.0,
-            incoming_pr_frequency: 0.0,
-            outgoing_pr_frequency: 0.0,
-            burst_active: false,
-            burst_activated: 0.0,
-            pr_burst_active: false,
-            pr_burst_activated: 0.0,
-            clients: None,
-            blocked_ips: None,
-            announce_rate_target: None,
-            announce_rate_grace: None,
-            announce_rate_penalty: None,
-            announce_cap: 0.02,
-            ifac_size: 0,
-            tx_drops: 0,
-            ..Default::default()
-        };
+        let mut master_interface = rns_transport::messages::InterfaceStatRpcEntry::default();
+        master_interface.id = 81;
+        master_interface.name = interface_name.clone();
+        master_interface.rx_bytes = 0;
+        master_interface.tx_bytes = 0;
+        master_interface.rx_rate = 0;
+        master_interface.tx_rate = 0;
+        master_interface.online = true;
+        master_interface.bitrate = 128_000;
+        master_interface.mtu = 1_200;
+        master_interface.mode = "Full".to_string();
+        master_interface.role = "normal".to_string();
+        master_interface.announce_queue = Some(0);
+        master_interface.held_announces = 0;
+        master_interface.incoming_announce_frequency = 0.0;
+        master_interface.outgoing_announce_frequency = 0.0;
+        master_interface.incoming_pr_frequency = 0.0;
+        master_interface.outgoing_pr_frequency = 0.0;
+        master_interface.burst_active = false;
+        master_interface.burst_activated = 0.0;
+        master_interface.pr_burst_active = false;
+        master_interface.pr_burst_activated = 0.0;
+        master_interface.clients = None;
+        master_interface.blocked_ips = None;
+        master_interface.announce_rate_target = None;
+        master_interface.announce_rate_grace = None;
+        master_interface.announce_rate_penalty = None;
+        master_interface.announce_cap = 0.02;
+        master_interface.ifac_size = 0;
+        master_interface.tx_drops = 0;
         let mut missing_mtu_interface = master_interface.clone();
         missing_mtu_interface.id = 82;
         missing_mtu_interface.name = missing_mtu_interface_name.clone();

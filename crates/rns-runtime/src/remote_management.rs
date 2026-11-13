@@ -403,38 +403,37 @@ mod tests {
 
     // RNode-like: a default IFAC size is configured, IFAC itself is off.
     fn mock_stat_entry() -> InterfaceStatRpcEntry {
-        InterfaceStatRpcEntry {
-            id: 1,
-            name: "MockIf".to_string(),
-            rx_bytes: 100,
-            tx_bytes: 200,
-            rx_rate: 10,
-            tx_rate: 20,
-            online: true,
-            bitrate: 12_000,
-            mtu: 512,
-            mode: "Gateway".to_string(),
-            role: "normal".to_string(),
-            announce_queue: Some(2),
-            held_announces: 1,
-            incoming_announce_frequency: 0.5,
-            outgoing_announce_frequency: 0.25,
-            incoming_pr_frequency: 3.0,
-            outgoing_pr_frequency: 1.5,
-            burst_active: true,
-            burst_activated: 1_700_000_001.0,
-            pr_burst_active: true,
-            pr_burst_activated: 1_700_000_002.0,
-            clients: None,
-            blocked_ips: Some(3),
-            announce_rate_target: None,
-            announce_rate_grace: None,
-            announce_rate_penalty: None,
-            announce_cap: 0.02,
-            ifac_size: 8,
-            tx_drops: 0,
-            ..Default::default()
-        }
+        let mut entry = InterfaceStatRpcEntry::default();
+        entry.id = 1;
+        entry.name = "MockIf".to_string();
+        entry.rx_bytes = 100;
+        entry.tx_bytes = 200;
+        entry.rx_rate = 10;
+        entry.tx_rate = 20;
+        entry.online = true;
+        entry.bitrate = 12_000;
+        entry.mtu = 512;
+        entry.mode = "Gateway".to_string();
+        entry.role = "normal".to_string();
+        entry.announce_queue = Some(2);
+        entry.held_announces = 1;
+        entry.incoming_announce_frequency = 0.5;
+        entry.outgoing_announce_frequency = 0.25;
+        entry.incoming_pr_frequency = 3.0;
+        entry.outgoing_pr_frequency = 1.5;
+        entry.burst_active = true;
+        entry.burst_activated = 1_700_000_001.0;
+        entry.pr_burst_active = true;
+        entry.pr_burst_activated = 1_700_000_002.0;
+        entry.clients = None;
+        entry.blocked_ips = Some(3);
+        entry.announce_rate_target = None;
+        entry.announce_rate_grace = None;
+        entry.announce_rate_penalty = None;
+        entry.announce_cap = 0.02;
+        entry.ifac_size = 8;
+        entry.tx_drops = 0;
+        entry
     }
 
     fn spawn_mock_transport() -> mpsc::Sender<TransportMessage> {

@@ -347,10 +347,8 @@ enum RemoteFailure {
 
 impl Session {
     async fn open(args: &Args) -> Result<Self, u8> {
-        let options = InitOptions {
-            require_shared_instance: args.remote.is_none(),
-            ..InitOptions::default()
-        };
+        let mut options = InitOptions::default();
+        options.require_shared_instance = args.remote.is_none();
         let handle = match init_with_options(
             args.config.as_deref(),
             None,

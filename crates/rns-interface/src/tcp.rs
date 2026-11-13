@@ -110,7 +110,7 @@ pub(crate) fn set_tcp_keepalive_tuned(stream: &TcpStream, i2p_tunneled: bool) {
 /// Python `get_address_for_if` / `get_address_for_host` of the TCP and
 /// Backbone listeners (TCPInterface.py): `device` wins over
 /// `listen_ip`, neither is an error, and nothing falls back to a wildcard.
-pub async fn resolve_bind_address(
+pub(crate) async fn resolve_bind_address(
     listen_ip: Option<&str>,
     device: Option<&str>,
     port: u16,

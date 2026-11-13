@@ -82,7 +82,7 @@ fn uses_epoll_backend() -> bool {
 }
 
 /// Simulated transmission time for `len` payload bytes at `bitrate`.
-pub fn forced_bitrate_delay(len: usize, bitrate: u64) -> Duration {
+pub(crate) fn forced_bitrate_delay(len: usize, bitrate: u64) -> Duration {
     Duration::from_secs_f64(len as f64 * 8.0 / bitrate as f64)
 }
 

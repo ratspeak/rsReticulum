@@ -9,7 +9,6 @@ pub const PERSIST_INTERVAL: u64 = 43200;
 pub const GRACIOUS_PERSIST_INTERVAL: u64 = 300;
 
 pub const RESOURCE_CACHE: u64 = 86400;
-pub use rns_transport::constants::MAX_QUEUED_ANNOUNCES;
 pub const QUEUED_ANNOUNCE_LIFE: u64 = rns_transport::constants::QUEUED_ANNOUNCE_LIFE as u64;
 
 /// Announce bandwidth cap as a fraction of interface bitrate (2%).

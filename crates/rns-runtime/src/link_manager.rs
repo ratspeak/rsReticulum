@@ -557,6 +557,7 @@ pub enum LinkSendError {
     ResourceStartFailed,
 }
 
+#[non_exhaustive]
 pub enum LinkManagerCommand {
     SendChannelMessage {
         link_id: [u8; 16],

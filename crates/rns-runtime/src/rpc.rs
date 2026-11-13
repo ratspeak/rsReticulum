@@ -207,6 +207,7 @@ pub struct PathTableEntry {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InterfaceStatEntry {
     pub id: u64,
     pub name: String,

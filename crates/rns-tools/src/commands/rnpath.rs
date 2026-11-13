@@ -1045,15 +1045,14 @@ async fn medium_path_timeout(ctx: &ClientCtx) -> f64 {
 /// Attach to the shared instance as a client, as `RNS.Reticulum()` does in rnpath.
 async fn attach_client(ctx: &ClientCtx) -> Result<ReticulumHandle, String> {
     let config_dir = ctx.config_dir.to_string_lossy().into_owned();
+    let mut options = InitOptions::default();
+    options.require_shared_instance = true;
     let handle = init_with_options(
         Some(&config_dir),
         None,
         ShutdownSignal::new(),
         Arc::new(AtomicBool::new(true)),
-        InitOptions {
-            require_shared_instance: true,
-            ..InitOptions::default()
-        },
+        options,
     )
     .await
     .map_err(|e| format!("could not attach to the shared instance: {e}"))?;

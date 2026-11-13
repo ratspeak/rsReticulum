@@ -110,43 +110,43 @@ pub struct TransportActor {
 
     pub path_table: PathTable,
     pub link_table: LinkTable,
-    pub announce_table: AnnounceTable,
+    pub(crate) announce_table: AnnounceTable,
     /// Queued announces temporarily displaced while a known-path response
     /// occupies `announce_table`.
-    pub held_announces: HashMap<[u8; 16], crate::announce::AnnounceEntry>,
-    pub reverse_table: ReverseTable,
-    pub tunnel_table: TunnelTable,
-    pub packet_hashlist: PacketHashlist,
-    pub rate_table: RateTable,
+    pub(crate) held_announces: HashMap<[u8; 16], crate::announce::AnnounceEntry>,
+    pub(crate) reverse_table: ReverseTable,
+    pub(crate) tunnel_table: TunnelTable,
+    pub(crate) packet_hashlist: PacketHashlist,
+    pub(crate) rate_table: RateTable,
     rate_table_retain: f64,
-    pub blackhole_table: BlackholeTable,
-    pub traffic: TrafficCounter,
+    pub(crate) blackhole_table: BlackholeTable,
+    pub(crate) traffic: TrafficCounter,
     /// Python's interface traffic count and top-level stats counters.
     traffic_count: rpc::TrafficCount,
     /// Python's `local_client_rssi_cache`, `_snr_cache` and `_q_cache`: one
     /// 512-entry list per metric, first match wins (Transport.py).
-    pub packet_rssi_cache: VecDeque<([u8; 32], f32)>,
-    pub packet_snr_cache: VecDeque<([u8; 32], f32)>,
-    pub packet_q_cache: VecDeque<([u8; 32], f32)>,
+    pub(crate) packet_rssi_cache: VecDeque<([u8; 32], f32)>,
+    pub(crate) packet_snr_cache: VecDeque<([u8; 32], f32)>,
+    pub(crate) packet_q_cache: VecDeque<([u8; 32], f32)>,
 
-    pub receipt_table: HashMap<[u8; 16], PacketReceipt>,
+    pub(crate) receipt_table: HashMap<[u8; 16], PacketReceipt>,
     /// Truncated packet hash to caller-supplied message ID for proof notifications.
-    pub receipt_msg_ids: HashMap<[u8; 16], String>,
+    pub(crate) receipt_msg_ids: HashMap<[u8; 16], String>,
     /// Unbounded direct application proof sinks. They avoid bounded destination
     /// mailbox pressure, but a closed receiver still loses its notification.
-    pub receipt_proof_txs:
+    pub(crate) receipt_proof_txs:
         HashMap<[u8; 16], mpsc::UnboundedSender<crate::link_messages::DestinationEvent>>,
     /// Latest per-send receipt state for runtime observers. Watch receivers can
     /// skip intermediate updates; this is not an event log.
-    pub receipt_updates:
+    pub(crate) receipt_updates:
         HashMap<[u8; 16], tokio::sync::watch::Sender<crate::messages::ReceiptUpdate>>,
 
     pub interfaces: HashMap<InterfaceId, InterfaceEntry>,
 
     pub local_destinations: HashSet<[u8; 16]>,
     /// Public keys of registered local destinations, for recall.
-    pub local_destination_keys: HashMap<[u8; 16], [u8; 64]>,
-    pub destination_channels:
+    pub(crate) local_destination_keys: HashMap<[u8; 16], [u8; 64]>,
+    pub(crate) destination_channels:
         HashMap<[u8; 16], mpsc::Sender<crate::link_messages::DestinationEvent>>,
     /// App names of registered destinations; link-id channel aliases are not here.
     registered_destination_names: HashMap<[u8; 16], String>,
@@ -181,7 +181,7 @@ pub struct TransportActor {
     /// Previous tag generation; a tag in either generation is a duplicate.
     pub discovery_pr_tags_prev: HashSet<[u8; 32]>,
     /// Failed-Link rediscovery requests awaiting throttled emission.
-    pub pending_discovery_prs: VecDeque<PendingDiscoveryPathRequest>,
+    pub(crate) pending_discovery_prs: VecDeque<PendingDiscoveryPathRequest>,
     // Only rejected driver admissions live here; successfully admitted targets
     // are never replayed by this owner. The public discovery records stay ABI/API
     // compatible and continue to describe operation scheduling, not radio TX.
@@ -189,18 +189,18 @@ pub struct TransportActor {
     /// Destination/interface pairs barred from new path installation until their
     /// Unix-seconds deadline. Suppression does not remove an existing path or
     /// guarantee discovery of an alternative.
-    pub path_interface_suppressions: HashMap<([u8; 16], InterfaceId), f64>,
+    pub(crate) path_interface_suppressions: HashMap<([u8; 16], InterfaceId), f64>,
     last_discovery_pr_tx: f64,
     /// External interface waiting for a path response from a local shared client.
     pub pending_local_path_requests: HashMap<[u8; 16], InterfaceId>,
     /// Legacy separate path-state map, cleared on shared-connection reset.
     /// Current path-state queries use `PathTable`'s state instead.
-    pub path_states: HashMap<[u8; 16], PathState>,
+    pub(crate) path_states: HashMap<[u8; 16], PathState>,
 
     /// AwaitPath reply channels and registration times in Unix seconds.
     /// Maintenance expires pending waiters after 15 seconds; callers needing a
     /// strict deadline must bound mailbox admission and reply waiting themselves.
-    pub path_waiters: HashMap<[u8; 16], Vec<(tokio::sync::oneshot::Sender<bool>, f64)>>,
+    pub(crate) path_waiters: HashMap<[u8; 16], Vec<(tokio::sync::oneshot::Sender<bool>, f64)>>,
 
     last_tables_cull: f64,
     /// Last never-used path pool check; starts at construction so the first
@@ -208,7 +208,7 @@ pub struct TransportActor {
     pub path_pool_last_checked: f64,
     /// Destinations with a path request admitted and not yet answered
     /// (Python `inflight_path_requests`), with the admission time.
-    pub inflight_path_requests: HashMap<[u8; 16], f64>,
+    pub(crate) inflight_path_requests: HashMap<[u8; 16], f64>,
     last_links_check: f64,
     last_receipts_check: f64,
     last_announces_check: f64,
@@ -247,23 +247,23 @@ pub struct TransportActor {
     pub local_hops_delta: u8,
     /// Allowed external source hashes for on-disk blackhole loading. Changing
     /// this vector alone does not reload or purge the table.
-    pub blackhole_sources: Vec<[u8; 16]>,
+    pub(crate) blackhole_sources: Vec<[u8; 16]>,
     /// Network stamp policy from configuration and constructor switches.
     pub stamp_policy: crate::stamps::StampPolicy,
     /// Destination-type announce filter from `[filter]` and application requests.
     pub destination_filter: crate::destination_filter::DestinationTypeFilter,
     /// Python `Transport.HOP_LIMITER`: inbound packets with this many wire hops
     /// or more are dropped.
-    pub hop_limiter: u8,
+    pub(crate) hop_limiter: u8,
     /// Shared set of currently blackholed identity hashes for runtime Link checks.
     /// Managed mutation/cull paths rebuild it and filter expired entries. Direct
-    /// public table mutation does not publish a snapshot; a poisoned snapshot
-    /// lock prevents publication.
-    pub blackholed_snapshot: Arc<std::sync::RwLock<HashSet<[u8; 16]>>>,
+    /// table mutation does not publish a snapshot; a poisoned snapshot lock
+    /// prevents publication.
+    pub(crate) blackholed_snapshot: Arc<std::sync::RwLock<HashSet<[u8; 16]>>>,
     /// Per-packet announce validation results (Identity.py).
-    pub announce_validation: crate::announce_validation::AnnounceValidationCache,
+    pub(crate) announce_validation: crate::announce_validation::AnnounceValidationCache,
     /// Path-request stamp worker and generated-stamp cache (Transport.py).
-    pub pr_stamper: crate::pr_stamper::PathRequestStamper,
+    pub(crate) pr_stamper: crate::pr_stamper::PathRequestStamper,
 
     /// Whether this actor currently uses a shared-instance peer. Routing policy
     /// uses that peer and reconnect handling invalidates prior routing state.
@@ -284,38 +284,38 @@ pub struct TransportActor {
 
     /// Unix time of the last routing-save request or attempt, not confirmation
     /// of successful persistence. Zero makes the first dirty periodic save eligible.
-    pub last_state_save: f64,
+    pub(crate) last_state_save: f64,
 
     /// Requests a periodic routing-state save. Maintenance and managed mutations
     /// set it; queued/synchronous save paths can clear it before success is known.
     /// It is not a reliable comparison between memory and durable disk state.
-    pub state_dirty: bool,
+    pub(crate) state_dirty: bool,
     /// Known-destination metadata changed since the last `announce_cache.msgpack`
     /// flush (Python `Identity._kd_mark_dirty`).
     known_destinations_dirty: bool,
     /// Whether an asynchronous routing writer is in flight. The separate
     /// publication lock and generation counter coordinate queued and synchronous
     /// snapshots; this flag alone is not a cross-process writer lock.
-    pub routing_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) routing_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Monotonic claim used to prevent an older queued routing snapshot from
     /// replacing a newer synchronous/shutdown snapshot.
-    pub routing_save_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) routing_save_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Serializes routing snapshot publication while generation ordering
     /// decides whether a queued writer is still current.
-    pub routing_save_lock: std::sync::Arc<std::sync::Mutex<()>>,
-    pub hashlist_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) routing_save_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    pub(crate) hashlist_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether an asynchronous announce-cache sweep is in flight. Scheduling
     /// skips another sweep while this flag is set.
-    pub announce_sweep_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) announce_sweep_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// Persisted path entries waiting on their interface to re-register.
     /// Drained by `drain_pending_for_interface` on `RegisterInterface`.
-    pub pending_path_entries: Vec<crate::persistence::PersistedPathEntry>,
+    pub(crate) pending_path_entries: Vec<crate::persistence::PersistedPathEntry>,
 
     /// Announce metadata keyed by destination hash. Fresh network input is
     /// validated before caching, but restored local metadata is trusted and queries
     /// do not re-verify signatures.
-    pub recent_announces: HashMap<[u8; 16], RecentAnnounce>,
+    pub(crate) recent_announces: HashMap<[u8; 16], RecentAnnounce>,
 
     /// Grace window before cache cleaning runs — protects freshly restored
     /// entries from being aged out before real traffic refreshes them.
@@ -324,7 +324,7 @@ pub struct TransportActor {
 
     /// Cumulative counted failures when trying destination delivery channels.
     /// This is not a complete transport-loss counter.
-    pub channel_drops: u64,
+    pub(crate) channel_drops: u64,
 
     announce_handlers: Vec<AnnounceHandlerRegistration>,
     next_announce_handler_id: u64,

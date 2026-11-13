@@ -53,7 +53,7 @@ impl RnsDiscoveryStamper {
 /// Upstream's worker count for a search: one per core up to 12 cores, else
 /// half the cores, and a single worker below [`POOLING_THRESHOLD_COST`]
 /// (Stamps.py).
-pub fn generation_threads(target_value: f64) -> NonZeroUsize {
+pub(crate) fn generation_threads(target_value: f64) -> NonZeroUsize {
     // Upstream compares the fixed-point cost, so 13.999 already pools.
     let pooled = stamps::cost_to_fp(target_value)
         .is_ok_and(|fp| f64::from(fp) >= POOLING_THRESHOLD_COST * f64::from(stamps::COST_FP));

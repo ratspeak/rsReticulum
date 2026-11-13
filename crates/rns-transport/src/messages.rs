@@ -345,6 +345,7 @@ pub struct TimerTick {
 /// Registration metadata, capacity policy and TX sender for one interface.
 /// Public fields and builder methods store caller values; they do not start a
 /// driver. Registration and dispatch apply ownership/capacity checks separately.
+#[non_exhaustive]
 pub struct InterfaceEntry {
     pub owner: InterfaceOwner,
     pub packet_capacity: InterfacePacketCapacity,
@@ -624,6 +625,7 @@ pub struct PathRequestOptions {
 // This is the transport actor's public message surface. Boxing individual
 // variants would churn all senders/receivers for little runtime benefit.
 #[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
 pub enum TransportMessage {
     /// Producer-bound event. A stale registration cannot act on a replacement.
     InterfaceEvent {
@@ -953,6 +955,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
 /// These variants are not an access-control boundary. Responses describe local
 /// state and command results, not remote presence or persistence guarantees.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum TransportQuery {
     /// Return currently non-expired paths; presence is not proof of reachability.
     GetPathTable,
@@ -1240,6 +1243,7 @@ pub struct PathTableRpcEntry {
 /// per second, `mtu` is reported bytes, `ifac_size` is configured bytes, and
 /// `announce_cap` is a fraction. Names can contain caller-supplied text.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct InterfaceStatRpcEntry {
     pub id: InterfaceId,
     pub name: String,

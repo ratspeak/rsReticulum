@@ -3171,7 +3171,7 @@ pub(crate) fn build_persist_bluetooth_enabled_sequence() -> Vec<u8> {
 
 /// Airtime-lock command word: Python `int(percent * 100)` in double
 /// precision, truncated toward zero, sent as a big-endian u16.
-pub fn airtime_lock_word(percent: f64) -> u16 {
+pub(crate) fn airtime_lock_word(percent: f64) -> u16 {
     (percent * 100.0) as u16
 }
 

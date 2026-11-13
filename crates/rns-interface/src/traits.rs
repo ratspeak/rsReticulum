@@ -244,7 +244,7 @@ pub fn optimise_mtu(bitrate: u64) -> Option<u32> {
 /// The reported MTU and packet capacity of an interface with a known
 /// hardware MTU, within the driver's wire budget. `None` is Python's
 /// `HW_MTU = None`: base-size packets and no Link MTU upgrade.
-pub fn hardware_mtu_capacity(
+pub(crate) fn hardware_mtu_capacity(
     hw_mtu: Option<u32>,
     wire_budget: u32,
 ) -> (u32, rns_transport::messages::InterfacePacketCapacity) {
