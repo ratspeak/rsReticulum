@@ -617,6 +617,10 @@ loglevel = 4
 
 "#;
 
+/// Rust-only spelling the 1.3 and 1.4 releases accepted, kept for existing
+/// scripts (upstream has `--config` only).
+const DEPRECATED_SPELLINGS: &[(&str, &str)] = &[("-c", "--config")];
+
 #[derive(Parser)]
 #[command(
     name = "rnsd-rs",
@@ -627,7 +631,7 @@ struct Args {
     #[command(subcommand)]
     command: Option<ifac_migration::Command>,
     /// Alternative config directory.
-    #[arg(long, short = 'c', hide_short_help = true)]
+    #[arg(long, short_alias = 'c')]
     config: Option<String>,
 
     /// Increase verbosity (repeatable; ignored with --service).
@@ -673,6 +677,7 @@ pub(crate) async fn main() {
         print!("{RNSD_EXAMPLE_CONFIG}");
         return;
     }
+    rns_tools::warn_deprecated_spellings("rnsd-rs", DEPRECATED_SPELLINGS);
 
     let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
     if let Some(command) = &args.command {

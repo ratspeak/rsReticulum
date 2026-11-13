@@ -50,6 +50,10 @@ const HASH_INVALID: &str = "Invalid hash entered. Check your input.";
 /// Python's `len(None)` error, printed when a flag needs the missing destination.
 const NO_DESTINATION: &str = "object of type 'NoneType' has no len()";
 
+/// Rust-only spelling the 1.3 and 1.4 releases accepted, kept for existing
+/// scripts (upstream has `--config` only).
+const DEPRECATED_SPELLINGS: &[(&str, &str)] = &[("-c", "--config")];
+
 #[derive(Parser)]
 #[command(
     name = "rnpath-rs",
@@ -58,7 +62,7 @@ const NO_DESTINATION: &str = "object of type 'NoneType' has no len()";
 )]
 struct Args {
     /// Path to alternative Reticulum config directory
-    #[arg(short = 'c', long)]
+    #[arg(long, short_alias = 'c')]
     config: Option<String>,
 
     /// Show program's version number and exit
@@ -158,6 +162,7 @@ pub(crate) async fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
+    rns_tools::warn_deprecated_spellings("rnpath-rs", DEPRECATED_SPELLINGS);
 
     let level = rns_tools::Utility::Rnpath.loglevel(None, args.verbose, 0, false);
     let config_dir = resolve_config_dir(args.config.as_deref());

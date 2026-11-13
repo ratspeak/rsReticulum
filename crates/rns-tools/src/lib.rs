@@ -33,6 +33,41 @@ pub fn version_line(tool: &str, crate_version: &str, also: &[(&str, &str)]) -> S
     format!("{tool} {crate_version} ({})", follows.join(", "))
 }
 
+/// The warning for each use of a Rust-only spelling among `arguments`.
+/// `spellings` pairs each with the upstream spelling to use; a short one also
+/// matches with its value attached (`-cDIR`).
+fn deprecated_spelling_warnings(
+    tool: &str,
+    spellings: &[(&str, &str)],
+    arguments: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for argument in arguments {
+        if argument == "--" {
+            break;
+        }
+        for (old, new) in spellings {
+            let short = old.len() == 2 && !old.starts_with("--");
+            if argument == *old
+                || argument.starts_with(&format!("{old}="))
+                || (short && argument.starts_with(old))
+            {
+                warnings.push(format!("{tool}: warning: {old} is deprecated, use {new}"));
+            }
+        }
+    }
+    warnings
+}
+
+/// Warn on stderr for each Rust-only spelling this command line uses. The
+/// 1.3 and 1.4 releases accepted them unannounced, so they keep working for
+/// existing scripts; upstream has only the spelling each is paired with.
+pub fn warn_deprecated_spellings(tool: &str, spellings: &[(&str, &str)]) {
+    for warning in deprecated_spelling_warnings(tool, spellings, std::env::args().skip(1)) {
+        eprintln!("{warning}");
+    }
+}
+
 /// Read `[logging] logtimestamps` from `<config_dir>/config` before tracing
 /// initialization. Returns true when the file cannot be read/parsed or the
 /// setting is absent or not a recognized boolean.
@@ -341,5 +376,29 @@ pub async fn medium_path_timeout(handle: &ReticulumHandle) -> f64 {
                 + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
         }
         None => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deprecated_spelling_warnings;
+
+    fn warnings(arguments: &[&str]) -> Vec<String> {
+        deprecated_spelling_warnings(
+            "tool",
+            &[("-c", "--config"), ("--remote", "-R")],
+            arguments.iter().map(ToString::to_string),
+        )
+    }
+
+    #[test]
+    fn deprecated_spellings_are_named_once_per_use() {
+        let config = "tool: warning: -c is deprecated, use --config";
+        let remote = "tool: warning: --remote is deprecated, use -R";
+        assert_eq!(warnings(&["-c", "dir", "--remote=ab"]), [config, remote]);
+        assert_eq!(warnings(&["-cdir"]), [config]);
+        assert_eq!(warnings(&["--remote", "ab"]), [remote]);
+        assert!(warnings(&["--config", "dir", "-R", "ab", "--remotes"]).is_empty());
+        assert!(warnings(&["--", "-c", "--remote"]).is_empty());
     }
 }

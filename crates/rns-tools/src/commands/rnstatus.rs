@@ -56,7 +56,7 @@ const CLR: &str = "\r                                                          \
 )]
 struct Args {
     /// Path to alternative Reticulum config directory.
-    #[arg(short = 'c', long)]
+    #[arg(long, short_alias = 'c')]
     config: Option<String>,
 
     /// Print version and exit.
@@ -185,19 +185,6 @@ const DEPRECATED_SPELLINGS: &[(&str, &str)] = &[
     ("--timeout", "-w"),
 ];
 
-fn warn_deprecated_spellings() {
-    for arg in std::env::args().skip(1) {
-        if arg == "--" {
-            break;
-        }
-        for (old, new) in DEPRECATED_SPELLINGS {
-            if arg == *old || arg.starts_with(&format!("{old}=")) {
-                eprintln!("rnstatus-rs: warning: {old} is deprecated, use {new}");
-            }
-        }
-    }
-}
-
 /// Output of one run. Direct output is written out at each progress point;
 /// monitor mode buffers a whole frame, as rnstatus.py does.
 struct Out {
@@ -266,7 +253,7 @@ pub(crate) async fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    warn_deprecated_spellings();
+    rns_tools::warn_deprecated_spellings("rnstatus-rs", DEPRECATED_SPELLINGS);
 
     let level = rns_tools::Utility::Rnstatus.loglevel(None, args.verbose, 0, false);
     let config_dir = resolve_config_dir(args.config.as_deref());
