@@ -662,7 +662,10 @@ pub(crate) async fn main() {
     let args = Args::parse();
 
     if args.version {
-        println!("rnsd-rs {RS_RETICULUM_VERSION} (Reticulum {RETICULUM_COMPAT_VERSION})");
+        println!(
+            "{}",
+            rns_tools::version_line("rnsd-rs", RS_RETICULUM_VERSION, &[])
+        );
         return;
     }
 

@@ -100,7 +100,10 @@ struct Args {
 pub(crate) async fn main() {
     let args = Args::parse();
     if args.version {
-        println!("rnx-rs {RS_RETICULUM_VERSION}");
+        println!(
+            "{}",
+            rns_tools::version_line("rnx-rs", RS_RETICULUM_VERSION, &[])
+        );
         return;
     }
     let level = rns_tools::Utility::Rnx.loglevel(None, args.verbose, args.quiet, false);

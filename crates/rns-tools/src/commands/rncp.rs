@@ -459,7 +459,10 @@ impl Ui {
 pub(crate) async fn main() {
     let args = Args::parse();
     if args.version {
-        println!("rncp-rs {RS_RETICULUM_VERSION}");
+        println!(
+            "{}",
+            rns_tools::version_line("rncp-rs", RS_RETICULUM_VERSION, &[])
+        );
         return;
     }
 

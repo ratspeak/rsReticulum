@@ -247,8 +247,10 @@ struct Args {
 pub(crate) fn main() -> ExitCode {
     let args = Args::parse();
     if args.version {
-        out(format!(
-            "rnodeconf-rs {RS_RETICULUM_VERSION} (rnodeconf {RNODECONF_VERSION})"
+        out(rns_tools::version_line(
+            "rnodeconf-rs",
+            RS_RETICULUM_VERSION,
+            &[("rnodeconf", RNODECONF_VERSION)],
         ));
         return ExitCode::SUCCESS;
     }

@@ -313,7 +313,7 @@ fn daemon_readiness_requires_completed_initialization_and_a_live_child() {
     // The starting message is not a promise of completed runtime initialization.
     fs::write(&log, "rnsd-rs 1.3.0 starting\n").expect("write starting log");
     assert!(!wait_for_ready_log(&mut child, &log, Duration::ZERO));
-    fs::write(&log, "Started rnsd-rs version 1.4.0 (Reticulum 1.4.2)\n").expect("write ready log");
+    fs::write(&log, "Started rnsd-rs version 1.4.0 (Reticulum 1.6.0)\n").expect("write ready log");
     assert!(wait_for_ready_log(&mut child, &log, Duration::ZERO));
 
     child.kill().expect("stop control");

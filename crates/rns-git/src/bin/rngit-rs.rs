@@ -36,7 +36,7 @@ use rns_runtime::link_manager::{
     DeferredAdmission, DeferredRequestResponder, DestinationAnnounceOptions, DestinationRequest,
     RequestOutcome,
 };
-use rns_tools::{LogLevel, RS_RETICULUM_VERSION};
+use rns_tools::LogLevel;
 
 const JOBS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -418,7 +418,7 @@ async fn clone_subcommand(op: Operation, argv: Vec<String>) {
     };
     let (version, config, rnsconfig, identity, source, target, verbose, quiet) = parsed;
     if version {
-        println!("rngit-rs {RS_RETICULUM_VERSION}");
+        print_version();
         return;
     }
     let args = ClientArgs {
@@ -501,7 +501,7 @@ async fn work_subcommand(argv: Vec<String>) {
     use rns_git::client::work::{CommonArgs, WorkArgs, run_client, run_work};
     let args = WorkCliArgs::parse_from(argv);
     if args.version {
-        println!("rngit-rs {RS_RETICULUM_VERSION}");
+        print_version();
         return;
     }
     if args.operation.as_deref().is_none_or(str::is_empty) {
@@ -546,7 +546,7 @@ async fn perms_subcommand(argv: Vec<String>) {
     use rns_git::client::work::{CommonArgs, run_client};
     let args = PermsCliArgs::parse_from(argv);
     if args.version {
-        println!("rngit-rs {RS_RETICULUM_VERSION}");
+        print_version();
         return;
     }
     let Some((remote, target)) = perms_target(&args.remote) else {
@@ -1037,6 +1037,14 @@ impl std::io::Write for ServerLog {
     }
 }
 
+/// `--version`, for the node and every subcommand: the version its pages name.
+fn print_version() {
+    println!(
+        "{}",
+        rns_tools::version_line("rngit-rs", rns_git::pages::VERSION, &[])
+    );
+}
+
 fn prettyhex(hash: &[u8]) -> String {
     format!("<{}>", hex::encode(hash))
 }
@@ -1048,13 +1056,23 @@ fn non_empty(value: Option<String>) -> Option<String> {
 #[tokio::main]
 async fn main() {
     let mut argv: Vec<String> = std::env::args().collect();
+    // argparse answers `--version` before it asks for a subcommand's required arguments.
+    if argv
+        .iter()
+        .skip(1)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--version")
+    {
+        print_version();
+        return;
+    }
     if argv.get(1).map(String::as_str) == Some("node") {
         argv.remove(1);
     } else if argv.get(1).map(String::as_str) == Some("release") {
         argv.remove(1);
         let args = ReleaseArgs::parse_from(argv);
         if args.version {
-            println!("rngit-rs {RS_RETICULUM_VERSION}");
+            print_version();
             return;
         }
         release(args).await;
@@ -1071,7 +1089,7 @@ async fn main() {
         argv.remove(1);
         let args = CreateArgs::parse_from(argv);
         if args.version {
-            println!("rngit-rs {RS_RETICULUM_VERSION}");
+            print_version();
             return;
         }
         create(args).await;
@@ -1090,7 +1108,7 @@ async fn main() {
     }
     let args = Args::parse_from(argv);
     if args.version {
-        println!("rngit-rs {RS_RETICULUM_VERSION}");
+        print_version();
         return;
     }
     let verbosity = if args.service {

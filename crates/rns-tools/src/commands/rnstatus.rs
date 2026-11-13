@@ -260,7 +260,10 @@ enum Flow {
 pub(crate) async fn main() -> ExitCode {
     let args = Args::parse();
     if args.version {
-        println!("rnstatus-rs {RS_RETICULUM_VERSION}");
+        println!(
+            "{}",
+            rns_tools::version_line("rnstatus-rs", RS_RETICULUM_VERSION, &[])
+        );
         return ExitCode::SUCCESS;
     }
     warn_deprecated_spellings();

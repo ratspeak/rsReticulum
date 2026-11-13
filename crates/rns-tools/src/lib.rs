@@ -15,10 +15,23 @@ use rns_runtime::rpc::{RpcRequest, RpcResponse};
 /// rsReticulum package version printed by CLI `--version` output.
 pub const RS_RETICULUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Python compatibility-baseline label used by selected CLI surfaces,
-/// including the `rnsd-rs` interactive console. It is distinct from this
-/// package's release version and is not a Python installation requirement.
-pub const RETICULUM_COMPAT_VERSION: &str = "1.4.2";
+/// The Reticulum release the tools follow: named in every `--version` line
+/// and given where upstream gives `RNS.__version__` (the `rnsd-rs` console).
+/// It is distinct from this package's release version and is not a Python
+/// installation requirement.
+pub const RETICULUM_COMPAT_VERSION: &str = "1.6.0";
+
+/// A tool's `--version` line: its own name and crate version, then the
+/// releases it follows, `also` first and Reticulum last, as
+/// `lxmd-rs 1.4.0 (LXMF 1.3.0, Reticulum 1.6.0)`.
+pub fn version_line(tool: &str, crate_version: &str, also: &[(&str, &str)]) -> String {
+    let follows: Vec<String> = also
+        .iter()
+        .chain(&[("Reticulum", RETICULUM_COMPAT_VERSION)])
+        .map(|(name, version)| format!("{name} {version}"))
+        .collect();
+    format!("{tool} {crate_version} ({})", follows.join(", "))
+}
 
 /// Read `[logging] logtimestamps` from `<config_dir>/config` before tracing
 /// initialization. Returns true when the file cannot be read/parsed or the

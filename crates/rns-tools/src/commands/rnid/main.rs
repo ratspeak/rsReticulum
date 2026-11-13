@@ -341,7 +341,10 @@ async fn run(args: &Args, ctx: &mut Ctx) -> u8 {
         return 0;
     }
     if args.version {
-        println!("rnid-rs {RS_RETICULUM_VERSION}");
+        println!(
+            "{}",
+            rns_tools::version_line("rnid-rs", RS_RETICULUM_VERSION, &[])
+        );
         return 0;
     }
 

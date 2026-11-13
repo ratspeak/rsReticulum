@@ -28,7 +28,10 @@ struct Args {
 pub(crate) async fn main() {
     let args = Args::parse();
     if args.version {
-        println!("rnir-rs {RS_RETICULUM_VERSION}");
+        println!(
+            "{}",
+            rns_tools::version_line("rnir-rs", RS_RETICULUM_VERSION, &[])
+        );
         return;
     }
     let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());

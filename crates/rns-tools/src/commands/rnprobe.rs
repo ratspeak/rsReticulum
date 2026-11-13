@@ -79,7 +79,10 @@ struct Args {
 pub(crate) async fn main() {
     let args = Args::parse();
     if args.version {
-        println!("rnprobe-rs {RS_RETICULUM_VERSION}");
+        println!(
+            "{}",
+            rns_tools::version_line("rnprobe-rs", RS_RETICULUM_VERSION, &[])
+        );
         return;
     }
     exit_silently_on_signal();

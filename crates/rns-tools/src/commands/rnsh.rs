@@ -18,14 +18,13 @@ use rns_identity::identity::Identity;
 use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
 use rns_runtime::platform::{StoragePaths, resolve_config_dir};
 use rns_runtime::rnsh::{
-    RnshClientConfig, RnshClientOutcome, RnshClientProgress, RnshError, RnshListenerConfig,
-    RnshWindowSize, rnsh_client_execute, run_rnsh_listener_with_shutdown,
+    RNSH_SOFTWARE_VERSION, RnshClientConfig, RnshClientOutcome, RnshClientProgress, RnshError,
+    RnshListenerConfig, RnshWindowSize, rnsh_client_execute, run_rnsh_listener_with_shutdown,
 };
 use tokio::sync::mpsc;
 
 use rns_tools::RS_RETICULUM_VERSION;
 
-const RNSH_PROTOCOL_VERSION: &str = "0.3.0";
 const APP_NAME: &str = "rnsh";
 const DEFAULT_SERVICE_NAME: &str = "default";
 /// Rust counterpart of upstream's `rnsh` directory name (`~/.config/rnsh`, `~/.rnsh`).
@@ -127,8 +126,15 @@ pub(crate) async fn main() -> ExitCode {
 
 async fn run(mut args: Args) -> ExitCode {
     if args.version {
-        // The Rust tools report their own name and package version.
-        println!("rnsh-rs {RS_RETICULUM_VERSION} (protocol {RNSH_PROTOCOL_VERSION})");
+        // Upstream labels the rnsh release "protocol" (rnsh/args.py).
+        println!(
+            "{}",
+            rns_tools::version_line(
+                "rnsh-rs",
+                RS_RETICULUM_VERSION,
+                &[("protocol", RNSH_SOFTWARE_VERSION)]
+            )
+        );
         return ExitCode::SUCCESS;
     }
 

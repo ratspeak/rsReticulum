@@ -152,7 +152,10 @@ pub(crate) async fn main() -> ExitCode {
     let args = Args::parse();
 
     if args.version {
-        println!("rnpath-rs {RS_RETICULUM_VERSION}");
+        println!(
+            "{}",
+            rns_tools::version_line("rnpath-rs", RS_RETICULUM_VERSION, &[])
+        );
         return ExitCode::SUCCESS;
     }
 

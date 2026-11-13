@@ -34,7 +34,10 @@ struct Args {
 pub(crate) async fn main() {
     let args = Args::parse();
     if args.version {
-        println!("rnpkg-rs {RS_RETICULUM_VERSION}");
+        println!(
+            "{}",
+            rns_tools::version_line("rnpkg-rs", RS_RETICULUM_VERSION, &[])
+        );
         return;
     }
     if args.exampleconfig {
