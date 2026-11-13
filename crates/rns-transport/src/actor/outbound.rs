@@ -783,7 +783,7 @@ impl TransportActor {
         // shared instance's path cache even when the instance is not a transport
         // node. Ordinary peers still require transport mode.
         if let Some(path) = (self.is_transport_enabled || is_from_local_client)
-            .then(|| self.path_table.get_live(&requested_dest))
+            .then(|| self.path_table.get_live(&requested_dest).cloned())
             .flatten()
         {
             let requestor_is_next_hop =

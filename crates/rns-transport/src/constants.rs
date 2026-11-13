@@ -155,12 +155,16 @@ pub const CACHE_CLEAN_INTERVAL: f64 = 300.0;
 /// On-disk announce cache sweep interval, in seconds (5 minutes, Python
 /// `cache_clean_interval`). The first sweep runs one interval after a
 /// 60-second deferral from storage init. Scheduling requires storage,
-/// non-client ownership and no sweep already in flight.
+/// non-client ownership and no clean already in flight.
 pub const ANNOUNCE_CACHE_SWEEP_INTERVAL: f64 = 300.0;
 
 /// Deferral added to the first announce-cache sweep after storage init
 /// (Python `cache_last_cleaned = time.time() + 60`).
 pub(crate) const ANNOUNCE_CACHE_SWEEP_DEFER: f64 = 60.0;
+/// Seconds between announce-cache flushes to the store (Python `ac_flush_interval`).
+pub(crate) const ANNOUNCE_CACHE_FLUSH_INTERVAL: f64 = 15.0;
+/// Pending announces that force a flush (Python `announce_cache_max_pending`).
+pub(crate) const ANNOUNCE_CACHE_MAX_PENDING: usize = 10_000;
 
 /// Interval in seconds between known-destination cleaning passes, the first
 /// one interval after the actor starts (Python `known_destinations_interval`).
@@ -173,11 +177,6 @@ pub(crate) const KD_FLUSH_INTERVAL: f64 = 10.0;
 /// Minimum spacing in seconds between a full persist and one requested by a
 /// local client disconnecting (Python `GRACIOUS_PERSIST_INTERVAL`).
 pub const GRACIOUS_PERSIST_INTERVAL: f64 = 300.0;
-
-/// Minimum age in seconds before an unreferenced announce-cache file is
-/// eligible for removal. This grace reduces races with a keep-set snapshot;
-/// it is not a transaction between cache writers and the sweep.
-pub const ANNOUNCE_CACHE_SWEEP_GRACE_SECS: u64 = 300;
 
 /// Routing-table and link-table culling interval, in seconds.
 pub const TABLES_CULL_INTERVAL: f64 = 5.0;

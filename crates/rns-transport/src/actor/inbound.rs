@@ -998,7 +998,7 @@ impl TransportActor {
         // silently un-pins an RPC-retained destination. Swept by
         // `cleanup_known_destinations` (linger + 7-day eviction).
         let is_path_response = header.context == rns_wire::context::PacketContext::PathResponse;
-        self.cache_announce_to_disk(&announce_packet_hash, raw, interface_id);
+        self.cache_announce(&announce_packet_hash, raw, interface_id);
         if let Some(e) = self.recent_announces.get_mut(&header.destination_hash) {
             e.hops = header.hops;
             e.packet_hash = Some(announce_packet_hash);

@@ -54,13 +54,7 @@ fn carries(actor: &TransportActor, tunnel_id: &[u8; 32], dest: &[u8; 16]) -> boo
 
 fn cache_announce(dir: &std::path::Path, raw: &[u8], interface: Option<&str>) -> [u8; 32] {
     let packet_hash = rns_wire::hash::packet_hash(raw, HeaderType::Header1);
-    crate::persistence::write_python_cached_announce_if_absent(
-        &dir.join("cache").join("announces"),
-        &packet_hash,
-        raw,
-        interface,
-    )
-    .unwrap();
+    crate::store::seed_cached_announce(dir, &packet_hash, raw, interface).unwrap();
     packet_hash
 }
 

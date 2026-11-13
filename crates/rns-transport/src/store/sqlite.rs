@@ -475,6 +475,19 @@ impl SqliteAnnounceCache {
         )?;
         Ok(Self { conn })
     }
+
+    /// Opens an existing file read-only, for [`AnnounceCacheStore::fetch`]. The
+    /// database is not created or altered.
+    pub fn open_ro(path: &Path) -> Result<Self, StoreError> {
+        let uri = format!("file:{}?mode=ro", uri_path(path)?);
+        let conn = with_busy_timeout(db(Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ))?)?;
+        Ok(Self { conn })
+    }
 }
 
 impl AnnounceCacheStore for SqliteAnnounceCache {

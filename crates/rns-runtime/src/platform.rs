@@ -102,6 +102,8 @@ pub struct StoragePaths {
     pub resource_dir: PathBuf,
     pub identity_dir: PathBuf,
     pub blackhole_dir: PathBuf,
+    /// Announce files from before `cache_dir/announces.db`. Still created, empty,
+    /// as upstream does; the transport imports any files left in it.
     pub announce_cache_dir: PathBuf,
 }
 

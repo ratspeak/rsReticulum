@@ -40,6 +40,8 @@ impl TransportActor {
             self.flush_known_destinations();
         }
 
+        self.flush_cached_announces(now);
+
         if now - self.last_tables_cull >= TABLES_CULL_INTERVAL {
             self.cull_path_table(now);
             self.reverse_table.cull_expired();
@@ -216,17 +218,12 @@ impl TransportActor {
             self.last_known_destinations_clean = now;
         }
 
-        // On-disk announce-cache prune. Deliberately outside the
-        // startup_complete gate: that gate is stamped on first interface
-        // registration, and a node with no interfaces must still collect
-        // backlog (Python's jobs thread cleans unconditionally). Safe before
-        // interfaces exist — pending re-registration entries are in the
-        // keep-set and the mtime grace covers fresh writes. Storage init
-        // defers the first sweep, which then repeats every 5 minutes.
-        if now - self.last_announce_cache_sweep >= ANNOUNCE_CACHE_SWEEP_INTERVAL
-            && self.maybe_sweep_announce_cache()
-        {
+        // Cached-announce clean. Outside the startup_complete gate, as Python's
+        // jobs thread runs it unconditionally; storage init defers the first one.
+        // Stamped before the clean, so one that is skipped waits a full interval.
+        if now - self.last_announce_cache_sweep >= ANNOUNCE_CACHE_SWEEP_INTERVAL {
             self.last_announce_cache_sweep = now;
+            self.clean_announce_cache();
         }
 
         self.expire_path_waiters(now);

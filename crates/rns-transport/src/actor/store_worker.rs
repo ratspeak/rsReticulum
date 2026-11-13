@@ -1,13 +1,11 @@
-//! Write-behind for known destinations and received ratchets (Python
-//! `KnownDestinationsStore`). The actor keeps the pending marks and builds each
-//! batch from its live entries. One thread owns the read-write store and runs
-//! jobs in the order they were sent. The actor reads ratchets through its own
-//! read-only connection.
+//! Write-behind for known destinations, received ratchets, and cached announces
+//! (Python `KnownDestinationsStore` and `AnnounceCache`). The actor keeps the
+//! pending state and builds each batch from it. One thread owns the read-write
+//! stores and runs jobs in the order they were sent. The actor reads ratchets and
+//! cached announces through its own read-only connections.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-#[cfg(feature = "sqlite-store")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -16,18 +14,23 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, error, trace, warn};
 
 use super::RecentAnnounce;
+use crate::constants::{ANNOUNCE_CACHE_FLUSH_INTERVAL, ANNOUNCE_CACHE_MAX_PENDING};
 use crate::store::{
-    ApplyReport, DestHash, KdBatch, KnownDestinationRow, KnownDestinationStore, MemoryStore,
-    Ratchet, RatchetRow, RejectedTable, StoreError,
+    AnnounceCacheStore, AnnounceRow, ApplyReport, CachedAnnounce, DestHash, KdBatch,
+    KnownDestinationRow, KnownDestinationStore, MemoryStore, PacketHash, Ratchet, RatchetRow,
+    RejectedTable, StoreError,
 };
 #[cfg(feature = "sqlite-store")]
-use crate::store::{SqliteKnownDestinations, legacy};
+use crate::store::{SqliteAnnounceCache, SqliteKnownDestinations, legacy};
 
 #[derive(Clone)]
 enum StoreSource {
     Memory,
     #[cfg(feature = "sqlite-store")]
-    Sqlite(PathBuf),
+    Sqlite {
+        known: PathBuf,
+        announces: PathBuf,
+    },
 }
 
 enum StoreJob {
@@ -41,6 +44,16 @@ enum StoreJob {
     ExpireRatchets {
         cutoff: f64,
     },
+    AnnounceUpsert {
+        /// The actor's number for this flush; its rows stay with the actor until answered.
+        flush: u64,
+        rows: Vec<AnnounceRow>,
+        /// Shutdown waits on this; ordinary flushes report through the actor's channel.
+        reply: Option<std_mpsc::Sender<StoreResult>>,
+    },
+    AnnounceClean {
+        keep: HashSet<PacketHash>,
+    },
     #[cfg(feature = "sqlite-store")]
     Load {
         now: f64,
@@ -50,10 +63,30 @@ enum StoreJob {
 
 /// Outcome of one job, delivered to the actor.
 pub(super) enum StoreResult {
-    Applied { report: ApplyReport },
-    Failed { batch: KdBatch, error: StoreError },
-    Expired { removed: usize },
+    Applied {
+        report: ApplyReport,
+    },
+    Failed {
+        batch: KdBatch,
+        error: StoreError,
+    },
+    Expired {
+        removed: usize,
+    },
     ExpireFailed(StoreError),
+    AnnounceFlushed {
+        flush: u64,
+    },
+    AnnounceFailed {
+        flush: u64,
+        error: StoreError,
+    },
+    AnnounceCleaned {
+        removed: usize,
+    },
+    AnnounceCleanFailed(StoreError),
+    /// There is no announce database this session; the actor keeps the announces.
+    AnnounceStoreUnavailable,
 }
 
 /// Bound on the exit flush: three lock waits of the store's five seconds.
@@ -120,6 +153,7 @@ fn run(
     // Opened on the first write, so a process that only reads never creates or
     // writes the file.
     let mut slot: Option<Box<dyn KnownDestinationStore>> = None;
+    let mut announces = AnnounceSlot::default();
     while let Ok(job) = jobs.recv() {
         match job {
             StoreJob::Apply {
@@ -152,11 +186,38 @@ fn run(
                 };
                 let _ = results.send(result);
             }
+            StoreJob::AnnounceClean { keep } => {
+                let result = match announces.writable(&source) {
+                    Some(store) => match store.retain_only(&keep) {
+                        Ok(removed) => StoreResult::AnnounceCleaned { removed },
+                        Err(e) => StoreResult::AnnounceCleanFailed(e),
+                    },
+                    None => StoreResult::AnnounceStoreUnavailable,
+                };
+                let _ = results.send(result);
+            }
+            StoreJob::AnnounceUpsert { flush, rows, reply } => {
+                let result = match announces.writable(&source) {
+                    Some(store) => match store.upsert(&rows) {
+                        Ok(()) => StoreResult::AnnounceFlushed { flush },
+                        Err(error) => StoreResult::AnnounceFailed { flush, error },
+                    },
+                    None => StoreResult::AnnounceStoreUnavailable,
+                };
+                match reply {
+                    Some(tx) => {
+                        let _ = tx.send(result);
+                    }
+                    None => {
+                        let _ = results.send(result);
+                    }
+                }
+            }
             #[cfg(feature = "sqlite-store")]
             StoreJob::Load { now, reply } => {
                 let out = match &source {
                     StoreSource::Memory => Vec::new(),
-                    StoreSource::Sqlite(path) => load_at_start(path, now),
+                    StoreSource::Sqlite { known, .. } => load_at_start(known, now),
                 };
                 let _ = reply.send(Ok(out));
             }
@@ -175,7 +236,8 @@ fn writable<'a>(
         let store: Box<dyn KnownDestinationStore> = match source {
             StoreSource::Memory => Box::new(MemoryStore::new()),
             #[cfg(feature = "sqlite-store")]
-            StoreSource::Sqlite(path) => match SqliteKnownDestinations::open_rw(path) {
+            StoreSource::Sqlite { known: path, .. } => match SqliteKnownDestinations::open_rw(path)
+            {
                 Ok(mut store) => {
                     import_known_sources(
                         &LegacyFiles::beside(path),
@@ -209,7 +271,6 @@ fn read_rows(
     Ok(rows)
 }
 
-#[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
 fn has_entries(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
 }
@@ -484,8 +545,80 @@ impl KdPending {
     }
 }
 
-/// The actor's side of the store: pending marks, the worker, and a read-only
-/// connection for ratchet lookups.
+/// Cached announces the actor still holds, keyed by packet hash.
+#[derive(Debug, Default)]
+pub(super) struct AnnouncePending {
+    /// Stored since the last flush (Python `AnnounceCache._pending`).
+    rows: HashMap<PacketHash, AnnounceRow>,
+    /// Handed to the worker and not yet answered, with the flush they went in.
+    /// A fetch still finds them here, as upstream's fetch waits for a running flush.
+    in_flight: HashMap<PacketHash, (u64, AnnounceRow)>,
+    /// Number of the last flush handed to the worker.
+    flushes: u64,
+    /// Unix time of the last flush attempt (Python `ac_last_flush`).
+    last_flush: f64,
+    /// The last flush was not written; the next one waits for the interval.
+    flush_failed: bool,
+    /// No announce database this session: `rows` is the whole cache and is never flushed.
+    in_memory: bool,
+    /// Set while a clean is queued or running; another clean waits for it.
+    clean_in_flight: bool,
+}
+
+impl AnnouncePending {
+    fn get(&self, packet_hash: &PacketHash) -> Option<&AnnounceRow> {
+        self.rows
+            .get(packet_hash)
+            .or_else(|| self.in_flight.get(packet_hash).map(|(_, row)| row))
+    }
+
+    /// Moves the pending rows to `in_flight` under a new flush number and returns
+    /// the number with a copy of the rows for the worker.
+    fn take_flush(&mut self) -> (u64, Vec<AnnounceRow>) {
+        self.flushes += 1;
+        let flush = self.flushes;
+        let rows = self.rows.values().cloned().collect();
+        for (hash, row) in self.rows.drain() {
+            self.in_flight.insert(hash, (flush, row));
+        }
+        (flush, rows)
+    }
+
+    /// The rows of `flush` are stored.
+    fn confirm(&mut self, flush: u64) {
+        self.in_flight.retain(|_, (sent, _)| *sent != flush);
+    }
+
+    /// Re-queues the rows of a flush that was not written. A row stored or sent
+    /// since then for the same hash is newer and is kept; upstream's
+    /// `AnnounceCache.__apply_pending` overwrites it with the attempted one.
+    fn restore(&mut self, flush: u64) {
+        let failed: Vec<PacketHash> = self
+            .in_flight
+            .iter()
+            .filter(|(_, (sent, _))| *sent == flush)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in failed {
+            if let Some((_, row)) = self.in_flight.remove(&hash) {
+                self.rows.entry(hash).or_insert(row);
+            }
+        }
+    }
+
+    /// Keeps the cache in memory for the rest of the session and takes back
+    /// every row the worker could not store.
+    fn keep_in_memory(&mut self) {
+        self.in_memory = true;
+        self.clean_in_flight = false;
+        for (hash, (_, row)) in self.in_flight.drain() {
+            self.rows.entry(hash).or_insert(row);
+        }
+    }
+}
+
+/// The actor's side of the stores: pending state, the worker, and read-only
+/// connections for ratchet and cached-announce lookups.
 pub(super) struct KdState {
     pub(super) pending: KdPending,
     /// Taken on the first submit, which starts the worker thread.
@@ -494,10 +627,19 @@ pub(super) struct KdState {
     results_tx: tokio_mpsc::UnboundedSender<StoreResult>,
     /// Outcomes of ordinary flushes and expiries, drained by the actor loop.
     pub(super) results: tokio_mpsc::UnboundedReceiver<StoreResult>,
+    /// Cached announces not yet known to be stored.
+    announces: AnnouncePending,
+    /// `storage/cache/announces` while it may still hold files from before the
+    /// database; a fetch that misses everywhere else reads the file there.
+    legacy_announce_dir: Option<PathBuf>,
     #[cfg(feature = "sqlite-store")]
     db_path: Option<PathBuf>,
     #[cfg(feature = "sqlite-store")]
     reader: Option<SqliteKnownDestinations>,
+    #[cfg(feature = "sqlite-store")]
+    announce_db_path: Option<PathBuf>,
+    #[cfg(feature = "sqlite-store")]
+    announce_reader: Option<SqliteAnnounceCache>,
 }
 
 impl KdState {
@@ -510,27 +652,45 @@ impl KdState {
             worker: None,
             results_tx,
             results,
+            announces: AnnouncePending {
+                in_memory: true,
+                ..AnnouncePending::default()
+            },
+            legacy_announce_dir: None,
             #[cfg(feature = "sqlite-store")]
             db_path: None,
             #[cfg(feature = "sqlite-store")]
             reader: None,
+            #[cfg(feature = "sqlite-store")]
+            announce_db_path: None,
+            #[cfg(feature = "sqlite-store")]
+            announce_reader: None,
         }
     }
 
-    /// Uses `dir`'s `known_destinations.db`. Nothing is opened here; the file is
-    /// opened by the worker when a job needs it.
+    /// Uses `dir`'s `known_destinations.db` and `cache/announces.db`. Nothing is
+    /// opened here; each file is opened by the worker when a job needs it.
     pub(super) fn attach_storage(&mut self, dir: &Path) {
         self.close(Instant::now() + EXIT_FLUSH_DEADLINE);
+        let cache_dir = dir.join("cache");
+        self.legacy_announce_dir = Some(cache_dir.join("announces"));
+        self.announces = AnnouncePending::default();
         #[cfg(feature = "sqlite-store")]
         {
             let path = dir.join("known_destinations.db");
             self.reader = None;
             self.db_path = Some(path.clone());
-            self.source = Some(StoreSource::Sqlite(path));
+            let announces = cache_dir.join("announces.db");
+            self.announce_reader = None;
+            self.announce_db_path = Some(announces.clone());
+            self.source = Some(StoreSource::Sqlite {
+                known: path,
+                announces,
+            });
         }
         #[cfg(not(feature = "sqlite-store"))]
         {
-            let _ = dir;
+            self.announces.in_memory = true;
             self.source = Some(StoreSource::Memory);
         }
     }
@@ -589,15 +749,18 @@ impl KdState {
         }
     }
 
-    /// Shutdown (`Identity.exit_handler`): applies the pending marks and waits for
-    /// the answer, then closes the store.
+    /// Shutdown: writes the pending announces (`Transport.exit_handler`), then
+    /// applies the pending marks (`Identity.exit_handler`), waiting for each answer
+    /// within one exit deadline, then closes the stores.
     pub(super) fn shutdown(&mut self, entries: &HashMap<DestHash, RecentAnnounce>, write: bool) {
+        let deadline = Instant::now() + EXIT_FLUSH_DEADLINE;
         if !write {
             self.pending = KdPending::default();
-            self.close(Instant::now() + EXIT_FLUSH_DEADLINE);
+            self.discard_announces();
+            self.close(deadline);
             return;
         }
-        let deadline = Instant::now() + EXIT_FLUSH_DEADLINE;
+        self.shutdown_announces(deadline);
         // An empty batch still opens the writable store, which runs any pending legacy import.
         let (tx, rx) = std_mpsc::channel();
         let open = StoreJob::Apply {
@@ -664,6 +827,188 @@ impl KdState {
         }
     }
 
+    /// A cached announce (`AnnounceCache.fetch`): the row the actor still holds,
+    /// then the stored row, then a file from before the database. A shared-instance
+    /// client passes `allow_db = false` and never opens the database; like
+    /// upstream's `Transport.get_cached_packet` it still reads a legacy file.
+    pub(super) fn fetch_announce(
+        &mut self,
+        packet_hash: &PacketHash,
+        allow_db: bool,
+    ) -> Option<CachedAnnounce> {
+        if let Some(row) = self.announces.get(packet_hash) {
+            return Some((row.raw.clone(), row.interface_reference.clone()));
+        }
+        let stored = if allow_db {
+            self.fetch_stored_announce(packet_hash)
+        } else {
+            self.close_announce_reader();
+            None
+        };
+        stored.or_else(|| self.fetch_legacy_announce(packet_hash))
+    }
+
+    #[cfg(feature = "sqlite-store")]
+    fn fetch_stored_announce(&mut self, packet_hash: &PacketHash) -> Option<CachedAnnounce> {
+        if self.announce_reader.is_none() {
+            let path = self.announce_db_path.as_ref()?;
+            if !path.is_file() {
+                return None;
+            }
+            self.announce_reader = SqliteAnnounceCache::open_ro(path).ok();
+        }
+        let reader = self.announce_reader.as_mut()?;
+        match reader.fetch(packet_hash) {
+            Ok(found) => found,
+            Err(e) => {
+                trace!("could not read stored announce: {e}");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "sqlite-store"))]
+    fn fetch_stored_announce(&mut self, _packet_hash: &PacketHash) -> Option<CachedAnnounce> {
+        None
+    }
+
+    fn close_announce_reader(&mut self) {
+        #[cfg(feature = "sqlite-store")]
+        {
+            self.announce_reader = None;
+        }
+    }
+
+    /// Reads `storage/cache/announces/<hash>`, written before the database held the
+    /// cache and not yet imported. Looked at only while that directory holds files.
+    fn fetch_legacy_announce(&mut self, packet_hash: &PacketHash) -> Option<CachedAnnounce> {
+        let dir = self.legacy_announce_dir.as_ref()?;
+        match crate::persistence::load_python_cached_announce(dir, packet_hash) {
+            Ok(Some(cached)) => Some((cached.raw_packet, cached.interface_reference)),
+            Ok(None) => {
+                if !has_entries(dir) {
+                    self.legacy_announce_dir = None;
+                }
+                None
+            }
+            Err(e) => {
+                trace!("could not read legacy cached announce: {e}");
+                None
+            }
+        }
+    }
+
+    /// `Transport.cache` for an announce: a later store for the same packet hash
+    /// replaces the pending row.
+    pub(super) fn store_announce(
+        &mut self,
+        packet_hash: PacketHash,
+        raw: &[u8],
+        interface: Option<String>,
+    ) {
+        let row = AnnounceRow::new(packet_hash, crate::now_f64(), raw.to_vec(), interface);
+        self.announces.rows.insert(packet_hash, row);
+    }
+
+    /// Jobs loop (`Transport.jobs`): flushes when `ac_flush_interval` has passed
+    /// since the last attempt or more than `announce_cache_max_pending` rows wait.
+    /// Upstream also retries a failed flush on every pass while that many rows
+    /// wait; here a failed flush is retried at the interval.
+    pub(super) fn flush_announces_due(&mut self, now: f64) {
+        let over_limit = self.announces.rows.len() > ANNOUNCE_CACHE_MAX_PENDING;
+        let due = now - self.announces.last_flush >= ANNOUNCE_CACHE_FLUSH_INTERVAL
+            || (over_limit && !self.announces.flush_failed);
+        if !due {
+            return;
+        }
+        self.announces.last_flush = now;
+        self.flush_announces();
+    }
+
+    /// Queues the pending announces as one write without waiting for the store.
+    fn flush_announces(&mut self) {
+        if self.announces.in_memory || self.announces.rows.is_empty() {
+            return;
+        }
+        self.send_announces(None);
+    }
+
+    /// Hands the pending announces to the worker. False when it is not running;
+    /// the cache then stays in memory.
+    fn send_announces(&mut self, reply: Option<std_mpsc::Sender<StoreResult>>) -> bool {
+        let (flush, rows) = self.announces.take_flush();
+        let sent = self
+            .submit(StoreJob::AnnounceUpsert { flush, rows, reply })
+            .is_ok();
+        if !sent {
+            self.announce_worker_gone();
+        }
+        sent
+    }
+
+    fn announce_worker_gone(&mut self) {
+        error!(
+            "announce-cache store is not running; keeping cached announces in memory for this session"
+        );
+        self.announces.keep_in_memory();
+    }
+
+    /// A shared-instance client has no announce cache: drops every announce the
+    /// actor holds and the read connection a restore at start-up may have opened.
+    pub(super) fn discard_announces(&mut self) {
+        self.announces.rows.clear();
+        self.announces.in_flight.clear();
+        self.close_announce_reader();
+    }
+
+    /// True while a clean is queued or running on the worker.
+    pub(super) fn announce_clean_in_flight(&self) -> bool {
+        self.announces.clean_in_flight
+    }
+
+    /// `AnnounceCache.clean`: after it, only announces in `keep` remain. Upstream
+    /// writes the pending rows and then deletes the ones outside `keep`; here a
+    /// pending row outside `keep` is dropped unwritten, which leaves the same rows.
+    pub(super) fn clean_announces(&mut self, keep: HashSet<PacketHash>) {
+        let before = self.announces.rows.len();
+        self.announces.rows.retain(|hash, _| keep.contains(hash));
+        if self.announces.in_memory {
+            let removed = before - self.announces.rows.len();
+            debug!(removed, "cleaned cached announces held in memory");
+            return;
+        }
+        self.flush_announces();
+        if self.announces.in_memory {
+            return;
+        }
+        if self.submit(StoreJob::AnnounceClean { keep }).is_ok() {
+            self.announces.clean_in_flight = true;
+        } else {
+            self.announce_worker_gone();
+        }
+    }
+
+    /// Exit (`Transport.exit_handler`): writes the pending announces and waits for
+    /// the answer until `deadline`. The job also opens the database when nothing
+    /// is pending, which imports any legacy files.
+    fn shutdown_announces(&mut self, deadline: Instant) {
+        self.drain_results();
+        if self.announces.in_memory {
+            return;
+        }
+        let (tx, rx) = std_mpsc::channel();
+        if !self.send_announces(Some(tx)) {
+            return;
+        }
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(result) => self.handle(result),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => error!(
+                "announce-cache flush did not finish before exit; unwritten announces are learned again from the network"
+            ),
+            Err(_) => error!("announce-cache store stopped before the final flush"),
+        }
+    }
+
     /// Applies one job's outcome to the pending state.
     pub(super) fn handle(&mut self, result: StoreResult) {
         match result {
@@ -674,6 +1019,24 @@ impl KdState {
             }
             StoreResult::Expired { removed } => debug!(removed, "expired stored ratchets"),
             StoreResult::ExpireFailed(error) => error!("could not expire stored ratchets: {error}"),
+            StoreResult::AnnounceFlushed { flush } => {
+                self.announces.flush_failed = false;
+                self.announces.confirm(flush);
+            }
+            StoreResult::AnnounceFailed { flush, error } => {
+                error!("could not write cached announces: {error}; will retry");
+                self.announces.flush_failed = true;
+                self.announces.restore(flush);
+            }
+            StoreResult::AnnounceCleaned { removed } => {
+                self.announces.clean_in_flight = false;
+                debug!(removed, "cleaned cached announces");
+            }
+            StoreResult::AnnounceCleanFailed(error) => {
+                self.announces.clean_in_flight = false;
+                error!("could not clean cached announces: {error}");
+            }
+            StoreResult::AnnounceStoreUnavailable => self.announces.keep_in_memory(),
         }
     }
 
@@ -742,6 +1105,74 @@ impl KdState {
     #[cfg(not(feature = "sqlite-store"))]
     fn fetch_stored_ratchet(&mut self, _dest: &DestHash) -> Option<(Ratchet, f64)> {
         None
+    }
+}
+
+/// The worker's announce cache, opened by its first job. `store` stays empty when
+/// there is no database to write; the actor then keeps the announces itself.
+#[derive(Default)]
+struct AnnounceSlot {
+    opened: bool,
+    store: Option<Box<dyn AnnounceCacheStore>>,
+}
+
+impl AnnounceSlot {
+    /// The writable store. The first call opens the file and imports any legacy
+    /// files. A file that cannot be opened, including one from a newer release, is
+    /// left alone and logged once.
+    fn writable(&mut self, source: &StoreSource) -> Option<&mut dyn AnnounceCacheStore> {
+        if !self.opened {
+            self.opened = true;
+            self.store = open_announce_store(source);
+        }
+        match self.store.as_mut() {
+            Some(store) => Some(store.as_mut()),
+            None => None,
+        }
+    }
+}
+
+/// Opens `announces.db`, creating `storage/cache` first as `Reticulum.__init__` does.
+#[cfg(feature = "sqlite-store")]
+fn open_announce_db(path: &Path) -> Result<SqliteAnnounceCache, StoreError> {
+    if let Some(cache_dir) = path.parent() {
+        std::fs::create_dir_all(cache_dir)?;
+    }
+    SqliteAnnounceCache::open_rw(path)
+}
+
+fn open_announce_store(source: &StoreSource) -> Option<Box<dyn AnnounceCacheStore>> {
+    match source {
+        StoreSource::Memory => None,
+        #[cfg(feature = "sqlite-store")]
+        StoreSource::Sqlite {
+            announces: path, ..
+        } => match open_announce_db(path) {
+            Ok(mut store) => {
+                // Transport.init_announce_cache: only a directory that holds files.
+                let legacy_dir = path.with_file_name("announces");
+                if has_entries(&legacy_dir) {
+                    match legacy::import_python_announce_cache(
+                        &legacy_dir,
+                        crate::now_f64(),
+                        &mut store,
+                    ) {
+                        Ok(imported) => {
+                            debug!(rows = imported.imported(), "imported announce files");
+                        }
+                        Err(e) => error!("could not import announce files: {e}"),
+                    }
+                }
+                Some(Box::new(store))
+            }
+            Err(e) => {
+                error!(
+                    path = %path.display(),
+                    "could not open the announce cache database, keeping cached announces in memory for this session: {e}; remove the announces.db* files or update to recover"
+                );
+                None
+            }
+        },
     }
 }
 
@@ -1061,6 +1492,328 @@ mod tests {
         actor.on_shutdown();
         assert!(!dir.join("known_destinations.db").exists());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Waits for the worker's next answer and applies it, as the actor loop does.
+    fn settle(actor: &mut TransportActor) {
+        let result = actor
+            .kd
+            .results
+            .blocking_recv()
+            .expect("store worker answers");
+        actor.kd.handle(result);
+    }
+
+    fn announces_db(dir: &Path) -> PathBuf {
+        dir.join("cache").join("announces.db")
+    }
+
+    fn legacy_file(dir: &Path, hash: &PacketHash) -> PathBuf {
+        dir.join("cache").join("announces").join(hex::encode(hash))
+    }
+
+    fn write_legacy_announce(dir: &Path, hash: &PacketHash, raw: &[u8]) {
+        crate::persistence::write_python_cached_announce(
+            &dir.join("cache").join("announces"),
+            hash,
+            raw,
+            Some("legacy0"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_failed_flush_does_not_replace_a_newer_announce() {
+        let old = |h: u8| AnnounceRow::new([h; 32], 100.0, vec![1], None);
+        let new = |h: u8| AnnounceRow::new([h; 32], 200.0, vec![2], None);
+        let mut p = AnnouncePending::default();
+        for h in [1, 2, 3] {
+            p.rows.insert([h; 32], old(h));
+        }
+        let (first, sent) = p.take_flush();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(p.get(&[1; 32]), Some(&old(1)), "in flight is still fetched");
+
+        // 1 is stored again and still pending; 2 is stored again and sent in a later flush.
+        p.rows.insert([2; 32], new(2));
+        let (second, _) = p.take_flush();
+        p.rows.insert([1; 32], new(1));
+
+        p.restore(first);
+        assert_eq!(p.rows[&[1; 32]], new(1), "the newer pending row stays");
+        assert!(!p.rows.contains_key(&[2; 32]), "the newer row is in flight");
+        assert_eq!(p.get(&[2; 32]), Some(&new(2)));
+        assert_eq!(
+            p.rows[&[3; 32]],
+            old(3),
+            "an unwritten row is pending again"
+        );
+
+        p.confirm(second);
+        assert!(p.in_flight.is_empty());
+    }
+
+    #[test]
+    fn a_cached_announce_is_fetched_while_pending_and_after_a_restart() {
+        let dir = temp_dir();
+        let mut actor = actor_on(&dir);
+        let hash = [0x21; 32];
+        actor
+            .kd
+            .store_announce(hash, &[1; 40], Some("first".into()));
+        actor
+            .kd
+            .store_announce(hash, &[2; 40], Some("second".into()));
+        let latest = Some((vec![2; 40], Some("second".to_string())));
+        assert_eq!(actor.kd.fetch_announce(&hash, true), latest);
+        assert!(
+            !announces_db(&dir).exists(),
+            "nothing is written before a flush"
+        );
+
+        actor.kd.flush_announces_due(crate::now_f64());
+        assert_eq!(
+            actor.kd.fetch_announce(&hash, true),
+            latest,
+            "a row on its way to the store is still fetched"
+        );
+        settle(&mut actor);
+        assert!(actor.kd.announces.rows.is_empty() && actor.kd.announces.in_flight.is_empty());
+        assert_eq!(actor.kd.fetch_announce(&hash, true), latest);
+
+        // A row stored after the flush is written at exit.
+        let late = [0x22; 32];
+        actor.kd.store_announce(late, &[3; 40], None);
+        actor.on_shutdown();
+
+        let mut restarted = actor_on(&dir);
+        assert_eq!(restarted.kd.fetch_announce(&hash, true), latest);
+        assert_eq!(
+            restarted.kd.fetch_announce(&late, true),
+            Some((vec![3; 40], None))
+        );
+        restarted.on_shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_flush_waits_for_its_interval_unless_too_many_announces_are_pending() {
+        let dir = temp_dir();
+        let mut actor = actor_on(&dir);
+        let start = crate::now_f64();
+        actor.kd.store_announce([1; 32], &[1; 40], None);
+        actor.kd.flush_announces_due(start);
+        settle(&mut actor);
+
+        actor.kd.store_announce([2; 32], &[1; 40], None);
+        actor
+            .kd
+            .flush_announces_due(start + ANNOUNCE_CACHE_FLUSH_INTERVAL - 1.0);
+        assert_eq!(actor.kd.announces.rows.len(), 1, "not due yet");
+
+        for i in 0..=ANNOUNCE_CACHE_MAX_PENDING as u32 {
+            let mut hash = [3; 32];
+            hash[..4].copy_from_slice(&i.to_be_bytes());
+            actor.kd.store_announce(hash, &[1; 40], None);
+        }
+        actor.kd.flush_announces_due(start + 1.0);
+        assert!(
+            actor.kd.announces.rows.is_empty(),
+            "more than the pending limit flushes at once"
+        );
+        settle(&mut actor);
+
+        // After a failed flush the pending count alone does not start another.
+        actor.kd.handle(StoreResult::AnnounceFailed {
+            flush: 0,
+            error: StoreError::Locked,
+        });
+        for i in 0..=ANNOUNCE_CACHE_MAX_PENDING as u32 {
+            let mut hash = [4; 32];
+            hash[..4].copy_from_slice(&i.to_be_bytes());
+            actor.kd.store_announce(hash, &[1; 40], None);
+        }
+        actor.kd.flush_announces_due(start + 2.0);
+        assert!(!actor.kd.announces.rows.is_empty());
+        actor
+            .kd
+            .flush_announces_due(start + 1.0 + ANNOUNCE_CACHE_FLUSH_INTERVAL);
+        assert!(
+            actor.kd.announces.rows.is_empty(),
+            "retried at the interval"
+        );
+        settle(&mut actor);
+        assert!(!actor.kd.announces.flush_failed);
+        actor.on_shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Runs a session over a storage directory whose announce database cannot be
+    /// opened for writing, and checks the cache works from memory.
+    fn runs_from_memory(dir: &Path) {
+        let mut actor = actor_on(dir);
+        let (kept, dropped) = ([0x31; 32], [0x32; 32]);
+        actor.kd.store_announce(kept, &[1; 40], Some("if0".into()));
+        actor.kd.flush_announces_due(crate::now_f64());
+        settle(&mut actor);
+        assert!(actor.kd.announces.in_memory);
+        assert_eq!(
+            actor.kd.fetch_announce(&kept, true),
+            Some((vec![1; 40], Some("if0".to_string()))),
+            "an announce cached this session is still served"
+        );
+
+        // Later flushes send nothing, so nothing can fail again.
+        actor.kd.store_announce(dropped, &[2; 40], None);
+        actor
+            .kd
+            .flush_announces_due(crate::now_f64() + 2.0 * ANNOUNCE_CACHE_FLUSH_INTERVAL);
+        assert!(actor.kd.announces.in_flight.is_empty());
+        assert!(actor.kd.results.try_recv().is_err());
+
+        actor.kd.clean_announces([kept].into_iter().collect());
+        assert!(actor.kd.fetch_announce(&kept, true).is_some());
+        assert_eq!(actor.kd.fetch_announce(&dropped, true), None);
+        assert!(!actor.kd.announce_clean_in_flight());
+        actor.on_shutdown();
+    }
+
+    #[test]
+    fn a_newer_announce_database_is_left_alone_and_the_cache_runs_from_memory() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(announces_db(&dir)).unwrap();
+            conn.execute_batch("PRAGMA user_version = 7; CREATE TABLE cached_announces (x);")
+                .unwrap();
+        }
+        let before = std::fs::read(announces_db(&dir)).unwrap();
+        runs_from_memory(&dir);
+        assert_eq!(std::fs::read(announces_db(&dir)).unwrap(), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_corrupt_announce_database_is_left_alone_and_the_cache_runs_from_memory() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(announces_db(&dir), b"not a sqlite file at all").unwrap();
+        runs_from_memory(&dir);
+        assert_eq!(
+            std::fs::read(announces_db(&dir)).unwrap(),
+            b"not a sqlite file at all"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_cache_directory_runs_the_cache_from_memory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root ignores the mode, so the directory cannot be made unwritable.
+        if std::fs::write(cache.join("probe"), b"").is_ok() {
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+        runs_from_memory(&dir);
+        assert!(!announces_db(&dir).exists());
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_legacy_announce_file_is_served_before_its_import_and_stored_by_the_first_write() {
+        let dir = temp_dir();
+        let legacy = [0x41; 32];
+        write_legacy_announce(&dir, &legacy, &[9; 40]);
+        let mut actor = actor_on(&dir);
+        let cached = Some((vec![9; 40], Some("legacy0".to_string())));
+        assert_eq!(actor.kd.fetch_announce(&legacy, true), cached);
+        assert!(!announces_db(&dir).exists(), "a fetch writes nothing");
+        assert!(legacy_file(&dir, &legacy).exists());
+
+        actor.kd.store_announce([0x42; 32], &[1; 40], None);
+        actor.kd.flush_announces_due(crate::now_f64());
+        settle(&mut actor);
+        assert!(
+            !legacy_file(&dir, &legacy).exists(),
+            "the first write imports the file and removes it"
+        );
+        assert_eq!(actor.kd.fetch_announce(&legacy, true), cached);
+        assert_eq!(actor.kd.fetch_announce(&[0x43; 32], true), None);
+        assert!(
+            actor.kd.legacy_announce_dir.is_none(),
+            "an empty legacy directory is not looked at again"
+        );
+        actor.on_shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn exit_imports_legacy_announce_files_when_nothing_was_cached() {
+        let dir = temp_dir();
+        let legacy = [0x44; 32];
+        write_legacy_announce(&dir, &legacy, &[9; 40]);
+        let mut actor = actor_on(&dir);
+        actor.on_shutdown();
+        assert!(!legacy_file(&dir, &legacy).exists());
+        let mut restarted = actor_on(&dir);
+        assert!(restarted.kd.fetch_announce(&legacy, true).is_some());
+        restarted.on_shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_shared_instance_client_leaves_the_announce_cache_alone() {
+        let dir = temp_dir();
+        let (stored, legacy) = ([0x51; 32], [0x52; 32]);
+        crate::store::seed_cached_announce(&dir, &stored, &[1; 40], None).unwrap();
+        write_legacy_announce(&dir, &legacy, &[9; 40]);
+        let listing = |dir: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(dir.join("cache"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+
+        // Before the actor knows it is a client, a restore may read the database.
+        let mut actor = actor_on(&dir);
+        assert!(actor.cached_announce(&stored).is_some());
+        assert!(actor.kd.announce_reader.is_some());
+        let before = listing(&dir);
+
+        actor.shared_instance_client_mode = true;
+        actor.cache_announce(&[0x53; 32], &[2; 40], 0);
+        actor.flush_cached_announces(crate::now_f64());
+        assert!(
+            actor.kd.announce_reader.is_none(),
+            "a client closes the read connection"
+        );
+        actor.clean_announce_cache();
+        assert!(actor.kd.announces.rows.is_empty());
+        assert!(!actor.kd.announce_clean_in_flight());
+        assert!(
+            actor.cached_announce(&stored).is_none(),
+            "a client does not read the database"
+        );
+        assert!(actor.kd.announce_reader.is_none());
+        assert!(
+            actor.cached_announce(&legacy).is_some(),
+            "a client reads a legacy file, as upstream's does"
+        );
+        actor.on_shutdown();
+        assert!(
+            legacy_file(&dir, &legacy).exists(),
+            "a client imports nothing"
+        );
+        assert_eq!(listing(&dir), before, "a client creates nothing");
         let _ = std::fs::remove_dir_all(dir);
     }
 

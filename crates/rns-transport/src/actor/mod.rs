@@ -307,9 +307,6 @@ pub struct TransportActor {
     /// decides whether a queued writer is still current.
     pub(crate) routing_save_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub(crate) hashlist_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Whether an asynchronous announce-cache sweep is in flight. Scheduling
-    /// skips another sweep while this flag is set.
-    pub(crate) announce_sweep_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// Persisted path entries waiting on their interface to re-register.
     /// Drained by `drain_pending_for_interface` on `RegisterInterface`.
@@ -594,9 +591,6 @@ impl TransportActor {
             routing_save_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             routing_save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             hashlist_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            announce_sweep_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                false,
-            )),
             pending_path_entries: Vec::new(),
             recent_announces: HashMap::new(),
             startup_complete: false,
@@ -3438,6 +3432,7 @@ mod tests {
         actor.is_transport_enabled = true;
         actor.transport_identity_hash = Some([0x77; 16]);
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
 
         let cached_announces = 1_200;
         for i in 0..cached_announces {
@@ -3467,13 +3462,7 @@ mod tests {
         let (target_raw, target_dest) = make_valid_announce("test.shared.cached_path_response", 2);
         let target_ph =
             rns_wire::hash::packet_hash(&target_raw, rns_wire::flags::HeaderType::Header1);
-        crate::persistence::write_python_cached_announce_if_absent(
-            &dir.join("cache").join("announces"),
-            &target_ph,
-            &target_raw,
-            None,
-        )
-        .unwrap();
+        crate::store::seed_cached_announce(&dir, &target_ph, &target_raw, None).unwrap();
         actor.recent_announces.insert(
             target_dest,
             RecentAnnounce {
@@ -9348,6 +9337,7 @@ mod tests {
 
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         actor.load_state();
 
         // Expired entry dropped, fresh entry staged for rebind.
@@ -9363,7 +9353,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_storage_uses_python_cache_index_for_destination_table() {
+    fn initialize_storage_resolves_destination_table_from_cached_announces() {
         let dir = std::env::temp_dir().join("rns_load_python_destination_cache_index");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -9396,13 +9386,8 @@ mod tests {
         .unwrap();
 
         // Disk cache file exists only for cached_dest's announce packet hash.
-        crate::persistence::write_python_cached_announce_if_absent(
-            &dir.join("cache").join("announces"),
-            &[0x11; 32],
-            &[0xFE; 42],
-            Some("Border_TCP"),
-        )
-        .unwrap();
+        crate::store::seed_cached_announce(&dir, &[0x11; 32], &[0xFE; 42], Some("Border_TCP"))
+            .unwrap();
 
         let (mut actor, _tx) = TransportActor::new();
         actor.initialize_storage(dir.clone());
@@ -9438,6 +9423,7 @@ mod tests {
         // Fresh actor → load → register interface under a *different* id.
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         actor.load_state();
         assert_eq!(actor.pending_path_entries.len(), 1);
 
@@ -9563,6 +9549,7 @@ mod tests {
 
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         actor.load_state();
         assert!(actor.pending_path_entries.is_empty());
         assert_eq!(actor.path_table.iter().count(), 0);
@@ -9583,6 +9570,7 @@ mod tests {
         {
             let (mut actor, _tx) = TransportActor::new();
             actor.storage_dir = Some(dir.clone());
+            actor.kd.attach_storage(&dir);
             let (entry, _rx) = make_test_interface("ble_peer");
             actor.handle_message(TransportMessage::RegisterInterface { id: 1, entry });
             actor.path_table.insert(
@@ -9614,6 +9602,7 @@ mod tests {
 
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         let (entry, _rx) = make_test_interface("tcp_backbone");
         actor.handle_message(TransportMessage::RegisterInterface { id: 1, entry });
         actor.path_table.insert(
@@ -9656,6 +9645,7 @@ mod tests {
 
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         let (entry, _rx) = make_test_interface("tcp_backbone");
         actor.handle_message(TransportMessage::RegisterInterface { id: 1, entry });
 
@@ -9703,6 +9693,7 @@ mod tests {
 
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         let (entry, _rx) = make_test_interface("tcp_backbone");
         actor.handle_message(TransportMessage::RegisterInterface { id: 1, entry });
         actor.path_table.insert(
@@ -9733,6 +9724,7 @@ mod tests {
 
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         actor.is_shared_instance = true;
         actor.shared_instance_client_mode = true;
         actor.state_dirty = true;
@@ -9825,6 +9817,7 @@ mod tests {
         let dir = unique_temp_dir("hashlist-disabled-save");
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         actor.packet_hashlist.insert([0xAA; 32]);
 
         actor.save_state();
@@ -9838,6 +9831,7 @@ mod tests {
         let dir = unique_temp_dir("hashlist-shutdown");
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         actor.is_transport_enabled = true;
         actor.packet_hashlist.insert([0xAA; 32]);
 
@@ -9855,6 +9849,7 @@ mod tests {
         let path = dir.join("packet_hashlist.raw");
         let (mut actor, tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         actor.is_transport_enabled = true;
         actor.packet_hashlist.insert([0xAA; 32]);
         let trigger = actor.persistence_trigger();
@@ -9886,6 +9881,7 @@ mod tests {
         let path = dir.join("packet_hashlist.raw");
         let (mut actor, _tx) = TransportActor::new();
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
         actor.is_transport_enabled = true;
         actor.packet_hashlist.insert([0xBB; 32]);
 
@@ -11431,6 +11427,7 @@ mod tests {
         actor.is_transport_enabled = true;
         actor.transport_identity_hash = Some([0x44; 16]);
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
 
         let (mut gateway, _gateway_rx) = make_test_interface("gateway");
         gateway.mode = InterfaceMode::Gateway;
@@ -11441,13 +11438,7 @@ mod tests {
 
         let (raw, dest) = make_valid_announce("test.pr_burst.known_path", 1);
         let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
-        crate::persistence::write_python_cached_announce_if_absent(
-            &dir.join("cache").join("announces"),
-            &ph,
-            &raw,
-            None,
-        )
-        .unwrap();
+        crate::store::seed_cached_announce(&dir, &ph, &raw, None).unwrap();
         let mut path_entry =
             crate::path_table::PathEntry::new(Some([0xAB; 16]), 2, 2, InterfaceMode::Gateway);
         path_entry.packet_hash = Some(ph);
@@ -12075,6 +12066,7 @@ mod tests {
         actor.is_transport_enabled = true;
         actor.transport_identity_hash = Some([0x44; 16]);
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
 
         let (requestor, mut requestor_rx) = make_test_interface("requestor");
         actor.interfaces.insert(1, requestor);
@@ -12084,13 +12076,7 @@ mod tests {
         let next_hop = [0xAB; 16];
         let (raw, dest) = make_valid_announce("test.path.request.next_hop", 1);
         let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
-        crate::persistence::write_python_cached_announce_if_absent(
-            &dir.join("cache").join("announces"),
-            &ph,
-            &raw,
-            None,
-        )
-        .unwrap();
+        crate::store::seed_cached_announce(&dir, &ph, &raw, None).unwrap();
         let mut path_entry =
             crate::path_table::PathEntry::new(Some(next_hop), 2, 2, InterfaceMode::Gateway);
         path_entry.packet_hash = Some(ph);
@@ -12171,6 +12157,7 @@ mod tests {
         actor.is_transport_enabled = true;
         actor.transport_identity_hash = Some([0x44; 16]);
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
 
         let (requestor, mut requestor_rx) = make_test_interface("requestor");
         actor.interfaces.insert(1, requestor);
@@ -12179,13 +12166,7 @@ mod tests {
 
         let (raw, dest) = make_valid_announce("test.path.request.held", 1);
         let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
-        crate::persistence::write_python_cached_announce_if_absent(
-            &dir.join("cache").join("announces"),
-            &ph,
-            &raw,
-            None,
-        )
-        .unwrap();
+        crate::store::seed_cached_announce(&dir, &ph, &raw, None).unwrap();
         let mut path_entry =
             crate::path_table::PathEntry::new(Some([0xAB; 16]), 2, 2, InterfaceMode::Gateway);
         path_entry.packet_hash = Some(ph);
@@ -12267,6 +12248,7 @@ mod tests {
         actor.is_transport_enabled = true;
         // Cached announce is fully available — only the roaming rule may block.
         actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
 
         let (mut roaming, mut roaming_rx) = make_test_interface("roaming");
         roaming.mode = InterfaceMode::Roaming;
@@ -12274,13 +12256,7 @@ mod tests {
 
         let (raw, dest) = make_valid_announce("test.path.request.roaming", 1);
         let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
-        crate::persistence::write_python_cached_announce_if_absent(
-            &dir.join("cache").join("announces"),
-            &ph,
-            &raw,
-            None,
-        )
-        .unwrap();
+        crate::store::seed_cached_announce(&dir, &ph, &raw, None).unwrap();
         let mut path_entry = crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Roaming);
         path_entry.packet_hash = Some(ph);
         actor.path_table.insert(dest, path_entry);

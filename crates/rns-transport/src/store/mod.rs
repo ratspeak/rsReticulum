@@ -354,6 +354,39 @@ impl AnnounceCacheStore for MemoryStore {
     }
 }
 
+/// Seeds one cached announce for a test: into `storage_dir/cache/announces.db`,
+/// or as a legacy file when the crate is built without the database.
+#[cfg(test)]
+pub(crate) fn seed_cached_announce(
+    storage_dir: &std::path::Path,
+    packet_hash: &PacketHash,
+    raw: &[u8],
+    interface: Option<&str>,
+) -> Result<(), StoreError> {
+    let cache = storage_dir.join("cache");
+    std::fs::create_dir_all(&cache)?;
+    #[cfg(feature = "sqlite-store")]
+    {
+        let mut store = SqliteAnnounceCache::open_rw(&cache.join("announces.db"))?;
+        store.upsert(&[AnnounceRow::new(
+            *packet_hash,
+            crate::now_f64(),
+            raw.to_vec(),
+            interface.map(str::to_string),
+        )])
+    }
+    #[cfg(not(feature = "sqlite-store"))]
+    {
+        crate::persistence::write_python_cached_announce(
+            &cache.join("announces"),
+            packet_hash,
+            raw,
+            interface,
+        )
+        .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

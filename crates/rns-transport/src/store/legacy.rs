@@ -1,6 +1,7 @@
 //! One-way importers for the pre-SQLite files. Each function reads one source,
 //! writes through the given store, and returns the paths the caller may remove
-//! after its own transaction has committed. Nothing is renamed or unlinked here.
+//! after its own transaction has committed. Only the announce-cache import
+//! removes files itself, chunk by chunk, each after its own commit.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -219,53 +220,79 @@ pub fn import_python_ratchets(
     })
 }
 
-/// Imports `storage/cache/announces/<hex>` files, each `[raw, interface]`. Every
-/// announce gets `received = now`, as `AnnounceCache.import_legacy` does
-/// in `RNS/Storage.py`. Files whose name is not a 32-byte hash, or whose
-/// content does not decode, are skipped; all regular files are removable.
+/// Files per announce-cache import transaction; matches upstream's `executemany` batching.
+const ANNOUNCE_CHUNK_FILES: usize = 4096;
+
+/// Imports `storage/cache/announces/<hex>` files, each `[raw, interface]`, as
+/// `AnnounceCache.import_legacy` does in `RNS/Storage.py`. Every announce gets
+/// `received = now`. Upstream unlinks every file before its one commit; here the
+/// files go in chunks of [`ANNOUNCE_CHUNK_FILES`], and a chunk's files are removed
+/// only after its transaction has committed, so an interrupted import loses
+/// nothing and resumes with the files that remain. A file whose name is not a
+/// 32-byte hash, or whose content does not decode, is removed without a row.
 pub fn import_python_announce_cache(
     dir: &Path,
     now: f64,
     store: &mut dyn AnnounceCacheStore,
 ) -> Result<LegacyImport, StoreError> {
-    let mut removable = Vec::new();
-    let mut rows = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(io)? {
-        let path = entry.map_err(io)?.path();
-        if !path.is_file() {
-            continue;
+    let mut imported = 0usize;
+    loop {
+        // The directory is listed again for every chunk: removing files under an
+        // open listing makes it skip entries on common filesystems.
+        let mut rows = Vec::new();
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).map_err(io)? {
+            let path = entry.map_err(io)?.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(row) = read_announce_file(&path, now) {
+                rows.push(row);
+            }
+            files.push(path);
+            if files.len() >= ANNOUNCE_CHUNK_FILES {
+                break;
+            }
         }
-        removable.push(path.clone());
-        let Some(hash) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| hex::decode(n).ok())
-            .and_then(|b| <PacketHash>::try_from(b).ok())
-        else {
-            continue;
-        };
-        let Ok(data) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(Value::Array(fields)) = rmpv::decode::read_value(&mut data.as_slice()) else {
-            continue;
-        };
-        let Some(Value::Binary(raw)) = fields.first() else {
-            continue;
-        };
-        let interface = match fields.get(1) {
-            Some(Value::String(s)) => s.as_str().map(str::to_string),
-            _ => None,
-        };
-        rows.push(AnnounceRow::new(hash, now, raw.clone(), interface));
+        if files.is_empty() {
+            break;
+        }
+        store.upsert(&rows)?;
+        imported += rows.len();
+        let removed = files
+            .iter()
+            .filter(|file| std::fs::remove_file(file).is_ok())
+            .count();
+        // Files that cannot be removed would come back in every listing.
+        if removed == 0 {
+            break;
+        }
     }
-    let imported = rows.len();
-    store.upsert(&rows)?;
     Ok(LegacyImport {
         imported,
         rejected: 0,
-        removable,
+        removable: Vec::new(),
     })
+}
+
+fn read_announce_file(path: &Path, now: f64) -> Option<AnnounceRow> {
+    let hash = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| hex::decode(n).ok())
+        .and_then(|b| <PacketHash>::try_from(b).ok())?;
+    let data = std::fs::read(path).ok()?;
+    let Ok(Value::Array(fields)) = rmpv::decode::read_value(&mut data.as_slice()) else {
+        return None;
+    };
+    let Some(Value::Binary(raw)) = fields.first() else {
+        return None;
+    };
+    let interface = match fields.get(1) {
+        Some(Value::String(s)) => s.as_str().map(str::to_string),
+        _ => None,
+    };
+    Some(AnnounceRow::new(hash, now, raw.clone(), interface))
 }
 
 /// Imports the Rust `announce_cache.msgpack` (version 6, or version 5 through
@@ -468,7 +495,8 @@ mod tests {
         let mut store = MemoryStore::new();
         let got = import_python_announce_cache(&dir, NOW, &mut store).unwrap();
         assert_eq!(got.imported(), 2);
-        assert_eq!(got.removable().len(), 2);
+        assert!(!dir.join(hex::encode(with_iface)).exists());
+        assert!(!dir.join(hex::encode(without)).exists());
         let raw = bytes(
             "010005050505050505050505050505050505050505050505050505050505050505050505050505050505",
         );
@@ -477,6 +505,72 @@ mod tests {
             Some((raw.clone(), Some("tcp0".to_string())))
         );
         assert_eq!(store.fetch(&without).unwrap(), Some((raw, None)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Fails every write after the first `good` ones, as a crash would end the import.
+    struct FailsAfter {
+        good: usize,
+        inner: MemoryStore,
+    }
+
+    impl AnnounceCacheStore for FailsAfter {
+        fn upsert(&mut self, rows: &[AnnounceRow]) -> Result<(), StoreError> {
+            if self.good == 0 {
+                return Err(StoreError::Locked);
+            }
+            self.good -= 1;
+            self.inner.upsert(rows)
+        }
+
+        fn fetch(
+            &mut self,
+            packet_hash: &PacketHash,
+        ) -> Result<Option<super::super::CachedAnnounce>, StoreError> {
+            self.inner.fetch(packet_hash)
+        }
+
+        fn retain_only(&mut self, keep: &HashSet<PacketHash>) -> Result<usize, StoreError> {
+            self.inner.retain_only(keep)
+        }
+    }
+
+    fn files_in(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    #[test]
+    fn an_interrupted_announce_import_keeps_unwritten_files_and_resumes() {
+        let dir = unique_dir("announces-chunks");
+        let total = ANNOUNCE_CHUNK_FILES + 40;
+        let hash = |i: usize| {
+            let mut h = [0x5Au8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            h
+        };
+        for i in 0..total {
+            std::fs::write(dir.join(hex::encode(hash(i))), bytes(ANNOUNCE_FILE_HEX)).unwrap();
+        }
+        std::fs::write(dir.join("not-a-hash"), b"junk").unwrap();
+
+        // The second chunk's transaction fails: its files stay, the first chunk's are gone.
+        let mut store = FailsAfter {
+            good: 1,
+            inner: MemoryStore::new(),
+        };
+        assert!(import_python_announce_cache(&dir, NOW, &mut store).is_err());
+        assert_eq!(files_in(&dir), total + 1 - ANNOUNCE_CHUNK_FILES);
+
+        store.good = usize::MAX;
+        import_python_announce_cache(&dir, NOW, &mut store).unwrap();
+        assert_eq!(
+            files_in(&dir),
+            0,
+            "every file, decodable or not, is removed"
+        );
+        for i in 0..total {
+            assert!(store.fetch(&hash(i)).unwrap().is_some(), "announce {i}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

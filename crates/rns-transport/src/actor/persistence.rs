@@ -62,45 +62,6 @@ fn recent_announce_from_cached_packet(
     recent
 }
 
-fn python_announce_cache_index(
-    announce_cache_dir: &std::path::Path,
-) -> Option<std::collections::HashSet<String>> {
-    match std::fs::read_dir(announce_cache_dir) {
-        Ok(entries) => {
-            let mut names = std::collections::HashSet::new();
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str()
-                    && name.len() == 64
-                    && name.as_bytes().iter().all(u8::is_ascii_hexdigit)
-                {
-                    names.insert(name.to_ascii_lowercase());
-                }
-            }
-            Some(names)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Some(std::collections::HashSet::new())
-        }
-        Err(_) => None,
-    }
-}
-
-fn load_indexed_python_cached_announce(
-    announce_cache_dir: &std::path::Path,
-    cache_index: Option<&std::collections::HashSet<String>>,
-    packet_hash: &[u8; 32],
-) -> Result<Option<crate::persistence::PythonCachedAnnounce>, crate::persistence::PersistenceError>
-{
-    if let Some(index) = cache_index {
-        let name = hex::encode(packet_hash);
-        if !index.contains(&name) {
-            return Ok(None);
-        }
-    }
-
-    crate::persistence::load_python_cached_announce(announce_cache_dir, packet_hash)
-}
-
 /// Owned copy of everything `write_routing_snapshot` persists, so the disk
 /// I/O (fsync-heavy on macOS: F_FULLFSYNC per file + dir) can run on the
 /// blocking pool without borrowing the actor.
@@ -192,62 +153,44 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
 }
 
 impl TransportActor {
-    /// Fetch raw announce bytes from the disk announce cache
-    /// (`cache/announces/<packet_hash>`). Misses are normal: legacy entries,
-    /// cleaned cache files, or shared-instance client mode.
-    pub(super) fn cached_announce_raw(&self, packet_hash: &[u8; 32]) -> Option<Vec<u8>> {
+    /// Raw bytes of a cached announce (Python `Transport.get_cached_packet`).
+    /// Misses are normal: a cleaned announce, or shared-instance client mode.
+    pub(super) fn cached_announce_raw(&mut self, packet_hash: &[u8; 32]) -> Option<Vec<u8>> {
         self.cached_announce(packet_hash)
             .map(|cached| cached.raw_packet)
     }
 
     /// The cached announce with the interface it was received on.
     pub(super) fn cached_announce(
-        &self,
+        &mut self,
         packet_hash: &[u8; 32],
     ) -> Option<crate::persistence::PythonCachedAnnounce> {
-        let dir = self.storage_dir.as_ref()?;
-        let announce_cache_dir = dir.join("cache").join("announces");
-        match crate::persistence::load_python_cached_announce(&announce_cache_dir, packet_hash) {
-            Ok(cached) => cached,
-            Err(e) => {
-                trace!("failed to load cached announce: {}", e);
-                None
-            }
-        }
+        let allow_db = !self.shared_instance_client_mode;
+        let (raw_packet, interface_reference) = self.kd.fetch_announce(packet_hash, allow_db)?;
+        Some(crate::persistence::PythonCachedAnnounce {
+            raw_packet,
+            interface_reference,
+        })
     }
 
-    /// Event-driven announce cache write at receive (Python parity:
-    /// `Transport.cache(packet, force_cache=True)` on announce ingest).
-    /// One file per announce packet; a later write for the same packet hash
-    /// replaces the bytes and interface reference, like Python's
-    /// `AnnounceCache.store`. No fsync — the cache is best-effort and rebuilt
-    /// from live traffic, and an fsync chain here would stall the actor on
-    /// every announce.
-    pub(super) fn cache_announce_to_disk(
-        &self,
+    /// Announce cache write at receive (Python `Transport.cache(packet,
+    /// force_cache=True)` on announce ingest), which upstream skips on a
+    /// shared-instance client. Pending until the next flush; a later store for
+    /// the same packet hash replaces it.
+    pub(super) fn cache_announce(
+        &mut self,
         packet_hash: &[u8; 32],
         raw: &[u8],
         interface_id: InterfaceId,
     ) {
-        if self.shared_instance_client_mode {
+        if self.shared_instance_client_mode || self.storage_dir.is_none() {
             return;
         }
-        let Some(dir) = self.storage_dir.as_ref() else {
-            return;
-        };
-        let announce_cache_dir = dir.join("cache").join("announces");
         let interface_name = self
             .interfaces
             .get(&interface_id)
             .map(|entry| entry.name.clone());
-        if let Err(e) = crate::persistence::write_python_cached_announce(
-            &announce_cache_dir,
-            packet_hash,
-            raw,
-            interface_name.as_deref(),
-        ) {
-            trace!("failed to write announce cache file: {}", e);
-        }
+        self.kd.store_announce(*packet_hash, raw, interface_name);
     }
 
     fn routing_snapshot(&self) -> RoutingSnapshot {
@@ -357,32 +300,34 @@ impl TransportActor {
         self.last_state_save = now();
     }
 
-    /// Reference-counted prune of the on-disk announce cache — Python
-    /// `Transport.clean_announce_cache` parity. The keep-set is every packet
-    /// hash a path response could still be served from: live paths, tunnel
-    /// paths, and persisted entries still waiting for their interface to
-    /// re-register (Rust restores paths lazily). The walk
-    /// and unlinks run on the blocking pool; the actor only snapshots.
-    /// Returns true when a sweep was scheduled (or ran inline).
-    pub(super) fn maybe_sweep_announce_cache(&mut self) -> bool {
+    /// Jobs-loop flush of the pending announces (Python `Transport.jobs`). A
+    /// shared-instance client has no announce cache and writes nothing.
+    pub(super) fn flush_cached_announces(&mut self, now: f64) {
+        if self.storage_dir.is_none() {
+            return;
+        }
         if self.shared_instance_client_mode {
-            // Python parity: shared-instance clients never clean the cache —
-            // an empty client routing table must not wipe files the owning
-            // instance still references.
-            return false;
+            self.kd.discard_announces();
+            return;
         }
-        let Some(dir) = self.storage_dir.clone() else {
-            return false;
-        };
-        if self
-            .announce_sweep_in_flight
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            trace!("announce-cache sweep already in flight; retry next pass");
-            return false;
-        }
+        self.kd.flush_announces_due(now);
+    }
 
-        let mut keep: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    /// Reference-counted clean of the cached announces (Python `Transport.clean_cache`
+    /// and `clean_announce_cache`). Keeps the packet hash of every path and every
+    /// tunnel path, as upstream does, and of every restored path still waiting for
+    /// its interface: upstream binds those at load, this actor when the interface
+    /// registers, and the announce must still be there then.
+    pub(super) fn clean_announce_cache(&mut self) {
+        // Transport.clean_cache: never on a shared-instance client, never two at once.
+        if self.shared_instance_client_mode || self.storage_dir.is_none() {
+            return;
+        }
+        if self.kd.announce_clean_in_flight() {
+            debug!("announce-cache clean still running, postponing until the next interval");
+            return;
+        }
+        let mut keep: HashSet<[u8; 32]> = HashSet::new();
         keep.extend(self.path_table.iter().filter_map(|(_, e)| e.packet_hash));
         keep.extend(
             self.tunnel_table
@@ -395,32 +340,7 @@ impl TransportActor {
                 .filter_map(|e| e.packet_hash.as_deref())
                 .filter_map(|h| <[u8; 32]>::try_from(h).ok()),
         );
-
-        self.announce_sweep_in_flight
-            .store(true, std::sync::atomic::Ordering::Release);
-        let in_flight = self.announce_sweep_in_flight.clone();
-        let grace =
-            std::time::Duration::from_secs(crate::constants::ANNOUNCE_CACHE_SWEEP_GRACE_SECS);
-        let sweep = move || {
-            let started = std::time::Instant::now();
-            let (removed, total) = crate::persistence::sweep_announce_cache(&dir, &keep, grace);
-            if removed > 0 {
-                debug!(
-                    removed,
-                    total,
-                    elapsed = ?started.elapsed(),
-                    "cleaned cached announces"
-                );
-            }
-            in_flight.store(false, std::sync::atomic::Ordering::Release);
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn_blocking(sweep);
-            }
-            Err(_) => sweep(),
-        }
-        true
+        self.kd.clean_announces(keep);
     }
 
     /// Wait (bounded) for an older asynchronous hashlist snapshot before a
@@ -546,7 +466,7 @@ impl TransportActor {
             crate::messages::LinkEndpointTerminalReason::TransportShutdown,
         );
         self.save_state();
-        // Identity.exit_handler: drain, apply, close.
+        // Transport.exit_handler, then Identity.exit_handler: flush, apply, close.
         let write = !self.shared_instance_client_mode;
         self.kd.shutdown(&self.recent_announces, write);
     }
@@ -667,24 +587,14 @@ impl TransportActor {
                     let mut expired = 0usize;
                     let mut missing_cache = 0usize;
                     let mut pending = 0usize;
-                    let announce_cache_dir = dir.join("cache").join("announces");
-                    let announce_cache_index = python_announce_cache_index(&announce_cache_dir);
                     for pe in entries {
                         if pe.expires <= now_ts {
                             expired += 1;
                             continue;
                         }
-                        let cached = match load_indexed_python_cached_announce(
-                            &announce_cache_dir,
-                            announce_cache_index.as_ref(),
-                            &pe.packet_hash,
-                        ) {
-                            Ok(Some(cached)) => cached,
-                            Ok(None) => {
-                                missing_cache += 1;
-                                continue;
-                            }
-                            Err(_) => {
+                        let cached = match self.cached_announce(&pe.packet_hash) {
+                            Some(cached) => cached,
+                            None => {
                                 missing_cache += 1;
                                 continue;
                             }
@@ -821,8 +731,6 @@ impl TransportActor {
                     let mut expired = 0usize;
                     let mut missing_cache = 0usize;
                     let mut loaded = 0usize;
-                    let announce_cache_dir = dir.join("cache").join("announces");
-                    let announce_cache_index = python_announce_cache_index(&announce_cache_dir);
                     for te in entries {
                         if te.expires <= now_ts {
                             expired += 1;
@@ -835,13 +743,9 @@ impl TransportActor {
                                 expired += 1;
                                 continue;
                             }
-                            let cached = match load_indexed_python_cached_announce(
-                                &announce_cache_dir,
-                                announce_cache_index.as_ref(),
-                                &tp.packet_hash,
-                            ) {
-                                Ok(Some(cached)) => cached,
-                                Ok(None) | Err(_) => {
+                            let cached = match self.cached_announce(&tp.packet_hash) {
+                                Some(cached) => cached,
+                                None => {
                                     missing_cache += 1;
                                     continue;
                                 }
@@ -1185,100 +1089,73 @@ impl TransportActor {
     }
 }
 
-#[cfg(test)]
-mod announce_sweep_actor_tests {
+#[cfg(all(test, feature = "sqlite-store"))]
+mod announce_clean_tests {
     use super::*;
 
     fn temp_storage(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "rns-sweep-actor-{tag}-{}-{}",
+            "rns-announce-clean-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(dir.join("cache").join("announces")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    /// Write an announce-cache file whose mtime is one hour in the past so
-    /// the sweep's grace window never protects it.
-    fn write_aged(storage: &std::path::Path, hash: [u8; 32]) -> std::path::PathBuf {
-        let p = storage
-            .join("cache")
-            .join("announces")
-            .join(hex::encode(hash));
-        std::fs::write(&p, b"announce").unwrap();
-        let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        let file = std::fs::File::options().write(true).open(&p).unwrap();
-        file.set_times(std::fs::FileTimes::new().set_modified(aged))
-            .unwrap();
-        p
+    fn settle(actor: &mut TransportActor) {
+        let result = actor
+            .kd
+            .results
+            .blocking_recv()
+            .expect("store worker answers");
+        actor.kd.handle(result);
     }
 
-    fn sweep_actor(storage: &std::path::Path) -> TransportActor {
-        let (mut actor, _tx) = TransportActor::new();
-        actor.storage_dir = Some(storage.to_path_buf());
-        actor
-    }
-
-    fn retained_announce(hash: [u8; 32]) -> super::super::RecentAnnounce {
-        super::super::RecentAnnounce {
-            dest_hash: [0x01; 16],
-            hops: 1,
-            app_data: None,
-            timestamp: crate::now_f64(),
-            public_key: None,
-            ratchet: None,
-            ratchet_received: None,
-            packet_hash: Some(hash),
-            is_path_response: false,
-            retained: true,
-            last_used: None,
-            name_hash: [0u8; 10],
-            stamp: None,
-            stamp_value: 0.0,
-            lr_cost: None,
-        }
-    }
-
-    /// Keep-set covers live paths, tunnel paths and persisted entries still
-    /// waiting for interface re-registration. Everything else, a retained
-    /// destination's announce included, is removed once past the grace window. No tokio runtime → the sweep runs inline,
-    /// making the test fully deterministic.
+    /// The keep-set is every path, every tunnel path, and every restored path
+    /// still waiting for its interface. Everything else goes, whatever its age,
+    /// a retained destination's announce and a not yet flushed one included.
     #[test]
-    fn sweep_keeps_all_reference_sources_and_removes_orphans() {
+    fn clean_keeps_every_reference_source_and_removes_the_rest() {
         let storage = temp_storage("keepset");
         let path_hash = [0x33; 32];
         let tunnel_hash = [0x44; 32];
         let pin_hash = [0x55; 32];
         let pending_path_hash = [0x66; 32];
+        let unflushed_path_hash = [0x77; 32];
         let orphan_hash = [0x88; 32];
-        for h in [
+        let unflushed_orphan_hash = [0x99; 32];
+        for hash in [
             path_hash,
             tunnel_hash,
             pin_hash,
             pending_path_hash,
             orphan_hash,
         ] {
-            write_aged(&storage, h);
+            crate::store::seed_cached_announce(&storage, &hash, &[0x01; 40], None).unwrap();
         }
 
-        let mut actor = sweep_actor(&storage);
-        actor.path_table.insert(
-            [0x11; 16],
-            crate::path_table::PathEntry {
-                used: 0.0,
-                timestamp: crate::now_f64(),
-                next_hop: Some([0x22; 16]),
-                hops: 1,
-                expires: crate::now_f64() + 600.0,
-                random_blobs: std::collections::VecDeque::new(),
-                interface_id: 7,
-                packet_hash: Some(path_hash),
-            },
-        );
+        let (mut actor, _tx) = TransportActor::new();
+        actor.initialize_storage(storage.clone());
+        let now = crate::now_f64();
+        for (dest, hash) in [([0x11; 16], path_hash), ([0x14; 16], unflushed_path_hash)] {
+            actor.path_table.insert(
+                dest,
+                crate::path_table::PathEntry {
+                    used: 0.0,
+                    timestamp: now,
+                    next_hop: Some([0x22; 16]),
+                    hops: 1,
+                    expires: now + 600.0,
+                    random_blobs: std::collections::VecDeque::new(),
+                    interface_id: 7,
+                    packet_hash: Some(hash),
+                },
+            );
+        }
         actor.tunnel_table.insert(crate::tunnel::TunnelEntry {
             tunnel_id: [0xAB; 32],
             interface_id: Some(7),
@@ -1286,87 +1163,158 @@ mod announce_sweep_actor_tests {
                 [0x12; 16],
                 crate::tunnel::TunnelPath {
                     used: 0.0,
-                    timestamp: crate::now_f64(),
+                    timestamp: now,
                     next_hop: None,
                     hops: 2,
-                    expires: crate::now_f64() + 600.0,
+                    expires: now + 600.0,
                     random_blobs: Vec::new(),
                     packet_hash: Some(tunnel_hash),
                 },
             )]),
-            expires: crate::now_f64() + 600.0,
+            expires: now + 600.0,
         });
-        actor
-            .recent_announces
-            .insert([0x01; 16], retained_announce(pin_hash));
+        actor.recent_announces.insert(
+            [0x01; 16],
+            super::super::RecentAnnounce {
+                dest_hash: [0x01; 16],
+                hops: 1,
+                app_data: None,
+                timestamp: now,
+                public_key: None,
+                ratchet: None,
+                ratchet_received: None,
+                packet_hash: Some(pin_hash),
+                is_path_response: false,
+                retained: true,
+                last_used: None,
+                name_hash: [0u8; 10],
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
+            },
+        );
         actor
             .pending_path_entries
             .push(crate::persistence::PersistedPathEntry {
                 used: None,
                 destination_hash: vec![0x13; 16],
-                timestamp: crate::now_f64(),
+                timestamp: now,
                 next_hop: None,
                 hops: 1,
-                expires: crate::now_f64() + 600.0,
+                expires: now + 600.0,
                 random_blobs: Vec::new(),
                 interface_id: 9,
                 interface_name: None,
                 interface_hash: None,
                 packet_hash: Some(pending_path_hash.to_vec()),
             });
+        actor.cache_announce(&unflushed_path_hash, &[0x02; 40], 7);
+        actor.cache_announce(&unflushed_orphan_hash, &[0x02; 40], 7);
 
-        actor.maybe_sweep_announce_cache();
+        actor.clean_announce_cache();
+        assert!(actor.kd.announce_clean_in_flight());
+        // The flush of the pending rows, then the clean.
+        settle(&mut actor);
+        settle(&mut actor);
+        assert!(!actor.kd.announce_clean_in_flight());
 
-        let dir = storage.join("cache").join("announces");
-        for (h, why) in [
-            (path_hash, "live path"),
+        for (hash, why) in [
+            (path_hash, "path"),
             (tunnel_hash, "tunnel path"),
-            (pending_path_hash, "pending path entry"),
+            (pending_path_hash, "restored path waiting for its interface"),
+            (unflushed_path_hash, "path whose announce was still pending"),
         ] {
             assert!(
-                dir.join(hex::encode(h)).exists(),
-                "{why} announce must survive the sweep"
+                actor.cached_announce(&hash).is_some(),
+                "the announce of a {why} must survive the clean"
             );
         }
-        for (h, why) in [(orphan_hash, "orphan"), (pin_hash, "retained pin")] {
-            assert!(!dir.join(hex::encode(h)).exists(), "{why} must be removed");
+        for (hash, why) in [
+            (orphan_hash, "orphan"),
+            (pin_hash, "retained destination"),
+            (unflushed_orphan_hash, "pending orphan"),
+        ] {
+            assert!(
+                actor.cached_announce(&hash).is_none(),
+                "the announce of a {why} must be removed"
+            );
         }
-        assert!(
-            !actor
-                .announce_sweep_in_flight
-                .load(std::sync::atomic::Ordering::Acquire),
-            "inline sweep must clear the in-flight flag"
-        );
-
+        actor.on_shutdown();
         let _ = std::fs::remove_dir_all(&storage);
     }
 
     #[test]
-    fn sweep_skips_when_in_flight_or_shared_client() {
-        let storage = temp_storage("guards");
-        let orphan = write_aged(&storage, [0x99; 32]);
-        let mut actor = sweep_actor(&storage);
-
-        actor
-            .announce_sweep_in_flight
-            .store(true, std::sync::atomic::Ordering::Release);
-        actor.maybe_sweep_announce_cache();
-        assert!(orphan.exists(), "in-flight guard must skip the sweep");
-        actor
-            .announce_sweep_in_flight
-            .store(false, std::sync::atomic::Ordering::Release);
-
-        actor.shared_instance_client_mode = true;
-        actor.maybe_sweep_announce_cache();
+    fn a_second_clean_waits_for_the_one_in_flight() {
+        let storage = temp_storage("in-flight");
+        let (mut actor, _tx) = TransportActor::new();
+        actor.initialize_storage(storage.clone());
+        actor.clean_announce_cache();
+        actor.clean_announce_cache();
+        settle(&mut actor);
         assert!(
-            orphan.exists(),
-            "shared-instance clients must never clean the cache"
+            actor.kd.results.try_recv().is_err(),
+            "only one clean was queued"
         );
+        actor.on_shutdown();
+        let _ = std::fs::remove_dir_all(&storage);
+    }
 
-        actor.shared_instance_client_mode = false;
-        actor.maybe_sweep_announce_cache();
-        assert!(!orphan.exists(), "unguarded sweep collects the orphan");
+    #[test]
+    fn clean_is_not_queued_without_storage() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.clean_announce_cache();
+        assert!(!actor.kd.announce_clean_in_flight());
+    }
 
+    /// Only legacy files and a persisted path: the path is restored at start,
+    /// before anything is written.
+    #[test]
+    fn a_path_whose_announce_is_a_legacy_file_is_restored_at_start() {
+        let storage = temp_storage("legacy-restore");
+        let now = crate::now_f64();
+        let dest = [0xCA; 16];
+        let packet_hash = [0x11; 32];
+        let mut entry =
+            crate::path_table::PathEntry::new(None, 1, 7, crate::constants::InterfaceMode::Gateway);
+        entry.timestamp = now;
+        entry.expires = now + 3600.0;
+        entry.packet_hash = Some(packet_hash);
+        let mut table = crate::path_table::PathTable::new();
+        table.insert(dest, entry);
+        let names = std::collections::HashMap::from([(7u64, "Border_TCP".to_string())]);
+        crate::persistence::save_python_destination_table(
+            &table,
+            &names,
+            &storage.join("destination_table"),
+        )
+        .unwrap();
+        let legacy_dir = storage.join("cache").join("announces");
+        crate::persistence::write_python_cached_announce(
+            &legacy_dir,
+            &packet_hash,
+            &[0xFE; 42],
+            Some("Border_TCP"),
+        )
+        .unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.initialize_storage(storage.clone());
+        assert_eq!(actor.pending_path_entries.len(), 1);
+        assert_eq!(
+            actor.pending_path_entries[0].destination_hash,
+            dest.to_vec()
+        );
+        assert_eq!(
+            actor.pending_path_entries[0].interface_name.as_deref(),
+            Some("Border_TCP")
+        );
+        assert!(
+            !storage.join("cache").join("announces.db").exists(),
+            "start-up writes nothing"
+        );
+        assert!(legacy_dir.join(hex::encode(packet_hash)).exists());
+
+        actor.on_shutdown();
         let _ = std::fs::remove_dir_all(&storage);
     }
 }
