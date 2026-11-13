@@ -3020,6 +3020,11 @@ pub struct InitOptions {
     /// in [`ReticulumHandle::startup_interface_failures`] and the rest start.
     /// Off, startup stops as upstream does (Reticulum.py).
     pub keep_starting_after_interface_failure: bool,
+    /// Embedder choice: configured interfaces start at the same time, so a
+    /// slow one (an unreachable TCP server) does not hold up the rest. Ids,
+    /// listing order, and failure handling are those of the one-at-a-time
+    /// start upstream does (Reticulum.py), which stays the default.
+    pub start_interfaces_concurrently: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4457,220 +4462,184 @@ pub async fn init_with_policy(
 
     // Client mode leaves hardware to the Shared sibling.
     if instance_mode != InstanceMode::Client {
-        let tunnel_identity =
-            rns_interface::traits::TunnelIdentity(wire_transport_identity.clone());
-        for iface_config in &interfaces {
-            #[cfg(feature = "ble")]
-            if should_defer_android_ble_rnode(iface_config, cfg!(target_os = "android")) {
-                tracing::info!(
-                    interface = %interface_config_name(iface_config),
-                    "deferring configured BLE RNode to Android native GATT owner"
-                );
-                continue;
+        let starter = InterfaceStarter {
+            config: &config,
+            rc: &rc,
+            transport_tx: &transport_tx,
+            id_gen: &id_gen,
+            handle_tx: &handle_tx,
+            socket_base: &socket_base,
+            storage_dir: &paths.storage_dir,
+            is_foreground: &is_foreground,
+            rnode_startup_options,
+            tunnel_identity: rns_interface::traits::TunnelIdentity(wire_transport_identity.clone()),
+            interface_controls: &interface_controls,
+            interface_registry: &interface_registry,
+            shutdown: &shutdown,
+            shutdown_coordinator: &shutdown_coordinator,
+        };
+        // Upstream starts one interface at a time (Reticulum.py); an embedder
+        // may have them all start together.
+        let together = if options.start_interfaces_concurrently {
+            interfaces.len().max(1)
+        } else {
+            1
+        };
+        for batch in interfaces.chunks(together) {
+            let mut prepared = Vec::with_capacity(batch.len());
+            let mut permits = Vec::with_capacity(batch.len());
+            let mut abort = None;
+            for iface_config in batch {
+                #[cfg(feature = "ble")]
+                if should_defer_android_ble_rnode(iface_config, cfg!(target_os = "android")) {
+                    tracing::info!(
+                        interface = %interface_config_name(iface_config),
+                        "deferring configured BLE RNode to Android native GATT owner"
+                    );
+                    continue;
+                }
+                match starter.prepare(iface_config) {
+                    Ok((start, spawn_permit)) => {
+                        prepared.push(start);
+                        permits.push(spawn_permit);
+                    }
+                    // Interfaces ahead of this one still start and report first.
+                    Err(reason) => {
+                        abort = Some(reason);
+                        break;
+                    }
+                }
             }
-            let spawn_permit = match interface_registry.acquire_spawn_permit() {
-                Ok(permit) => permit,
-                Err(_) => {
+            let outcomes = join_in_order(
+                prepared
+                    .iter()
+                    .zip(permits)
+                    .map(|(start, spawn_permit)| starter.start_and_register(start, spawn_permit)),
+            )
+            .await;
+            for (start, outcome) in prepared.iter().zip(outcomes) {
+                let iface_config = start.iface_config;
+                match outcome {
+                    InterfaceStartOutcome::Interrupted => {
+                        shutdown_coordinator.start_and_wait().await;
+                        return Err(ReticulumError::Interface(
+                            "runtime shutdown during interface initialization".to_string(),
+                        )
+                        .into());
+                    }
+                    InterfaceStartOutcome::Registered {
+                        registered_ids,
+                        rnode_runtime,
+                        discovery_online,
+                        discovery_addresses,
+                    } => {
+                        startup_rnode_runtimes.extend(rnode_runtime);
+                        if let Some((host, port)) = configured_client_target(iface_config) {
+                            for &registered_id in &registered_ids {
+                                record_client_target(
+                                    &interface_controls,
+                                    registered_id,
+                                    &host,
+                                    port,
+                                );
+                            }
+                        }
+                        // Python announces an I2P interface itself, never its
+                        // peers (Discovery.py); without a server the
+                        // first peer stands in.
+                        let announced = match iface_config {
+                            interface_factory::InterfaceConfig::I2P(_) => {
+                                &registered_ids[..registered_ids.len().min(1)]
+                            }
+                            _ => &registered_ids[..],
+                        };
+                        for &registered_id in announced {
+                            if let Some(ref cfg) = start.discovery_config {
+                                discovery_runtime.local_interfaces.lock().await.push(
+                                    LocalDiscoveryInterface {
+                                        id: registered_id,
+                                        config: cfg.clone(),
+                                        online: discovery_online.get(&registered_id).cloned(),
+                                        reachable_on: discovery_addresses
+                                            .get(&registered_id)
+                                            .cloned(),
+                                        location_cmd: interface_section(&config, iface_config)
+                                            .and_then(|section| section.get("location_cmd"))
+                                            .map(ToString::to_string),
+                                    },
+                                );
+                            }
+                            // Python never detaches an I2PInterface
+                            // (Reticulum.py).
+                            if start.bootstrap_only
+                                && !matches!(
+                                    iface_config,
+                                    interface_factory::InterfaceConfig::I2P(_)
+                                )
+                            {
+                                discovery_runtime
+                                    .bootstrap_interfaces
+                                    .lock()
+                                    .await
+                                    .push(registered_id);
+                            }
+                        }
+                        if start.bootstrap_only {
+                            if matches!(iface_config, interface_factory::InterfaceConfig::I2P(_)) {
+                                discovery_runtime
+                                    .i2p_bootstrap
+                                    .store(true, Ordering::Release);
+                            } else {
+                                discovery_runtime.bootstrap_configs.lock().await.push(
+                                    BootstrapConfig {
+                                        config: iface_config.clone(),
+                                        post_init: clone_interface_post_init(&start.post_init),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    InterfaceStartOutcome::RegistrationFailed(error)
+                        if rc.panic_on_interface_error =>
+                    {
+                        shutdown_coordinator.start_and_wait().await;
+                        return Err(ReticulumError::Interface(error.to_string()).into());
+                    }
+                    InterfaceStartOutcome::RegistrationFailed(error) => {
+                        startup_interface_failures.push((
+                            interface_config_name(iface_config).to_string(),
+                            error.to_string(),
+                        ));
+                        tracing::warn!("failed to register interface: {error}");
+                    }
+                    InterfaceStartOutcome::StartFailed(e)
+                        if options.keep_starting_after_interface_failure =>
+                    {
+                        tracing::warn!("failed to start interface: {e}");
+                        startup_interface_failures
+                            .push((interface_config_name(iface_config).to_string(), e));
+                    }
+                    // Upstream panics when a constructor raises, e.g. on an occupied port.
+                    InterfaceStartOutcome::StartFailed(e) => {
+                        shutdown_coordinator.start_and_wait().await;
+                        return Err(ReticulumError::Interface(e).into());
+                    }
+                }
+            }
+            match abort {
+                None => {}
+                Some(InterfaceStartupAbort::ShuttingDown) => {
                     shutdown_coordinator.wait().await;
                     return Err(ReticulumError::Interface(
                         "runtime shutdown during interface initialization".to_string(),
                     )
                     .into());
                 }
-            };
-            let iface_id = next_id(&id_gen);
-            let mut post_init = match get_post_init_for_config(&config, iface_config) {
-                Ok(post_init) => post_init,
-                Err(error) => {
-                    drop(spawn_permit);
+                Some(InterfaceStartupAbort::Failed(error)) => {
                     shutdown_coordinator.start_and_wait().await;
-                    return Err(ReticulumError::Interface(error.to_string()).into());
+                    return Err(error.into());
                 }
-            };
-            finalize_post_init(&mut post_init, &rc);
-            if let Err(error) =
-                interface_factory::validate_config_capacity(iface_config, &post_init)
-            {
-                drop(spawn_permit);
-                shutdown_coordinator.start_and_wait().await;
-                return Err(ReticulumError::Interface(error.to_string()).into());
-            }
-
-            let discovery_config = discovery_config_for_interface(
-                &config,
-                iface_config,
-                &post_init,
-                rc.enable_transport,
-                &rc.stamps,
-            )
-            .map_err(ReticulumError::Config)?;
-            let bootstrap_only = interface_bootstrap_only(&config, iface_config);
-            let ifac_key = derive_ifac_key_from_post_init(&post_init);
-
-            let spawning = spawn_interface_with_rnode_startup_options(
-                iface_config,
-                iface_id,
-                transport_tx.clone(),
-                id_gen.clone(),
-                handle_tx.clone(),
-                &socket_base,
-                &paths.storage_dir,
-                is_foreground.clone(),
-                rnode_startup_options,
-                &tunnel_identity,
-            );
-            let spawned = tokio::select! {
-                biased;
-                _ = shutdown.wait(), if spawn_awaits_first_connect(iface_config) => None,
-                spawned = spawning => Some(spawned),
-            };
-            let Some(spawned) = spawned else {
-                drop(spawn_permit);
-                shutdown_coordinator.start_and_wait().await;
-                return Err(ReticulumError::Interface(
-                    "runtime shutdown during interface initialization".to_string(),
-                )
-                .into());
-            };
-            match spawned {
-                Ok(mut iface_handles) => {
-                    apply_configured_bitrate_mtu(iface_config, &post_init, &mut iface_handles);
-                    let pending_rnode =
-                        pending_configured_rnode_runtime(iface_config, &iface_handles);
-                    let hardware_failures: Vec<_> = iface_handles
-                        .iter()
-                        .filter_map(|owned| owned.hardware_failures.clone())
-                        .collect();
-                    let discovery_online: HashMap<_, _> = iface_handles
-                        .iter()
-                        .map(|owned| (owned.interface.id, owned.interface.online.clone()))
-                        .collect();
-                    let discovery_addresses: HashMap<_, _> = iface_handles
-                        .iter()
-                        .filter_map(|owned| {
-                            Some((owned.interface.id, owned.discovery_address.clone()?))
-                        })
-                        .collect();
-                    match register_interfaces_with_post_init_batch(
-                        &transport_tx,
-                        iface_handles,
-                        &post_init,
-                        ifac_key,
-                        &interface_controls,
-                        &interface_registry,
-                        interface_kind_for_config(iface_config),
-                        Some(spawn_permit),
-                    )
-                    .await
-                    {
-                        Ok(registered_ids) => {
-                            if let Some(runtime) =
-                                pending_rnode.and_then(|pending| pending.commit(&registered_ids))
-                            {
-                                startup_rnode_runtimes.push(runtime);
-                            }
-                            if rc.panic_on_interface_error {
-                                for failures in hardware_failures {
-                                    spawn_interface_panic_monitor(
-                                        interface_config_name(iface_config).to_string(),
-                                        failures,
-                                        &shutdown_coordinator,
-                                    );
-                                }
-                            }
-                            if let Some((host, port)) = configured_client_target(iface_config) {
-                                for &registered_id in &registered_ids {
-                                    record_client_target(
-                                        &interface_controls,
-                                        registered_id,
-                                        &host,
-                                        port,
-                                    );
-                                }
-                            }
-                            // Python announces an I2P interface itself, never its
-                            // peers (Discovery.py); without a server the
-                            // first peer stands in.
-                            let announced = match iface_config {
-                                interface_factory::InterfaceConfig::I2P(_) => {
-                                    &registered_ids[..registered_ids.len().min(1)]
-                                }
-                                _ => &registered_ids[..],
-                            };
-                            for &registered_id in announced {
-                                if let Some(ref cfg) = discovery_config {
-                                    discovery_runtime.local_interfaces.lock().await.push(
-                                        LocalDiscoveryInterface {
-                                            id: registered_id,
-                                            config: cfg.clone(),
-                                            online: discovery_online.get(&registered_id).cloned(),
-                                            reachable_on: discovery_addresses
-                                                .get(&registered_id)
-                                                .cloned(),
-                                            location_cmd: interface_section(&config, iface_config)
-                                                .and_then(|section| section.get("location_cmd"))
-                                                .map(ToString::to_string),
-                                        },
-                                    );
-                                }
-                                // Python never detaches an I2PInterface
-                                // (Reticulum.py).
-                                if bootstrap_only
-                                    && !matches!(
-                                        iface_config,
-                                        interface_factory::InterfaceConfig::I2P(_)
-                                    )
-                                {
-                                    discovery_runtime
-                                        .bootstrap_interfaces
-                                        .lock()
-                                        .await
-                                        .push(registered_id);
-                                }
-                            }
-                            if bootstrap_only {
-                                if matches!(
-                                    iface_config,
-                                    interface_factory::InterfaceConfig::I2P(_)
-                                ) {
-                                    discovery_runtime
-                                        .i2p_bootstrap
-                                        .store(true, Ordering::Release);
-                                } else {
-                                    discovery_runtime.bootstrap_configs.lock().await.push(
-                                        BootstrapConfig {
-                                            config: iface_config.clone(),
-                                            post_init: clone_interface_post_init(&post_init),
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) if rc.panic_on_interface_error => {
-                            shutdown_coordinator.start_and_wait().await;
-                            return Err(ReticulumError::Interface(error.to_string()).into());
-                        }
-                        Err(error) => {
-                            startup_interface_failures.push((
-                                interface_config_name(iface_config).to_string(),
-                                error.to_string(),
-                            ));
-                            tracing::warn!("failed to register interface: {error}");
-                        }
-                    }
-                }
-                Err(e) if options.keep_starting_after_interface_failure => {
-                    drop(spawn_permit);
-                    tracing::warn!("failed to start interface: {e}");
-                    startup_interface_failures
-                        .push((interface_config_name(iface_config).to_string(), e));
-                }
-                // Upstream panics when a constructor raises, e.g. on an occupied port.
-                Err(e) => {
-                    drop(spawn_permit);
-                    shutdown_coordinator.start_and_wait().await;
-                    return Err(ReticulumError::Interface(e).into());
-                }
+                Some(InterfaceStartupAbort::Unwound(error)) => return Err(error.into()),
             }
         }
     }
@@ -5006,6 +4975,217 @@ fn collect_deferred_android_ble_rnodes(
             _ => None,
         })
         .collect()
+}
+
+/// An interface's own id, then one for each further interface it starts with
+/// (I2P peers, RNodeMulti subinterfaces): taken before the start, so ids
+/// follow config order however long each start takes.
+fn reserve_interface_ids(
+    config: &interface_factory::InterfaceConfig,
+    id_gen: &Arc<AtomicU64>,
+) -> (u64, Vec<u64>) {
+    let further = match config {
+        interface_factory::InterfaceConfig::I2P(c) => {
+            (usize::from(c.connectable) + c.peers.len()).saturating_sub(1)
+        }
+        #[cfg(feature = "serial")]
+        interface_factory::InterfaceConfig::RNodeMulti(c) => c.subinterfaces.len(),
+        _ => 0,
+    };
+    let id = next_id(id_gen);
+    (id, (0..further).map(|_| next_id(id_gen)).collect())
+}
+
+/// Drive every future on this task at once; outputs keep the input order.
+async fn join_in_order<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
+    let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, output) in futures.iter_mut().zip(&mut outputs) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => *output = Some(value),
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
+}
+
+/// What starting one configured interface needs from `init`.
+struct InterfaceStarter<'a> {
+    config: &'a Config,
+    rc: &'a ReticulumConfig,
+    transport_tx: &'a mpsc::Sender<TransportMessage>,
+    id_gen: &'a Arc<AtomicU64>,
+    handle_tx: &'a mpsc::Sender<rns_interface::traits::InterfaceHandle>,
+    socket_base: &'a Path,
+    storage_dir: &'a Path,
+    is_foreground: &'a Arc<AtomicBool>,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+    tunnel_identity: rns_interface::traits::TunnelIdentity,
+    interface_controls: &'a InterfaceControlMap,
+    interface_registry: &'a InterfaceRegistry,
+    shutdown: &'a ShutdownSignal,
+    shutdown_coordinator: &'a RuntimeShutdownCoordinator,
+}
+
+/// A configured interface with its ids taken and its settings validated.
+struct PreparedInterfaceStart<'a> {
+    iface_config: &'a interface_factory::InterfaceConfig,
+    id: u64,
+    further_ids: Vec<u64>,
+    post_init: interface_factory::InterfacePostInit,
+    ifac_key: Option<IfacKey>,
+    discovery_config: Option<DiscoveryInterfaceConfig>,
+    bootstrap_only: bool,
+}
+
+/// Why start-up stops before an interface starts.
+enum InterfaceStartupAbort {
+    /// The registry is closed: a shutdown is already running.
+    ShuttingDown,
+    /// The interface's settings are refused; start-up shuts down and fails.
+    Failed(ReticulumError),
+    /// Returned without waiting for the shutdown the init guard starts.
+    Unwound(ReticulumError),
+}
+
+enum InterfaceStartOutcome {
+    /// Shutdown arrived while a client waited for its first connect.
+    Interrupted,
+    StartFailed(String),
+    RegistrationFailed(InterfaceRegistrationError),
+    Registered {
+        registered_ids: Vec<u64>,
+        rnode_runtime: Option<StartupRNodeRuntime>,
+        discovery_online: HashMap<u64, Arc<AtomicBool>>,
+        discovery_addresses: HashMap<u64, watch::Receiver<Option<String>>>,
+    },
+}
+
+impl<'a> InterfaceStarter<'a> {
+    fn prepare(
+        &self,
+        iface_config: &'a interface_factory::InterfaceConfig,
+    ) -> Result<(PreparedInterfaceStart<'a>, InterfaceSpawnPermit), InterfaceStartupAbort> {
+        let spawn_permit = self
+            .interface_registry
+            .acquire_spawn_permit()
+            .map_err(|_| InterfaceStartupAbort::ShuttingDown)?;
+        let (id, further_ids) = reserve_interface_ids(iface_config, self.id_gen);
+        let refused = |error: interface_factory::InterfaceFactoryError| {
+            InterfaceStartupAbort::Failed(ReticulumError::Interface(error.to_string()))
+        };
+        let mut post_init = get_post_init_for_config(self.config, iface_config).map_err(refused)?;
+        finalize_post_init(&mut post_init, self.rc);
+        interface_factory::validate_config_capacity(iface_config, &post_init).map_err(refused)?;
+        let discovery_config = discovery_config_for_interface(
+            self.config,
+            iface_config,
+            &post_init,
+            self.rc.enable_transport,
+            &self.rc.stamps,
+        )
+        .map_err(|error| InterfaceStartupAbort::Unwound(ReticulumError::Config(error)))?;
+        let prepared = PreparedInterfaceStart {
+            iface_config,
+            id,
+            further_ids,
+            ifac_key: derive_ifac_key_from_post_init(&post_init),
+            post_init,
+            discovery_config,
+            bootstrap_only: interface_bootstrap_only(self.config, iface_config),
+        };
+        Ok((prepared, spawn_permit))
+    }
+
+    /// Start the interface and register it as soon as it has started, so no
+    /// interface waits on another between the two.
+    async fn start_and_register(
+        &self,
+        start: &PreparedInterfaceStart<'_>,
+        spawn_permit: InterfaceSpawnPermit,
+    ) -> InterfaceStartOutcome {
+        let iface_config = start.iface_config;
+        let spawning = spawn_interface_with_rnode_startup_options(
+            iface_config,
+            start.id,
+            &start.further_ids,
+            self.transport_tx.clone(),
+            self.id_gen.clone(),
+            self.handle_tx.clone(),
+            self.socket_base,
+            self.storage_dir,
+            self.is_foreground.clone(),
+            self.rnode_startup_options,
+            &self.tunnel_identity,
+        );
+        let spawned = tokio::select! {
+            biased;
+            _ = self.shutdown.wait(), if spawn_awaits_first_connect(iface_config) => None,
+            spawned = spawning => Some(spawned),
+        };
+        let mut iface_handles = match spawned {
+            None => return InterfaceStartOutcome::Interrupted,
+            Some(Err(error)) => return InterfaceStartOutcome::StartFailed(error),
+            Some(Ok(iface_handles)) => iface_handles,
+        };
+        apply_configured_bitrate_mtu(iface_config, &start.post_init, &mut iface_handles);
+        let pending_rnode = pending_configured_rnode_runtime(iface_config, &iface_handles);
+        let hardware_failures: Vec<_> = iface_handles
+            .iter()
+            .filter_map(|owned| owned.hardware_failures.clone())
+            .collect();
+        let discovery_online: HashMap<_, _> = iface_handles
+            .iter()
+            .map(|owned| (owned.interface.id, owned.interface.online.clone()))
+            .collect();
+        let discovery_addresses: HashMap<_, _> = iface_handles
+            .iter()
+            .filter_map(|owned| Some((owned.interface.id, owned.discovery_address.clone()?)))
+            .collect();
+        match register_interfaces_with_post_init_batch(
+            self.transport_tx,
+            iface_handles,
+            &start.post_init,
+            start.ifac_key.clone(),
+            self.interface_controls,
+            self.interface_registry,
+            interface_kind_for_config(iface_config),
+            Some(spawn_permit),
+        )
+        .await
+        {
+            Ok(registered_ids) => {
+                if self.rc.panic_on_interface_error {
+                    for failures in hardware_failures {
+                        spawn_interface_panic_monitor(
+                            interface_config_name(iface_config).to_string(),
+                            failures,
+                            self.shutdown_coordinator,
+                        );
+                    }
+                }
+                InterfaceStartOutcome::Registered {
+                    rnode_runtime: pending_rnode
+                        .and_then(|pending| pending.commit(&registered_ids)),
+                    registered_ids,
+                    discovery_online,
+                    discovery_addresses,
+                }
+            }
+            Err(error) => InterfaceStartOutcome::RegistrationFailed(error),
+        }
+    }
 }
 
 /// TCP and Backbone clients spawn nothing before their first connect returns,
@@ -8548,12 +8728,13 @@ async fn spawn_configured_interface_for_discovery(
     post_init: &interface_factory::InterfacePostInit,
 ) -> Result<SpawnedForDiscovery, String> {
     let spawn_permit = ensure_runtime_interface_admission(handle)?;
-    let id = next_id(&handle.id_gen);
+    let (id, further_ids) = reserve_interface_ids(config, &handle.id_gen);
     let storage_dir = StoragePaths::from_config_dir(&handle.config_dir).storage_dir;
     let tunnel_identity = rns_interface::traits::TunnelIdentity(handle.transport_identity.clone());
     let handles = spawn_interface_with_rnode_startup_options(
         config,
         id,
+        &further_ids,
         handle.transport_tx.clone(),
         handle.id_gen.clone(),
         handle.handle_tx.clone(),
@@ -10332,6 +10513,7 @@ async fn finish_interface_shutdown(
 async fn spawn_interface_with_rnode_startup_options(
     iface_config: &interface_factory::InterfaceConfig,
     id: u64,
+    further_ids: &[u64],
     transport_tx: mpsc::Sender<TransportMessage>,
     id_gen: Arc<AtomicU64>,
     handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
@@ -10538,7 +10720,7 @@ async fn spawn_interface_with_rnode_startup_options(
             // Python runs the server and one peer interface per configured
             // peer, each named "<name> to <peer>" (I2PInterface.py).
             let mut handles = Vec::new();
-            let mut next = Some(id);
+            let mut ids = std::iter::once(id).chain(further_ids.iter().copied());
             if c.connectable {
                 let mut server_config = rns_interface::i2p::I2PServerConfig::new(&c.name);
                 server_config.sam_host = c.i2p_sam_host.clone();
@@ -10548,7 +10730,7 @@ async fn spawn_interface_with_rnode_startup_options(
                     Some(i2p_key_path(storage_dir, &c.name, &tunnel_identity.0.hash));
                 let (b32_tx, b32_rx) = tokio::sync::watch::channel(None);
                 server_config.b32 = Some(b32_tx);
-                let server_id = next.take().unwrap_or_else(|| next_id(&id_gen));
+                let server_id = ids.next().unwrap_or_else(|| next_id(&id_gen));
                 let server = rns_interface::i2p::spawn_i2p_server(
                     server_config,
                     server_id,
@@ -10572,7 +10754,7 @@ async fn spawn_interface_with_rnode_startup_options(
                 client_config.sam_port = c.i2p_sam_port;
                 client_config.mode = c.mode;
                 client_config.tunnel_identity = Some(tunnel_identity.clone());
-                let peer_id = next.take().unwrap_or_else(|| next_id(&id_gen));
+                let peer_id = ids.next().unwrap_or_else(|| next_id(&id_gen));
                 match rns_interface::i2p::spawn_i2p_client(
                     client_config,
                     peer_id,
@@ -10633,11 +10815,12 @@ async fn spawn_interface_with_rnode_startup_options(
                     c.name
                 ));
             }
-            // The parent takes `id`, then one ID per subinterface.
+            // The parent takes `id`, then one reserved ID per subinterface.
+            let mut reserved = further_ids.iter().copied();
             let mut sub_ids = Vec::with_capacity(multi_config.subinterfaces.len() + 1);
             sub_ids.push(id);
             for _ in 0..multi_config.subinterfaces.len() {
-                sub_ids.push(id_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+                sub_ids.push(reserved.next().unwrap_or_else(|| next_id(&id_gen)));
             }
             rns_interface::rnode_multi::spawn_rnode_multi_interface_observed(
                 multi_config,
@@ -10931,6 +11114,7 @@ mod tests {
     use std::collections::HashSet;
 
     mod autoconnect;
+    mod concurrent_start;
     mod interface_stats;
     mod manage_interfaces;
     mod tunnels;
