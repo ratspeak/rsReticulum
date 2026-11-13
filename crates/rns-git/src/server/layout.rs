@@ -199,6 +199,11 @@ impl Repositories {
         Ok(true)
     }
 
+    /// Whether `blocked_identities` names this identity.
+    pub fn is_blocked(&self, hash: &[u8; 16]) -> bool {
+        self.blocked.iter().any(|b| b.as_slice() == hash)
+    }
+
     /// `resolve_permission` (`server.py`), the only resolver that
     /// checks the blocklist.
     pub fn resolve_permission(
@@ -208,7 +213,7 @@ impl Repositories {
         repository: &str,
         perm: Perm,
     ) -> bool {
-        if self.blocked.iter().any(|b| b.as_slice() == hash) {
+        if self.is_blocked(hash) {
             return false;
         }
         let Some(g) = self.groups.get(group) else {

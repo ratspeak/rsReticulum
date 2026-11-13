@@ -377,6 +377,14 @@ fn handle_remote_clone(
     let Some(path_value) = get(map, &Value::from(IDX_REPOSITORY)) else {
         return Some(status(RES_INVALID_REQ, "No repository specified"));
     };
+    // Differs from `_handle_remote_clone` (`server.py`), which admits a blocked identity.
+    if repos
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_blocked(hash)
+    {
+        return Some(status(RES_NOT_FOUND, "Not found"));
+    }
     let source = get(map, &Value::from("source"));
     if !source.is_some_and(truthy) {
         return Some(status(RES_INVALID_REQ, "No source specified"));

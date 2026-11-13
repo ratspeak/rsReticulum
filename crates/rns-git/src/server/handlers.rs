@@ -161,7 +161,7 @@ pub fn identity_text(identity: Option<&[u8; 16]>) -> String {
 
 /// `log_request` (`server.py`).
 pub fn log_request(repos: &Repositories, message: &str, identity: Option<&[u8; 16]>) {
-    if identity.is_some_and(|h| repos.blocked.iter().any(|b| b.as_slice() == h)) {
+    if identity.is_some_and(|h| repos.is_blocked(h)) {
         tracing::debug!("Blocked: {message}");
     } else {
         tracing::debug!("{message}");
@@ -594,7 +594,6 @@ pub fn handle_delete(
 pub(super) const REPO_CREATE_PERMS_TEMPLATE: &str = "adm:{IDENTITY_HASH}";
 
 /// `handle_create` (`server.py`). `None` sends no response.
-/// Group permissions are checked without the blocklist, as upstream does.
 pub fn handle_create(
     repos: &std::sync::RwLock<Repositories>,
     identity: Option<&[u8; 16]>,
@@ -612,6 +611,10 @@ pub fn handle_create(
         Ok(Some(parsed)) => parsed,
     };
     let hash = identity.expect("checked");
+    // Differs from `handle_create` (`server.py`), which admits a blocked identity.
+    if repos.is_blocked(hash) {
+        return Some(status(RES_NOT_FOUND, "Not found"));
+    }
     let Some((group, repo)) = path.filter(|(g, r)| !g.is_empty() && !r.is_empty()) else {
         return Some(status(RES_INVALID_REQ, "Invalid request"));
     };
