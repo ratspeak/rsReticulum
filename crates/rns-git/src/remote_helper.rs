@@ -143,8 +143,9 @@ impl ClientConfig {
                 })
         };
         let loglevel = as_int("logging", "loglevel")?.map(|l| l.clamp(LOG_NONE, LOG_EXTREME));
+        // Differs from `__apply_config` (`client.py`), whose lower bound of 0 never fetches.
         let ref_batch_size = as_int("client", "ref_batch_size")?
-            .map_or(REF_BATCH_SIZE, |n| n.clamp(0, 1024) as usize);
+            .map_or(REF_BATCH_SIZE, |n| n.clamp(1, 1024) as usize);
         let mut aliases = BTreeMap::new();
         if let Some(section) = config.section("aliases") {
             for alias in section.values.keys() {
@@ -531,8 +532,8 @@ impl<T: Transport> RemoteHelper<T> {
             return Ok(Flow::Continue);
         }
         let have_shas = self.local_remote_shas();
-        // Upstream's batch size 0 sends an empty batch each time and never
-        // shrinks the queue; its node answers "No refs specified", which aborts.
+        // A batch size of 0, which the config never yields, sends an empty batch each
+        // time and never shrinks the queue; the node answers "No refs specified", which aborts.
         while !queue.is_empty() {
             let take = self.ref_batch_size.min(queue.len());
             let batch: Vec<_> = queue.drain(..take).collect();
