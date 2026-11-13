@@ -23,8 +23,9 @@ pub use chart::{render_chart, render_combined_chart};
 pub const APP_NAME: &str = "nomadnetwork.node";
 /// `JOBS_INTERVAL`, seconds.
 pub const JOBS_INTERVAL: u64 = 5;
-/// `RNS._version.__version__` of the reference the pages render as `{VERSION}`.
-pub const VERSION: &str = "1.6.0";
+/// What the pages render as `{VERSION}`: this crate's version, as `rngit-rs --version` prints it.
+/// Differs from `pages.py`, which renders `RNS._version.__version__`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const PATH_INDEX: &str = "/page/index.mu";
 pub const PATH_GROUP: &str = "/page/group.mu";
@@ -98,7 +99,8 @@ pub(crate) const IMAGE_EXTS: [&str; 8] = [
     ".webp", ".png", ".jpg", ".jpeg", ".gif", ".tiff", ".tif", ".bmp",
 ];
 
-const DEFAULT_BASE_TEMPLATE: &str = "#!c=0\n> {NODE_NAME}\n\n{NAVIGATION}\n{PAGE_CONTENT}\n<\n-\n`a`F666`[Served by rngit {VERSION}`:/page/index.mu] - {GEN_TIME}`f";
+// Names `rngit-rs`, where `DEFAULT_BASE_TEMPLATE` (`pages.py`) names `rngit`.
+const DEFAULT_BASE_TEMPLATE: &str = "#!c=0\n> {NODE_NAME}\n\n{NAVIGATION}\n{PAGE_CONTENT}\n<\n-\n`a`F666`[Served by rngit-rs {VERSION}`:/page/index.mu] - {GEN_TIME}`f";
 const DEFAULT_FRONT_TEMPLATE: &str = "> Groups\n\n{PAGE_CONTENT}";
 const DEFAULT_NO_IDENT_TEMPLATE: &str =
     ">>No Identity\n\nThis page requires identification, and none was received.\n";
