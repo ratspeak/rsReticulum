@@ -205,6 +205,15 @@ pub fn import_python_ratchets(
         if received < cutoff || !known.contains(&dest) {
             continue;
         }
+        // A file may be older than what the store already holds: upstream
+        // imports only into an empty store, this also takes files handed
+        // over by lxmd-rs and Ratspeak while the store was in use.
+        if store
+            .fetch_ratchet(&dest)?
+            .is_some_and(|(_, stored)| stored >= received)
+        {
+            continue;
+        }
         ratchets.push(RatchetRow::new(dest, ratchet, received));
     }
 
@@ -482,6 +491,28 @@ mod tests {
         );
         assert_eq!(store.fetch_ratchet(&[9; 16]).unwrap(), None);
         assert_eq!(got.removable().len(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_ratchet_file_older_than_the_stored_ratchet_is_not_imported() {
+        let dir = unique_dir("ratchet-older");
+        let known_hash = [1u8; 16];
+        std::fs::write(dir.join(hex::encode(known_hash)), bytes(RATCHET_FILE_HEX)).unwrap();
+        let known: HashSet<DestHash> = [known_hash].into_iter().collect();
+        let mut store = MemoryStore::new();
+        let newer = KdBatch {
+            ratchet_upserts: vec![RatchetRow::new(known_hash, [0x77; 32], NOW + 10.0)],
+            ..KdBatch::default()
+        };
+        store.apply(&newer, &|h| known.contains(h)).unwrap();
+        let got = import_python_ratchets(&dir, NOW + 20.0, &known, &mut store).unwrap();
+        assert_eq!(got.imported(), 0);
+        assert_eq!(
+            store.fetch_ratchet(&known_hash).unwrap(),
+            Some(([0x77; 32], NOW + 10.0))
+        );
+        assert_eq!(got.removable().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
