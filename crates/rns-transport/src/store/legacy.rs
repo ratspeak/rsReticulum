@@ -306,8 +306,9 @@ fn read_announce_file(path: &Path, now: f64) -> Option<AnnounceRow> {
 
 /// Imports the Rust `announce_cache.msgpack` (version 6, or version 5 through
 /// the existing loader). It yields known-destination rows, retained as `used = -1`,
-/// and each entry's ratchet with its receive time. Its packet bytes live in
-/// separate files and are not imported here.
+/// and each entry's ratchet with its receive time. A cache written before receive
+/// times were kept dates each ratchet at its entry's last announce, the latest it
+/// can have arrived. Its packet bytes live in separate files and are not imported here.
 pub fn import_rust_announce_cache(
     path: &Path,
     now: f64,
@@ -343,9 +344,8 @@ pub fn import_rust_announce_cache(
         row.stamp_value = e.stamp_value;
         row.lr_cost = e.lr_cost;
         row.announce_facts = e.facts;
-        let ratchet = e
-            .ratchet
-            .map(|r| RatchetRow::new(e.dest, r, e.ratchet_received.unwrap_or(now)));
+        let received = e.ratchet_received.unwrap_or(e.timestamp.min(now));
+        let ratchet = e.ratchet.map(|r| RatchetRow::new(e.dest, r, received));
         rows.push(LegacyRow { row, ratchet });
     }
     write_rows(rows, vec![path.to_path_buf()], store)
@@ -620,6 +620,42 @@ mod tests {
         for i in 0..total {
             assert!(store.fetch(&hash(i)).unwrap().is_some(), "announce {i}");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Version 6 as 1.0.44 wrote it, before ratchet receive times were kept.
+    #[test]
+    fn a_cache_ratchet_without_a_receive_time_dates_from_its_last_announce() {
+        let dir = unique_dir("rust-v6-unreceived");
+        let path = dir.join("announce_cache.msgpack");
+        let entry = persistence::PersistedAnnounceEntry {
+            destination_hash: vec![6; 16],
+            hops: 1,
+            app_data: None,
+            timestamp: NOW - 3600.0,
+            public_key: Some(vec![6; 64]),
+            ratchet: Some(vec![0x60; 32]),
+            packet_hash: None,
+            retained: false,
+            name_hash: vec![0; 10],
+            is_path_response: false,
+            last_used: None,
+            stamp: None,
+            stamp_value: 0.0,
+            lr_cost: None,
+            ratchet_received: None,
+        };
+        let file = persistence::PersistedAnnounceCache {
+            entries: vec![entry],
+            version: persistence::PersistedAnnounceCache::CURRENT_VERSION,
+        };
+        std::fs::write(&path, rmp_serde::to_vec(&file).unwrap()).unwrap();
+        let mut store = MemoryStore::new();
+        import_rust_announce_cache(&path, NOW, &mut store).unwrap();
+        assert_eq!(
+            store.fetch_ratchet(&[6; 16]).unwrap(),
+            Some(([0x60; 32], NOW - 3600.0))
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

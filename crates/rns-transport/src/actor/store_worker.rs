@@ -1531,6 +1531,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A 1.0.44 cache kept no ratchet receive times. A ratchet file handed over
+    /// by lxmd-rs or Ratspeak after the cache's last announce is newer and wins.
+    #[test]
+    fn a_handed_over_ratchet_newer_than_the_caches_last_announce_wins() {
+        let dir = temp_dir();
+        let now = crate::now_f64();
+        let mut cached = entry([11; 16], None, true);
+        cached.timestamp = now - 3600.0;
+        cached.ratchet = Some([1; 32]);
+        crate::persistence::save_announce_cache([&cached], &dir.join("announce_cache.msgpack"))
+            .unwrap();
+        rns_identity::ratchet::ReceivedRatchet::new_at([2; 32], now - 60.0)
+            .save(&dir.join("ratchets").join(hex::encode([11u8; 16])))
+            .unwrap();
+        let mut actor = actor_on(&dir);
+        assert_eq!(
+            actor.kd.stored_ratchet(&[11; 16]),
+            Some(([2; 32], now - 60.0))
+        );
+        actor.on_shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_corrupt_database_starts_the_session_in_memory() {
         let dir = temp_dir();
