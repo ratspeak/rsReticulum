@@ -9,8 +9,10 @@ license-file.workspace = true
 autobins = false
 
 [features]
-default = []
+default = ["rnodeconf-firmware"]
 hardware = ["dep:rns-ratkey"]
+# Firmware download and archive reading for rnodeconf-rs -u / -f.
+rnodeconf-firmware = ["dep:ureq", "dep:zip"]
 
 [dependencies]
 rns-runtime = { workspace = true, features = ["serial"] }
@@ -35,6 +37,8 @@ nix = { workspace = true }
 bytes = { workspace = true }
 sha2 = { workspace = true }
 rsa = "0.9"
+ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
+zip = { version = "9", optional = true, default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [[bin]]
 name = "rnsd-rs"

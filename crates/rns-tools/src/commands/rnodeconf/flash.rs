@@ -1,8 +1,8 @@
-//! Firmware flasher command planning.
+//! Firmware flasher command lines, after upstream `rnodeconf`'s `get_flasher_call`.
 
 use std::path::{Path, PathBuf};
 
-use super::model;
+use super::{log, model};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashContext {
@@ -29,17 +29,110 @@ impl FlashPlan {
     }
 }
 
-pub fn plan_unzip(update_dir: &Path, version: &str, fw_filename: &str) -> FlashPlan {
-    let archive = update_dir.join(version).join(fw_filename);
-    FlashPlan {
-        program: "unzip".to_string(),
-        args: vec![
-            "-o".to_string(),
-            path_string(&archive),
-            "-d".to_string(),
-            path_string(&update_dir.join(version)),
-        ],
+/// Upstream `get_flasher_call`: the flasher must be on `PATH` (for ESP32,
+/// the firmware package's `esptool.py`). `Ok(None)` is upstream returning
+/// nothing for an unknown board; `Err` is its `graceful_exit` code.
+pub fn flasher_call(
+    platform: u8,
+    fw_filename: &str,
+    ctx: &FlashContext,
+) -> Result<Option<FlashPlan>, u8> {
+    match platform {
+        model::PLATFORM_AVR | model::PLATFORM_NRF52 => {
+            let (flasher, install) = if platform == model::PLATFORM_AVR {
+                ("avrdude", "sudo apt install avrdude")
+            } else {
+                ("adafruit-nrfutil", "pip3 install --user adafruit-nrfutil")
+            };
+            if which(flasher).is_none() {
+                missing_flasher(flasher, install);
+                return Err(0);
+            }
+            Ok(plan_flasher(platform, fw_filename, ctx))
+        }
+        model::PLATFORM_ESP32 => {
+            if ctx.selected_version.parse::<f64>().is_err() {
+                return Ok(None);
+            }
+            let package_flasher = ctx
+                .update_dir
+                .join(&ctx.selected_version)
+                .join("esptool.py");
+            if package_flasher.is_file() {
+                make_executable(&package_flasher);
+                let plan = plan_flasher(platform, fw_filename, ctx);
+                if plan.is_none() {
+                    log("No flasher available for this board, cannot install firmware.");
+                }
+                return Ok(plan);
+            }
+            // Upstream falls back to its embedded recovery esptool; this build uses one from PATH.
+            let Some(flasher) = ["esptool.py", "esptool"]
+                .into_iter()
+                .find(|f| which(f).is_some())
+            else {
+                missing_flasher("esptool.py", "pip3 install --user esptool");
+                return Err(0);
+            };
+            log("No flasher present, using esptool from PATH to write firmware to device");
+            let plan = plan_flasher(platform, fw_filename, ctx).map(|plan| FlashPlan {
+                program: flasher.to_string(),
+                args: plan.args[1..].to_vec(),
+            });
+            if plan.is_none() {
+                log("No flasher available for this board, cannot install firmware.");
+            }
+            Ok(plan)
+        }
+        _ => Ok(None),
     }
+}
+
+fn missing_flasher(flasher: &str, install: &str) {
+    log("");
+    log(format!(
+        "You do not currently have the \"{flasher}\" program installed on your system."
+    ));
+    log("Unfortunately, that means we can't proceed, since it is needed to flash your");
+    log("board. You can install it via your package manager, for example:");
+    log("");
+    log(format!("  {install}"));
+    log("");
+    log(format!("Please install \"{flasher}\" and try again."));
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // Upstream: os.chmod(flasher, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP).
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750));
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+/// `shutil.which`: an executable file named `program` on `PATH`.
+pub fn which(program: &str) -> Option<PathBuf> {
+    let is_exec = |path: &Path| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata()
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            path.is_file()
+        }
+    };
+    let candidate = Path::new(program);
+    if candidate.components().count() > 1 {
+        return is_exec(candidate).then(|| candidate.to_path_buf());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(program))
+        .find(|path| is_exec(path))
 }
 
 pub fn plan_flasher(platform: u8, fw_filename: &str, ctx: &FlashContext) -> Option<FlashPlan> {

@@ -2,8 +2,8 @@
 //!
 //! Device probe, info, configuration summary, EEPROM dump and backup, device
 //! settings, signing and trust, firmware hash readout and TNC/normal startup
-//! mode, EEPROM wipe and EEPROM bootstrap follow upstream `rnodeconf`.
-//! Firmware installation and extraction are disabled in this build.
+//! mode, EEPROM wipe and bootstrap, and firmware update, flashing and
+//! extraction follow upstream `rnodeconf`. Autoinstall is disabled in this build.
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -26,6 +26,8 @@ mod firmware;
 #[allow(dead_code)]
 #[path = "rnodeconf/flash.rs"]
 mod flash;
+#[path = "rnodeconf/install.rs"]
+mod install;
 #[allow(dead_code)]
 #[path = "rnodeconf/model.rs"]
 mod model;
@@ -245,7 +247,7 @@ struct Args {
 }
 
 pub(crate) fn main() -> ExitCode {
-    let args = Args::parse();
+    let mut args = Args::parse();
     if args.version {
         out(rns_tools::version_line(
             "rnodeconf-rs",
@@ -276,6 +278,17 @@ pub(crate) fn main() -> ExitCode {
     if let Some(key) = args.trust_key.as_deref().filter(|key| !key.is_empty()) {
         return trust_key(key);
     }
+    if let Some(message) = install::feature_refusal(&args) {
+        eprintln!("rnodeconf-rs: {message}");
+        return ExitCode::from(2);
+    }
+    if let Err(e) = install::use_extracted_warning(&args) {
+        eprintln!("rnodeconf-rs: {e}");
+        return ExitCode::from(1);
+    }
+    if args.extract {
+        return install::extract(&args);
+    }
     if let Some(message) = plan::refusal_without_port(&args) {
         eprintln!("rnodeconf-rs: {message}");
         return ExitCode::from(2);
@@ -294,9 +307,11 @@ pub(crate) fn main() -> ExitCode {
         out("");
         return ExitCode::SUCCESS;
     };
-    if let Some(message) = plan::refusal_with_port(&args) {
-        eprintln!("rnodeconf-rs: {message}");
-        return ExitCode::from(2);
+    if args.flash {
+        match install::flash(&args, &port_path) {
+            Ok(rom) => args.rom = rom,
+            Err(code) => return code,
+        }
     }
 
     log(format!("Opening serial port {port_path}..."));
@@ -310,7 +325,7 @@ pub(crate) fn main() -> ExitCode {
     };
     let mut rnode = RNode::new(port, port_path.clone());
     rnode.usb_serial_id = bootstrap::usb_serial_number(&port_path);
-    match run_device(&mut rnode, &args) {
+    match run_device(rnode, &args) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("rnodeconf-rs: {e}");
@@ -344,7 +359,9 @@ fn print_donation_block() {
 
 /// Upstream `main()` from the device probe on, for the operations this build
 /// supports. Errors are the cases where upstream raises an exception.
-fn run_device(rnode: &mut RNode, args: &Args) -> Result<ExitCode, String> {
+fn run_device(session: RNode, args: &Args) -> Result<ExitCode, String> {
+    let mut session = session;
+    let rnode = &mut session;
     if let Err(e) = rnode.device_probe() {
         log("Serial port opened, but RNode did not respond. Is a valid firmware installed?");
         out(e);
@@ -375,6 +392,20 @@ fn run_device(rnode: &mut RNode, args: &Args) -> Result<ExitCode, String> {
     {
         return Err(format!("unknown model code {}", device.model));
     }
+
+    let (mut session, device, info) = if args.update {
+        match install::update(session, args, device)? {
+            install::UpdateStep::Exit(code) => return Ok(code),
+            install::UpdateStep::Continue {
+                rnode,
+                info,
+                device,
+            } => (*rnode, device, info),
+        }
+    } else {
+        (session, device, args.info)
+    };
+    let rnode = &mut session;
 
     if args.config {
         rnode.download_cfg_sector()?;
@@ -408,7 +439,7 @@ fn run_device(rnode: &mut RNode, args: &Args) -> Result<ExitCode, String> {
         return Ok(code);
     }
 
-    if args.info {
+    if info {
         let Some(device) = device.as_ref() else {
             log("EEPROM is invalid, no further information available");
             return Ok(graceful_exit(rnode, 0));
