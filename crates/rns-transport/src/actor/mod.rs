@@ -2614,6 +2614,7 @@ mod tests {
     mod packet_capacity;
     mod path_request_tags;
     mod path_table_lifecycle;
+    mod restored_state;
     mod slow_media_discovery;
     mod transport_api_defaults;
     mod tunnels;

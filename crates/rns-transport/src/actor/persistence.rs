@@ -54,8 +54,7 @@ fn recent_announce_from_cached_packet(
             recent.stamp_value = stamp.value.unwrap_or(0.0);
             recent.lr_cost = stamp.lr_cost;
             recent.public_key = Some(announce.public_key);
-            recent.ratchet = announce.ratchet;
-            recent.ratchet_received = announce.ratchet.map(|_| timestamp);
+            // The packet may predate a stored rotation; the store answers the ratchet.
             recent.name_hash = announce.name_hash;
             recent.facts_known = true;
         }
@@ -844,20 +843,21 @@ impl TransportActor {
     ) {
         let count = rows.len();
         for row in rows {
-            let loaded = store_worker::recent_from_row(row);
+            let mut loaded = store_worker::recent_from_row(row);
             match self.recent_announces.entry(loaded.dest_hash) {
                 std::collections::hash_map::Entry::Occupied(mut o) => {
-                    // Keep what the cached packet gave (hops, name hash, ratchet).
+                    // The store flushes far more often than the routing snapshot:
+                    // the row wins, and the path's cached announce fills in only
+                    // the facts the row lacks.
                     let e = o.get_mut();
-                    e.app_data = loaded.app_data;
-                    e.timestamp = loaded.timestamp;
-                    e.public_key = loaded.public_key;
-                    e.packet_hash = loaded.packet_hash.or(e.packet_hash);
-                    e.retained = loaded.retained;
-                    e.last_used = loaded.last_used;
-                    e.stamp = loaded.stamp;
-                    e.stamp_value = loaded.stamp_value;
-                    e.lr_cost = loaded.lr_cost;
+                    if !loaded.facts_known {
+                        loaded.hops = e.hops;
+                        loaded.name_hash = e.name_hash;
+                        loaded.is_path_response = e.is_path_response;
+                        loaded.facts_known = e.facts_known;
+                    }
+                    loaded.packet_hash = loaded.packet_hash.or(e.packet_hash);
+                    *e = loaded;
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
                     v.insert(loaded);

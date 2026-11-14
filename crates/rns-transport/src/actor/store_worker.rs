@@ -1098,27 +1098,22 @@ impl KdState {
     }
 
     /// `KnownDestinationsStore.remember_ratchet`: the pending upsert, then the
-    /// stored row, are checked before a ratchet is queued.
-    pub(super) fn remember_ratchet(&mut self, dest: DestHash, ratchet: Ratchet, now: f64) {
+    /// stored row, are checked before a ratchet is queued. Returns the receive
+    /// time that stands: the held one for an unchanged ratchet, else `now`.
+    pub(super) fn remember_ratchet(&mut self, dest: DestHash, ratchet: Ratchet, now: f64) -> f64 {
         self.pending.ratchet_quarantine.remove(&dest);
-        let same_as_pending = self
-            .pending
-            .ratchet_upserts
-            .get(&dest)
-            .map(|(pending, _)| *pending == ratchet);
-        let unchanged = match same_as_pending {
-            Some(same) => same,
-            None => self
-                .fetch_stored_ratchet(&dest)
-                .is_some_and(|(stored, _)| stored == ratchet),
+        let held = match self.pending.ratchet_upserts.get(&dest) {
+            Some(pending) => Some(*pending),
+            None => self.fetch_stored_ratchet(&dest),
         };
-        if unchanged {
-            self.pending.ratchet_deletes.remove(&dest);
-            return;
-        }
-        self.pending.ratchet_quarantine.remove(&dest);
-        self.pending.ratchet_upserts.insert(dest, (ratchet, now));
         self.pending.ratchet_deletes.remove(&dest);
+        if let Some((held, received)) = held
+            && held == ratchet
+        {
+            return received;
+        }
+        self.pending.ratchet_upserts.insert(dest, (ratchet, now));
+        now
     }
 
     /// `Identity.get_ratchet` after the in-memory copy: pending upsert, pending
@@ -1287,20 +1282,24 @@ pub(super) fn recent_from_row(row: KnownDestinationRow) -> RecentAnnounce {
 
 impl super::TransportActor {
     /// `Identity._remember_ratchet`: a ratchet already held in memory is not
-    /// re-queued; otherwise memory is filled and the store is updated.
+    /// re-queued; otherwise the store is updated and memory takes the receive
+    /// time the store keeps, which a repeated ratchet does not restart.
     pub(super) fn remember_received_ratchet(&mut self, dest: DestHash, ratchet: Option<Ratchet>) {
         let Some(ratchet) = ratchet else {
             return;
         };
-        let now = crate::now_f64();
-        if let Some(entry) = self.recent_announces.get_mut(&dest) {
-            if entry.ratchet == Some(ratchet) {
-                return;
-            }
-            entry.ratchet = Some(ratchet);
-            entry.ratchet_received = Some(now);
+        if self
+            .recent_announces
+            .get(&dest)
+            .is_some_and(|entry| entry.ratchet == Some(ratchet))
+        {
+            return;
         }
-        self.kd.remember_ratchet(dest, ratchet, now);
+        let received = self.kd.remember_ratchet(dest, ratchet, crate::now_f64());
+        if let Some(entry) = self.recent_announces.get_mut(&dest) {
+            entry.ratchet = Some(ratchet);
+            entry.ratchet_received = Some(received);
+        }
     }
 
     /// `Identity.get_ratchet`: the in-memory copy, else the pending or stored
