@@ -1,6 +1,6 @@
 # Reticulum runtime examples
 
-These examples use the 1.4 source API and `rns_runtime::prelude`. Run them from
+These examples use `rns_runtime::prelude`. Run them from
 the rsReticulum repository root after installing the [build prerequisites](../../../README.md#build-it).
 They demonstrate application ownership; they are not ready-made services.
 
@@ -79,5 +79,5 @@ that key alone does not demonstrate key retirement or forward secrecy.
 
 Python's `ExampleInterface.py` loads Python classes at runtime. Rust integrates
 third-party interfaces at compile time through `rns_interface::InterfaceHandle`
-and the interface factory. Custom drivers on the 1.4 line must also follow the
+and the interface factory. Custom drivers must also follow the
 [interface ownership and capacity contract](../../../api/migrations/capacity-and-receipts.md).

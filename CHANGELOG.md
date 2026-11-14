@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 1.5.0 - 2026-11-13
+
+### Added
+
+- **Network stamps**: announces, path requests, and link requests can carry Reticulum 1.6.0 stamps. Turn them on in the new `[stamps]` section (see `rnsd-rs --exampleconfig`). Stamps that arrive are checked, and required only with `enforce_stamps = yes`.
+- **Link MTU discovery**: Links use the largest packets the path allows, so transfers on fast links finish sooner. It's on by default; set `link_mtu_discovery = no` to turn it off.
+- **Resources as files**: an application can receive a Resource of any size straight to a file with `DestinationHandle::receive_resource_files` or `LinkSessionResourceOffer::accept_to_file`.
+- **Filters**: the new `[filter]` section can drop destination types you don't use and packets that have travelled too many hops.
+- **New tools**: `rngit-rs` hosts git repositories over Reticulum, `git-remote-rns` lets `git` clone, fetch, and push `rns://` repositories, `rngcs-rs` signs and checks commits, and `rnx-rs` runs commands on a remote node. `rngit-rs` stops a fork, mirror, or sync after 30 minutes or 1 GB by default.
+- **rnodeconf-rs**: every `rnodeconf` option now works, including firmware install and update, device signing, EEPROM bootstrap, and the `-a` guided installer. Flashing uses the same external tools as Python's `rnodeconf`.
+
+### Fixed and improved
+
+- `rnsd-rs` auto-connects to discovered Backbone servers running Python Reticulum 1.5.7 or later, or rsReticulum 1.5.0 or later. Set `autoconnect_unverified_implementations = yes` to allow any.
+- Every tool's `--version` names the Reticulum release it follows, for example `rnsd-rs 1.5.0 (Reticulum 1.6.0)`.
+- `rnsd-rs` logs at Notice by default, which is quieter than before; set `loglevel = 4` for the old output.
+- `rnstatus-rs`, `rnpath-rs`, `rnprobe-rs`, and `rnid-rs` match Python's tools in output, options, and exit codes, and `rnstatus-rs` can attach, detach, and reload interfaces on a running `rnsd-rs`.
+- `rncp-rs -f` now takes the remote file before the destination hash, as Python's `rncp` does. Listeners accept files only from allowed identities unless `-n` is given, and files of any size work.
+- In `rnsh-rs`, `-c` now names rnsh's own config directory, as in Python's `rnsh`; use `--rnsconfig` for the Reticulum one.
+- An interface that fails to start now stops start-up, as in Python Reticulum. Embedders can keep going with `InitOptions::keep_starting_after_interface_failure`.
+- RNodeMulti reads `interface_mode` from the device section and `flow_control` from each subinterface.
+- AutoInterface, Backbone, and I2P interfaces, path expiry, and announce queues behave as in Python Reticulum 1.6.0.
+- Key exchange rejects weak peer keys that would give an all-zero shared secret.
+
+### Build and compatibility
+
+- Bluetooth Peer uses new service identifiers, so it doesn't find peers on 1.4.0 or earlier until both update. Bluetooth RNodes aren't affected.
+- Known destinations, ratchets, and cached announces are stored in the same SQLite files as Python Reticulum 1.6.0. Old files are imported on first start, so going back to an older release starts with no known destinations.
+- Breaking API changes are listed in the [1.5 migration guide](api/migrations/1.5.md); use the `~1.5.0` line. The default `sqlite-store` feature builds a bundled SQLite, so builds need a C compiler.
+
 ## 1.4.0 - 2026-11-08
 
 - RNode drivers confirm the settings the radio applies once it is on, on every transport, and stop with the rejected setting named (for example TX power below an amplifier's minimum) instead of transmitting at other settings or retrying forever.
