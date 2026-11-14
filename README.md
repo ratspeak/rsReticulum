@@ -123,7 +123,7 @@ The `rns-tools` crate builds Rust-namespaced Reticulum utilities:
 | rnid-rs | Identity generation, inspection, public/private import/export, hashing, signing, verification, encryption, and decryption. |
 | rnprobe-rs | Destination probe utility with loss and round-trip reporting. |
 | rncp-rs | File transfer utility with send, listen, and authenticated fetch modes. |
-| rnodeconf-rs | RNode inspection, EEPROM backup, and saved TNC/normal startup configuration. |
+| rnodeconf-rs | RNode inspection, settings, signing, EEPROM bootstrap, firmware install and update, and the guided installer. |
 | rnsh-rs | Reticulum shell listener/client. |
 
 Common command forms (use each binary’s `--help` for the complete option list):
@@ -147,6 +147,8 @@ rncp-rs     -f <destination_hash> <remote_path> [-s DEST_DIR]
 rnodeconf-rs [-i] [--config] [--eeprom-backup|--eeprom-dump] [--version] [PORT]
 rnodeconf-rs -T --freq HZ --bw HZ --txp DBM --sf SF --cr CR PORT
 rnodeconf-rs -N PORT
+rnodeconf-rs -a [PORT]
+rnodeconf-rs -u [-U] [--fw-version V] [--fw-url URL] [--nocheck] PORT
 rnsh-rs     -l [-i FILE] [-s NAME] [-b PERIOD] [-a HASH]... [-n] [-A|-C] [-- CMD...]
 rnsh-rs     [-i FILE] [-s NAME] [-N] [-m] [-w SECONDS] <destination_hash> [-- CMD...]
 ```
@@ -163,11 +165,15 @@ Without `-n`, fetch requests require an identified peer on the allowlist.
 `-j <jail>` to constrain fetched paths to a directory under trusted local
 control; it is not an operating-system sandbox.
 
-`rnodeconf-rs` in 1.4.0 and 1.3.0 supports inspection,
-EEPROM dump/backup, and saving TNC/normal startup settings. `-T` requires all five
-RF values shown above. Firmware installation, signing/trust enrollment and
-Bluetooth, Wi-Fi, display and interference-avoidance changes are disabled.
-Their options remain in the parser but return an error.
+`rnodeconf-rs` covers the upstream `rnodeconf` options: inspection, device
+settings, signing and trust, EEPROM bootstrap and wipe, firmware download,
+update, flashing and extraction, and the `-a` guided installer. Firmware comes
+from the official RNode firmware releases unless `--fw-url` names another
+source. Flashing runs the same external tools as upstream (`avrdude`,
+`adafruit-nrfutil`, and the firmware's own `esptool.py` through `python3`);
+upstream's bundled recovery esptool is not included, so `--extract` needs
+`esptool.py` or `esptool` on `PATH`. On nRF52 boards the EEPROM bootstrap
+writes more slowly than upstream and reads every byte back before locking.
 
 `rnid-rs` tracks the Reticulum 1.4.2 identity utility surface for normal
 software identities: public/private import and export, destination hashing,
@@ -314,10 +320,9 @@ Known gaps and intentional limits:
 
 - `rnx`, `rnir`, `rnpkg`, `rngit`, and `git-remote-rns` are not implemented;
   of the rngit tools only the `rngcs-rs` commit signer exists.
-- `rnodeconf-rs` is partial; safe inspection/configuration and EEPROM
-  dump/backup are furthest along. Firmware flashing, autoinstall/update, ROM
-  bootstrap, destructive EEPROM wipe, and full signing-key management are not
-  implemented.
+- `rnodeconf-rs` flashing, EEPROM bootstrap and the guided installer are
+  checked against upstream on an emulated RNode; real-board coverage depends
+  on hardware testing.
 - `rnstatus-rs` covers the practical operator surface, but does not implement
   every display/API behavior from upstream.
 - `rnpath-rs` remote mode is read-only for table/rates, including destination

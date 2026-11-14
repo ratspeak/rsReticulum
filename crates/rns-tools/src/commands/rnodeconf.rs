@@ -9,12 +9,15 @@ use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{CommandFactory, Parser};
 use rns_interface::{rnode, rnode_admin};
 use rns_tools::RS_RETICULUM_VERSION;
 
+#[path = "rnodeconf/autoinstall.rs"]
+mod autoinstall;
 #[path = "rnodeconf/bootstrap.rs"]
 mod bootstrap;
 #[allow(dead_code)]
@@ -31,8 +34,6 @@ mod install;
 #[allow(dead_code)]
 #[path = "rnodeconf/model.rs"]
 mod model;
-#[path = "rnodeconf/plan.rs"]
-mod plan;
 #[path = "rnodeconf/session.rs"]
 mod session;
 #[path = "rnodeconf/trust.rs"]
@@ -289,16 +290,26 @@ pub(crate) fn main() -> ExitCode {
     if args.extract {
         return install::extract(&args);
     }
-    if let Some(message) = plan::refusal_without_port(&args) {
-        eprintln!("rnodeconf-rs: {message}");
-        return ExitCode::from(2);
-    }
+    let auto = if args.autoinstall {
+        match autoinstall::run(&mut args) {
+            Ok(plan) => Some(plan),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
     if args.public {
         show_public_keys();
         return ExitCode::SUCCESS;
     }
     if args.key {
-        return generate_keys();
+        // Autoinstall makes the keys it needs and carries on to flashing.
+        if let Err(code) = generate_keys(args.autoinstall) {
+            return code;
+        }
+        if !args.autoinstall {
+            return ExitCode::SUCCESS;
+        }
     }
     let Some(port_path) = args.port.clone() else {
         out("");
@@ -308,7 +319,24 @@ pub(crate) fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     if args.flash {
-        match install::flash(&args, &port_path) {
+        let flashed = match auto.as_ref() {
+            Some(plan) => match rnodeconf_cache_paths() {
+                Ok(paths) => install::flash_firmware(
+                    &args,
+                    &port_path,
+                    &paths,
+                    plan.choice.platform,
+                    &plan.choice.fw_filename,
+                    &plan.version,
+                ),
+                Err(error) => {
+                    eprintln!("rnodeconf-rs: {error}");
+                    return ExitCode::from(1);
+                }
+            },
+            None => install::flash(&args, &port_path),
+        };
+        match flashed {
             Ok(rom) => args.rom = rom,
             Err(code) => return code,
         }
@@ -325,7 +353,7 @@ pub(crate) fn main() -> ExitCode {
     };
     let mut rnode = RNode::new(port, port_path.clone());
     rnode.usb_serial_id = bootstrap::usb_serial_number(&port_path);
-    match run_device(rnode, &args) {
+    match run_device(rnode, &args, auto.as_ref()) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("rnodeconf-rs: {e}");
@@ -359,7 +387,11 @@ fn print_donation_block() {
 
 /// Upstream `main()` from the device probe on, for the operations this build
 /// supports. Errors are the cases where upstream raises an exception.
-fn run_device(session: RNode, args: &Args) -> Result<ExitCode, String> {
+fn run_device(
+    session: RNode,
+    args: &Args,
+    auto: Option<&autoinstall::Plan>,
+) -> Result<ExitCode, String> {
     let mut session = session;
     let rnode = &mut session;
     if let Err(e) = rnode.device_probe() {
@@ -458,9 +490,14 @@ fn run_device(session: RNode, args: &Args) -> Result<ExitCode, String> {
             model: args.model.as_deref(),
             hwrev: args.hwrev,
             autoinstall: args.autoinstall,
-            mapped_product: model::PRODUCT_RNODE,
-            mapped_model: None,
-            firmware: None,
+            mapped_product: auto.map_or(model::PRODUCT_RNODE, |plan| plan.choice.product),
+            mapped_model: auto.map(|plan| plan.choice.model),
+            firmware: auto
+                .filter(|plan| plan.provisions_firmware_hash())
+                .map(|plan| bootstrap::FirmwareProvision {
+                    fw_filename: plan.choice.fw_filename.clone(),
+                    selected_version: plan.version.clone(),
+                }),
             port_path: &rnode.name.clone(),
         };
         let signature_valid = device.as_ref().is_some_and(|d| d.signature.valid);
@@ -881,12 +918,13 @@ fn show_public_keys() {
 /// Upstream `-k`: a device signing identity and an EEPROM signing key, each
 /// created only when absent. Exits 81 and 82 are upstream's intent; upstream
 /// never reaches them because `Identity.to_file` and `from_file` swallow errors.
-fn generate_keys() -> ExitCode {
+/// `Err` ends the run with that code; autoinstall goes on after `Ok`.
+fn generate_keys(autoinstall: bool) -> Result<(), ExitCode> {
     let root = match rnodeconf_root() {
         Ok(root) => root,
         Err(error) => {
             log(error);
-            return ExitCode::SUCCESS;
+            return Err(ExitCode::SUCCESS);
         }
     };
     let firmware_dir = root.join("firmware");
@@ -901,7 +939,7 @@ fn generate_keys() -> ExitCode {
             ));
             log(error.to_string());
             log("Please ensure filesystem access and try again.");
-            return ExitCode::from(81);
+            return Err(ExitCode::from(81));
         }
         log(format!(
             "Device signing key written to {}",
@@ -918,37 +956,41 @@ fn generate_keys() -> ExitCode {
             ));
             log(error);
             log("Please restore or clear the key and try again.");
-            return ExitCode::from(82);
+            return Err(ExitCode::from(82));
         }
     }
 
     let signing_key = trust::signing_key_path(&root);
     if signing_key.is_file() {
         let _ = fs::create_dir_all(&firmware_dir);
-        log("EEPROM Signing key already exists, not overwriting!");
-        log("Manually delete this key to create a new one.");
-        return ExitCode::SUCCESS;
+        if !autoinstall {
+            log("EEPROM Signing key already exists, not overwriting!");
+            log("Manually delete this key to create a new one.");
+        }
+        return Ok(());
     }
     log("Generating a new EEPROM signing key...");
     let (private_bytes, public_bytes) = match trust::generate_signing_key() {
         Ok(keys) => keys,
         Err(error) => {
             log(error);
-            return ExitCode::SUCCESS;
+            return Err(ExitCode::SUCCESS);
         }
     };
     if fs::create_dir_all(&firmware_dir).is_err() || !firmware_dir.is_dir() {
         log("The firmware directory does not exist, can't write key!");
-        return ExitCode::SUCCESS;
+        return Ok(());
     }
     if let Err(error) = fs::write(&signing_key, &private_bytes) {
         log(py_os_error(&error, &signing_key));
-        return ExitCode::SUCCESS;
+        return Err(ExitCode::SUCCESS);
     }
-    log("Wrote signing key");
-    log("Public key:");
-    log(hex::encode(public_bytes));
-    ExitCode::SUCCESS
+    if !QUIET_UNVERIFIED.load(Ordering::Relaxed) {
+        log("Wrote signing key");
+        log("Public key:");
+        log(hex::encode(public_bytes));
+    }
+    Ok(())
 }
 
 /// Upstream `graceful_exit`: only Windows tells the device the host left.
@@ -1084,11 +1126,13 @@ fn parse_eeprom(bytes: &[u8], port_name: &str) -> ParsedEeprom {
         log("Device signature validated");
     } else {
         log("Device signature validation failed");
-        for line in UNVERIFIED_DEVICE_WARNING {
-            out(*line);
+        if !QUIET_UNVERIFIED.load(Ordering::Relaxed) {
+            for line in UNVERIFIED_DEVICE_WARNING {
+                out(*line);
+            }
+            out(format!("              rnodeconf {port_name} --autoinstall"));
+            out("");
         }
-        out(format!("              rnodeconf {port_name} --autoinstall"));
-        out("");
     }
     let image = eeprom::EepromImage::new(bytes.to_vec()).expect("length checked");
     let identity = image.identity();
@@ -1105,6 +1149,10 @@ fn parse_eeprom(bytes: &[u8], port_name: &str) -> ParsedEeprom {
         configured: image.radio_config(),
     }))
 }
+
+/// Upstream global `squashvw`: autoinstall silences the unverified-device warning
+/// and the new signing key printout.
+static QUIET_UNVERIFIED: AtomicBool = AtomicBool::new(false);
 
 const UNVERIFIED_DEVICE_WARNING: &[&str] = &[
     "     ",
