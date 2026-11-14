@@ -8,6 +8,7 @@
 //! operation. Callbacks run on the manager task and must return promptly.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub use crate::deferred_request::{
@@ -24,6 +25,7 @@ use crate::resource_source::{
     AutoCompress, PreparedResourceSegment, PreparedResourceSource, ResourceOptions, ResourceSource,
     ResourceSourceError,
 };
+use crate::resource_spool::ResourceSpool;
 use bytes::Bytes;
 use rns_identity::destination::ProofStrategy;
 use tokio::sync::{mpsc, oneshot};
@@ -251,6 +253,9 @@ struct ActiveLink {
     /// Reverse index per-segment `resource_hash` → coordinator; routes assembled
     /// bytes without re-parsing the ADV.
     segment_routing: HashMap<[u8; 32], SegmentRoute>,
+    /// Files of inbound Resources above the in-memory limit, keyed by logical
+    /// hash. Dropping an entry removes its partial file.
+    inbound_spools: HashMap<[u8; 32], ResourceSpool>,
 }
 
 struct PendingResponderEndpointBind {
@@ -408,6 +413,13 @@ struct PendingResponderEndpointCleanup {
 struct SegmentRoute {
     original_hash: [u8; 32],
     segment_index: usize,
+}
+
+/// [`LinkManager::set_resource_file_channel`].
+struct ResourceFiles {
+    dir: PathBuf,
+    min_size: usize,
+    tx: mpsc::Sender<ResourceFileCompletion>,
 }
 
 #[derive(Debug, Clone)]
@@ -682,6 +694,13 @@ pub enum LinkManagerCommand {
         limit: Option<usize>,
         result_tx: Option<oneshot::Sender<()>>,
     },
+    /// [`LinkManager::set_resource_file_channel`].
+    SetResourceFileChannel {
+        dir: PathBuf,
+        min_size: usize,
+        files_tx: mpsc::Sender<ResourceFileCompletion>,
+        result_tx: Option<oneshot::Sender<()>>,
+    },
     /// Remove a per-path request handler.
     DeregisterRequestHandler {
         path: String,
@@ -730,6 +749,26 @@ pub struct ResourceCompletion {
     pub data: Vec<u8>,
     /// Opaque metadata bytes, if supplied by the sender. Applications such
     /// as rncp use MessagePack; this type does not validate that encoding.
+    pub metadata: Option<Vec<u8>>,
+}
+
+/// A completed inbound Resource held in a file, as upstream hands the
+/// application `resource.data` as an open file (Resource.py). Sent on the
+/// channel given to [`LinkManager::set_resource_file_channel`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ResourceFileCompletion {
+    /// The Link the Resource arrived on.
+    pub link_id: [u8; 16],
+    /// Logical hash: Python's `original_hash`.
+    pub resource_hash: [u8; 32],
+    /// Hash of the final segment: Python's `get_hash()` in the concluded callback.
+    pub last_segment_hash: [u8; 32],
+    /// The received payload. The receiver owns this file: move it or remove it.
+    pub path: PathBuf,
+    /// Payload bytes in the file.
+    pub size: u64,
+    /// Opaque metadata bytes, if supplied by the sender.
     pub metadata: Option<Vec<u8>>,
 }
 
@@ -1015,6 +1054,9 @@ pub struct LinkManager {
     /// Largest advertised total size of an inbound Resource this manager
     /// reassembles in memory; `None` accepts any size.
     inbound_reassembly_limit: Option<usize>,
+    /// Which ordinary Resources are assembled into files, where, and who
+    /// receives them.
+    resource_files: Option<ResourceFiles>,
     /// Python `Link.last_resource_window` / `last_resource_eifr`, per Link.
     last_inbound_resource: HashMap<[u8; 16], (usize, Option<f64>)>,
     deferred_request_notify: Arc<tokio::sync::Notify>,
@@ -1150,6 +1192,7 @@ impl LinkManager {
             request_handler: None,
             max_request_size: None,
             inbound_reassembly_limit: Some(DEFAULT_INBOUND_REASSEMBLY_LIMIT),
+            resource_files: None,
             last_inbound_resource: HashMap::new(),
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
             pending_deferred_requests: Vec::new(),
@@ -1255,6 +1298,7 @@ impl LinkManager {
             request_handler: None,
             max_request_size: None,
             inbound_reassembly_limit: Some(DEFAULT_INBOUND_REASSEMBLY_LIMIT),
+            resource_files: None,
             last_inbound_resource: HashMap::new(),
             deferred_request_notify: Arc::new(tokio::sync::Notify::new()),
             pending_deferred_requests: Vec::new(),
@@ -2665,6 +2709,18 @@ impl LinkManager {
                 }
                 true
             }
+            LinkManagerCommand::SetResourceFileChannel {
+                dir,
+                min_size,
+                files_tx,
+                result_tx,
+            } => {
+                self.set_resource_file_channel(dir, min_size, files_tx);
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(());
+                }
+                true
+            }
             LinkManagerCommand::DeregisterRequestHandler { path, result_tx } => {
                 let result = self.deregister_request_handler(&path);
                 if let Some(tx) = result_tx {
@@ -3483,6 +3539,7 @@ impl LinkManager {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -4163,10 +4220,22 @@ impl LinkManager {
                                 break 'adv;
                             }
 
-                            if self
+                            // An ordinary Resource the application takes as a
+                            // file is not bound by the in-memory limit; a
+                            // follow-up segment keeps the first one's form.
+                            let spooled = if existing_lifecycle.is_some() {
+                                active.inbound_spools.contains_key(&resource_id)
+                            } else {
+                                ordinary_resource
+                                    && self
+                                        .resource_files
+                                        .as_ref()
+                                        .is_some_and(|files| adv.data_size >= files.min_size)
+                            };
+                            let above_memory_limit = self
                                 .inbound_reassembly_limit
-                                .is_some_and(|limit| adv.data_size > limit)
-                            {
+                                .is_some_and(|limit| adv.data_size > limit);
+                            if above_memory_limit && !spooled {
                                 let cancel_sent = Self::send_resource_action(
                                     &self.transport_tx,
                                     &mut self.pending_link_control,
@@ -4374,6 +4443,11 @@ impl LinkManager {
 
                             // Routing is published only after structural validation,
                             // admission and the initial part request have succeeded.
+                            if spooled && let Some(files) = self.resource_files.as_ref() {
+                                active.inbound_spools.entry(resource_id).or_insert_with(|| {
+                                    ResourceSpool::new(&files.dir, &resource_id)
+                                });
+                            }
                             if is_split {
                                 active
                                     .inbound_split_resources
@@ -4512,18 +4586,33 @@ impl LinkManager {
                             let resource_id = Self::inbound_resource_identity(active, &rh).0;
                             match completion {
                                 Some(Ok((assembled_data, proof))) => {
-                                    let received_before = active
-                                        .segment_routing
-                                        .get(&rh)
-                                        .and_then(|route| {
-                                            active.inbound_split_resources.get(&route.original_hash)
-                                        })
-                                        .map_or(0, |coordinator| coordinator.data_size);
+                                    let spooled_bytes = active
+                                        .inbound_spools
+                                        .get(&resource_id)
+                                        .map(|spool| spool.len());
+                                    let received_before = match spooled_bytes {
+                                        Some(bytes) => usize::try_from(bytes).unwrap_or(usize::MAX),
+                                        None => active
+                                            .segment_routing
+                                            .get(&rh)
+                                            .and_then(|route| {
+                                                active
+                                                    .inbound_split_resources
+                                                    .get(&route.original_hash)
+                                            })
+                                            .map_or(0, |coordinator| coordinator.data_size),
+                                    };
+                                    // A spooled transfer is bounded by its
+                                    // advertised size alone.
+                                    let memory_limit = match spooled_bytes {
+                                        Some(_) => usize::MAX,
+                                        None => self.inbound_reassembly_limit.unwrap_or(usize::MAX),
+                                    };
                                     let size_bound = self
                                         .active_inbound_lifecycles
                                         .get(&(link_id, resource_id))
                                         .map_or(usize::MAX, |lifecycle| lifecycle.data_size)
-                                        .min(self.inbound_reassembly_limit.unwrap_or(usize::MAX));
+                                        .min(memory_limit);
                                     let overflow = received_before
                                         .saturating_add(assembled_data.len())
                                         > size_bound;
@@ -4559,6 +4648,37 @@ impl LinkManager {
                                         );
                                         break 'resource_part;
                                     }
+                                    // Resource.assemble writes the segment before
+                                    // Resource.prove: a failed write sends neither a
+                                    // proof nor a cancel, and the Link stays up.
+                                    let assembled_data =
+                                        match active.inbound_spools.get_mut(&resource_id) {
+                                            Some(spool) => {
+                                                if let Err(error) = spool.append(&assembled_data) {
+                                                    Self::conclude_inbound_failure(
+                                                        active,
+                                                        &mut self.active_inbound_lifecycles,
+                                                        &mut self.pending_inbound_request_resources,
+                                                        &self.resource_event_tx,
+                                                        &self.accounting_event_tx,
+                                                        link_id,
+                                                        resource_id,
+                                                        LinkResourceConclusion::Failed(format!(
+                                                            "could not write Resource data: {error}"
+                                                        )),
+                                                    );
+                                                    tracing::error!(
+                                                        link_id = hex::encode(link_id),
+                                                        resource = hex::encode(&resource_id[..8]),
+                                                        %error,
+                                                        "could not write received Resource data"
+                                                    );
+                                                    break 'resource_part;
+                                                }
+                                                Vec::new()
+                                            }
+                                            None => assembled_data,
+                                        };
                                     // PROOF+RESOURCE_PRF = plaintext, PacketType::Proof
                                     // (Packet.py). Each split segment still needs its
                                     // own proof or the sender retries.
@@ -4627,6 +4747,9 @@ impl LinkManager {
 
                                         match split_outcome {
                                             Ok(Some((blob, metadata, total_segments))) => {
+                                                let spool = active
+                                                    .inbound_spools
+                                                    .remove(&route.original_hash);
                                                 Self::drop_inbound_logical(
                                                     active,
                                                     &route.original_hash,
@@ -4641,6 +4764,19 @@ impl LinkManager {
                                                 {
                                                     if lifecycle.is_request {
                                                         completed_request_resource = Some(blob);
+                                                    } else if let Some(spool) = spool {
+                                                        let (path, size) = spool.finish();
+                                                        Self::emit_resource_file(
+                                                            &self.resource_files,
+                                                            ResourceFileCompletion {
+                                                                link_id,
+                                                                resource_hash: route.original_hash,
+                                                                last_segment_hash: rh,
+                                                                path,
+                                                                size,
+                                                                metadata,
+                                                            },
+                                                        );
                                                     } else {
                                                         Self::emit_resource_completion(
                                                             &self.resource_completion_tx,
@@ -4724,6 +4860,7 @@ impl LinkManager {
                                         let metadata = active.inbound_resources.get(&rh).and_then(
                                             |transfer| transfer.resource.metadata.clone(),
                                         );
+                                        let spool = active.inbound_spools.remove(&rh);
                                         Self::drop_inbound_logical(active, &rh);
                                         if let Some(lifecycle) = Self::claim_inbound_terminal(
                                             &mut self.active_inbound_lifecycles,
@@ -4733,6 +4870,19 @@ impl LinkManager {
                                         ) {
                                             if lifecycle.is_request {
                                                 completed_request_resource = Some(assembled_data);
+                                            } else if let Some(spool) = spool {
+                                                let (path, size) = spool.finish();
+                                                Self::emit_resource_file(
+                                                    &self.resource_files,
+                                                    ResourceFileCompletion {
+                                                        link_id,
+                                                        resource_hash: rh,
+                                                        last_segment_hash: rh,
+                                                        path,
+                                                        size,
+                                                        metadata,
+                                                    },
+                                                );
                                             } else {
                                                 Self::emit_resource_completion(
                                                     &self.resource_completion_tx,
@@ -6149,6 +6299,35 @@ impl LinkManager {
         active
             .segment_routing
             .retain(|_, route| route.original_hash != *resource_id);
+        // An unfinished spool removes its partial file here.
+        active.inbound_spools.remove(resource_id);
+    }
+
+    /// Hand a completed spool to the application. Without a receiver the file
+    /// is removed: nobody else could.
+    fn emit_resource_file(
+        resource_files: &Option<ResourceFiles>,
+        completion: ResourceFileCompletion,
+    ) {
+        let undelivered = match resource_files {
+            Some(files) => files
+                .tx
+                .try_send(completion)
+                .err()
+                .map(|error| match error {
+                    mpsc::error::TrySendError::Full(completion)
+                    | mpsc::error::TrySendError::Closed(completion) => completion,
+                }),
+            None => Some(completion),
+        };
+        if let Some(completion) = undelivered {
+            tracing::warn!(
+                link_id = hex::encode(completion.link_id),
+                resource = hex::encode(&completion.resource_hash[..8]),
+                "received Resource file has no receiver; removing it"
+            );
+            let _ = std::fs::remove_file(&completion.path);
+        }
     }
 
     fn claim_inbound_terminal(
@@ -7258,12 +7437,37 @@ impl LinkManager {
         self.max_request_size = limit;
     }
 
-    /// Bound the advertised total size of inbound Resources, which this
-    /// manager reassembles in memory. Larger advertisements are refused with a
-    /// cancel before admission. Defaults to
-    /// [`DEFAULT_INBOUND_REASSEMBLY_LIMIT`]; `None` accepts any size.
+    /// Bound the advertised total size of inbound Resources this manager
+    /// reassembles in memory. A larger advertisement is refused with a cancel
+    /// before admission, unless it is an ordinary Resource that
+    /// [`Self::set_resource_file_channel`] takes as a file. Defaults to
+    /// [`DEFAULT_INBOUND_REASSEMBLY_LIMIT`]; `None` reassembles any size in
+    /// memory.
     pub fn set_inbound_reassembly_limit(&mut self, limit: Option<usize>) {
         self.inbound_reassembly_limit = limit;
+    }
+
+    /// Receive ordinary inbound Resources that advertise `min_size` bytes or
+    /// more as files in `dir`, with no total size limit, as upstream assembles
+    /// every Resource under `Reticulum.resourcepath` (Resource.py). Smaller
+    /// ones, and request Resources, are still reassembled in memory. Each
+    /// verified segment is appended before its proof is sent, so one segment
+    /// at a time is held in memory. The file is private to the user and named
+    /// by the Resource hash and a random suffix. A file that cannot be
+    /// written, or a transfer that fails, is cancelled or times out, leaves
+    /// nothing behind. A completion that the bounded channel cannot take is
+    /// dropped and its file removed.
+    pub fn set_resource_file_channel(
+        &mut self,
+        dir: impl Into<PathBuf>,
+        min_size: usize,
+        tx: mpsc::Sender<ResourceFileCompletion>,
+    ) {
+        self.resource_files = Some(ResourceFiles {
+            dir: dir.into(),
+            min_size,
+            tx,
+        });
     }
 
     /// Remove the request handler registered for `path`.
@@ -8938,6 +9142,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -9014,6 +9219,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         own_test_endpoint(&mut lm, link_id);
@@ -9190,6 +9396,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         own_test_endpoint(&mut lm, link_id);
@@ -9245,6 +9452,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -9869,6 +10077,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -9927,6 +10136,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -9993,6 +10203,7 @@ mod tests {
                     outbound_split_queues: HashMap::new(),
                     inbound_split_resources: HashMap::new(),
                     segment_routing: HashMap::new(),
+                    inbound_spools: HashMap::new(),
                 },
             );
 
@@ -10108,6 +10319,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -10184,6 +10396,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -10394,6 +10607,7 @@ mod tests {
             outbound_split_queues: HashMap::new(),
             inbound_split_resources: HashMap::new(),
             segment_routing: HashMap::new(),
+            inbound_spools: HashMap::new(),
         }
     }
 
@@ -11539,6 +11753,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         manager.set_link_endpoint_dispatch_handle(dispatch.clone());
@@ -11628,6 +11843,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         manager.set_link_endpoint_dispatch_handle(dispatch.clone());
@@ -11785,6 +12001,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         own_test_endpoint(&mut manager, link_id);
@@ -11869,6 +12086,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -12077,6 +12295,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -12267,6 +12486,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -12366,6 +12586,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -12459,6 +12680,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -12489,6 +12711,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         lm.get_channel(&link_id)
@@ -12528,6 +12751,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             }
         }
 
@@ -12641,6 +12865,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -12716,6 +12941,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -12788,6 +13014,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -12846,6 +13073,7 @@ mod tests {
             outbound_split_queues: HashMap::new(),
             inbound_split_resources: HashMap::new(),
             segment_routing: HashMap::new(),
+            inbound_spools: HashMap::new(),
         };
 
         assert!(LinkManager::send_resource_action(
@@ -12973,6 +13201,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -13045,6 +13274,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -13084,6 +13314,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -13157,6 +13388,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -13424,6 +13656,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         let receipt = manager
@@ -13915,6 +14148,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -13973,6 +14207,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -14019,6 +14254,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -14109,6 +14345,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -14190,6 +14427,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -14260,6 +14498,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -14308,6 +14547,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -14387,6 +14627,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -14585,6 +14826,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -14683,6 +14925,292 @@ mod tests {
         ));
     }
 
+    /// What a spooled-transfer test does once the first of two segments has
+    /// been received.
+    enum AfterFirstSegment {
+        Continue,
+        Cancel,
+        CloseLink,
+        DropManager,
+    }
+
+    struct SpooledSplit {
+        events: Vec<LinkManagerAccountingEvent>,
+        contexts: Vec<rns_wire::context::PacketContext>,
+        files: mpsc::Receiver<ResourceFileCompletion>,
+        link_active: bool,
+    }
+
+    /// Drive a two-segment split Resource of 16 KiB into a manager with a
+    /// 1 KiB in-memory limit that takes Resources of `min_size` bytes or more
+    /// as files in `dir`.
+    fn drive_spooled_split(
+        dir: &std::path::Path,
+        min_size: usize,
+        after_first: AfterFirstSegment,
+    ) -> SpooledSplit {
+        use rns_protocol::resource::OutboundResource;
+
+        let (sender_link, receiver_link) = handshaken_link_pair();
+        let link_id = receiver_link.link_id;
+        let resource_id = [0x5B; 32];
+        let (transport_tx, mut transport_rx) = mpsc::channel(4096);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xBB; 16], None);
+        lm.set_inbound_reassembly_limit(Some(1024));
+        let (files_tx, files) = mpsc::channel(4);
+        lm.set_resource_file_channel(dir, min_size, files_tx);
+        let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
+        lm.set_accounting_event_channel(accounting_tx);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                interface_owner: None,
+                endpoint_authority: None,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
+            },
+        );
+        let mut lm = Some(lm);
+
+        let encrypt_fn = |d: &[u8]| sender_link.encrypt(d).expect("link encrypt");
+        let mut contexts = Vec::new();
+        for index in 1..=2 {
+            let Some(manager) = lm.as_mut() else { break };
+            let chunk = vec![index as u8; 8 * 1024];
+            let mut segment =
+                OutboundResource::with_options(chunk, false, None, None, Some(&encrypt_fn))
+                    .expect("build segment");
+            segment.flags.split = true;
+            segment.segment_index = index;
+            segment.total_segments = 2;
+            segment.original_hash = Some(resource_id);
+            segment.advertisement_data_size = 16 * 1024;
+            let mut transfer =
+                OutboundTransfer::from_prebuilt(segment, std::time::Duration::from_millis(50));
+            let TransferAction::SendAdvertisement(adv) = transfer.tick() else {
+                panic!("expected an advertisement");
+            };
+            manager.handle_inbound_packet(&resource_advertisement_packet(&sender_link, &adv), 1);
+            let segment_hash = transfer.resource.resource_hash;
+            let total_parts = transfer.resource.parts.len();
+            if let Some(inbound) = manager
+                .active_links
+                .get_mut(&link_id)
+                .and_then(|active| active.inbound_resources.get_mut(&segment_hash))
+            {
+                inbound.resource.window.window = total_parts;
+                inbound.outstanding_parts = total_parts;
+                for part in &transfer.resource.parts {
+                    manager.handle_inbound_packet(&resource_data_packet(&sender_link, part), 1);
+                }
+            }
+            if index == 1 {
+                match after_first {
+                    AfterFirstSegment::Continue => {}
+                    AfterFirstSegment::Cancel => {
+                        assert!(
+                            manager.handle_command(LinkManagerCommand::CancelLinkResource {
+                                link_id,
+                                resource_id,
+                                direction: LinkResourceDirection::Inbound,
+                                result_tx: None,
+                            })
+                        );
+                    }
+                    AfterFirstSegment::CloseLink => {
+                        manager.close_active_link(link_id, CloseReason::Timeout, false);
+                    }
+                    AfterFirstSegment::DropManager => {
+                        lm = None;
+                    }
+                }
+            }
+            while let Ok(message) = next_transport_message(&mut transport_rx) {
+                let raw = match message {
+                    TransportMessage::Outbound(request)
+                    | TransportMessage::OutboundAttached { request, .. } => request.raw,
+                    _ => continue,
+                };
+                contexts.push(
+                    rns_wire::header::PacketHeader::unpack(&raw)
+                        .unwrap()
+                        .0
+                        .context,
+                );
+            }
+        }
+        let mut events = Vec::new();
+        while let Ok(event) = accounting_rx.try_recv() {
+            events.push(event);
+        }
+        let link_active = lm.as_ref().is_some_and(|manager| {
+            manager
+                .active_links
+                .get(&link_id)
+                .is_some_and(|active| active.link.state == LinkState::Active)
+        });
+        SpooledSplit {
+            events,
+            contexts,
+            files,
+            link_active,
+        }
+    }
+
+    fn dir_entries(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    #[test]
+    fn inbound_resource_taken_as_a_file_is_assembled_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = 16 * 1024;
+        let mut run = drive_spooled_split(dir.path(), size, AfterFirstSegment::Continue);
+        assert!(
+            !run.contexts
+                .contains(&rns_wire::context::PacketContext::ResourceRcl),
+            "a Resource taken as a file is not bound by the in-memory limit: {:?}",
+            run.contexts
+        );
+        assert_eq!(
+            run.contexts
+                .iter()
+                .filter(|context| **context == rns_wire::context::PacketContext::ResourcePrf)
+                .count(),
+            2,
+            "every segment is proved"
+        );
+        assert!(matches!(
+            inbound_conclusion(&run.events),
+            Some(LinkResourceConclusion::Complete)
+        ));
+        assert!(
+            !run.events
+                .iter()
+                .any(|event| matches!(event, LinkManagerAccountingEvent::ResourceCompletion(_))),
+            "a spooled Resource is not also delivered as bytes"
+        );
+        let file = run.files.try_recv().expect("one file completion");
+        assert_eq!(file.resource_hash, [0x5B; 32]);
+        assert_eq!(file.size, size as u64);
+        assert!(file.path.starts_with(dir.path()));
+        let mut expected = vec![1u8; 8 * 1024];
+        expected.extend_from_slice(&[2u8; 8 * 1024]);
+        assert!(std::fs::read(&file.path).unwrap() == expected);
+        assert_eq!(dir_entries(dir.path()), 1, "only the completed file exists");
+        assert!(run.files.try_recv().is_err());
+    }
+
+    #[test]
+    fn inbound_resource_below_the_file_size_keeps_the_memory_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut run = drive_spooled_split(dir.path(), 16 * 1024 + 1, AfterFirstSegment::Continue);
+        assert_eq!(
+            run.contexts.first(),
+            Some(&rns_wire::context::PacketContext::ResourceRcl),
+            "below the file size the in-memory limit still refuses it"
+        );
+        assert!(
+            !run.events
+                .iter()
+                .any(|event| matches!(event, LinkManagerAccountingEvent::ResourceCompletion(_)))
+        );
+        assert!(run.files.try_recv().is_err());
+        assert_eq!(dir_entries(dir.path()), 0);
+    }
+
+    #[test]
+    fn spooled_inbound_resource_that_ends_early_leaves_no_file() {
+        for (name, after_first) in [
+            ("cancel", AfterFirstSegment::Cancel),
+            ("link close", AfterFirstSegment::CloseLink),
+            ("manager drop", AfterFirstSegment::DropManager),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut run = drive_spooled_split(dir.path(), 0, after_first);
+            assert_eq!(
+                run.contexts
+                    .iter()
+                    .filter(|context| **context == rns_wire::context::PacketContext::ResourcePrf)
+                    .count(),
+                1,
+                "{name}: the first segment was written and proved"
+            );
+            assert!(
+                run.files.try_recv().is_err(),
+                "{name}: no file is delivered"
+            );
+            assert_eq!(
+                dir_entries(dir.path()),
+                0,
+                "{name}: no partial file remains"
+            );
+        }
+    }
+
+    #[test]
+    fn unwritable_resource_directory_fails_the_transfer_without_proof_or_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent");
+        let mut run = drive_spooled_split(&missing, 0, AfterFirstSegment::Continue);
+        // Resource.assemble: a failed write is CORRUPT, which sends nothing.
+        assert!(
+            !run.contexts
+                .contains(&rns_wire::context::PacketContext::ResourcePrf),
+            "an unwritten segment is not proved: {:?}",
+            run.contexts
+        );
+        assert_eq!(
+            run.contexts,
+            vec![rns_wire::context::PacketContext::ResourceReq],
+            "only the part request is sent"
+        );
+        assert!(matches!(
+            inbound_conclusion(&run.events),
+            Some(LinkResourceConclusion::Failed(_))
+        ));
+        assert!(run.link_active, "the Link stays up");
+        assert!(run.files.try_recv().is_err());
+        assert_eq!(dir_entries(dir.path()), 0);
+    }
+
+    #[test]
+    fn completed_file_without_a_receiver_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = drive_spooled_split(dir.path(), 0, AfterFirstSegment::Continue);
+        assert_eq!(dir_entries(dir.path()), 1);
+        drop(run);
+
+        let (files_tx, files_rx) = mpsc::channel(1);
+        drop(files_rx);
+        let path = dir.path().join("undelivered");
+        std::fs::write(&path, b"data").unwrap();
+        LinkManager::emit_resource_file(
+            &Some(ResourceFiles {
+                dir: dir.path().to_path_buf(),
+                min_size: 0,
+                tx: files_tx,
+            }),
+            ResourceFileCompletion {
+                link_id: [1; 16],
+                resource_hash: [2; 32],
+                last_segment_hash: [2; 32],
+                path: path.clone(),
+                size: 4,
+                metadata: None,
+            },
+        );
+        assert!(!path.exists());
+    }
+
     #[test]
     fn inbound_split_resource_sending_more_than_advertised_is_cut_off() {
         let (events, contexts) = drive_split_with_advertised_size(8 * 1024 + 1, None);
@@ -14744,6 +15272,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         let (completion_tx, mut completion_rx) = mpsc::channel(1);
@@ -14827,6 +15356,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -14928,6 +15458,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -14991,6 +15522,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         manager.set_resource_strategy(ResourceStrategy::AcceptApp);
@@ -15194,6 +15726,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         manager.set_resource_strategy(ResourceStrategy::AcceptApp);
@@ -15266,6 +15799,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         let (accounting_tx, mut accounting_rx) = mpsc::unbounded_channel();
@@ -15372,6 +15906,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -15528,6 +16063,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         let (completion_tx, mut completion_rx) = mpsc::channel(1);
@@ -15611,6 +16147,7 @@ mod tests {
                     MultiSegmentInbound::new(2, resource_id),
                 )]),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
         manager.active_inbound_lifecycles.insert(
@@ -15819,6 +16356,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 
@@ -15960,6 +16498,7 @@ mod tests {
                 outbound_split_queues: HashMap::new(),
                 inbound_split_resources: HashMap::new(),
                 segment_routing: HashMap::new(),
+                inbound_spools: HashMap::new(),
             },
         );
 

@@ -205,6 +205,27 @@ matches these errors exhaustively needs the new arms.
 - `ResourceError::DecompressedTooLarge`, `TransferAction` and
   `ResourceFlags::app_flag` are new. `InboundTransfer`, `OutboundTransfer` and
   `MultiSegmentInbound` gain public fields.
+- An inbound Resource can be received as a file of any size, not bound by the
+  in-memory limit (`inbound_reassembly_limit`, 128 MiB - 1 by default). Each
+  verified segment is appended to the file before its proof is sent, as
+  `Resource.assemble` writes it (`RNS/Resource.py`), and a transfer that
+  fails, is cancelled or cannot be written leaves no file behind. Additions,
+  none of which changes a caller that takes bytes:
+  - `LinkManager::set_resource_file_channel(dir, min_size, tx)` and
+    `DestinationHandle::receive_resource_files(dir, min_size, capacity)`
+    deliver `ResourceFileCompletion { path, size, .. }` for ordinary Resources
+    that advertise `min_size` bytes or more. Without them a Resource above the
+    in-memory limit is refused, as before.
+  - `LinkSessionResourceOffer::accept_to_file(dir)` assembles the offer into
+    a file and returns its path in `LinkSessionReceivedResource::file`.
+  - A session now offers a Resource above its limit to the application
+    instead of refusing it unseen. `accept` on such an offer rejects it with
+    `LinkSessionResourceError::TooLarge`.
+
+  The receiver owns a delivered file and moves or removes it. Use the
+  runtime's `storage/resources` directory (`StoragePaths::resource_dir`),
+  where upstream keeps them; the cache job removes a spool left there by a
+  crash after one day.
 
 ## Crypto
 
@@ -235,6 +256,12 @@ matches these errors exhaustively needs the new arms.
   for `--phy-rates` (`RNS/Utilities/rncp.py:331`).
 - `RncpError` gains `Interrupted`, `NotFound`, `RemoteError`, `RequestFailed`
   and `Stamp`.
+- `spawn_rncp_listener_with_resource_dir` and
+  `rncp_fetch_file_with_resource_dir` name the directory a received or fetched
+  file is assembled in before it is moved to the save directory, as rncp moves
+  `resource.data` (`RNS/Utilities/rncp.py`). `rncp-rs` passes
+  `storage/resources`; the functions without the argument use the system
+  temporary directory. Neither holds the file in memory.
 - `rnsh::RnshError` is `#[non_exhaustive]`. `Denied` carries the remote
   message, `Denied(String)`, and the enum gains `ClientException`, `LinkClosed`,
   `ProtocolError`, `StampFailure` and `Terminated`

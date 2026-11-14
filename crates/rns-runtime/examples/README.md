@@ -48,7 +48,7 @@ below follow the `--`; networked examples also accept `--config DIRECTORY`.
 | `channel` | `server`, or `client HASH [MESSAGE]`. Exchanges a custom Channel message. |
 | `buffer` | `server`, or `client HASH [MESSAGE]`. Exchanges a short UTF-8 string using Buffer/stream frames and interoperates with upstream `Examples/Buffer.py`. Use the default short message; the server replies `I received "<text>" over the buffer` per received frame and is not an arbitrary-length echo protocol. |
 | `resource` | `server`, or `client HASH [MESSAGE]`. Transfers a Resource with progress reporting. |
-| `filetransfer` | `server NEW_OUTPUT_FILE`, or `client HASH INPUT_FILE`. Writes the first completed Resource to a new file and refuses to replace an existing file. |
+| `filetransfer` | `server NEW_OUTPUT_FILE`, or `client HASH INPUT_FILE`. Writes the first completed Resource to a new file and refuses to replace an existing file. A Resource of 1 MiB or more is received as a file of any size. |
 | `speedtest` | `server`, or `client HASH [BYTE_COUNT]`. Queues Link packets; the default is 2 MiB. |
 | `ratchets` | `IDENTITY_FILE RATCHET_FILE [MESSAGE]`. Local key persistence and encrypt/decrypt composition; it does not start a network runtime. |
 

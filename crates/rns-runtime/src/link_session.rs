@@ -37,6 +37,7 @@ use crate::resource_source::{
     PreparedResourceSegment, PreparedResourceSource, ResourceOptions, ResourceSource,
     ResourceSourceError,
 };
+use crate::resource_spool::{ResourceSpool, spool_dir};
 
 const COMMAND_BUFFER: usize = 64;
 const EVENT_BUFFER: usize = 256;
@@ -67,12 +68,14 @@ pub struct LinkSessionConfig {
     /// is an OUT destination, which Python leaves at `PROVE_NONE`; `ProveApp`
     /// has no callback here and proves nothing.
     pub proof_strategy: ProofStrategy,
-    /// Where file responses are spooled by default, as Reticulum.resourcepath;
-    /// the system temp dir when unset.
+    /// Where file responses and Resources accepted to a file are written by
+    /// default, as Reticulum.resourcepath; the system temp dir when unset.
     pub resource_dir: Option<PathBuf>,
     /// Largest advertised total size of an inbound Resource the session
-    /// reassembles in memory; `None` accepts any size. Spooled responses are
-    /// not bounded by it. See [`DEFAULT_INBOUND_REASSEMBLY_LIMIT`].
+    /// reassembles in memory; `None` reassembles any size. Spooled responses
+    /// and Resources accepted with
+    /// [`LinkSessionResourceOffer::accept_to_file`] are not bounded by it. See
+    /// [`DEFAULT_INBOUND_REASSEMBLY_LIMIT`].
     pub inbound_reassembly_limit: Option<usize>,
 }
 
@@ -296,7 +299,10 @@ pub struct LinkSessionReceivedResource {
     pub link_id: [u8; 16],
     pub resource_id: [u8; 32],
     pub data: Vec<u8>,
-    /// Set instead of `data` when a request response was spooled to disk.
+    /// Set instead of `data` when a request response was spooled to disk or
+    /// the offer was accepted with
+    /// [`LinkSessionResourceOffer::accept_to_file`]. The receiver owns the
+    /// file: move it or remove it.
     pub file: Option<PathBuf>,
     pub metadata: Option<Vec<u8>>,
     pub total_segments: usize,
@@ -313,8 +319,9 @@ pub struct LinkSessionReceivedResource {
 /// Dropping an offer leaves this expiry in force and does not accept data.
 /// Acceptance covers the logical transfer and valid follow-up segments.
 /// Response Resources for pending requests are accepted internally, without an
-/// offer. Inspect advertised size before accepting; completed inbound data is
-/// assembled in memory.
+/// offer. Inspect the advertised size before accepting: `accept` assembles the
+/// data in memory, up to the session's in-memory limit, and `accept_to_file`
+/// assembles any size into a file.
 pub struct LinkSessionResourceOffer {
     link_id: [u8; 16],
     resource_id: [u8; 32],
@@ -361,8 +368,32 @@ impl LinkSessionResourceOffer {
         self.is_response
     }
 
+    /// Accept the Resource and receive its data in memory. An offer above
+    /// [`LinkSessionConfig::inbound_reassembly_limit`] is rejected with
+    /// [`LinkSessionResourceError::TooLarge`]; use [`Self::accept_to_file`].
     pub async fn accept(
         self,
+    ) -> Result<LinkSessionInboundResourceHandle, LinkSessionResourceError> {
+        self.accept_with(None).await
+    }
+
+    /// Accept the Resource into a file, whatever its size, as upstream
+    /// assembles every Resource under `Reticulum.resourcepath` (Resource.py).
+    /// The file is written in `dir`, or in the session's resource directory.
+    /// Each verified segment is appended before its proof is sent, so one
+    /// segment at a time is held in memory. `concluded` returns the path in
+    /// [`LinkSessionReceivedResource::file`] with empty `data`; a transfer
+    /// that fails, is cancelled or cannot be written leaves no file behind.
+    pub async fn accept_to_file(
+        self,
+        dir: Option<PathBuf>,
+    ) -> Result<LinkSessionInboundResourceHandle, LinkSessionResourceError> {
+        self.accept_with(Some(dir)).await
+    }
+
+    async fn accept_with(
+        self,
+        file_dir: Option<Option<PathBuf>>,
     ) -> Result<LinkSessionInboundResourceHandle, LinkSessionResourceError> {
         let (progress_tx, progress_rx) = watch::channel(0.0);
         let (conclusion_tx, conclusion_rx) = oneshot::channel();
@@ -371,6 +402,7 @@ impl LinkSessionResourceOffer {
             .send(LinkSessionCommand::Resource(
                 LinkSessionResourceCommand::AcceptInbound {
                     segment_hash: self.segment_hash,
+                    file_dir,
                     progress_tx,
                     conclusion_tx,
                     result_tx,
@@ -410,8 +442,8 @@ impl LinkSessionResourceOffer {
 }
 
 /// Lifecycle handle for an accepted inbound Resource. `concluded` returns the
-/// complete in-memory payload after assembly and local proof admission; the
-/// application still owns processing and persistence. Dropping this handle
+/// complete payload, in memory or as a file, after assembly and local proof
+/// admission; the application still owns processing and persistence. Dropping this handle
 /// does not cancel reception. `cancel` returns whether a live logical transfer
 /// was removed locally, not an acknowledgment from its sender. Progress is a
 /// coalescing estimate; only `concluded` establishes success.
@@ -626,6 +658,8 @@ enum LinkSessionResourceCommand {
     },
     AcceptInbound {
         segment_hash: [u8; 32],
+        /// `Some` assembles into a file, in the given or the default directory.
+        file_dir: Option<Option<PathBuf>>,
         progress_tx: watch::Sender<f64>,
         conclusion_tx:
             oneshot::Sender<Result<LinkSessionReceivedResource, LinkSessionResourceError>>,
@@ -765,6 +799,9 @@ struct SessionInboundLogical {
     reported_bytes: usize,
     reported_progress: f64,
     spool: Option<ResponseSpool>,
+    /// The file of a Resource accepted to a file. Dropping it unfinished
+    /// removes the partial file.
+    file: Option<ResourceSpool>,
     /// Payload bytes assembled so far.
     received_bytes: usize,
     /// RequestReceipt.max_response_size, enforced on received bytes too.
@@ -781,6 +818,8 @@ struct InboundResourceLifecycle {
     progress_tx: watch::Sender<f64>,
     conclusion_tx: oneshot::Sender<Result<LinkSessionReceivedResource, LinkSessionResourceError>>,
     spool: Option<ResponseSpool>,
+    /// Directory of a Resource accepted to a file.
+    file_dir: Option<PathBuf>,
     max_bytes: Option<usize>,
     segment_gap_timeout: Option<Duration>,
 }
@@ -1978,10 +2017,13 @@ async fn handle_resource_command(
         }
         LinkSessionResourceCommand::AcceptInbound {
             segment_hash,
+            file_dir,
             progress_tx,
             conclusion_tx,
             result_tx,
         } => {
+            let file_dir = file_dir
+                .map(|dir| dir.unwrap_or_else(|| spool_dir(resources.resource_dir.as_deref())));
             let result = accept_inbound_offer(
                 transport_tx,
                 attached_interface,
@@ -1993,6 +2035,7 @@ async fn handle_resource_command(
                     progress_tx,
                     conclusion_tx,
                     spool: None,
+                    file_dir,
                     max_bytes: None,
                     segment_gap_timeout: None,
                 },
@@ -2685,6 +2728,27 @@ async fn accept_inbound_offer(
     if advertisement.segment_index != 1 || resources.inbound_logicals.contains_key(&resource_id) {
         return Err(LinkSessionResourceError::OfferExpired);
     }
+    // Only a file can take a Resource above the in-memory limit.
+    if lifecycle.spool.is_none()
+        && lifecycle.file_dir.is_none()
+        && let Some(max) = resources.inbound_reassembly_limit
+        && advertisement.data_size > max
+    {
+        send_resource_action(
+            transport_tx,
+            attached_interface,
+            link,
+            TransferAction::SendCancel(CancelType::Rcl, segment_hash),
+        )
+        .await?;
+        resources
+            .rejected_inbound
+            .insert(resource_id, Instant::now());
+        return Err(LinkSessionResourceError::TooLarge {
+            size: advertisement.data_size as u64,
+            max,
+        });
+    }
 
     let mut transfer =
         inbound_transfer_from_advertisement(&advertisement, link, resources.last_inbound)?;
@@ -2707,9 +2771,13 @@ async fn accept_inbound_offer(
     let coordinator = (advertisement.total_segments > 1).then(|| {
         MultiSegmentInbound::new(advertisement.total_segments, advertisement.original_hash)
     });
-    let in_memory_limit = match lifecycle.spool {
-        Some(_) => None,
-        None => resources.inbound_reassembly_limit,
+    let file = lifecycle
+        .file_dir
+        .as_deref()
+        .map(|dir| ResourceSpool::new(dir, &resource_id));
+    let in_memory_limit = match (&lifecycle.spool, &file) {
+        (None, None) => resources.inbound_reassembly_limit,
+        _ => None,
     };
     let size_bound = advertisement
         .data_size
@@ -2729,6 +2797,7 @@ async fn accept_inbound_offer(
             reported_bytes: 0,
             reported_progress: 0.0,
             spool: lifecycle.spool,
+            file,
             received_bytes: 0,
             max_bytes: lifecycle.max_bytes,
             segment_gap_since: None,
@@ -2805,9 +2874,15 @@ fn conclude_inbound_resource(
     let Some(logical) = resources.inbound_logicals.remove(&resource_id) else {
         return;
     };
-    // A failed spool is removed by its writer's owner once the writer ends.
+    // A failed spool is removed by its writer's owner once the writer ends;
+    // a failed file is removed when `logical` drops.
     let succeeded = result.is_ok();
-    let _ = logical.conclusion_tx.send(result);
+    if let Err(Ok(received)) = logical.conclusion_tx.send(result)
+        && let Some(path) = received.file
+    {
+        // The handle is gone, so nobody else can remove the file.
+        let _ = std::fs::remove_file(path);
+    }
     let _ = event_tx.try_send(LinkSessionEvent::ResourceConcluded {
         resource_id,
         direction: LinkSessionResourceDirection::Inbound,
@@ -3101,7 +3176,7 @@ async fn process_inbound_resource_advertisement(
                 advertisement
                     .flags
                     .has_metadata
-                    .then(|| default_spool_dir(resources.resource_dir.as_deref()))
+                    .then(|| spool_dir(resources.resource_dir.as_deref()))
             })
             .and_then(|dir| open_response_spool(&dir, &resource_id));
         let (spool, writer) = match spool {
@@ -3160,6 +3235,7 @@ async fn process_inbound_resource_advertisement(
                 progress_tx,
                 conclusion_tx,
                 spool,
+                file_dir: None,
                 max_bytes,
                 segment_gap_timeout,
             },
@@ -3181,12 +3257,11 @@ async fn process_inbound_resource_advertisement(
         return matches!(result, Err(LinkSessionResourceError::TransportUnavailable));
     }
 
+    // An offer above the in-memory limit still reaches the application,
+    // which can take it as a file.
     if advertisement.segment_index != 1
         || has_pending_logical
         || resources.pending_inbound.len() >= MAX_PENDING_RESOURCE_OFFERS
-        || resources
-            .inbound_reassembly_limit
-            .is_some_and(|limit| advertisement.data_size > limit)
     {
         return matches!(
             send_resource_action(
@@ -3390,6 +3465,32 @@ async fn complete_inbound_segment(
         fail_inbound_logical(link, resources, event_tx, resource_id, error);
         return transport_failed;
     }
+    // Resource.assemble writes the segment before Resource.prove: a failed
+    // write sends neither a proof nor a cancel, and the Link stays up.
+    let segment_len = data.len();
+    let data = match resources
+        .inbound_logicals
+        .get_mut(&resource_id)
+        .and_then(|logical| logical.file.as_mut())
+    {
+        Some(file) => {
+            if let Err(error) = file.append(&data) {
+                tracing::error!(%error, "could not write received Resource data");
+                fail_inbound_logical(
+                    link,
+                    resources,
+                    event_tx,
+                    resource_id,
+                    LinkSessionResourceError::Failed(format!(
+                        "could not write Resource data: {error}"
+                    )),
+                );
+                return false;
+            }
+            Vec::new()
+        }
+        None => data,
+    };
     if let Err(error) = send_resource_action(
         transport_tx,
         attached_interface,
@@ -3416,7 +3517,7 @@ async fn complete_inbound_segment(
         logical.current_segment = None;
         logical.received_bytes = logical
             .received_bytes
-            .saturating_add(data.len())
+            .saturating_add(segment_len)
             .saturating_add(metadata_size);
         if let Some(max) = logical.max_bytes
             && logical.received_bytes > max
@@ -3480,10 +3581,13 @@ async fn complete_inbound_segment(
     let Some(data) = complete_data else {
         return false;
     };
-    let Some(logical) = resources.inbound_logicals.get(&resource_id) else {
+    let Some(logical) = resources.inbound_logicals.get_mut(&resource_id) else {
         return false;
     };
-    let file = logical.spool.as_ref().map(|spool| spool.path.clone());
+    let file = match logical.file.take() {
+        Some(file) => Some(file.finish().0),
+        None => logical.spool.as_ref().map(|spool| spool.path.clone()),
+    };
     let received = LinkSessionReceivedResource {
         link_id: link.link_id,
         resource_id,
@@ -4237,15 +4341,6 @@ fn deliver_session_response(
 }
 
 type SpoolWriter = oneshot::Receiver<std::io::Result<()>>;
-
-/// Resource.storagepath's directory: the runtime's `storage/resources`,
-/// or the system temporary directory without a runtime.
-fn default_spool_dir(resource_dir: Option<&std::path::Path>) -> PathBuf {
-    resource_dir
-        .filter(|dir| dir.is_dir())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir)
-}
 
 fn open_response_spool(
     dir: &std::path::Path,
@@ -5063,11 +5158,13 @@ mod tests {
 
     /// An ordinary inbound Resource of `data` advertising `advertised` bytes,
     /// offered to a session with the given reassembly limit and accepted when
-    /// offered. Returns the control packet contexts sent and the conclusion.
+    /// offered, into a file when `file_dir` is given. Returns the control
+    /// packet contexts sent and the conclusion, or why it was not accepted.
     async fn drive_session_inbound(
         data: Vec<u8>,
         advertised: usize,
         limit: Option<usize>,
+        file_dir: Option<PathBuf>,
     ) -> (
         Vec<rns_wire::context::PacketContext>,
         Option<Result<LinkSessionReceivedResource, LinkSessionResourceError>>,
@@ -5124,7 +5221,7 @@ mod tests {
         if offer_rx.try_recv().is_ok() {
             let (progress_tx, _progress_rx) = watch::channel(0.0);
             let (conclusion_tx, mut conclusion_rx) = oneshot::channel();
-            accept_inbound_offer(
+            let accepted = accept_inbound_offer(
                 &transport_tx,
                 1,
                 &mut initiator,
@@ -5135,24 +5232,29 @@ mod tests {
                     progress_tx,
                     conclusion_tx,
                     spool: None,
+                    file_dir,
                     max_bytes: None,
                     segment_gap_timeout: None,
                 },
             )
-            .await
-            .unwrap();
-            for part in sender.resource.parts.clone() {
-                handle_inbound_resource_part(
-                    &transport_tx,
-                    1,
-                    &mut initiator,
-                    &mut resources,
-                    &event_tx,
-                    &part,
-                )
-                .await;
+            .await;
+            match accepted {
+                Ok(()) => {
+                    for part in sender.resource.parts.clone() {
+                        handle_inbound_resource_part(
+                            &transport_tx,
+                            1,
+                            &mut initiator,
+                            &mut resources,
+                            &event_tx,
+                            &part,
+                        )
+                        .await;
+                    }
+                    conclusion = conclusion_rx.try_recv().ok();
+                }
+                Err(error) => conclusion = Some(Err(error)),
             }
-            conclusion = conclusion_rx.try_recv().ok();
         }
         drop(transport_tx);
         let mut contexts = Vec::new();
@@ -5189,24 +5291,134 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_resource_above_session_reassembly_limit_is_refused() {
+    async fn inbound_resource_above_session_reassembly_limit_needs_a_file() {
         let data = vec![0x5C; 4000];
+        let limit = Some(data.len() - 1);
         let (contexts, conclusion) =
-            drive_session_inbound(data.clone(), data.len(), Some(data.len() - 1)).await;
+            drive_session_inbound(data.clone(), data.len(), limit, None).await;
         assert_eq!(
             contexts,
             vec![rns_wire::context::PacketContext::ResourceRcl]
         );
-        assert!(conclusion.is_none(), "a refused Resource is never offered");
+        assert!(
+            matches!(
+                conclusion,
+                Some(Err(LinkSessionResourceError::TooLarge {
+                    size: 4000,
+                    max: 3999
+                }))
+            ),
+            "accepting into memory above the limit is refused: {conclusion:?}"
+        );
 
-        let (_, conclusion) = drive_session_inbound(data.clone(), data.len(), None).await;
+        let (_, conclusion) = drive_session_inbound(data.clone(), data.len(), None, None).await;
         assert_eq!(conclusion.unwrap().unwrap().data, data);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (contexts, conclusion) =
+            drive_session_inbound(data.clone(), data.len(), limit, Some(dir.path().into())).await;
+        assert_eq!(
+            contexts.last(),
+            Some(&rns_wire::context::PacketContext::ResourcePrf)
+        );
+        let received = conclusion.unwrap().unwrap();
+        assert!(received.data.is_empty());
+        let path = received
+            .file
+            .expect("the Resource is handed over as a file");
+        assert!(path.starts_with(dir.path()));
+        assert!(std::fs::read(&path).unwrap() == data);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn inbound_resource_accepted_to_a_file_leaves_nothing_behind_on_failure() {
+        let data = vec![0x5E; 4000];
+
+        // More data than advertised: cancelled, not proved.
+        let dir = tempfile::tempdir().unwrap();
+        let (contexts, conclusion) =
+            drive_session_inbound(data.clone(), 3999, Some(0), Some(dir.path().into())).await;
+        assert!(matches!(
+            conclusion,
+            Some(Err(LinkSessionResourceError::Failed(_)))
+        ));
+        assert!(!contexts.contains(&rns_wire::context::PacketContext::ResourcePrf));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // A directory that cannot be written: Resource.assemble marks the
+        // Resource corrupt, which sends neither a proof nor a cancel.
+        let missing = dir.path().join("absent");
+        let (contexts, conclusion) =
+            drive_session_inbound(data.clone(), data.len(), Some(0), Some(missing)).await;
+        assert!(matches!(
+            conclusion,
+            Some(Err(LinkSessionResourceError::Failed(_)))
+        ));
+        assert!(
+            contexts
+                .iter()
+                .all(|context| *context == rns_wire::context::PacketContext::ResourceReq),
+            "only part requests are sent: {contexts:?}"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // The handle is gone before the transfer ends: nobody can take the file.
+        let (progress_tx, _progress_rx) = watch::channel(0.0);
+        let (conclusion_tx, conclusion_rx) = oneshot::channel();
+        drop(conclusion_rx);
+        let mut file = ResourceSpool::new(dir.path(), &[9; 32]);
+        file.append(&data).unwrap();
+        let path = file.finish().0;
+        let mut resources = SessionResources::default();
+        resources.inbound_logicals.insert(
+            [9; 32],
+            SessionInboundLogical {
+                data_size: data.len(),
+                total_segments: 1,
+                request_id: None,
+                is_request: false,
+                is_response: false,
+                progress_tx,
+                conclusion_tx,
+                coordinator: None,
+                current_segment: None,
+                reported_bytes: 0,
+                reported_progress: 0.0,
+                spool: None,
+                file: None,
+                received_bytes: 0,
+                max_bytes: None,
+                segment_gap_since: None,
+                segment_gap_timeout: None,
+                size_bound: data.len(),
+            },
+        );
+        let (event_tx, _event_rx) = mpsc::channel(4);
+        conclude_inbound_resource(
+            &mut resources,
+            &event_tx,
+            [9; 32],
+            Ok(LinkSessionReceivedResource {
+                link_id: [0; 16],
+                resource_id: [9; 32],
+                data: Vec::new(),
+                file: Some(path.clone()),
+                metadata: None,
+                total_segments: 1,
+                request_id: None,
+                is_request: false,
+                is_response: false,
+            }),
+        );
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
     async fn inbound_resource_sending_more_than_advertised_is_cut_off() {
         let data = vec![0x5D; 4000];
-        let (contexts, conclusion) = drive_session_inbound(data, 3999, None).await;
+        let (contexts, conclusion) = drive_session_inbound(data, 3999, None, None).await;
         assert!(matches!(
             conclusion,
             Some(Err(LinkSessionResourceError::Failed(_)))

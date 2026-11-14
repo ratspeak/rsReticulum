@@ -24,7 +24,7 @@ use crate::link_manager::{
     DestinationAnnounceOptions, DestinationControlError, DestinationRequest, LinkChannelMessage,
     LinkManager, LinkManagerCommand, LinkPacketProof, LinkPacketSendReceipt,
     LinkPayloadSendReceipt, LinkResourceEvent, LinkResourceProof, LinkResourceSendReceipt,
-    LinkSendError, RequestOutcome, ResourceCompletion,
+    LinkSendError, RequestOutcome, ResourceCompletion, ResourceFileCompletion,
 };
 
 const DEFAULT_EVENT_CAPACITY: usize = 128;
@@ -52,8 +52,10 @@ pub struct DestinationRuntimeOptions {
     pub stamp_value: Option<f64>,
     /// Announced link-request cost (Python `Destination.set_link_cost`).
     pub link_cost: Option<f64>,
-    /// Largest advertised total size of an inbound Resource, which the
-    /// destination reassembles in memory; `None` accepts any size. See
+    /// Largest advertised total size of an inbound Resource the destination
+    /// reassembles in memory; `None` reassembles any size. A larger Resource
+    /// is refused unless [`DestinationHandle::receive_resource_files`] takes
+    /// it as a file. See
     /// [`rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT`].
     pub inbound_reassembly_limit: Option<usize>,
     /// Exact endpoint dispatch from the same runtime
@@ -401,6 +403,41 @@ impl DestinationHandle {
         result_rx
             .await
             .map_err(|_| DestinationRuntimeError::ManagerUnavailable)
+    }
+
+    /// Receive ordinary inbound Resources that advertise `min_size` bytes or
+    /// more as files in `dir`, whatever their size; they are not bound by
+    /// [`DestinationRuntimeOptions::inbound_reassembly_limit`]. Smaller ones
+    /// still arrive on [`DestinationEvents::resource_completions`]. Use the
+    /// runtime's `storage/resources` directory (`StoragePaths::resource_dir`),
+    /// where upstream assembles Resources, unless the application has its own.
+    /// See
+    /// [`LinkManager::set_resource_file_channel`](crate::link_manager::LinkManager::set_resource_file_channel).
+    /// Drain the receiver: each file belongs to whoever receives it.
+    pub async fn receive_resource_files(
+        &self,
+        dir: impl Into<PathBuf>,
+        min_size: usize,
+        capacity: usize,
+    ) -> Result<mpsc::Receiver<ResourceFileCompletion>, DestinationRuntimeError> {
+        if capacity == 0 {
+            return Err(DestinationRuntimeError::InvalidEventCapacity);
+        }
+        let (files_tx, files_rx) = mpsc::channel(capacity);
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(LinkManagerCommand::SetResourceFileChannel {
+                dir: dir.into(),
+                min_size,
+                files_tx,
+                result_tx: Some(result_tx),
+            })
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)?;
+        result_rx
+            .await
+            .map_err(|_| DestinationRuntimeError::ManagerUnavailable)?;
+        Ok(files_rx)
     }
 
     pub async fn deregister_request_handler(

@@ -42,22 +42,48 @@ async fn server(args: ExampleArgs) -> ExampleResult {
         .await?;
     println!("The first completed transfer will be written to {output_path}");
 
-    let completed = tokio::select! {
-        _ = runtime.shutdown.wait() => None,
-        completed = destination.events.resource_completions.recv() => completed,
-    };
-    if let Some(completed) = completed {
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output_path)?;
-        output.write_all(&completed.data)?;
-        output.sync_all()?;
-        println!(
-            "Wrote {} bytes to {} without replacing an existing file",
-            completed.data.len(),
-            output_path,
-        );
+    // A Resource of 1 MiB or more arrives as a file of any size, assembled
+    // where Reticulum keeps its Resources; a smaller one arrives as bytes.
+    let resource_dir =
+        rns_runtime::platform::StoragePaths::from_config_dir(&runtime.handle.config_dir)
+            .resource_dir;
+    let mut files = destination
+        .handle
+        .receive_resource_files(resource_dir, 1 << 20, 4)
+        .await?;
+
+    tokio::select! {
+        _ = runtime.shutdown.wait() => {}
+        Some(completed) = destination.events.resource_completions.recv() => {
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output_path)?;
+            output.write_all(&completed.data)?;
+            output.sync_all()?;
+            println!(
+                "Wrote {} bytes to {} without replacing an existing file",
+                completed.data.len(),
+                output_path,
+            );
+        }
+        Some(completed) = files.recv() => {
+            // The received file is ours: copy it into place, then remove it.
+            let copied = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output_path)
+                .and_then(|mut output| {
+                    std::io::copy(&mut File::open(&completed.path)?, &mut output)?;
+                    output.sync_all()
+                });
+            std::fs::remove_file(&completed.path)?;
+            copied?;
+            println!(
+                "Wrote {} bytes to {} without replacing an existing file",
+                completed.size, output_path,
+            );
+        }
     }
 
     destination.close().await?;

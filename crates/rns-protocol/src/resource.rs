@@ -865,10 +865,9 @@ pub enum ResourceError {
 pub const MAX_RESOURCE_SIZE: usize = 134_217_727;
 
 /// Default bound on the advertised total size of an inbound Resource that is
-/// reassembled in memory (128 MiB - 1). Local difference from upstream, which
-/// assembles every inbound Resource to storage and has no such bound
-/// (Resource.py). Streaming inbound reassembly to the
-/// consumer would remove the need for it.
+/// reassembled in memory (128 MiB - 1). Upstream assembles every inbound
+/// Resource into a file and has no such bound (Resource.py); a receiver that
+/// takes larger Resources as files is not bound by it either.
 pub const DEFAULT_INBOUND_REASSEMBLY_LIMIT: usize = MAX_RESOURCE_SIZE;
 
 /// Former split-resource segment cap. The Resource protocol has no segment

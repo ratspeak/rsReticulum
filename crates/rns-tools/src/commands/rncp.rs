@@ -42,8 +42,8 @@ use rns_runtime::platform::StoragePaths;
 use rns_runtime::reticulum::ReticulumHandle;
 use rns_runtime::rncp::{
     DEFAULT_RNCP_APP_NAME, RncpError, RncpEvent, RncpFetchRequest, RncpListenerConfig,
-    RncpProgress, RncpSendRequest, default_rncp_app_name, rncp_fetch_file, rncp_send_file,
-    spawn_rncp_listener,
+    RncpProgress, RncpSendRequest, default_rncp_app_name, rncp_fetch_file_with_resource_dir,
+    rncp_send_file, spawn_rncp_listener_with_resource_dir,
 };
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
@@ -625,17 +625,20 @@ async fn run_fetch(args: Args) -> ! {
         })
     };
 
-    let result = rncp_fetch_file(RncpFetchRequest {
-        transport_tx: handle.transport_tx.clone(),
-        identity,
-        dest_hash,
-        remote_path: path_arg,
-        save_dir: &save_dir,
-        overwrite: args.overwrite,
-        path_timeout: link_wait,
-        progress_tx: Some(progress_tx),
-        shutdown: Some(interrupt.clone()),
-    })
+    let result = rncp_fetch_file_with_resource_dir(
+        RncpFetchRequest {
+            transport_tx: handle.transport_tx.clone(),
+            identity,
+            dest_hash,
+            remote_path: path_arg,
+            save_dir: &save_dir,
+            overwrite: args.overwrite,
+            path_timeout: link_wait,
+            progress_tx: Some(progress_tx),
+            shutdown: Some(interrupt.clone()),
+        },
+        &paths.resource_dir,
+    )
     .await;
 
     let _ = progress_task.await;
@@ -987,7 +990,14 @@ async fn run_listen(args: Args) -> ! {
         fetch_jail,
         fetch_auto_compress: !args.no_compress,
     };
-    let listener = match spawn_rncp_listener(handle.transport_tx.clone(), cfg, event_tx).await {
+    let listener = match spawn_rncp_listener_with_resource_dir(
+        handle.transport_tx.clone(),
+        cfg,
+        event_tx,
+        &paths.resource_dir,
+    )
+    .await
+    {
         Ok(h) => h,
         Err(e) => {
             tracing::error!("rncp-rs: failed to start listener: {e}");

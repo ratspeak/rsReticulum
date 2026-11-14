@@ -1143,7 +1143,8 @@ pub struct LinkConnectOptions {
     /// Retain RSSI, SNR and quality measurements reported by interfaces.
     pub track_phy_stats: bool,
     /// Largest advertised total size of an inbound Resource the session
-    /// reassembles in memory; `None` accepts any size. See
+    /// reassembles in memory; `None` reassembles any size. A Resource
+    /// accepted to a file is not bound by it. See
     /// [`rns_protocol::resource::DEFAULT_INBOUND_REASSEMBLY_LIMIT`].
     pub inbound_reassembly_limit: Option<usize>,
 }
@@ -11031,7 +11032,9 @@ fn clean_cache_dir_at(cache_dir: &Path, ttl: std::time::Duration, now: std::time
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             // Python matches names of full-hash hex length, (HASHLENGTH//8)*2.
-            if file_name.as_encoded_bytes().len() != 64 {
+            // A Resource spool a crash left behind is cleaned the same way.
+            let name = file_name.as_encoded_bytes();
+            if name.len() != 64 && !crate::resource_spool::is_spool_name(name) {
                 continue;
             }
             if let Ok(metadata) = entry.metadata()
@@ -18872,6 +18875,8 @@ port = 37428
         let packet_path = cache_dir.join(hash_name);
         let resource_path = resource_dir.join(hash_name);
         let unrelated_path = resource_dir.join("unrelated");
+        let spool_path = resource_dir.join(format!("{hash_name}-0123456789abcdef"));
+        fs::write(&spool_path, b"spool").unwrap();
         fs::write(&packet_path, b"packet").unwrap();
         fs::write(&resource_path, b"resource").unwrap();
         fs::write(&unrelated_path, b"keep").unwrap();
@@ -18889,6 +18894,10 @@ port = 37428
             after_resource_ttl,
         );
         assert!(!resource_path.exists(), "Resources expire after one day");
+        assert!(
+            !spool_path.exists(),
+            "an abandoned Resource spool expires after one day"
+        );
         assert!(
             packet_path.exists(),
             "packet cache entries live for seven days"

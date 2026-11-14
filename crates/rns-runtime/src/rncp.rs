@@ -25,8 +25,11 @@ use rns_transport::messages::{
 use tokio::sync::oneshot;
 
 use crate::lifecycle::ShutdownSignal;
-use crate::link_manager::{DestinationRequest, LinkManager, RequestOutcome, ResourceCompletion};
+use crate::link_manager::{
+    DestinationRequest, LinkManager, RequestOutcome, ResourceFileCompletion,
+};
 use crate::resource_source::{PreparedResourceSource, ResourceOptions, ResourceSource};
+use crate::resource_spool::ResourceSpool;
 use rns_identity::destination::AllowPolicy;
 use rns_link::link::ResourceStrategy;
 
@@ -407,10 +410,26 @@ impl RncpListenerHandle {
 ///
 /// Keep the handle and read [`RncpListenerHandle::shutdown`] before embedding this
 /// listener in a longer-lived runtime.
+///
+/// Received files are assembled in the system temporary directory; use
+/// [`spawn_rncp_listener_with_resource_dir`] to name the directory.
 pub async fn spawn_rncp_listener(
     transport_tx: mpsc::Sender<TransportMessage>,
     cfg: RncpListenerConfig,
     events_tx: mpsc::Sender<RncpEvent>,
+) -> Result<RncpListenerHandle, RncpError> {
+    spawn_rncp_listener_with_resource_dir(transport_tx, cfg, events_tx, &std::env::temp_dir()).await
+}
+
+/// [`spawn_rncp_listener`], assembling each received file in `resource_dir`
+/// before it is moved to the save directory, as rncp moves the file Reticulum
+/// assembled under `Reticulum.resourcepath` (rncp.py). Pass the runtime's
+/// `storage/resources` directory. A received file has no size limit.
+pub async fn spawn_rncp_listener_with_resource_dir(
+    transport_tx: mpsc::Sender<TransportMessage>,
+    cfg: RncpListenerConfig,
+    events_tx: mpsc::Sender<RncpEvent>,
+    resource_dir: &Path,
 ) -> Result<RncpListenerHandle, RncpError> {
     let signing_key = cfg
         .identity
@@ -443,8 +462,11 @@ pub async fn spawn_rncp_listener(
         Some(signing_key),
     );
 
-    let (completion_tx, mut completion_rx) = mpsc::channel::<ResourceCompletion>(64);
-    link_mgr.set_resource_completion_channel(completion_tx);
+    // Every received file is assembled on disk, whatever its size; a fetch
+    // request sent as a Resource is unpacked in memory, as upstream does.
+    let (file_tx, mut file_rx) = mpsc::channel::<ResourceFileCompletion>(64);
+    link_mgr.set_resource_file_channel(resource_dir, 0, file_tx);
+    link_mgr.set_inbound_reassembly_limit(None);
 
     let allowed_set: Arc<std::collections::HashSet<[u8; 16]>> =
         Arc::new(cfg.allowed.iter().copied().collect());
@@ -454,8 +476,6 @@ pub async fn spawn_rncp_listener(
     let (identified_tx, mut identified_rx) = mpsc::channel::<([u8; 16], [u8; 16])>(64);
     link_mgr.set_link_identified_channel(identified_tx);
     link_mgr.set_resource_strategy(ResourceStrategy::AcceptApp);
-    // Received files are handed to storage, as upstream rncp moves its file.
-    link_mgr.set_inbound_reassembly_limit(None);
     let link_identities = link_mgr.link_identities_handle();
     let push_allowed = Arc::clone(&allowed_set);
     link_mgr.set_resource_accept_handler(move |link_id, _adv| {
@@ -530,9 +550,10 @@ pub async fn spawn_rncp_listener(
                             .await;
                     }
                 }
-                completion = completion_rx.recv() => {
+                completion = file_rx.recv() => {
                     let Some(evt) = completion else { break };
                     if denied_links.contains(&evt.link_id) {
+                        let _ = std::fs::remove_file(&evt.path);
                         continue;
                     }
 
@@ -541,17 +562,18 @@ pub async fn spawn_rncp_listener(
                             link_id = hex::encode(evt.link_id),
                             "Invalid data received, ignoring resource"
                         );
+                        let _ = std::fs::remove_file(&evt.path);
                         continue;
                     };
 
-                    match save_payload(&save_dir, &file_name, &evt.data, overwrite).await {
+                    match save_received_file(&save_dir, &file_name, evt.path, overwrite).await {
                         Ok(path) => {
                             let _ = events_tx_cb
                                 .send(RncpEvent::Completed {
                                     link_id: evt.link_id,
                                     file_name,
                                     saved_path: path,
-                                    bytes: evt.data.len(),
+                                    bytes: usize::try_from(evt.size).unwrap_or(usize::MAX),
                                 })
                                 .await;
                         }
@@ -656,21 +678,36 @@ fn extract_filename(metadata: Option<&[u8]>) -> Option<String> {
     None
 }
 
-async fn save_payload(
+/// Move a received file from its spool to `save_dir`, as rncp moves the file
+/// Reticulum assembled (rncp.py). The spool is removed on every outcome.
+async fn save_received_file(
     save_dir: &Path,
     file_name: &str,
-    data: &[u8],
+    spooled: PathBuf,
     overwrite: bool,
 ) -> Result<PathBuf, String> {
+    let save_dir = save_dir.to_path_buf();
+    let file_name = file_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let saved = save_path_for(&save_dir, &file_name, overwrite)
+            .and_then(|path| move_into_place(&spooled, &path).map(|()| path));
+        if saved.is_err() {
+            let _ = std::fs::remove_file(&spooled);
+        }
+        saved
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("save task failed: {error}")))
+}
+
+fn save_path_for(save_dir: &Path, file_name: &str, overwrite: bool) -> Result<PathBuf, String> {
     // rncp.py: the basename must name an entry directly in save_dir.
     let basename = basename(file_name).to_string();
     if basename.is_empty() || basename == "." || basename == ".." {
         return Err(format!("invalid save path for {file_name:?}"));
     }
 
-    tokio::fs::create_dir_all(save_dir)
-        .await
-        .map_err(|e| format!("create save_dir: {e}"))?;
+    std::fs::create_dir_all(save_dir).map_err(|e| format!("create save_dir: {e}"))?;
     let mut path = save_dir.join(&basename);
     if !overwrite && path.exists() {
         let mut i = 1;
@@ -683,10 +720,35 @@ async fn save_payload(
             i += 1;
         }
     }
-    tokio::fs::write(&path, data)
-        .await
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
+}
+
+fn move_into_place(spooled: &Path, path: &Path) -> Result<(), String> {
+    let describe = |e: std::io::Error| format!("write {}: {e}", path.display());
+    // The spool is private; the saved file takes the permissions a file
+    // written in place would have.
+    let permissions = std::fs::File::create(path)
+        .and_then(|placeholder| placeholder.metadata())
+        .map_err(describe)?
+        .permissions();
+    if std::fs::rename(spooled, path).is_ok() {
+        return std::fs::set_permissions(path, permissions).map_err(describe);
+    }
+    // Another filesystem: copy, as shutil.move does.
+    let copied = std::fs::File::open(spooled).and_then(|mut from| {
+        let mut to = std::fs::File::create(path)?;
+        std::io::copy(&mut from, &mut to)
+    });
+    match copied {
+        Ok(_) => {
+            let _ = std::fs::remove_file(spooled);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(path);
+            Err(describe(error))
+        }
+    }
 }
 
 fn build_link_close(link: &mut Link) -> Option<Bytes> {
@@ -1486,10 +1548,23 @@ pub struct RncpFetchRequest<'a> {
 /// ([`RncpError::RemoteError`]) or 240 ([`RncpError::Denied`]). No answer
 /// within the request timeout gives [`RncpError::RequestFailed`].
 ///
-/// Success means the assembled file was written under `save_dir`; the Resource
-/// proof is sent before this local write. Filename collision handling follows
-/// [`RncpListenerConfig`].
+/// Success means the assembled file was moved under `save_dir`; each Resource
+/// proof is sent after its segment is written to the spool and before this
+/// move. Filename collision handling follows [`RncpListenerConfig`]. The file
+/// is assembled in the system temporary directory; use
+/// [`rncp_fetch_file_with_resource_dir`] to name the directory.
 pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchOutcome, RncpError> {
+    rncp_fetch_file_with_resource_dir(request, &std::env::temp_dir()).await
+}
+
+/// [`rncp_fetch_file`], assembling the fetched file in `resource_dir` before
+/// it is moved to the save directory, as rncp moves the file Reticulum
+/// assembled under `Reticulum.resourcepath` (rncp.py). Pass the runtime's
+/// `storage/resources` directory. A fetched file has no size limit.
+pub async fn rncp_fetch_file_with_resource_dir(
+    request: RncpFetchRequest<'_>,
+    resource_dir: &Path,
+) -> Result<RncpFetchOutcome, RncpError> {
     use rns_protocol::resource::{InboundTransfer, MultiSegmentInbound, TransferAction};
 
     let RncpFetchRequest {
@@ -1558,11 +1633,14 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
         std::collections::HashMap::new();
     let mut split_resources: std::collections::HashMap<[u8; 32], MultiSegmentInbound> =
         std::collections::HashMap::new();
+    // The fetched file, appended one verified segment at a time. Dropped
+    // unfinished, it removes the partial file.
+    let mut spool: Option<ResourceSpool> = None;
     let mut segment_routes: std::collections::HashMap<[u8; 32], ([u8; 32], usize)> =
         std::collections::HashMap::new();
 
     let fetch_loop = async {
-        let result: Result<(String, Vec<u8>), RncpError> = loop {
+        let result: Result<(String, ResourceSpool), RncpError> = loop {
             if !ack_seen && Instant::now() >= request_deadline {
                 break Err(RncpError::RequestFailed);
             }
@@ -1688,7 +1766,6 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                         }
                         let coord = split_resources.entry(adv.original_hash).or_insert_with(|| {
                             MultiSegmentInbound::new(adv.total_segments, adv.original_hash)
-                                .with_size_bound(adv.data_size)
                         });
                         if coord.total_segments != adv.total_segments {
                             break Err(RncpError::ResourceFailed(
@@ -1781,11 +1858,14 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                     }
 
                     if let Some(rh) = completed_rh {
-                        let (payload, proof, metadata) = match transfers.get_mut(&rh) {
+                        let (payload, proof, metadata, advertised) = match transfers.get_mut(&rh) {
                             Some(t) => match t.complete(Some(&decrypt_fn)) {
-                                Ok((payload, proof)) => {
-                                    (payload, proof, t.resource.metadata.clone())
-                                }
+                                Ok((payload, proof)) => (
+                                    payload,
+                                    proof,
+                                    t.resource.metadata.clone(),
+                                    t.resource.data_size as u64,
+                                ),
                                 Err(e) => {
                                     break Err(RncpError::ResourceFailed(format!(
                                         "resource assemble/proof failed: {e:?}; parts={}/{} map_hashes={} total_size={} data_size={} flags={:?}",
@@ -1804,6 +1884,21 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                                 ));
                             }
                         };
+                        // Resource.assemble writes the segment before
+                        // Resource.prove: no proof for an unwritten segment.
+                        let logical_id = segment_routes.get(&rh).map_or(rh, |route| route.0);
+                        let file = spool
+                            .get_or_insert_with(|| ResourceSpool::new(resource_dir, &logical_id));
+                        if file.len().saturating_add(payload.len() as u64) > advertised {
+                            break Err(RncpError::ResourceFailed(
+                                "received more data than advertised".into(),
+                            ));
+                        }
+                        if let Err(error) = file.append(&payload) {
+                            break Err(RncpError::Io(format!(
+                                "could not write received data: {error}"
+                            )));
+                        }
                         let prf_raw = build_resource_proof_packet(link_id, &proof);
                         // The received file is not locally concluded until its
                         // Resource proof has been admitted on the exact Link
@@ -1823,7 +1918,7 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                             if let Some(meta) = metadata {
                                 coord.set_metadata(meta);
                             }
-                            if let Err(e) = coord.set_segment_data(segment_index, payload) {
+                            if let Err(e) = coord.set_segment_data(segment_index, Vec::new()) {
                                 break Err(RncpError::ResourceFailed(format!(
                                     "split segment rejected: {e:?}"
                                 )));
@@ -1838,14 +1933,6 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                                 continue;
                             }
 
-                            let payload = match coord.reassemble() {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    break Err(RncpError::ResourceFailed(format!(
-                                        "split reassemble: {e:?}"
-                                    )));
-                                }
-                            };
                             let meta_bytes = coord.metadata.clone();
                             let Some(file_name) = extract_filename(meta_bytes.as_deref()) else {
                                 break Err(RncpError::ResourceFailed(
@@ -1859,7 +1946,9 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                                     phy_bytes: last_phy_bytes,
                                 });
                             }
-                            break Ok((file_name, payload));
+                            break spool.take().map(|file| (file_name, file)).ok_or_else(|| {
+                                RncpError::ResourceFailed("no data received".into())
+                            });
                         }
 
                         let Some(file_name) = extract_filename(metadata.as_deref()) else {
@@ -1871,7 +1960,10 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                                 phy_bytes: last_phy_bytes,
                             });
                         }
-                        break Ok((file_name, payload));
+                        break spool
+                            .take()
+                            .map(|file| (file_name, file))
+                            .ok_or_else(|| RncpError::ResourceFailed("no data received".into()));
                     }
                 }
                 rns_wire::context::PacketContext::ResourceHmu => {
@@ -1922,9 +2014,10 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
     };
     close_link(rl, &transport_tx, &result).await;
 
-    let (file_name, payload) = result?;
-    let bytes = payload.len();
-    let saved_path = save_payload(save_dir, &file_name, &payload, overwrite)
+    let (file_name, file) = result?;
+    let (spooled, bytes) = file.finish();
+    let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+    let saved_path = save_received_file(save_dir, &file_name, spooled, overwrite)
         .await
         .map_err(RncpError::Io)?;
 
