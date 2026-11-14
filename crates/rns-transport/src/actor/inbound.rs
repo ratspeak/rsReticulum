@@ -693,6 +693,15 @@ impl TransportActor {
                 e.stamp = validated.stamp;
                 e.stamp_value = announce_stamp_value;
                 e.lr_cost = validated.lr_cost;
+                // Facts describe the latest packet; a replay keeps known hops.
+                let is_path_response =
+                    header.context == rns_wire::context::PacketContext::PathResponse;
+                if !e.facts_known || !is_path_response {
+                    e.hops = header.hops;
+                }
+                e.is_path_response = is_path_response;
+                e.name_hash = announce_name_hash;
+                e.facts_known = true;
                 self.kd.pending.mark_dirty(header.destination_hash);
                 self.remember_received_ratchet(header.destination_hash, announce_ratchet);
             }

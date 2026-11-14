@@ -109,6 +109,50 @@ fn a_replay_refreshes_the_remembered_identity() {
     );
 }
 
+/// An entry restored without its facts (imported from an older store) is
+/// completed by the peer's next announce, so consumers see it as heard.
+#[test]
+fn a_fresh_announce_completes_a_restored_entry() {
+    let mut actor = hub();
+    let identity = rns_identity::identity::Identity::new();
+    let (first, dest) =
+        make_announce_for_context(&identity, "identity.restored", 3, PacketContext::None);
+    inbound(&mut actor, &first);
+    let (hops, name_hash) = (
+        actor.recent_announces[&dest].hops,
+        actor.recent_announces[&dest].name_hash,
+    );
+    let restored = actor.recent_announces.get_mut(&dest).unwrap();
+    (restored.facts_known, restored.hops, restored.name_hash) = (false, 0, [0; 10]);
+
+    let (fresh, _) =
+        make_announce_for_context(&identity, "identity.restored", 3, PacketContext::None);
+    inbound(&mut actor, &fresh);
+
+    let entry = &actor.recent_announces[&dest];
+    assert!(entry.facts_known && !entry.is_path_response);
+    assert_eq!((entry.hops, entry.name_hash), (hops, name_hash));
+}
+
+/// A destination first learned from a hub's replay is no longer a path
+/// response once the peer itself announces.
+#[test]
+fn a_fresh_announce_after_a_replay_is_not_a_path_response() {
+    let mut actor = hub();
+    let identity = rns_identity::identity::Identity::new();
+    let (first, dest) =
+        make_announce_for_context(&identity, "identity.first-replay", 2, PacketContext::None);
+    inbound(&mut actor, &as_path_response(&first));
+    assert!(actor.recent_announces[&dest].is_path_response);
+
+    let (fresh, _) =
+        make_announce_for_context(&identity, "identity.first-replay", 2, PacketContext::None);
+    inbound(&mut actor, &fresh);
+
+    let entry = &actor.recent_announces[&dest];
+    assert!(entry.facts_known && !entry.is_path_response);
+}
+
 /// A paused handler is skipped (Transport.py) while the announce
 /// still updates the path table; resuming takes effect for the next announce.
 #[test]
