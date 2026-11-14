@@ -93,6 +93,9 @@ impl TransportActor {
                             .get(&iface_id)
                             .copied()
                             .unwrap_or_default();
+                        // Python publishes IFAC only for an interface that has it.
+                        let ifac_signature = entry.ifac_signature();
+                        let has_ifac = entry.ifac_key.is_some();
                         Some(InterfaceStatRpcEntry {
                             id: iface_id,
                             name: entry.name.clone(),
@@ -133,9 +136,9 @@ impl TransportActor {
                             announce_rate_grace: entry.announce_rate_grace,
                             announce_rate_penalty: entry.announce_rate_penalty,
                             announce_cap: entry.announce_cap,
-                            ifac_size: Some(entry.ifac_size),
-                            ifac_signature: None,
-                            ifac_netname: None,
+                            ifac_size: has_ifac.then_some(entry.ifac_size),
+                            ifac_signature: ifac_signature.map(Vec::from),
+                            ifac_netname: entry.ifac_netname.clone().filter(|_| has_ifac),
                             tx_drops: entry.tx_drops.load(std::sync::atomic::Ordering::Relaxed),
                             tx_dropped_bytes: entry.tx_dropped_bytes,
                             announces_received: entry.ingress.announces_received(),
@@ -149,7 +152,7 @@ impl TransportActor {
                             announces_to_internal: entry.announces_to_internal,
                             parent_id: entry.parent_id,
                             parent_interface_name: None,
-                            autoconnect_source: None,
+                            autoconnect_source: entry.autoconnect_source.clone(),
                             identity: entry
                                 .inspection
                                 .as_ref()

@@ -12,19 +12,17 @@ use tokio::sync::mpsc;
 use rns_transport::messages::TransportMessage;
 
 use crate::lifecycle::ShutdownSignal;
-use crate::reticulum::InterfaceIfacStats;
 use crate::rpc::{self, RpcError, RpcRequest, RpcResponse};
 
 const MAX_REQUEST_SIZE: usize = 1_048_576;
 const MAX_CONTROL_CLIENTS: usize = 64;
 const CONTROL_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// What the control port answers from: the transport, plus the runtime's IFAC
-/// records and transport instance when a runtime serves it.
+/// What the control port answers from: the transport, plus the runtime's
+/// transport instance when a runtime serves it.
 #[derive(Clone)]
 pub(crate) struct RpcBackend {
     transport_tx: mpsc::Sender<TransportMessage>,
-    ifac: Option<InterfaceIfacStats>,
     transport: Option<TransportStatsSource>,
     inbound_queues: Option<Arc<rns_transport::inbound_queues::InboundQueues>>,
     lowest_interface_bitrate: Arc<Mutex<Option<u64>>>,
@@ -32,13 +30,9 @@ pub(crate) struct RpcBackend {
 }
 
 impl RpcBackend {
-    pub(crate) fn new(
-        transport_tx: mpsc::Sender<TransportMessage>,
-        ifac: Option<InterfaceIfacStats>,
-    ) -> Self {
+    pub(crate) fn new(transport_tx: mpsc::Sender<TransportMessage>) -> Self {
         Self {
             transport_tx,
-            ifac,
             transport: None,
             inbound_queues: None,
             lowest_interface_bitrate: Arc::default(),
@@ -108,33 +102,14 @@ impl TransportStatsSource {
     }
 }
 
-/// Transport stat entries as the control port and remote management report
-/// them: IFAC and the auto-connect source come from the runtime's records,
-/// and are absent without them.
-pub(crate) fn stat_entries(
-    mut entries: Vec<rns_transport::messages::InterfaceStatRpcEntry>,
-    ifac: Option<&InterfaceIfacStats>,
-) -> Vec<rns_transport::messages::InterfaceStatRpcEntry> {
-    for entry in &mut entries {
-        entry.autoconnect_source = ifac.and_then(|records| records.autoconnect_source(entry.id));
-        let ifac = ifac.map(|ifac| ifac.lookup(entry.id)).unwrap_or_default();
-        entry.ifac_signature = ifac.signature.map(Vec::from);
-        entry.ifac_size = ifac.size;
-        entry.ifac_netname = ifac.netname;
-    }
-    entries
-}
-
 /// Serve a TCP control endpoint on IPv4 loopback using a bare transport.
-/// IFAC fields in interface stats are absent because no runtime IFAC records
-/// are supplied; that does not establish whether an interface uses IFAC.
 pub async fn run_rpc_server(
     port: u16,
     rpc_key: Vec<u8>,
     transport_tx: mpsc::Sender<TransportMessage>,
     shutdown: ShutdownSignal,
 ) -> Result<(), RpcError> {
-    serve_rpc_port(port, rpc_key, RpcBackend::new(transport_tx, None), shutdown).await
+    serve_rpc_port(port, rpc_key, RpcBackend::new(transport_tx), shutdown).await
 }
 
 pub(crate) async fn serve_rpc_port(
@@ -149,10 +124,9 @@ pub(crate) async fn serve_rpc_port(
     run_rpc_server_with_listener(listener, rpc_key, backend, shutdown).await
 }
 
-/// Serve a Unix control endpoint using a bare transport, without runtime IFAC
-/// records in interface stats. A filesystem socket path is removed before
-/// binding; supply a path owned by this service. A leading NUL selects an
-/// abstract name, supported on Linux and Android.
+/// Serve a Unix control endpoint using a bare transport. A filesystem socket
+/// path is removed before binding; supply a path owned by this service. A
+/// leading NUL selects an abstract name, supported on Linux and Android.
 #[cfg(unix)]
 pub async fn run_unix_rpc_server(
     socket_path: &str,
@@ -163,7 +137,7 @@ pub async fn run_unix_rpc_server(
     serve_unix_rpc(
         socket_path,
         rpc_key,
-        RpcBackend::new(transport_tx, None),
+        RpcBackend::new(transport_tx),
         shutdown,
     )
     .await
@@ -197,7 +171,7 @@ pub async fn run_unix_rpc_server(
     serve_unix_rpc(
         socket_path,
         rpc_key,
-        RpcBackend::new(transport_tx, None),
+        RpcBackend::new(transport_tx),
         shutdown,
     )
     .await
@@ -413,7 +387,7 @@ async fn respond(request: RpcRequest, backend: &RpcBackend) -> Result<Vec<u8>, R
         }
         _ => {}
     }
-    match process_rpc_request(request, &backend.transport_tx, backend.ifac.as_ref()).await {
+    match process_rpc_request(request, &backend.transport_tx).await {
         RpcResponse::InterfaceStats(entries) => {
             let traffic = traffic_totals(&backend.transport_tx).await;
             rpc::encode_interface_stats(
@@ -613,7 +587,6 @@ async fn request_path(
 async fn process_rpc_request(
     request: RpcRequest,
     transport_tx: &mpsc::Sender<TransportMessage>,
-    ifac: Option<&InterfaceIfacStats>,
 ) -> RpcResponse {
     use rns_transport::messages::{TransportQuery, TransportQueryResponse};
 
@@ -653,7 +626,7 @@ async fn process_rpc_request(
         RpcRequest::GetInterfaceStats => {
             match authoritative_query!(TransportQuery::GetInterfaceStats, "interface stats query") {
                 TransportQueryResponse::InterfaceStats(entries) => {
-                    RpcResponse::InterfaceStats(stat_entries(entries, ifac))
+                    RpcResponse::InterfaceStats(entries)
                 }
                 _ => unexpected_transport_response("interface stats query"),
             }
@@ -1147,13 +1120,8 @@ mod tests {
         let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(async move {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            run_rpc_server_with_listener(
-                listener,
-                rpc_key,
-                RpcBackend::new(tx, None),
-                shutdown_clone,
-            )
-            .await
+            run_rpc_server_with_listener(listener, rpc_key, RpcBackend::new(tx), shutdown_clone)
+                .await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1195,7 +1163,7 @@ mod tests {
             Some([0x22; 16]),
             std::time::Instant::now() - std::time::Duration::from_secs(3),
         );
-        let backend = RpcBackend::new(tx, None).with_transport(Some(transport.clone()));
+        let backend = RpcBackend::new(tx).with_transport(Some(transport.clone()));
 
         let stats = |encoded: Vec<u8>| -> Vec<(rmpv::Value, rmpv::Value)> {
             rmpv::decode::read_value(&mut encoded.as_slice())
@@ -1245,7 +1213,7 @@ mod tests {
         let (actor, tx) = rns_transport::actor::TransportActor::new();
         tokio::spawn(actor.run());
         let leaf = stats(
-            respond(RpcRequest::GetInterfaceStats, &RpcBackend::new(tx, None))
+            respond(RpcRequest::GetInterfaceStats, &RpcBackend::new(tx))
                 .await
                 .unwrap(),
         );
@@ -1533,7 +1501,7 @@ listener.close()
         tokio::spawn(actor.run());
 
         for req in all_rpc_requests() {
-            let resp = process_rpc_request(req, &tx, None).await;
+            let resp = process_rpc_request(req, &tx).await;
             assert!(
                 !matches!(resp, RpcResponse::Error(_)),
                 "unexpected Error response"
@@ -1554,7 +1522,6 @@ listener.close()
                     timeout_secs: Some(1.0),
                 },
                 &tx,
-                None,
             )
             .await
         });
@@ -1611,13 +1578,8 @@ listener.close()
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = run_rpc_server_with_listener(
-                listener,
-                rpc_key,
-                RpcBackend::new(tx, None),
-                shutdown,
-            )
-            .await;
+            let _ = run_rpc_server_with_listener(listener, rpc_key, RpcBackend::new(tx), shutdown)
+                .await;
         });
         port
     }
@@ -1670,10 +1632,12 @@ listener.close()
     /// Expected bytes are upstream 1.6.0 replies.
     #[tokio::test]
     async fn lowest_bitrate_and_medium_path_timeout_answer_as_upstream() {
-        let backend = RpcBackend::new(
-            stats_transport(vec![(true, 1200), (true, 115_200), (false, 300), (true, 0)]),
-            None,
-        );
+        let backend = RpcBackend::new(stats_transport(vec![
+            (true, 1200),
+            (true, 115_200),
+            (false, 300),
+            (true, 0),
+        ]));
         let bitrate = respond(RpcRequest::GetLowestInterfaceBitrate, &backend)
             .await
             .unwrap();
@@ -1683,7 +1647,7 @@ listener.close()
             .unwrap();
         assert_eq!(hex::encode(timeout), "cb4029555555555556");
 
-        let slow = RpcBackend::new(stats_transport(vec![(true, 3)]), None);
+        let slow = RpcBackend::new(stats_transport(vec![(true, 3)]));
         let timeout = respond(RpcRequest::GetMediumPathTimeout, &slow)
             .await
             .unwrap();
@@ -1692,7 +1656,7 @@ listener.close()
 
     #[tokio::test]
     async fn lowest_bitrate_is_none_until_an_interface_qualifies_then_kept() {
-        let backend = RpcBackend::new(stats_transport(vec![(true, 0), (false, 500)]), None);
+        let backend = RpcBackend::new(stats_transport(vec![(true, 0), (false, 500)]));
         let bitrate = respond(RpcRequest::GetLowestInterfaceBitrate, &backend)
             .await
             .unwrap();
@@ -1716,7 +1680,7 @@ listener.close()
 
     #[tokio::test]
     async fn stub_replies_match_upstream() {
-        let backend = RpcBackend::new(stats_transport(Vec::new()), None);
+        let backend = RpcBackend::new(stats_transport(Vec::new()));
         let reply = |request| respond(request, &backend);
         assert_eq!(
             hex::encode(reply(RpcRequest::GetLinkDistribution).await.unwrap()),
@@ -1730,7 +1694,7 @@ listener.close()
 
     #[tokio::test]
     async fn manage_answers_as_upstream_with_management_disabled() {
-        let backend = RpcBackend::new(stats_transport(Vec::new()), None);
+        let backend = RpcBackend::new(stats_transport(Vec::new()));
         for operation in [
             rpc::ManageOperation::Attach,
             rpc::ManageOperation::Detach,
@@ -1759,7 +1723,7 @@ listener.close()
         })
         .unwrap();
         tokio::spawn(actor.run());
-        let backend = RpcBackend::new(tx, None);
+        let backend = RpcBackend::new(tx);
         let requester = vec![0x11; 16];
         let wants = |name: &str| RpcRequest::WantsDestinationType {
             full_name: name.to_string(),

@@ -380,22 +380,66 @@ fn an_accepted_client_names_its_listener() {
     assert_eq!(stats(&mut actor, 1).parent_interface_name, None);
 }
 
-/// The actor knows the configured IFAC size; the signature, network name,
-/// and auto-connect source are the runtime's records.
+/// Python publishes an interface's IFAC only when it has one: the size,
+/// signature, and network name together, and none of them for a size that
+/// is configured without a key (Reticulum.py).
 #[test]
-fn stats_carry_the_configured_ifac_size_and_no_runtime_records() {
+fn stats_report_ifac_only_for_an_interface_that_has_it() {
     let mut actor = hub();
     attach_ifac(&mut actor, 1, [0x5a; 64]);
-    let entry = stats(&mut actor, 1);
-    assert_eq!(entry.ifac_size, Some(8));
+    actor.interfaces.get_mut(&1).unwrap().ifac_netname = Some("testnet".into());
+    let (mut plain, _rx) = make_test_interface("plain");
+    plain.ifac_size = 16;
+    plain.ifac_netname = Some("unused".into());
+    actor.interfaces.insert(2, plain);
+
+    let with = stats(&mut actor, 1);
+    assert_eq!(with.ifac_size, Some(8));
+    assert_eq!(
+        with.ifac_signature,
+        rns_identity::ifac::ifac_signature(&[0x5a; 64]).map(Vec::from)
+    );
+    assert!(with.ifac_signature.is_some());
+    assert_eq!(with.ifac_netname.as_deref(), Some("testnet"));
+
+    let without = stats(&mut actor, 2);
     assert_eq!(
         (
-            entry.ifac_signature,
-            entry.ifac_netname,
-            entry.autoconnect_source
+            without.ifac_size,
+            without.ifac_signature,
+            without.ifac_netname
         ),
         (None, None, None)
     );
+}
+
+/// The signature follows the key when an interface is given another.
+#[test]
+fn the_ifac_signature_follows_a_changed_key() {
+    let mut actor = hub();
+    attach_ifac(&mut actor, 1, [0x5a; 64]);
+    let first = stats(&mut actor, 1).ifac_signature;
+    assert_eq!(stats(&mut actor, 1).ifac_signature, first);
+    actor.interfaces.get_mut(&1).unwrap().ifac_key = Some([0x6b; 64].into());
+    assert_eq!(
+        stats(&mut actor, 1).ifac_signature,
+        rns_identity::ifac::ifac_signature(&[0x6b; 64]).map(Vec::from)
+    );
+    assert_ne!(stats(&mut actor, 1).ifac_signature, first);
+}
+
+/// An auto-connected interface names the network identity that announced it.
+#[test]
+fn stats_carry_the_autoconnect_source() {
+    let mut actor = hub();
+    let _rx = attach(&mut actor, 1);
+    actor.interfaces.get_mut(&1).unwrap().autoconnect_source = Some("5a".repeat(16));
+    let _other = attach(&mut actor, 2);
+    assert_eq!(
+        stats(&mut actor, 1).autoconnect_source,
+        Some("5a".repeat(16))
+    );
+    assert_eq!(stats(&mut actor, 2).autoconnect_source, None);
 }
 
 fn totals(actor: &mut TransportActor) -> crate::messages::TrafficTotalsRpcEntry {

@@ -364,6 +364,14 @@ pub struct InterfaceEntry {
     pub ifac_key: Option<rns_identity::ifac::IfacKey>,
     /// Configured IFAC size in bytes; inactive when no key is set.
     pub ifac_size: usize,
+    /// The network name the key was derived from, if one was given. Interface
+    /// stats report it with the key.
+    pub ifac_netname: Option<String>,
+    /// The key `ifac_signature` was last computed for, with the signature.
+    pub(crate) ifac_signed: Option<(rns_identity::ifac::IfacKey, [u8; 64])>,
+    /// The network identity, in hex, that announced an auto-connected
+    /// interface (Python `autoconnect_source`, Discovery.py).
+    pub autoconnect_source: Option<String>,
     /// Announce bitrate fraction: 0.02 represents 2%.
     pub announce_cap: f64,
     /// Earliest Unix time at which the next announce may be sent — enforces
@@ -455,6 +463,9 @@ impl InterfaceEntry {
             tx,
             ifac_key: None,
             ifac_size: 0,
+            ifac_netname: None,
+            ifac_signed: None,
+            autoconnect_source: None,
             announce_cap: crate::constants::ANNOUNCE_CAP,
             announce_allowed_at: 0.0,
             announce_rate_target: None,
@@ -498,6 +509,20 @@ impl InterfaceEntry {
         } else {
             0
         }
+    }
+
+    /// Python's `ifac_signature` for the current key, signed once per key.
+    pub(crate) fn ifac_signature(&mut self) -> Option<[u8; 64]> {
+        use subtle::ConstantTimeEq;
+        let key = self.ifac_key.as_ref()?;
+        if let Some((signed, signature)) = &self.ifac_signed
+            && bool::from(signed[..].ct_eq(&key[..]))
+        {
+            return Some(*signature);
+        }
+        let signature = rns_identity::ifac::ifac_signature(key)?;
+        self.ifac_signed = Some((key.clone(), signature));
+        Some(signature)
     }
     /// Check current ownership and clear/wire byte capacity before allocation.
     /// This does not parse a header or check direction or driver online state.
@@ -1287,13 +1312,11 @@ pub struct InterfaceStatRpcEntry {
     pub announce_rate_grace: Option<u32>,
     pub announce_rate_penalty: Option<f64>,
     pub announce_cap: f64,
-    /// IFAC tag bytes. The transport actor reports the configured size
-    /// whether or not IFAC is on; a shared instance's reply carries a size
-    /// only with IFAC, and `None` without (Reticulum.py).
+    /// IFAC tag bytes, signature, and network name, as Python's
+    /// `get_interface_stats()` reports them: all `None` for an interface
+    /// without IFAC, and the name also `None` when the key came from a
+    /// passphrase alone (Reticulum.py).
     pub ifac_size: Option<usize>,
-    /// IFAC signature and network name; a signature means IFAC is on. The
-    /// runtime's registration records hold both, so the transport actor
-    /// leaves them `None`.
     pub ifac_signature: Option<Vec<u8>>,
     pub ifac_netname: Option<String>,
     pub tx_drops: u64,
@@ -1313,7 +1336,7 @@ pub struct InterfaceStatRpcEntry {
     pub parent_id: Option<InterfaceId>,
     pub parent_interface_name: Option<String>,
     /// The network identity, in hex, that announced an auto-connected
-    /// interface (Python `autoconnect_source`), from the runtime's records.
+    /// interface (Python `autoconnect_source`).
     pub autoconnect_source: Option<String>,
     /// How Python names the interface, when the driver or the wire says.
     pub identity: Option<InterfaceIdentity>,

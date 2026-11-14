@@ -141,14 +141,12 @@ async fn an_autoconnected_interface_names_its_source() {
         .and_then(|entry| entry.id)
         .expect("the interface auto-connected");
 
-    let Some(TransportQueryResponse::InterfaceStats(entries)) = handle
+    let Some(TransportQueryResponse::InterfaceStats(stats)) = handle
         .query_transport(TransportQuery::GetInterfaceStats)
         .await
     else {
         panic!("no interface stats");
     };
-    let records = InterfaceIfacStats(handle.interface_controls.clone());
-    let stats = crate::rpc_server::stat_entries(entries, Some(&records));
     let source = |name: &str| {
         stats
             .iter()

@@ -514,7 +514,17 @@ async fn configured_i2p_peers_inherit_their_interface_settings() {
     assert_eq!(peer.announce_cap, 0.05);
     assert_eq!(peer.bitrate, server.bitrate);
     assert!(server.ifac_size.is_some_and(|size| size > 0));
-    assert_eq!(peer.ifac_size, server.ifac_size);
+    assert!(server.ifac_signature.is_some());
+    assert_eq!(server.ifac_netname.as_deref(), Some("tunnelnet"));
+    assert_eq!(
+        (&peer.ifac_size, &peer.ifac_signature, &peer.ifac_netname),
+        (
+            &server.ifac_size,
+            &server.ifac_signature,
+            &server.ifac_netname
+        ),
+        "the peer inherits its server's IFAC"
+    );
     let ingress = |id: u64| {
         let controls = handle.interface_controls.lock().unwrap();
         let overrides = &controls[&id].ingress_overrides;
@@ -559,8 +569,15 @@ async fn i2p_server_peers_register_under_their_server() {
         "a peer of the I2P server is no shared-instance client"
     );
     assert!(server.ifac_size.is_some_and(|size| size > 0));
+    assert!(server.ifac_signature.is_some());
+    assert_eq!(server.ifac_netname.as_deref(), Some("tunnelnet"));
     assert_eq!(
-        peer.ifac_size, server.ifac_size,
+        (&peer.ifac_size, &peer.ifac_signature, &peer.ifac_netname),
+        (
+            &server.ifac_size,
+            &server.ifac_signature,
+            &server.ifac_netname
+        ),
         "the peer inherits its server's IFAC"
     );
     assert_eq!(

@@ -80,9 +80,6 @@ struct InterfaceControlMetadata {
     /// The host and port a client interface connects to (Python
     /// `target_ip`, `target_port`), which auto-connect checks.
     client_target: Option<(String, u16)>,
-    /// The network identity, in hex, that announced an auto-connected
-    /// interface (Python `autoconnect_source`, Discovery.py).
-    autoconnect_source: Option<String>,
     // Per-interface stamp costs, copied raw to spawned children (TCPInterface.py).
     destination_cost: Option<f64>,
     pr_cost: Option<f64>,
@@ -120,52 +117,6 @@ impl SpawnInheritance {
 }
 
 type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
-
-/// The fields of Python's interface stats that come from the runtime's
-/// registration records: IFAC, all `None` for an interface without it, and
-/// the auto-connect source.
-#[derive(Clone)]
-pub(crate) struct InterfaceIfacStats(InterfaceControlMap);
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct InterfaceIfac {
-    pub(crate) signature: Option<[u8; 64]>,
-    pub(crate) size: Option<usize>,
-    pub(crate) netname: Option<String>,
-}
-
-impl InterfaceIfacStats {
-    pub(crate) fn lookup(&self, id: u64) -> InterfaceIfac {
-        let record = self
-            .0
-            .lock()
-            .expect("interface_controls mutex poisoned")
-            .get(&id)
-            .and_then(|control| {
-                Some((
-                    control.ifac_key.clone()?,
-                    control.ifac_size,
-                    control.ifac_netname.clone(),
-                ))
-            });
-        let Some((key, size, netname)) = record else {
-            return InterfaceIfac::default();
-        };
-        InterfaceIfac {
-            signature: rns_identity::ifac::ifac_signature(&key),
-            size: Some(size),
-            netname,
-        }
-    }
-
-    pub(crate) fn autoconnect_source(&self, id: u64) -> Option<String> {
-        self.0
-            .lock()
-            .expect("interface_controls mutex poisoned")
-            .get(&id)
-            .and_then(|control| control.autoconnect_source.clone())
-    }
-}
 
 #[derive(Default)]
 struct TransportCompletion {
@@ -4046,13 +3997,10 @@ pub async fn init_with_policy(
             shutdown_coordinator.install_owned_control_task(tokio::spawn(
                 control.run(
                     rpc_key,
-                    crate::rpc_server::RpcBackend::new(
-                        transport_tx.clone(),
-                        Some(InterfaceIfacStats(interface_controls.clone())),
-                    )
-                    .with_transport(transport_stats.clone())
-                    .with_inbound_queues(inbound_queues.clone())
-                    .with_interface_manager(interface_manager.clone()),
+                    crate::rpc_server::RpcBackend::new(transport_tx.clone())
+                        .with_transport(transport_stats.clone())
+                        .with_inbound_queues(inbound_queues.clone())
+                        .with_interface_manager(interface_manager.clone()),
                     shutdown.clone(),
                 ),
             ));
@@ -4690,13 +4638,10 @@ pub async fn init_with_policy(
         && configured_policy
         && let Some(rpc_key) = rc.rpc_key.clone()
     {
-        let rpc_backend = crate::rpc_server::RpcBackend::new(
-            transport_tx.clone(),
-            Some(InterfaceIfacStats(interface_controls.clone())),
-        )
-        .with_transport(transport_stats.clone())
-        .with_inbound_queues(inbound_queues.clone())
-        .with_interface_manager(interface_manager.clone());
+        let rpc_backend = crate::rpc_server::RpcBackend::new(transport_tx.clone())
+            .with_transport(transport_stats.clone())
+            .with_inbound_queues(inbound_queues.clone())
+            .with_interface_manager(interface_manager.clone());
         let rpc_shutdown = shutdown.clone();
         if rc.shared_instance_type == SharedInstanceType::Unix {
             let rpc_socket = shared_unix_rpc_socket_path(&rc.instance_name, &socket_base);
@@ -4750,7 +4695,6 @@ pub async fn init_with_policy(
             transport_tx.clone(),
             &handle.transport_identity,
             allowed,
-            Some(InterfaceIfacStats(interface_controls.clone())),
             transport_stats.clone(),
             Some(inbound_queues.clone()),
         )
@@ -5945,6 +5889,7 @@ async fn prepare_interface_with_role_and_overrides(
     };
     let registry_owner = registration.owner();
     let child_stamp_costs;
+    let child_ifac_netname;
     {
         let mut controls = interface_controls
             .lock()
@@ -5961,6 +5906,7 @@ async fn prepare_interface_with_role_and_overrides(
             .map(|parent| (parent.destination_cost, parent.pr_cost))
             .unwrap_or_default();
         child_stamp_costs = (destination_cost, pr_cost);
+        child_ifac_netname = ifac_netname.clone();
         controls.insert(
             id,
             InterfaceControlMetadata {
@@ -5972,7 +5918,6 @@ async fn prepare_interface_with_role_and_overrides(
                 ifac_size,
                 ifac_netname,
                 client_target: None,
-                autoconnect_source: None,
                 destination_cost,
                 pr_cost,
                 spawn: None,
@@ -5997,6 +5942,7 @@ async fn prepare_interface_with_role_and_overrides(
     entry.accepted = handle.parent_id.is_some();
     entry.ifac_key = ifac_key;
     entry.ifac_size = ifac_size;
+    entry.ifac_netname = child_ifac_netname;
     entry.online = Some(online.clone());
     entry.rxb = handle.rxb;
     entry.txb = handle.txb;
@@ -6092,7 +6038,7 @@ async fn register_owned_interface_with_post_init(
         interface_registry.clone(),
         SingleRegistrationSpec::PostInit {
             owned,
-            post_init: clone_interface_post_init(post_init),
+            post_init: Box::new(clone_interface_post_init(post_init)),
             ifac_key,
             kind,
         },
@@ -6153,6 +6099,7 @@ fn clone_interface_post_init(
         gravity: post_init.gravity,
         destination_cost: post_init.destination_cost,
         pr_cost: post_init.pr_cost,
+        autoconnect_source: post_init.autoconnect_source.clone(),
     }
 }
 
@@ -6299,7 +6246,6 @@ async fn prepare_interface_with_post_init(
                 ifac_key: ifac_key.clone(),
                 ifac_size: post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
                 client_target: None,
-                autoconnect_source: None,
                 destination_cost: post_init.destination_cost,
                 pr_cost: post_init.pr_cost,
                 spawn: Some(SpawnInheritance {
@@ -6330,8 +6276,10 @@ async fn prepare_interface_with_post_init(
     entry.owner = handle.owner.clone();
     entry.packet_capacity = handle.packet_capacity;
     entry.parent_id = handle.parent_id;
+    entry.ifac_netname = ifac_key.as_ref().and(post_init.ifac_network_name.clone());
     entry.ifac_key = ifac_key;
     entry.ifac_size = post_init.ifac_size.unwrap_or(post_init.default_ifac_size);
+    entry.autoconnect_source = post_init.autoconnect_source.clone();
     entry.announce_cap = announce_cap;
     entry.announce_rate_target = announce_rate_target;
     entry.announce_rate_grace = post_init.announce_rate_grace;
@@ -6419,7 +6367,7 @@ enum SingleRegistrationSpec {
     },
     PostInit {
         owned: OwnedInterfaceHandle,
-        post_init: interface_factory::InterfacePostInit,
+        post_init: Box<interface_factory::InterfacePostInit>,
         ifac_key: Option<IfacKey>,
         kind: InterfaceKind,
     },
@@ -8475,6 +8423,7 @@ async fn spawn_discovered_backbone_client(
     post_init.ifac_network_name = discovered_ifac_value(&record.info.ifac_netname);
     post_init.ifac_passphrase =
         discovered_ifac_value(&record.info.ifac_netkey).map(zeroize::Zeroizing::new);
+    post_init.autoconnect_source = Some(hex::encode(record.network_id));
     let ifac_key = derive_ifac_key_from_post_init(&post_init);
     register_interface_with_post_init_and_spawn_permit(
         &handle.transport_tx,
@@ -8488,10 +8437,7 @@ async fn spawn_discovered_backbone_client(
     )
     .await
     .map_err(|error| format!("Backbone client registration failed: {error}"))?;
-    update_interface_control(&handle.interface_controls, id, |control| {
-        control.client_target = Some((host.to_string(), port));
-        control.autoconnect_source = Some(hex::encode(record.network_id));
-    });
+    record_client_target(&handle.interface_controls, id, host, port);
     watch_runtime_client_teardown(handle, name, spawned.teardown);
     rns_transport::notice!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
     Ok((id, online))
@@ -11245,7 +11191,6 @@ mod tests {
                 ifac_size: 0,
                 ifac_netname: None,
                 client_target: None,
-                autoconnect_source: None,
                 destination_cost: None,
                 pr_cost: None,
                 spawn: None,
@@ -11395,7 +11340,6 @@ mod tests {
                 ifac_size: 0,
                 ifac_netname: None,
                 client_target: None,
-                autoconnect_source: None,
                 destination_cost: None,
                 pr_cost: None,
                 spawn: None,
@@ -17212,7 +17156,6 @@ egress_control = Yes
                     ifac_size: 0,
                     ifac_netname: None,
                     client_target: None,
-                    autoconnect_source: None,
                     destination_cost: None,
                     pr_cost: None,
                     spawn: None,
@@ -17298,16 +17241,51 @@ egress_control = Yes
         assert_eq!(entry.ifac_size, 16);
 
         // Stats report Python's IFAC fields for the listener and its child.
-        let stats = InterfaceIfacStats(interface_controls.clone());
-        let expected = InterfaceIfac {
-            signature: rns_identity::ifac::ifac_signature(&ifac_key.unwrap()),
-            size: Some(16),
-            netname: Some("testnet".to_string()),
+        let signature = rns_identity::ifac::ifac_signature(&ifac_key.unwrap());
+        assert!(signature.is_some());
+        let stats = transport_stats(vec![(parent_id, parent_entry), (child_id, entry)]).await;
+        assert_eq!(stats.len(), 2);
+        for stat in stats {
+            assert_eq!(
+                stat.ifac_signature,
+                signature.map(Vec::from),
+                "{}",
+                stat.name
+            );
+            assert_eq!(stat.ifac_size, Some(16), "{}", stat.name);
+            assert_eq!(
+                stat.ifac_netname.as_deref(),
+                Some("testnet"),
+                "{}",
+                stat.name
+            );
+        }
+    }
+
+    /// What a transport reports for interfaces registered as `entries`.
+    async fn transport_stats(
+        entries: Vec<(u64, rns_transport::messages::InterfaceEntry)>,
+    ) -> Vec<rns_transport::messages::InterfaceStatRpcEntry> {
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        for (id, entry) in entries {
+            tx.send(TransportMessage::RegisterInterface { id, entry })
+                .await
+                .unwrap();
+        }
+        let running = tokio::spawn(actor.run());
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        tx.send(TransportMessage::Rpc {
+            query: TransportQuery::GetInterfaceStats,
+            response_tx,
+        })
+        .await
+        .unwrap();
+        let TransportQueryResponse::InterfaceStats(stats) = response_rx.await.unwrap() else {
+            panic!("unexpected interface stats response");
         };
-        assert!(expected.signature.is_some());
-        assert_eq!(stats.lookup(parent_id), expected);
-        assert_eq!(stats.lookup(child_id), expected);
-        assert_eq!(stats.lookup(930_003), InterfaceIfac::default());
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        running.await.unwrap();
+        stats
     }
 
     #[tokio::test]
@@ -17423,10 +17401,16 @@ egress_control = Yes
         )
         .await
         .unwrap();
-        let _ = transport_rx.recv().await.map(unwrap_owned_event);
+        let Some(TransportMessage::RegisterInterface { entry, .. }) =
+            transport_rx.recv().await.map(unwrap_owned_event)
+        else {
+            panic!("expected RegisterInterface");
+        };
+        assert_eq!(entry.ifac_size, 8, "the size is configured all the same");
+        let stat = transport_stats(vec![(id, entry)]).await.remove(0);
         assert_eq!(
-            InterfaceIfacStats(interface_controls).lookup(id),
-            InterfaceIfac::default()
+            (stat.ifac_signature, stat.ifac_size, stat.ifac_netname),
+            (None, None, None)
         );
     }
 
@@ -18326,10 +18310,11 @@ txpower = 17
             .find(|entry| entry.role == "shared_instance_peer")
             .expect("shared-instance peer interface");
         assert_eq!(
-            peer.ifac_size,
-            Some(16),
+            client.interface_controls.lock().unwrap()[&peer.id].ifac_size,
+            16,
             "the local interface admits HW_MTU plus the default IFAC size"
         );
+        assert_eq!(peer.ifac_size, None, "it has no IFAC to report");
 
         client.shutdown_and_wait().await;
         owner.shutdown_and_wait().await;

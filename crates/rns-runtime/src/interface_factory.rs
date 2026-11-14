@@ -2030,6 +2030,10 @@ pub struct InterfacePostInit {
     /// Required path request stamp value on this interface, clamped to the
     /// stamp cost cap. `None` follows the global `[stamps] pr_cost`.
     pub pr_cost: Option<f64>,
+    /// The network identity, in hex, that announced an auto-connected
+    /// interface (Python `autoconnect_source`, Discovery.py). Discovery sets
+    /// it; no configuration key does.
+    pub autoconnect_source: Option<String>,
 }
 
 impl InterfacePostInit {
@@ -2119,6 +2123,7 @@ impl InterfacePostInit {
             pr_cost: section
                 .get_float("pr_cost")
                 .map(rns_transport::stamps::StampPolicy::clamp_cost),
+            autoconnect_source: None,
         })
     }
 
