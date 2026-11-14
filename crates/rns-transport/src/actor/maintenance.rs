@@ -235,7 +235,8 @@ impl TransportActor {
 
         self.process_pending_discovery_path_requests(now);
         self.process_pending_path_request_admissions(now);
-        self.process_announce_queues(now);
+        // The cap counts from the send itself, not from the start of this tick.
+        self.process_announce_queues(now_f64());
     }
 
     /// Transport.py A leaf or shared-instance client lingers
@@ -422,10 +423,10 @@ impl TransportActor {
 
     /// Python `Interface.process_announce_queue` (Interface.py):
     /// drop stale entries, send the fewest-hops, oldest entry, and consume it
-    /// whatever the send outcome. Python re-arms a timer at each `wait_time`;
-    /// here each tick sends every entry whose slot has passed, chaining slots
-    /// from the previous one, up to `MAX_ANNOUNCE_DRAIN_PER_TICK`. A zero
-    /// bitrate empties the queue, as Python's ZeroDivisionError handler does.
+    /// whatever the send outcome. The next announce is allowed at this send
+    /// plus the full wait, and the actor wakes then, as Python re-arms a timer
+    /// for `wait_time`. A zero bitrate empties the queue, as Python's
+    /// ZeroDivisionError handler does.
     pub(super) fn process_announce_queues(&mut self, now: f64) {
         let iface_ids: Vec<InterfaceId> = self.interfaces.keys().copied().collect();
         for iface_id in iface_ids {
@@ -435,9 +436,25 @@ impl TransportActor {
                 }
             }
         }
+        // An interface that was due and could not send waits for the next tick.
+        self.announce_drain_at = self
+            .interfaces
+            .iter()
+            .filter(|(id, entry)| {
+                !entry.announce_queue.is_empty() && !self.offered_announces.contains_key(*id)
+            })
+            .map(|(_, entry)| entry.announce_allowed_at)
+            .filter(|at| *at > now)
+            .min_by(f64::total_cmp);
     }
 
-    /// Send at most one queued announce; `true` when another may follow now.
+    /// Wake the actor to drain announce queues at `at`, unless it wakes sooner.
+    pub(super) fn wake_for_announce_at(&mut self, at: f64) {
+        self.announce_drain_at = Some(self.announce_drain_at.map_or(at, |next| next.min(at)));
+    }
+
+    /// Send at most one queued announce; `true` when an entry was discarded
+    /// unsent and another may follow now.
     fn drain_one_queued_announce(&mut self, iface_id: InterfaceId, now: f64) -> bool {
         let Some(entry) = self.interfaces.get_mut(&iface_id) else {
             return false;
@@ -531,20 +548,12 @@ impl TransportActor {
         }
 
         let raw = entry.announce_queue.remove(idx).raw;
-        // Chain from the previous slot within one tick so throughput follows
-        // Python's timer; an idle queue starts from now.
-        let slot = if now - entry.announce_allowed_at < JOB_INTERVAL_MS as f64 / 1000.0 {
-            entry.announce_allowed_at
-        } else {
-            now
-        };
-        entry.announce_allowed_at = slot + announce_wait_time(entry, raw.len());
+        // `announce_allowed_at = now + wait_time` (Interface.py): the full
+        // wait from this send, never a slot carried over from the last one.
+        entry.announce_allowed_at = now + announce_wait_time(entry, raw.len());
 
         self.send_queued_announce(iface_id, &raw);
-        now >= self
-            .interfaces
-            .get(&iface_id)
-            .map_or(f64::INFINITY, |entry| entry.announce_allowed_at)
+        false
     }
 
     /// Python's interface job (Transport.py): re-evaluate both burst

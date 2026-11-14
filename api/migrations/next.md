@@ -335,6 +335,10 @@ Exhaustive literals and matches over these types need updating:
   `ic_burst_freq`, `ec_pr_freq` or similar key on an interface is no longer
   refused at load. As in upstream, it puts the interface into permanent
   limiting (`RNS/Reticulum.py:1001-1010`, `RNS/Interfaces/Interface.py:206`).
+- **Announce cap timing.** On an interface with an announce cap, a queued
+  announce leaves when the wait after the one before it ends, not on the next
+  250 ms job pass, and each wait counts from that send
+  (`RNS/Interfaces/Interface.py`, `process_announce_queue`).
 - **Stored files.**
   - Destination announce stamps persist as `<storage>/stamps/<hash>.dstamp`
     (`RNS/Stamps.py:869-875`) and are reused across restarts.

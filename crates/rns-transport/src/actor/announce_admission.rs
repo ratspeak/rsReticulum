@@ -575,6 +575,10 @@ impl TransportActor {
                             .announce_queue
                             .retain(|queued| queued.raw != offered.raw);
                         sent = true;
+                        if !entry.announce_queue.is_empty() {
+                            let allowed_at = entry.announce_allowed_at;
+                            self.wake_for_announce_at(allowed_at);
+                        }
                     }
                     if sent {
                         self.count_tx_packet();

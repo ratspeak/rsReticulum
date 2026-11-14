@@ -274,8 +274,8 @@ pub const QUEUED_ANNOUNCE_LIFE: f64 = 10_800.0;
 /// Maximum number of queued announces per interface.
 pub const MAX_QUEUED_ANNOUNCES: usize = 4096;
 
-/// Queued announces one interface may send in one maintenance tick; bounds
-/// actor work on fast links.
+/// Queued announces one interface may discard unsent in one drain pass, on
+/// the way to the one it sends; bounds actor work.
 pub(crate) const MAX_ANNOUNCE_DRAIN_PER_TICK: usize = 256;
 
 /// Grace period in seconds after the first interface registration before

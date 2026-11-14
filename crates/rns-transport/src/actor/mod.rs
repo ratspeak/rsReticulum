@@ -97,6 +97,9 @@ pub struct TransportActor {
     pending_announce_admissions: VecDeque<announce_admission::PendingAnnounce>,
     announce_pressure: announce_admission::AnnouncePressure,
     offered_announces: HashMap<InterfaceId, announce_admission::OfferedAnnounce>,
+    /// When the next queued announce may leave. The actor wakes then, as
+    /// Python arms a timer for each wait (Interface.py, `process_announce_queue`).
+    announce_drain_at: Option<f64>,
     persistence_tx: mpsc::Sender<()>,
     persistence_rx: mpsc::Receiver<()>,
     path_recovery_tx: mpsc::Sender<crate::path_recovery::PathRecoveryRequest>,
@@ -505,6 +508,7 @@ impl TransportActor {
             pending_announce_admissions: VecDeque::new(),
             announce_pressure: announce_admission::AnnouncePressure::default(),
             offered_announces: HashMap::new(),
+            announce_drain_at: None,
             persistence_tx,
             persistence_rx,
             path_recovery_tx,
@@ -674,6 +678,11 @@ impl TransportActor {
         let mut was_foreground = true;
 
         loop {
+            // A throttled background actor leaves queued announces to its tick.
+            let announce_wake = self
+                .announce_drain_at
+                .filter(|_| was_foreground || !cfg!(feature = "mobile-throttle"))
+                .map(|at| Duration::from_secs_f64((at - now_f64()).clamp(0.0, 3600.0)));
             tokio::select! {
                 msg = self.rx.recv() => {
                     match msg {
@@ -683,6 +692,9 @@ impl TransportActor {
                         }
                         Some(msg) => self.handle_message(msg),
                     }
+                }
+                _ = tokio::time::sleep(announce_wake.unwrap_or_default()), if announce_wake.is_some() => {
+                    self.process_announce_queues(now_f64());
                 }
                 (class, msg) = std::future::poll_fn(|cx| self.inbound_rx.poll_recv(cx, &self.inbound_queues)) => {
                     self.handle_inbound_event(class, msg);
@@ -2324,7 +2336,7 @@ impl TransportActor {
                 continue;
             }
             // A background lane must see every capped announce, so those queue
-            // and are offered on the next tick.
+            // and the actor wakes to offer them.
             if entry.announce_queue.is_empty()
                 && now > entry.announce_allowed_at
                 && entry.bitrate != 0
@@ -2361,6 +2373,8 @@ impl TransportActor {
                 hops,
                 raw: shared.clone(),
             });
+            let allowed_at = entry.announce_allowed_at;
+            self.wake_for_announce_at(allowed_at);
         }
     }
 
@@ -8428,6 +8442,65 @@ mod tests {
         actor.process_announce_queues(allowed_at);
         assert!(rx.try_recv().is_ok());
         assert!(actor.interfaces[&1].announce_queue.is_empty());
+    }
+
+    /// Python `Interface.process_announce_queue` (Interface.py): each send
+    /// sets `announce_allowed_at = now + wait_time`, so a queued announce that
+    /// leaves late still closes the interface for the full wait, and the
+    /// actor is woken for the next one when that wait ends.
+    #[test]
+    fn queued_announce_waits_the_full_interval_from_each_send() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, mut rx) = make_test_interface("full_wait_iface");
+        actor.interfaces.insert(1, entry);
+
+        let mut lens = Vec::new();
+        for (index, aspect) in ["test.wait.a", "test.wait.b", "test.wait.c"]
+            .into_iter()
+            .enumerate()
+        {
+            let (raw, dest) = make_valid_announce(aspect, 1);
+            actor.local_destinations.insert(dest);
+            actor.broadcast_announce_on_interfaces(&raw, None);
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                index == 0,
+                "only the first leaves at once"
+            );
+            lens.push(raw.len());
+        }
+        let wait = |len: usize| {
+            let entry = &actor.interfaces[&1];
+            (len as f64 * 8.0) / entry.bitrate as f64 / entry.announce_cap
+        };
+        let (wait_b, wait_c) = (wait(lens[1]), wait(lens[2]));
+        let opened = actor.interfaces[&1].announce_allowed_at;
+        assert_eq!(
+            actor.announce_drain_at,
+            Some(opened),
+            "queueing arms the wake for the end of the first wait"
+        );
+
+        // The second leaves a little late, as after a busy actor pass.
+        let late = opened + 0.2;
+        actor.process_announce_queues(late);
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(actor.interfaces[&1].announce_allowed_at, late + wait_b);
+        assert_eq!(actor.announce_drain_at, Some(late + wait_b));
+
+        actor.process_announce_queues(late + wait_b - 0.001);
+        assert!(
+            rx.try_recv().is_err(),
+            "no gap is shorter than the wait after the send before it"
+        );
+        actor.process_announce_queues(late + wait_b);
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(
+            actor.interfaces[&1].announce_allowed_at,
+            late + wait_b + wait_c
+        );
+        assert!(actor.interfaces[&1].announce_queue.is_empty());
+        assert_eq!(actor.announce_drain_at, None, "an empty queue arms no wake");
     }
 
     /// Python 1.3.8 Transport.py keeps one queued announce per
