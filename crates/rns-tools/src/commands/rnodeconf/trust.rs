@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 
 use rns_identity::identity::Identity;
 use rns_interface::rnode_admin::{self, AdminFrame};
-use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePublicKey};
+use rsa::pkcs8::spki::SubjectPublicKeyInfoRef;
+use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
+use rsa::rand_core::OsRng;
 use rsa::traits::PublicKeyParts;
-use rsa::{Pss, RsaPrivateKey, RsaPublicKey};
+use rsa::{BigUint, Pss, RsaPrivateKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
 
 use super::log;
@@ -155,8 +157,54 @@ pub fn device_key_path(root: &Path) -> PathBuf {
     root.join("firmware").join(DEVICE_KEY_FILENAME)
 }
 
-pub fn load_device_identity(path: &Path) -> Result<Identity, String> {
-    Identity::from_file(path).map_err(|e| format!("could not load device identity: {e}"))
+/// Prefix of the `cryptography` error for undecodable key data.
+const DESERIALIZE_ERROR: &str = "Could not deserialize key data. The data may be in an incorrect format, it may be encrypted with an unsupported algorithm, or it may be an unsupported key type (e.g. EC curves with explicit parameters). Details: ";
+
+/// A strict DER SubjectPublicKeyInfo holding an RSA key, the only kind that can
+/// validate a device signature. Upstream stores any key type it can load.
+pub fn check_public_key_der(der: &[u8]) -> Result<(), String> {
+    let spki = SubjectPublicKeyInfoRef::try_from(der)
+        .map_err(|error| format!("{DESERIALIZE_ERROR}{error}"))?;
+    RsaPublicKey::try_from(spki)
+        .map(|_| ())
+        .map_err(|_| format!("{DESERIALIZE_ERROR}not an RSA public key"))
+}
+
+/// Upstream `-P`: the DER SubjectPublicKeyInfo of the EEPROM signing key.
+pub fn signing_public_key_der(private_bytes: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let private_bytes =
+        private_bytes.ok_or("Cannot convert \"<class 'NoneType'>\" instance to a buffer.")?;
+    let key = RsaPrivateKey::from_pkcs8_der(private_bytes)
+        .map_err(|error| format!("{DESERIALIZE_ERROR}{error}"))?;
+    key.to_public_key()
+        .to_public_key_der()
+        .map(|der| der.as_bytes().to_vec())
+        .map_err(|error| error.to_string())
+}
+
+/// Upstream `-k` EEPROM signing key: RSA 1024, e = 65537, as unencrypted DER
+/// PKCS#8 together with its DER SubjectPublicKeyInfo.
+pub fn generate_signing_key() -> Result<(Vec<u8>, Vec<u8>), String> {
+    let key = RsaPrivateKey::new_with_exp(&mut OsRng, 1024, &BigUint::from(65537u32))
+        .map_err(|error| error.to_string())?;
+    let private = key.to_pkcs8_der().map_err(|error| error.to_string())?;
+    let public = key
+        .to_public_key()
+        .to_public_key_der()
+        .map_err(|error| error.to_string())?;
+    Ok((private.as_bytes().to_vec(), public.as_bytes().to_vec()))
+}
+
+/// Upstream `Identity.load_private_key`: the first 32 bytes are the X25519
+/// key and the rest the Ed25519 seed; the error is the one it logs.
+pub fn identity_from_private_key(bytes: &[u8]) -> Result<Identity, String> {
+    if bytes.len() < 32 {
+        return Err("An X25519 private key is 32 bytes long".to_string());
+    }
+    if bytes.len() != 64 {
+        return Err("An Ed25519 private key is 32 bytes long".to_string());
+    }
+    Identity::from_private_key(bytes).map_err(|error| error.to_string())
 }
 
 pub fn sign_device_hash(identity: &Identity, device_hash: &[u8; 32]) -> Result<[u8; 64], String> {
@@ -196,6 +244,22 @@ mod tests {
         assert_eq!(
             device_key_path(root),
             root.join("firmware").join("device.key")
+        );
+    }
+
+    #[test]
+    fn trusted_keys_must_be_rsa() {
+        let (_, rsa_public) = generate_signing_key().unwrap();
+        assert!(check_public_key_der(&rsa_public).is_ok());
+        let ed25519 = [
+            hex::decode("302a300506032b6570032100").unwrap(),
+            vec![1u8; 32],
+        ]
+        .concat();
+        assert!(
+            check_public_key_der(&ed25519)
+                .unwrap_err()
+                .ends_with("not an RSA public key")
         );
     }
 

@@ -3,7 +3,7 @@
 //! device state while the caller waits out upstream's fixed delays.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::time::{Duration, Instant};
 
 use rns_interface::{kiss, rnode, rnode_admin};
@@ -24,6 +24,7 @@ pub struct RNode {
     pub cfg_sector: Option<Vec<u8>>,
     pub firmware_hash: Option<Vec<u8>>,
     pub firmware_hash_target: Option<Vec<u8>>,
+    pub device_hash: Option<[u8; 32]>,
 }
 
 impl RNode {
@@ -42,6 +43,7 @@ impl RNode {
             cfg_sector: None,
             firmware_hash: None,
             firmware_hash_target: None,
+            device_hash: None,
         }
     }
 
@@ -62,6 +64,31 @@ impl RNode {
 
     pub fn send(&mut self, command: u8, payload: &[u8]) -> Result<(), String> {
         self.write(&rnode_admin::encode_frame(command, payload))
+    }
+
+    pub fn send_frame(&mut self, frame: &rnode_admin::AdminFrame) -> Result<(), String> {
+        self.send(frame.command, &frame.payload)
+    }
+
+    /// Upstream's `input()` while its reader thread keeps applying replies.
+    pub fn wait_for_enter(&mut self) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = tx.send(std::io::stdin().lock().read_line(&mut line));
+        });
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(0)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err("EOF when reading a line".to_string());
+                }
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(error)) => return Err(error.to_string()),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pump(Duration::from_millis(50))?;
+                }
+            }
+        }
     }
 
     /// Read and apply replies for `duration`, as upstream's reader thread does
@@ -110,6 +137,11 @@ impl RNode {
             )),
             rnode::CMD_BT_PIN if payload.len() >= 4 => {
                 log(format!("Bluetooth pairing PIN is: {:06}", be_u32(payload)))
+            }
+            rnode::CMD_DEV_HASH if payload.len() >= 32 => {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&payload[..32]);
+                self.device_hash = Some(hash);
             }
             rnode::CMD_HASHES if payload.len() >= 33 => match payload[0] {
                 0x01 => self.firmware_hash_target = Some(payload[1..33].to_vec()),
@@ -203,11 +235,6 @@ impl RNode {
             .ok_or_else(|| "can only concatenate str (not \"NoneType\") to str".to_string())?;
         log(format!("Current firmware version: {version}"));
         Ok(())
-    }
-
-    /// A one-byte command sent unescaped, as upstream's single-byte setters do.
-    pub fn send_raw_byte(&mut self, command: u8, value: u8) -> Result<(), String> {
-        self.write(&[kiss::FEND, command, value, kiss::FEND])
     }
 
     pub fn leave(&mut self) -> Result<(), String> {

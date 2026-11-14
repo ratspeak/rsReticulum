@@ -107,6 +107,32 @@ pub fn frame(command: u8, payload: &[u8]) -> AdminFrame {
     }
 }
 
+pub fn wifi_channel_frame(channel: u8) -> AdminFrame {
+    frame(rnode::CMD_WIFI_CHN, &[channel])
+}
+
+/// Upstream `set_wifi_ssid`: NUL-terminated UTF-8 of at most 33 bytes, or a
+/// lone NUL to delete. `None` when the length is invalid.
+pub fn wifi_ssid_frame(ssid: Option<&str>) -> Option<AdminFrame> {
+    wifi_string_frame(rnode::CMD_WIFI_SSID, ssid, 0)
+}
+
+/// Upstream `set_wifi_psk`: as the SSID, but at least 8 bytes with the NUL.
+pub fn wifi_psk_frame(psk: Option<&str>) -> Option<AdminFrame> {
+    wifi_string_frame(rnode::CMD_WIFI_PSK, psk, 8)
+}
+
+fn wifi_string_frame(command: u8, value: Option<&str>, min_len: usize) -> Option<AdminFrame> {
+    let Some(value) = value else {
+        return Some(frame(command, &[0]));
+    };
+    let mut data = value.as_bytes().to_vec();
+    data.push(0);
+    (min_len..=33)
+        .contains(&data.len())
+        .then(|| frame(command, &data))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WifiMode {

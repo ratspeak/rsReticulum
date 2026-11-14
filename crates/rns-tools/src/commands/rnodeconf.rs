@@ -1,10 +1,9 @@
 //! rnodeconf-rs - RNode configuration and firmware utility.
 //!
-//! Device probe, info, configuration summary, EEPROM dump and backup, firmware
-//! hash readout and TNC/normal startup mode follow upstream `rnodeconf`.
-//! Firmware installation, EEPROM wipe and bootstrap, signing and trust
-//! enrollment, and Bluetooth, Wi-Fi, display and interference-avoidance
-//! mutations are disabled in this build.
+//! Device probe, info, configuration summary, EEPROM dump and backup, device
+//! settings, signing and trust, firmware hash readout and TNC/normal startup
+//! mode follow upstream `rnodeconf`. Firmware installation, extraction, EEPROM
+//! wipe and bootstrap are disabled in this build.
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -13,7 +12,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{CommandFactory, Parser};
-use rns_interface::rnode;
+use rns_interface::{rnode, rnode_admin};
 use rns_tools::RS_RETICULUM_VERSION;
 
 #[allow(dead_code)]
@@ -32,7 +31,6 @@ mod model;
 mod plan;
 #[path = "rnodeconf/session.rs"]
 mod session;
-#[allow(dead_code)]
 #[path = "rnodeconf/trust.rs"]
 mod trust;
 
@@ -273,9 +271,19 @@ pub(crate) fn main() -> ExitCode {
         ));
         return ExitCode::SUCCESS;
     }
+    if let Some(key) = args.trust_key.as_deref().filter(|key| !key.is_empty()) {
+        return trust_key(key);
+    }
     if let Some(message) = plan::refusal_without_port(&args) {
         eprintln!("rnodeconf-rs: {message}");
         return ExitCode::from(2);
+    }
+    if args.public {
+        show_public_keys();
+        return ExitCode::SUCCESS;
+    }
+    if args.key {
+        return generate_keys();
     }
     let Some(port_path) = args.port.clone() else {
         out("");
@@ -368,6 +376,10 @@ fn run_device(rnode: &mut RNode, args: &Args) -> Result<ExitCode, String> {
         return Ok(graceful_exit(rnode, 0));
     }
 
+    if let Some(code) = apply_device_settings(rnode, args)? {
+        return Ok(code);
+    }
+
     if args.info {
         let Some(device) = device.as_ref() else {
             log("EEPROM is invalid, no further information available");
@@ -379,6 +391,43 @@ fn run_device(rnode: &mut RNode, args: &Args) -> Result<ExitCode, String> {
         out("");
         rnode.leave()?;
         return Ok(graceful_exit(rnode, 0));
+    }
+
+    if args.sign {
+        if device.is_none() {
+            log("This device has not been provisioned yet, cannot create device signature");
+            return Ok(graceful_exit(rnode, 79));
+        }
+        let signer = load_identity(&trust::device_key_path(&rnodeconf_root()?));
+        match (rnode.device_hash, signer) {
+            (None, _) => log("No device hash present, skipping device signing"),
+            (Some(_), None) => {
+                log("No device signer loaded, cannot sign device");
+                return Ok(graceful_exit(rnode, 78));
+            }
+            (Some(hash), Some(signer)) => {
+                let signature = trust::sign_device_hash(&signer, &hash)?;
+                rnode.send_frame(&trust::device_signature_frame(&signature))?;
+                log("Device signed");
+            }
+        }
+    }
+
+    if let Some(value) = args.firmware_hash.as_deref() {
+        if device.is_none() {
+            log("This device has not been provisioned yet, cannot set firmware hash");
+            return Ok(graceful_exit(rnode, 77));
+        }
+        match py_fromhex(value).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()) {
+            Some(hash) => {
+                rnode.send_frame(&trust::firmware_hash_frame(&hash))?;
+                log("Firmware hash set");
+            }
+            None => {
+                log("The provided value was not a valid SHA256 hash");
+                return Ok(graceful_exit(rnode, 78));
+            }
+        }
     }
 
     for (wanted, label, hash) in [
@@ -426,6 +475,408 @@ fn run_device(rnode: &mut RNode, args: &Args) -> Result<ExitCode, String> {
     Ok(graceful_exit(rnode, 0))
 }
 
+/// Upstream's display, interference avoidance, NeoPixel, Bluetooth and Wi-Fi
+/// setters, in its order. `Some` is an exit upstream takes inside this block.
+/// One-byte values are KISS-escaped: upstream sends them raw, so 0xC0 and 0xDB
+/// break their frames.
+fn apply_device_settings(rnode: &mut RNode, args: &Args) -> Result<Option<ExitCode>, String> {
+    let byte = |value: i64, max: i64| value.clamp(0, max) as u8;
+    if let Some(value) = args.display {
+        let di = byte(value, 255);
+        log(format!("Setting display intensity to {di}"));
+        rnode.send(rnode::CMD_DISP_INT, &[di])?;
+    }
+    if let Some(value) = args.timeout {
+        let di = byte(value, 255);
+        if di == 0 {
+            log("Disabling display blanking");
+        } else {
+            log(format!("Setting display timeout to {di}"));
+        }
+        rnode.send(rnode::CMD_DISP_BLNK, &[di])?;
+    }
+    if let Some(value) = args.rotation {
+        let dr = byte(value, 3);
+        log(format!("Setting display rotation to {dr}"));
+        rnode.send(rnode::CMD_DISP_ROT, &[dr])?;
+    }
+    if args.recondition_display {
+        log("Starting display reconditioning");
+        rnode.send(rnode::CMD_DISP_RCND, &[0x01])?;
+    }
+    if args.ia_enable {
+        log("Enabling interference avoidance");
+        rnode.send(rnode::CMD_DIS_IA, &[0x00])?;
+    }
+    if args.ia_disable {
+        log("Disabling interference avoidance");
+        rnode.send(rnode::CMD_DIS_IA, &[0x01])?;
+    }
+    if let Some(value) = args.neopixel {
+        let di = byte(value, 255);
+        log(format!("Setting NeoPixel intensity to {di}"));
+        rnode.send(rnode::CMD_NP_INT, &[di])?;
+    }
+    if let Some(addr) = args.display_addr.as_deref() {
+        let addr = addr.strip_prefix("0x").unwrap_or(addr);
+        match py_fromhex(addr).as_deref() {
+            Some(&[da]) => {
+                log(format!("Setting display address to {da:02x}"));
+                rnode.send(rnode::CMD_DISP_ADR, &[da])?;
+                rnode.hard_reset()?;
+                return Ok(Some(graceful_exit(rnode, 0)));
+            }
+            _ => log("Invalid display address specified"),
+        }
+    }
+    if args.bluetooth_on {
+        log("Enabling Bluetooth...");
+        rnode.send(rnode::CMD_BT_CTRL, &[0x01])?;
+        rnode.leave()?;
+    }
+    if args.bluetooth_off {
+        log("Disabling Bluetooth...");
+        rnode.send(rnode::CMD_BT_CTRL, &[0x00])?;
+        rnode.leave()?;
+    }
+    if args.bluetooth_pair {
+        log("Putting device into Bluetooth pairing mode. Press enter to exit when done.");
+        rnode.send(rnode::CMD_BT_CTRL, &[0x02])?;
+        rnode.wait_for_enter()?;
+        rnode.leave()?;
+    }
+
+    let given = |value: &Option<String>| value.clone().filter(|value| !value.is_empty());
+    let failed = |rnode: &mut RNode, what: &str, error: String| {
+        out(format!("Could not set WiFi {what}: {error}"));
+        Some(graceful_exit(rnode, 0))
+    };
+    if let Some(channel) = given(&args.channel) {
+        log(format!("Setting WiFi channel to {channel}"));
+        match py_int(&channel).ok().filter(|ch| (1..=14).contains(ch)) {
+            Some(ch) => rnode.send_frame(&rnode_admin::wifi_channel_frame(ch as u8))?,
+            None => return Ok(failed(rnode, "channel", "Invalid WiFi channel".into())),
+        }
+    }
+    if let Some(ssid) = given(&args.ssid) {
+        let ssid = if ssid.to_lowercase() == "none" {
+            log("Deleting WiFi SSID");
+            None
+        } else {
+            log(format!("Setting WiFi SSID to: {ssid}"));
+            Some(ssid)
+        };
+        match rnode_admin::wifi_ssid_frame(ssid.as_deref()) {
+            Some(frame) => rnode.send_frame(&frame)?,
+            None => return Ok(failed(rnode, "SSID", "Invalid SSID length".into())),
+        }
+    }
+    if let Some(psk) = given(&args.psk) {
+        let psk = if psk.to_lowercase() == "none" {
+            log("Deleting WiFi PSK");
+            None
+        } else {
+            log("Setting WiFi PSK");
+            Some(psk)
+        };
+        match rnode_admin::wifi_psk_frame(psk.as_deref()) {
+            Some(frame) => rnode.send_frame(&frame)?,
+            None => return Ok(failed(rnode, "PSK", "Invalid psk length".into())),
+        }
+    }
+    for (value, what, command) in [
+        (given(&args.ip), "IP", rnode::CMD_WIFI_IP),
+        (given(&args.nm), "netmask", rnode::CMD_WIFI_NM),
+    ] {
+        let Some(value) = value else { continue };
+        let address = if value.to_lowercase() == "none" {
+            log(if command == rnode::CMD_WIFI_IP {
+                "Setting WiFi IP to DHCP...".to_string()
+            } else {
+                "Deleting WiFi static netmask configuration...".to_string()
+            });
+            Ok([0; 4])
+        } else {
+            log(if command == rnode::CMD_WIFI_IP {
+                format!("Setting WiFi static IP to: {value}")
+            } else {
+                format!("Setting WiFi static netmask to: {value}")
+            });
+            parse_wifi_address(&value)
+        };
+        match address {
+            Ok(address) => rnode.send(command, &address)?,
+            Err(error) => return Ok(failed(rnode, what, error)),
+        }
+    }
+    if let Some(wifi) = given(&args.wifi) {
+        let wifi = wifi.to_lowercase();
+        let mode = if wifi.starts_with("sta") {
+            log("Setting WiFi to station mode");
+            rnode_admin::WifiMode::Station
+        } else if wifi.starts_with("ap") {
+            log("Setting WiFi to AP mode");
+            rnode_admin::WifiMode::AccessPoint
+        } else {
+            log("Disabling WiFi...");
+            rnode_admin::WifiMode::Off
+        };
+        rnode.send(rnode::CMD_WIFI_MODE, &[mode as u8])?;
+    }
+    Ok(None)
+}
+
+/// Upstream `set_wifi_ip` / `set_wifi_nm` address parsing and its messages.
+fn parse_wifi_address(value: &str) -> Result<[u8; 4], String> {
+    let octets: Vec<&str> = value.split('.').collect();
+    if octets.len() != 4 {
+        return Err("Invalid IP address length".to_string());
+    }
+    let mut address = [0u8; 4];
+    for (slot, octet) in address.iter_mut().zip(octets) {
+        let octet =
+            py_int(octet).map_err(|error| format!("Could not decode IP address octet: {error}"))?;
+        *slot = u8::try_from(octet)
+            .map_err(|_| "Could not decode IP address octet: Invalid IP octet value".to_string())?;
+    }
+    Ok(address)
+}
+
+/// Python `int(text)` for base 10; the error is Python's message.
+fn py_int(text: &str) -> Result<i128, String> {
+    let error = || format!("invalid literal for int() with base 10: {}", py_repr(text));
+    let trimmed = text.trim();
+    let (negative, digits) = match trimmed.as_bytes().first() {
+        Some(b'-') => (true, &trimmed[1..]),
+        Some(b'+') => (false, &trimmed[1..]),
+        _ => (false, trimmed),
+    };
+    let bytes = digits.as_bytes();
+    let well_formed = !bytes.is_empty()
+        && bytes.first().is_some_and(u8::is_ascii_digit)
+        && bytes.last().is_some_and(u8::is_ascii_digit)
+        && bytes.iter().all(|b| b.is_ascii_digit() || *b == b'_')
+        && !digits.contains("__");
+    if !well_formed {
+        return Err(error());
+    }
+    let magnitude = digits
+        .chars()
+        .filter(char::is_ascii_digit)
+        .fold(0i128, |acc, d| {
+            acc.saturating_mul(10)
+                .saturating_add(i128::from(d as u8 - b'0'))
+        });
+    Ok(if negative { -magnitude } else { magnitude })
+}
+
+/// Python `bytes.fromhex`: hex digit pairs, ASCII whitespace allowed between bytes.
+fn py_fromhex(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        let high = c.to_digit(16)?;
+        let low = chars.next()?.to_digit(16)?;
+        out.push((high * 16 + low) as u8);
+    }
+    Some(out)
+}
+
+/// Python `repr(str)` for the printable strings these messages quote.
+fn py_repr(text: &str) -> String {
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::from(quote);
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// Python's `str(OSError)` for a failed file operation on `path`.
+fn py_os_error(error: &std::io::Error, path: &Path) -> String {
+    let text = error.to_string();
+    match error.raw_os_error() {
+        Some(code) => format!(
+            "[Errno {code}] {}: {}",
+            text.split(" (os error").next().unwrap_or(&text),
+            py_repr(&path.display().to_string())
+        ),
+        None => text,
+    }
+}
+
+/// Upstream `RNS.Identity.from_file`: `None`, with its log lines, on failure.
+fn load_identity(path: &Path) -> Option<rns_identity::identity::Identity> {
+    match fs::read(path) {
+        Ok(bytes) => match trust::identity_from_private_key(&bytes) {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                log(format!(
+                    "Failed to load identity key, the contained exception was: {error}"
+                ));
+                None
+            }
+        },
+        Err(error) => {
+            log(format!(
+                "Error while loading identity from {}",
+                path.display()
+            ));
+            log(format!(
+                "The contained exception was: {}",
+                py_os_error(&error, path)
+            ));
+            None
+        }
+    }
+}
+
+/// Upstream `--trust-key`.
+fn trust_key(key: &str) -> ExitCode {
+    let Some(public_bytes) = py_fromhex(key) else {
+        log("Invalid key data supplied");
+        return ExitCode::SUCCESS;
+    };
+    let result = trust::check_public_key_der(&public_bytes).and_then(|()| {
+        log(format!(
+            "Trusting key: {}",
+            hex::encode(rns_crypto::sha::sha256(&public_bytes))
+        ));
+        let root = rnodeconf_root()?;
+        trust::write_trusted_key(&root, &public_bytes)
+            .map(|_| ())
+            .map_err(|error| py_os_error(&error, &trust::trusted_key_path(&root, &public_bytes)))
+    });
+    if let Err(error) = result {
+        log("Could not create public key from supplied data. Check that the key format is valid.");
+        log(error);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Upstream `-P`.
+fn show_public_keys() {
+    let root = match rnodeconf_root() {
+        Ok(root) => root,
+        Err(error) => {
+            log(error);
+            return;
+        }
+    };
+    let private_bytes = fs::read(trust::signing_key_path(&root)).ok();
+    if private_bytes.is_none() {
+        log("Could not load EEPROM signing key");
+    }
+    match trust::signing_public_key_der(private_bytes.as_deref()) {
+        Ok(public) => {
+            log("EEPROM Signing Public key:");
+            log(hex::encode(public));
+        }
+        Err(error) => {
+            log("Could not deserialize signing key");
+            log(error);
+        }
+    }
+    let signer = load_identity(&trust::device_key_path(&root));
+    log("");
+    log("Device Signing Public key:");
+    match signer {
+        Some(signer) => log(rns_tools::format::hex_rep(&signer.get_public_key()[32..])),
+        None => log("Could not load device signing key"),
+    }
+}
+
+/// Upstream `-k`: a device signing identity and an EEPROM signing key, each
+/// created only when absent. Exits 81 and 82 are upstream's intent; upstream
+/// never reaches them because `Identity.to_file` and `from_file` swallow errors.
+fn generate_keys() -> ExitCode {
+    let root = match rnodeconf_root() {
+        Ok(root) => root,
+        Err(error) => {
+            log(error);
+            return ExitCode::SUCCESS;
+        }
+    };
+    let firmware_dir = root.join("firmware");
+    let device_key = trust::device_key_path(&root);
+    if !device_key.is_file() {
+        log("Generating a new device signing key...");
+        let _ = fs::create_dir_all(&firmware_dir);
+        if let Err(error) = rns_identity::identity::Identity::new().to_file(&device_key) {
+            log(format!(
+                "Could not create new device signing key at {}. The contained exception was:",
+                device_key.display()
+            ));
+            log(error.to_string());
+            log("Please ensure filesystem access and try again.");
+            return ExitCode::from(81);
+        }
+        log(format!(
+            "Device signing key written to {}",
+            device_key.display()
+        ));
+    } else {
+        let loaded = fs::read(&device_key)
+            .map_err(|error| py_os_error(&error, &device_key))
+            .and_then(|bytes| trust::identity_from_private_key(&bytes).map(|_| ()));
+        if let Err(error) = loaded {
+            log(format!(
+                "Could not load device signing key from {}. The contained exception was:",
+                device_key.display()
+            ));
+            log(error);
+            log("Please restore or clear the key and try again.");
+            return ExitCode::from(82);
+        }
+    }
+
+    let signing_key = trust::signing_key_path(&root);
+    if signing_key.is_file() {
+        let _ = fs::create_dir_all(&firmware_dir);
+        log("EEPROM Signing key already exists, not overwriting!");
+        log("Manually delete this key to create a new one.");
+        return ExitCode::SUCCESS;
+    }
+    log("Generating a new EEPROM signing key...");
+    let (private_bytes, public_bytes) = match trust::generate_signing_key() {
+        Ok(keys) => keys,
+        Err(error) => {
+            log(error);
+            return ExitCode::SUCCESS;
+        }
+    };
+    if fs::create_dir_all(&firmware_dir).is_err() || !firmware_dir.is_dir() {
+        log("The firmware directory does not exist, can't write key!");
+        return ExitCode::SUCCESS;
+    }
+    if let Err(error) = fs::write(&signing_key, &private_bytes) {
+        log(py_os_error(&error, &signing_key));
+        return ExitCode::SUCCESS;
+    }
+    log("Wrote signing key");
+    log("Public key:");
+    log(hex::encode(public_bytes));
+    ExitCode::SUCCESS
+}
+
 /// Upstream `graceful_exit`: only Windows tells the device the host left.
 fn graceful_exit(rnode: &mut RNode, code: u8) -> ExitCode {
     if cfg!(windows) {
@@ -460,13 +911,13 @@ fn set_tnc_mode(rnode: &mut RNode, args: &Args) -> Result<(), String> {
     let coding_rate = given(args.coding_rate).map_or_else(|| prompt("Coding rate:\t\t"), Ok)?;
     out("");
 
-    // initRadio: frequency and bandwidth are escaped, the one-byte setters are not.
+    // initRadio, with the one-byte values escaped too (upstream sends them raw).
     rnode.send(rnode::CMD_FREQUENCY, &radio_word(frequency)?)?;
     rnode.send(rnode::CMD_BANDWIDTH, &radio_word(bandwidth)?)?;
-    rnode.send_raw_byte(rnode::CMD_TXPOWER, radio_byte(tx_power)?)?;
-    rnode.send_raw_byte(rnode::CMD_SF, radio_byte(spreading_factor)?)?;
-    rnode.send_raw_byte(rnode::CMD_CR, radio_byte(coding_rate)?)?;
-    rnode.send_raw_byte(rnode::CMD_RADIO_STATE, rnode::RADIO_STATE_ON)?;
+    rnode.send(rnode::CMD_TXPOWER, &[radio_byte(tx_power)?])?;
+    rnode.send(rnode::CMD_SF, &[radio_byte(spreading_factor)?])?;
+    rnode.send(rnode::CMD_CR, &[radio_byte(coding_rate)?])?;
+    rnode.send(rnode::CMD_RADIO_STATE, &[rnode::RADIO_STATE_ON])?;
     rnode.pump(Duration::from_millis(500))?;
     rnode.set_tnc_mode()?;
     log("Device set to TNC operating mode");
