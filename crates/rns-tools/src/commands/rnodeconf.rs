@@ -2,8 +2,8 @@
 //!
 //! Device probe, info, configuration summary, EEPROM dump and backup, device
 //! settings, signing and trust, firmware hash readout and TNC/normal startup
-//! mode, EEPROM wipe and bootstrap, and firmware update, flashing and
-//! extraction follow upstream `rnodeconf`. Autoinstall is disabled in this build.
+//! mode, EEPROM wipe and bootstrap, firmware update, flashing and extraction,
+//! and the `-a` guided installer follow upstream `rnodeconf`.
 
 use std::fs;
 use std::io::{BufRead, Write};
