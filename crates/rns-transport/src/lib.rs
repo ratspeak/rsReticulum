@@ -35,7 +35,7 @@ macro_rules! notice {
 pub use tracing as __tracing;
 
 pub mod actor;
-pub mod announce;
+pub(crate) mod announce;
 pub(crate) mod announce_validation;
 pub mod await_path;
 pub mod blackhole;
@@ -53,18 +53,17 @@ pub use interface_ownership::{
 };
 pub mod link_endpoint_dispatch;
 pub mod link_messages;
-pub mod link_table;
+pub(crate) mod link_table;
 pub mod messages;
 pub mod path_discovery;
 pub mod path_recovery;
 pub mod path_table;
 pub mod persistence;
 pub mod pr_stamper;
-pub mod rate_limit;
-pub mod reverse_table;
+pub(crate) mod rate_limit;
+pub(crate) mod reverse_table;
 pub mod stamps;
 pub mod store;
-pub mod traffic;
 pub mod tunnel;
 
 #[cfg(test)]

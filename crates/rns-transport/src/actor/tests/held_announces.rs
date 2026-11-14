@@ -16,10 +16,6 @@ fn ifac_hub() -> (TransportActor, mpsc::Receiver<Bytes>) {
     (actor, rx)
 }
 
-fn rx_bytes(actor: &TransportActor, id: InterfaceId) -> u64 {
-    actor.traffic.get(&id).map_or(0, |traffic| traffic.rx_bytes)
-}
-
 /// The interface keeps the announce it held as it was after IFAC, so its
 /// release must not verify IFAC again.
 fn hold(actor: &mut TransportActor, raw: Bytes, destination_hash: [u8; 16]) {
@@ -69,19 +65,6 @@ fn a_released_held_announce_on_an_ifac_interface_installs_its_path() {
         "Python runs received_announce again on release (Transport.py:1811)"
     );
     assert_eq!(actor.interfaces[&1].ifac_violations, 0);
-}
-
-#[test]
-fn a_released_held_announce_is_not_counted_as_received_traffic() {
-    let (mut actor, _rx) = ifac_hub();
-    let (announce, destination) = make_valid_announce("held.ifac.traffic", 1);
-    hold(&mut actor, announce, destination);
-    let before = rx_bytes(&actor, 1);
-
-    release_held(&mut actor);
-
-    assert!(actor.path_table.has_path(&destination));
-    assert_eq!(rx_bytes(&actor, 1), before, "the held bytes arrived once");
 }
 
 /// IFAC runs before the ingress hold, so a wire announce without valid IFAC

@@ -121,7 +121,6 @@ impl TransportActor {
             let _ = request.result.send(AnnounceDispatchResult::Expired);
             return;
         }
-        self.traffic.record_tx(0, request.raw.len() as u64);
         self.packet_hashlist.insert(rns_wire::hash::packet_hash(
             &request.raw,
             header.flags.header_type,

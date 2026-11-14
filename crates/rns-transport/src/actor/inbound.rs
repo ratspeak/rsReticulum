@@ -141,11 +141,6 @@ impl TransportActor {
     }
 
     fn on_inbound_inner(&mut self, packet: crate::messages::InboundPacket, origin: InboundOrigin) {
-        if origin == InboundOrigin::Wire {
-            self.traffic
-                .record_rx(packet.interface_id, packet.raw.len() as u64);
-        }
-
         // Transport.py: frames of two bytes or less are protocol
         // violations before any IFAC handling.
         if packet.raw.len() <= 2 {
@@ -880,7 +875,6 @@ impl TransportActor {
                     } else {
                         0
                     },
-                    received_from: header.transport_id.unwrap_or(header.destination_hash),
                     hops: header.hops,
                     packet_raw: rebroadcast_raw,
                     local_rebroadcasts: 0,
@@ -1031,7 +1025,6 @@ impl TransportActor {
                     timestamp: now,
                     retransmit_timeout: now,
                     retries: PATHFINDER_R,
-                    received_from: header.transport_id.unwrap_or(header.destination_hash),
                     hops: header.hops,
                     packet_raw: rebroadcast_raw,
                     local_rebroadcasts: 0,
@@ -1254,12 +1247,8 @@ impl TransportActor {
             to_local_client,
         ) {
             let pkt_hash = rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
-            self.reverse_table.insert_with_outbound(
-                pkt_hash,
-                interface_id,
-                header.hops,
-                Some(target_interface),
-            );
+            self.reverse_table
+                .insert(pkt_hash, interface_id, Some(target_interface));
             self.send_to_interface(target_interface, &forwarded);
             if let Some(path) = self.path_table.get_live_mut(&header.destination_hash) {
                 path.mark_used();
@@ -1407,7 +1396,6 @@ impl TransportActor {
                 interface_id: target_interface,
                 remaining_hops,
                 destination_hash: header.destination_hash,
-                established: false,
                 validated: false,
                 proof_timeout,
                 receiving_interface: interface_id,

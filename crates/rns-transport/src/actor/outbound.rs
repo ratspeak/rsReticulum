@@ -111,8 +111,6 @@ impl TransportActor {
         request: crate::messages::OutboundRequest,
         create_receipt: bool,
     ) -> bool {
-        self.traffic.record_tx(0, request.raw.len() as u64); // interface 0 = local
-
         let parsed = match rns_wire::header::PacketHeader::unpack(&request.raw) {
             Ok((header, _)) => header,
             Err(_) => return false,
@@ -312,8 +310,6 @@ impl TransportActor {
         request: crate::messages::OutboundRequest,
         interface_id: InterfaceId,
     ) -> bool {
-        self.traffic.record_tx(0, request.raw.len() as u64);
-
         if let Some(sent) = self.dispatch_local_link_attached(&request, interface_id) {
             return sent;
         }
@@ -418,7 +414,6 @@ impl TransportActor {
                 );
                 return Some(false);
             }
-            self.traffic.record_rx(0, request.raw.len() as u64);
             debug!(
                 link_id = %hex::encode(link_id),
                 dest = %hex::encode(request.destination_hash),
@@ -450,7 +445,6 @@ impl TransportActor {
             );
             return Some(false);
         }
-        self.traffic.record_rx(0, request.raw.len() as u64);
         Some(true)
     }
 
@@ -493,7 +487,6 @@ impl TransportActor {
             );
             return Some(false);
         }
-        self.traffic.record_rx(0, request.raw.len() as u64);
         Some(true)
     }
 
@@ -855,7 +848,6 @@ impl TransportActor {
                         timestamp: now,
                         retransmit_timeout: now + response_delay,
                         retries: 0,
-                        received_from: requestor_transport_id.unwrap_or([0; 16]),
                         hops,
                         packet_raw: response,
                         local_rebroadcasts: 0,

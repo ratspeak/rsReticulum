@@ -15,9 +15,6 @@ pub struct LinkEntry {
     pub interface_id: InterfaceId,
     pub remaining_hops: u8,
     pub destination_hash: [u8; 16],
-    /// Local establishment bookkeeping flag. Transit proof processing updates
-    /// `validated` separately, so this is not a universal Link-health check.
-    pub established: bool,
     /// Transport validation state. Link packets for a pending transit Link
     /// are dropped as protocol violations until its proof is relayed.
     pub validated: bool,
@@ -123,10 +120,6 @@ impl LinkTable {
         });
     }
 
-    pub fn remove(&mut self, link_id: &[u8; 16]) -> Option<LinkEntry> {
-        self.entries.remove(link_id)
-    }
-
     pub fn contains(&self, link_id: &[u8; 16]) -> bool {
         self.entries.contains_key(link_id)
     }
@@ -135,6 +128,7 @@ impl LinkTable {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -248,7 +242,6 @@ mod tests {
                 interface_id: 1,
                 remaining_hops: 0,
                 destination_hash: [0xBB; 16],
-                established: true,
                 validated: true,
                 proof_timeout: 0.0,
                 receiving_interface: 1,
@@ -277,7 +270,6 @@ mod tests {
                 interface_id: 1,
                 remaining_hops: 3,
                 destination_hash: [0xEE; 16],
-                established: false,
                 validated: false,
                 proof_timeout: 1060.0,
                 receiving_interface: 2,
@@ -307,7 +299,6 @@ mod tests {
                 interface_id: 1,
                 remaining_hops: 1,
                 destination_hash: dest_hash,
-                established: false,
                 validated: false,
                 proof_timeout: 500.0,
                 receiving_interface: 2,
@@ -344,7 +335,6 @@ mod tests {
                 interface_id: 1,
                 remaining_hops: 1,
                 destination_hash: [0xA1; 16],
-                established: true,
                 validated: true,
                 proof_timeout: now + 100.0,
                 receiving_interface: 2,
@@ -365,7 +355,6 @@ mod tests {
                 interface_id: 1,
                 remaining_hops: 1,
                 destination_hash: [0xA2; 16],
-                established: true,
                 validated: true,
                 proof_timeout: 200.0,
                 receiving_interface: 2,
@@ -386,7 +375,6 @@ mod tests {
                 interface_id: 1,
                 remaining_hops: 1,
                 destination_hash: [0xA3; 16],
-                established: false,
                 validated: false,
                 proof_timeout: now + 100.0,
                 receiving_interface: 2,
@@ -407,7 +395,6 @@ mod tests {
                 interface_id: 1,
                 remaining_hops: 1,
                 destination_hash: [0xA4; 16],
-                established: false,
                 validated: false,
                 proof_timeout: 500.0,
                 receiving_interface: 2,
@@ -445,7 +432,6 @@ mod tests {
                 interface_id: 1,
                 remaining_hops: 1,
                 destination_hash: [0xA1; 16],
-                established: true,
                 validated: true,
                 proof_timeout: now + 100.0,
                 receiving_interface: 2,
@@ -466,7 +452,6 @@ mod tests {
                 interface_id: 99,
                 remaining_hops: 1,
                 destination_hash: [0xA2; 16],
-                established: true,
                 validated: true,
                 proof_timeout: now + 100.0,
                 receiving_interface: 1,

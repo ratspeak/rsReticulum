@@ -11,7 +11,6 @@ use rns_wire::types::TruncatedHash;
 pub struct ReverseEntry {
     pub timestamp: f64,
     pub receiving_interface: InterfaceId,
-    pub remaining_hops: u8,
     /// Interface we forwarded the packet on, when known. Proofs that come
     /// back on a different interface are not forwarded by the actor. This
     /// routing check is separate from cryptographic proof validation.
@@ -32,22 +31,11 @@ impl ReverseTable {
         }
     }
 
+    /// See `ReverseEntry` for why the outbound interface is pinned.
     pub fn insert(
         &mut self,
         packet_hash: impl Into<TruncatedHash>,
         interface_id: InterfaceId,
-        remaining_hops: u8,
-    ) {
-        self.insert_with_outbound(packet_hash, interface_id, remaining_hops, None);
-    }
-
-    /// Insert with explicit outbound-interface tracking. See `ReverseEntry`
-    /// for why the outbound interface is pinned.
-    pub fn insert_with_outbound(
-        &mut self,
-        packet_hash: impl Into<TruncatedHash>,
-        interface_id: InterfaceId,
-        remaining_hops: u8,
         outbound_interface: Option<InterfaceId>,
     ) {
         let now = crate::now_f64();
@@ -57,7 +45,6 @@ impl ReverseTable {
             ReverseEntry {
                 timestamp: now,
                 receiving_interface: interface_id,
-                remaining_hops,
                 outbound_interface,
             },
         );
@@ -80,26 +67,6 @@ impl ReverseTable {
         before - self.entries.len()
     }
 
-    /// Remove at most `limit` expired entries. This bounds removals, not the
-    /// scan: the whole table may be examined to find them.
-    pub fn cull_expired_batch(&mut self, limit: usize) -> usize {
-        let now = crate::now_f64();
-        let cutoff = now - REVERSE_TIMEOUT as f64;
-
-        let to_remove: Vec<TruncatedHash> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.timestamp <= cutoff)
-            .take(limit)
-            .map(|(hash, _)| *hash)
-            .collect();
-        let count = to_remove.len();
-        for hash in &to_remove {
-            self.entries.remove(hash.as_bytes());
-        }
-        count
-    }
-
     /// Remove entries whose receiving interface or specified outbound
     /// interface is absent from the caller-supplied active set.
     pub fn cull_dead_interfaces(
@@ -116,10 +83,12 @@ impl ReverseTable {
         before - self.entries.len()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -139,21 +108,19 @@ mod tests {
     fn test_insert_and_get() {
         let mut rt = ReverseTable::new();
         let hash = [0xAA; 16];
-        rt.insert(hash, 42, 5);
+        rt.insert(hash, 42, None);
         let entry = rt.get(&hash).unwrap();
         assert_eq!(entry.receiving_interface, 42);
-        assert_eq!(entry.remaining_hops, 5);
         assert_eq!(entry.outbound_interface, None);
     }
 
     #[test]
-    fn test_insert_with_outbound() {
+    fn test_insert_pins_the_outbound_interface() {
         let mut rt = ReverseTable::new();
         let hash = [0xBB; 16];
-        rt.insert_with_outbound(hash, 1, 3, Some(2));
+        rt.insert(hash, 1, Some(2));
         let entry = rt.get(&hash).unwrap();
         assert_eq!(entry.receiving_interface, 1);
-        assert_eq!(entry.remaining_hops, 3);
         assert_eq!(entry.outbound_interface, Some(2));
     }
 
@@ -161,7 +128,7 @@ mod tests {
     fn test_remove() {
         let mut rt = ReverseTable::new();
         let hash = [0xAA; 16];
-        rt.insert(hash, 1, 0);
+        rt.insert(hash, 1, None);
         assert_eq!(rt.len(), 1);
         rt.remove(&hash);
         assert_eq!(rt.len(), 0);
@@ -174,10 +141,10 @@ mod tests {
         active.insert(1u64);
         active.insert(2u64);
 
-        rt.insert([0x01; 16], 1, 3);
-        rt.insert_with_outbound([0x02; 16], 1, 3, Some(2));
-        rt.insert([0x03; 16], 99, 3);
-        rt.insert_with_outbound([0x04; 16], 1, 3, Some(99));
+        rt.insert([0x01; 16], 1, None);
+        rt.insert([0x02; 16], 1, Some(2));
+        rt.insert([0x03; 16], 99, None);
+        rt.insert([0x04; 16], 1, Some(99));
 
         assert_eq!(rt.len(), 4);
         let culled = rt.cull_dead_interfaces(&active);

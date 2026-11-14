@@ -285,7 +285,6 @@ impl TransportActor {
             return None;
         }
 
-        self.traffic.record_tx(0, request.raw.len() as u64);
         let packet_hash = rns_wire::hash::packet_hash(&request.raw, header.flags.header_type);
         self.packet_hashlist.insert(packet_hash);
         if header.flags.packet_type == rns_wire::flags::PacketType::Proof
@@ -493,10 +492,7 @@ impl TransportActor {
             metrics: PacketMetrics::default(),
         };
         match target.try_send(event) {
-            Ok(()) => {
-                self.traffic.record_rx(0, raw.len() as u64);
-                InterfaceSendOutcome::Sent
-            }
+            Ok(()) => InterfaceSendOutcome::Sent,
             Err(mpsc::error::TrySendError::Full(_)) => InterfaceSendOutcome::Full,
             Err(mpsc::error::TrySendError::Closed(_)) => InterfaceSendOutcome::Closed,
         }

@@ -239,7 +239,6 @@ fn packet_capacity_authenticated_proof_obeys_request_ceiling_and_keeps_original_
             interface_id: 2,
             remaining_hops: 1,
             destination_hash: destination,
-            established: false,
             validated: false,
             proof_timeout: now_f64() + 60.,
             receiving_interface: 1,

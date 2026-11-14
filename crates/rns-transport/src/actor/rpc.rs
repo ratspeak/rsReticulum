@@ -1107,7 +1107,6 @@ mod tests {
             interface_id: 1,
             remaining_hops: 1,
             destination_hash: [0xCC; 16],
-            established: true,
             validated: true,
             proof_timeout: now_f64() + 120.0,
             receiving_interface: 1,

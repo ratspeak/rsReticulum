@@ -142,11 +142,6 @@ impl TransportActor {
 
         self.count_traffic(now);
 
-        if now - self.last_links_check >= LINKS_CHECK_INTERVAL {
-            self.traffic.update_speeds();
-            self.last_links_check = now;
-        }
-
         if now - self.last_receipts_check >= RECEIPTS_CHECK_INTERVAL {
             let mut concluded = Vec::new();
             for (key, receipt) in &mut self.receipt_table {
@@ -416,7 +411,6 @@ impl TransportActor {
     pub(super) fn on_resume(&mut self) {
         debug!("transport actor resume — forcing maintenance pass");
         self.last_tables_cull = 0.0;
-        self.last_links_check = 0.0;
         self.last_receipts_check = 0.0;
         self.last_announces_check = 0.0;
         self.last_announce_cache_sweep = 0.0;
@@ -865,10 +859,10 @@ mod cleanup_tests {
         for i in 0..10_000u32 {
             let mut hash = [0u8; 16];
             hash[..4].copy_from_slice(&i.to_be_bytes());
-            actor.reverse_table.insert(hash, 1, 1);
+            actor.reverse_table.insert(hash, 1, None);
         }
         clock.set(start + REVERSE_TIMEOUT as f64 + 1.0);
-        actor.reverse_table.insert([0xFF; 16], 1, 1);
+        actor.reverse_table.insert([0xFF; 16], 1, None);
         actor.last_tables_cull = 0.0;
         actor.on_tick();
         assert_eq!(actor.reverse_table.len(), 1);

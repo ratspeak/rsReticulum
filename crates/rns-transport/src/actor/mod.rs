@@ -22,7 +22,6 @@ pub use crate::path_discovery::DiscoveryPathRequest;
 use crate::path_table::PathTable;
 use crate::rate_limit::RateTable;
 use crate::reverse_table::ReverseTable;
-use crate::traffic::TrafficCounter;
 use crate::tunnel::TunnelTable;
 use rns_wire::receipt::{PacketReceipt, ReceiptStatus};
 
@@ -122,7 +121,6 @@ pub struct TransportActor {
     pub(crate) rate_table: RateTable,
     rate_table_retain: f64,
     pub(crate) blackhole_table: BlackholeTable,
-    pub(crate) traffic: TrafficCounter,
     /// Python's interface traffic count and top-level stats counters.
     traffic_count: rpc::TrafficCount,
     /// Python's `local_client_rssi_cache`, `_snr_cache` and `_q_cache`: one
@@ -211,7 +209,6 @@ pub struct TransportActor {
     /// Destinations with a path request admitted and not yet answered
     /// (Python `inflight_path_requests`), with the admission time.
     pub(crate) inflight_path_requests: HashMap<[u8; 16], f64>,
-    last_links_check: f64,
     last_receipts_check: f64,
     last_announces_check: f64,
     /// Last on-disk announce-cache sweep. Storage init sets it 60 s ahead so
@@ -526,7 +523,6 @@ impl TransportActor {
             rate_table: RateTable::new(),
             rate_table_retain: RATE_TABLE_RETAIN,
             blackhole_table: BlackholeTable::new(),
-            traffic: TrafficCounter::new(),
             traffic_count: rpc::TrafficCount::default(),
             packet_rssi_cache: VecDeque::new(),
             packet_snr_cache: VecDeque::new(),
@@ -561,7 +557,6 @@ impl TransportActor {
             last_tables_cull: 0.0,
             path_pool_last_checked: now_f64(),
             inflight_path_requests: HashMap::new(),
-            last_links_check: 0.0,
             last_receipts_check: 0.0,
             last_announces_check: 0.0,
             last_announce_cache_sweep: 0.0,
@@ -3438,7 +3433,6 @@ mod tests {
                 timestamp: now_f64(),
                 retransmit_timeout: now_f64(),
                 retries: 0,
-                received_from: [0x22; 16],
                 hops: 2,
                 packet_raw: vec![0x51, 0x01, 0x02],
                 local_rebroadcasts: 0,
@@ -4016,7 +4010,7 @@ mod tests {
 
         // Insert reverse entry: dest_hash -> interface 1
         let dest_hash = [0x33; 16];
-        actor.reverse_table.insert(dest_hash, 1, 3);
+        actor.reverse_table.insert(dest_hash, 1, None);
 
         // Inject proof on interface 2
         let raw = make_proof_packet(dest_hash, 0);
@@ -4201,7 +4195,6 @@ mod tests {
             interface_id: 2,   // next-hop interface (toward destination)
             remaining_hops: 1, // 1 hop from relay to destination
             destination_hash,
-            established: false,
             validated: false,
             proof_timeout: now_f64() + 120.0,
             receiving_interface: 1, // came from initiator side
@@ -4274,7 +4267,6 @@ mod tests {
                 interface_id: 2,
                 remaining_hops: 1,
                 destination_hash,
-                established: false,
                 validated: false,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
@@ -4328,7 +4320,6 @@ mod tests {
                 interface_id: 2,
                 remaining_hops: 1,
                 destination_hash,
-                established: false,
                 validated: false,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
@@ -4384,7 +4375,6 @@ mod tests {
                 interface_id: 2,
                 remaining_hops: 1,
                 destination_hash,
-                established: false,
                 validated: false,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
@@ -4436,7 +4426,6 @@ mod tests {
                     interface_id: 2,
                     remaining_hops: 1,
                     destination_hash,
-                    established: false,
                     validated: false,
                     proof_timeout: now_f64() + 120.0,
                     receiving_interface: 1,
@@ -4484,7 +4473,6 @@ mod tests {
                 interface_id: 2,
                 remaining_hops: 1,
                 destination_hash: [0xCE; 16],
-                established: true,
                 validated: true,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
@@ -4541,7 +4529,6 @@ mod tests {
                 interface_id: 2,
                 remaining_hops: 1,
                 destination_hash: [0xDF; 16],
-                established: true,
                 validated: true,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
@@ -4607,7 +4594,6 @@ mod tests {
                 interface_id: 2,
                 remaining_hops: 1,
                 destination_hash: [0xCF; 16],
-                established: true,
                 validated: true,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
@@ -4666,7 +4652,6 @@ mod tests {
                 interface_id: 2, // toward destination
                 remaining_hops: 1,
                 destination_hash,
-                established: false,
                 validated: false,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1, // from RelayA
@@ -4703,7 +4688,6 @@ mod tests {
                 interface_id: 2, // toward RelayB
                 remaining_hops: 2,
                 destination_hash,
-                established: false,
                 validated: false,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1, // from Initiator
@@ -5947,7 +5931,6 @@ mod tests {
             timestamp: 0.0,
             retransmit_timeout: 0.0, // already due
             retries: 0,
-            received_from: dest_hash,
             hops: 0,
             packet_raw: raw.to_vec(),
             local_rebroadcasts: 0,
@@ -8935,7 +8918,6 @@ mod tests {
                 interface_id: 2,
                 remaining_hops: 1,
                 destination_hash: [0xC1; 16],
-                established: true,
                 validated: true,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
@@ -8977,7 +8959,6 @@ mod tests {
                 interface_id: 2,
                 remaining_hops: 0,
                 destination_hash: [0xC2; 16],
-                established: true,
                 validated: true,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
@@ -9029,7 +9010,6 @@ mod tests {
                 interface_id: 2,
                 remaining_hops: 0,
                 destination_hash,
-                established: false,
                 validated: false,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
@@ -9074,7 +9054,6 @@ mod tests {
                 interface_id: 2,
                 remaining_hops: 0,
                 destination_hash,
-                established: false,
                 validated: false,
                 proof_timeout: now_f64() + 120.0,
                 receiving_interface: 1,
@@ -9111,7 +9090,7 @@ mod tests {
         actor.interfaces.insert(2, client);
 
         let proof_hash = [0x71; 16];
-        actor.reverse_table.insert(proof_hash, 1, 1);
+        actor.reverse_table.insert(proof_hash, 1, None);
         actor.on_inbound(InboundPacket {
             raw: make_proof_packet(proof_hash, 0),
             interface_id: 2,
@@ -9134,7 +9113,7 @@ mod tests {
         actor.interfaces.insert(2, client_b);
 
         let proof_hash = [0x72; 16];
-        actor.reverse_table.insert(proof_hash, 1, 0);
+        actor.reverse_table.insert(proof_hash, 1, None);
         actor.on_inbound(InboundPacket {
             raw: make_proof_packet(proof_hash, 0),
             interface_id: 2,
@@ -12303,7 +12282,6 @@ mod tests {
                 timestamp: now_f64(),
                 retransmit_timeout: now_f64() + 10.0,
                 retries: 0,
-                received_from: [0x22; 16],
                 hops: 1,
                 packet_raw: held_raw.clone(),
                 local_rebroadcasts: 0,
@@ -12591,7 +12569,7 @@ mod tests {
             [0x11; 16],
             crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
         );
-        actor.reverse_table.insert([0x22; 16], 1, 1);
+        actor.reverse_table.insert([0x22; 16], 1, None);
         actor.pending_local_path_requests.insert([0x33; 16], 1);
         let link_id = [0x34; 16];
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
@@ -12643,7 +12621,7 @@ mod tests {
             [0x11; 16],
             crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
         );
-        actor.reverse_table.insert([0x22; 16], 1, 1);
+        actor.reverse_table.insert([0x22; 16], 1, None);
         actor.pending_local_path_requests.insert([0x33; 16], 1);
 
         actor.handle_message(owned_event(

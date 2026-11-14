@@ -41,23 +41,12 @@ impl RateTable {
         }
     }
 
+    #[cfg(test)]
     pub fn is_blocked(&self, dest_hash: &[u8; 16]) -> bool {
         let now = crate::now_f64();
         self.entries
             .get(dest_hash)
             .is_some_and(|e| e.blocked_until > now)
-    }
-
-    pub fn last_announce(&self, dest_hash: &[u8; 16]) -> Option<f64> {
-        self.entries.get(dest_hash).map(|e| e.last)
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// Remove entries whose `last` is older than `now - ttl` and whose penalty
@@ -168,6 +157,120 @@ mod tests {
         assert_eq!(
             rt.entries[&DestHash::from(hash)].timestamps.len(),
             MAX_RATE_TIMESTAMPS
+        );
+    }
+
+    /// Goldens from `tests/fixtures/announce_rate/gen_rate_table.py`, which
+    /// calls upstream `AnnounceRateTable.check_and_update` and `cull`.
+    fn golden() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/announce_rate/rate_table.json"
+        ))
+        .unwrap()
+    }
+
+    fn now() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    }
+
+    /// When an interface configures `announce_rate_target` (e.g. minimum 1.0s
+    /// between announces) and a destination floods past the grace window, the
+    /// table flips to blocked. Mirrors Python Transport.py.
+    #[test]
+    fn rate_limit_per_interface_target_kicks_in_when_configured() {
+        let mut rt = RateTable::new();
+        let target = 1.0;
+        let grace = 2;
+        let penalty = 5.0;
+
+        // First call seeds the entry — never blocks.
+        let blocked = rt.check_interface_rate([0xAA; 16], target, grace, penalty);
+        assert!(!blocked, "first announce must not be blocked");
+
+        // Hammer the table fast enough that current_rate < target every time.
+        // After grace + 1 violations it must flip to blocked.
+        let mut blocked_anywhere = false;
+        for _ in 0..6 {
+            if rt.check_interface_rate([0xAA; 16], target, grace, penalty) {
+                blocked_anywhere = true;
+                break;
+            }
+        }
+        assert!(
+            blocked_anywhere,
+            "after exceeding grace violations, check_interface_rate must return true (blocked)"
+        );
+    }
+
+    /// Python appends the timestamp even
+    /// when the announce is blocked (Storage.py).
+    #[test]
+    fn blocked_check_still_appends_timestamp() {
+        let g = golden();
+        let c = &g["blocked_appends_timestamp"];
+        let (t, gr, p) = (
+            c["target"].as_f64().unwrap(),
+            c["grace"].as_u64().unwrap() as u32,
+            c["penalty"].as_f64().unwrap(),
+        );
+        let d = [0x11u8; 16];
+        let mut rt = RateTable::new();
+        let mut got = Vec::new();
+        for _ in c["steps"].as_array().unwrap() {
+            let blocked = rt.check_interface_rate(d, t, gr, p);
+            let e = rt.iter().find(|(h, _)| h.as_bytes() == &d).unwrap().1;
+            got.push((blocked, e.timestamps.len(), e.violations));
+        }
+        let want: Vec<(bool, usize, u32)> = c["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["blocked"].as_bool().unwrap(),
+                    s["n_timestamps"].as_u64().unwrap() as usize,
+                    s["rate_violations"].as_u64().unwrap() as u32,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got, want,
+            "(blocked, n_timestamps, violations) per step vs AnnounceRateTable 1.6.0"
+        );
+    }
+
+    /// Cull removes only entries both older than the retain window and no longer
+    /// blocked (Storage.py).
+    #[test]
+    fn cull_keeps_actively_blocked_entry() {
+        let g = golden();
+        let ttl = g["RATE_TABLE_RETAIN"].as_f64().unwrap();
+        let d = [0x11u8; 16];
+        let mut rt = RateTable::new();
+        rt.check_interface_rate(d, 60.0, 0, 7200.0);
+        assert!(
+            rt.check_interface_rate(d, 60.0, 0, 7200.0),
+            "precondition: blocked"
+        );
+        let later = now() + ttl + 100.0;
+        rt.cull(later, ttl);
+        assert_eq!(
+            rt.iter().any(|(h, _)| h.as_bytes() == &d),
+            g["cull_keeps_blocked"]["survives"].as_bool().unwrap(),
+            "blocked entry past the retain window"
+        );
+        let mut unblocked = RateTable::new();
+        unblocked.check_interface_rate(d, 60.0, 0, 7200.0);
+        unblocked.cull(later, ttl);
+        assert_eq!(
+            unblocked.iter().any(|(h, _)| h.as_bytes() == &d),
+            g["cull_removes_unblocked_stale"]["survives"]
+                .as_bool()
+                .unwrap(),
+            "unblocked entry past the retain window"
         );
     }
 }

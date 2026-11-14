@@ -210,7 +210,6 @@ async fn blocked_interface_rediscovery_shares_one_tag() {
                 interface_id: 2,
                 remaining_hops: 1,
                 destination_hash: dest,
-                established: false,
                 validated: false,
                 proof_timeout: 1.0,
                 receiving_interface: 1,

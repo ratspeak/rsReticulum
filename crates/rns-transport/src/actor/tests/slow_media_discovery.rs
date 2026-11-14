@@ -529,7 +529,6 @@ fn transit_table_capacity_and_driver_refusal_do_not_create_untracked_forwarding(
                         interface_id: 2,
                         remaining_hops: 1,
                         destination_hash: dest,
-                        established: false,
                         validated: false,
                         proof_timeout: now_f64() + 1000.0,
                         receiving_interface: 1,

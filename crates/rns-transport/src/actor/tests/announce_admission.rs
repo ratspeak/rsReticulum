@@ -75,7 +75,6 @@ fn cache_entry(raw: &Bytes, timestamp: f64, attached: bool) -> crate::announce::
         timestamp,
         retransmit_timeout: timestamp,
         retries: 0,
-        received_from: [0; 16],
         hops: 1,
         packet_raw: raw.to_vec(),
         local_rebroadcasts: 0,

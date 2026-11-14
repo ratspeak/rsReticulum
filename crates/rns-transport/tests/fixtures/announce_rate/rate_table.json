@@ -1,0 +1,8 @@
+{
+"provenance": {"generator": "crates/rns-transport/tests/fixtures/announce_rate/gen_rate_table.py", "rns_version": "1.6.0", "rns_commit": "cb1260891d1b6da8f6e9b21542c4f0cc0725cac4", "rns_path": "upstream Reticulum 1.6.0"},
+"RATE_TABLE_RETAIN": 3600,
+"MAX_RATE_TIMESTAMPS": 16,
+"blocked_appends_timestamp": {"target": 60.0, "grace": 0, "penalty": 100.0, "steps": [{"dt": 0.0, "blocked": false, "n_timestamps": 1, "rate_violations": 0, "blocked_until_minus_t0": 0.0, "last_minus_t0": 0.0}, {"dt": 0.001, "blocked": true, "n_timestamps": 2, "rate_violations": 1, "blocked_until_minus_t0": 160.0, "last_minus_t0": 0.0}, {"dt": 0.002, "blocked": true, "n_timestamps": 3, "rate_violations": 1, "blocked_until_minus_t0": 160.0, "last_minus_t0": 0.0}]},
+"cull_keeps_blocked": {"cull_now_minus_t0": 3700.0, "ttl": 3600, "culled": 0, "survives": true},
+"cull_removes_unblocked_stale": {"culled": 1, "survives": false}
+}

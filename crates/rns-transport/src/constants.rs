@@ -134,10 +134,6 @@ pub const UNUSED_DESTINATION_LINGER: f64 = 360.0;
 /// generation into the previous one. Tags have no time expiry.
 pub const MAX_DISCOVERY_PR_TAGS: usize = 16_000;
 
-/// Traffic-rate sampling interval, in seconds. Despite the name, transport
-/// link-table culling uses `TABLES_CULL_INTERVAL`.
-pub const LINKS_CHECK_INTERVAL: f64 = 1.0;
-
 /// Receipt timeout and count-limit check interval, in seconds.
 pub const RECEIPTS_CHECK_INTERVAL: f64 = 1.0;
 

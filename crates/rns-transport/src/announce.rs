@@ -11,8 +11,6 @@ pub struct AnnounceEntry {
     /// Next retransmit time (Unix seconds).
     pub retransmit_timeout: f64,
     pub retries: u8,
-    /// Transport ID or destination hash that delivered this announce to us.
-    pub received_from: [u8; 16],
     /// Hop count as observed on receipt.
     pub hops: u8,
     /// Complete inner announce packet with the actor-adjusted hop count.
@@ -59,10 +57,12 @@ impl AnnounceTable {
         self.entries.remove(dest_hash)
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -113,7 +113,6 @@ mod tests {
                 timestamp: 1000.0,
                 retransmit_timeout: 1005.0,
                 retries: 0,
-                received_from: [0xBB; 16],
                 hops: 2,
                 packet_raw: vec![0x01, 0x02],
                 local_rebroadcasts: 0,
@@ -135,7 +134,6 @@ mod tests {
                 timestamp: 1000.0,
                 retransmit_timeout: 1005.0,
                 retries: 0,
-                received_from: [0; 16],
                 hops: 0,
                 packet_raw: vec![],
                 local_rebroadcasts: 0,
@@ -150,7 +148,6 @@ mod tests {
                 timestamp: 1000.0,
                 retransmit_timeout: 1010.0,
                 retries: 0,
-                received_from: [0; 16],
                 hops: 0,
                 packet_raw: vec![],
                 local_rebroadcasts: 0,
