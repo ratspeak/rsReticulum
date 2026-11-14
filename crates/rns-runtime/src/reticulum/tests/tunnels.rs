@@ -513,7 +513,7 @@ async fn configured_i2p_peers_inherit_their_interface_settings() {
     );
     assert_eq!(peer.announce_cap, 0.05);
     assert_eq!(peer.bitrate, server.bitrate);
-    assert!(server.ifac_size > 0);
+    assert!(server.ifac_size.is_some_and(|size| size > 0));
     assert_eq!(peer.ifac_size, server.ifac_size);
     let ingress = |id: u64| {
         let controls = handle.interface_controls.lock().unwrap();
@@ -558,7 +558,7 @@ async fn i2p_server_peers_register_under_their_server() {
         peer.role, "normal",
         "a peer of the I2P server is no shared-instance client"
     );
-    assert!(server.ifac_size > 0);
+    assert!(server.ifac_size.is_some_and(|size| size > 0));
     assert_eq!(
         peer.ifac_size, server.ifac_size,
         "the peer inherits its server's IFAC"

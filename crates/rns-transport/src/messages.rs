@@ -1250,11 +1250,12 @@ pub struct PathTableRpcEntry {
     pub interface_role: InterfaceRole,
 }
 
-/// Interface metadata and sampled counters. Driver counters use independent
-/// atomic reads, so this is not a coherent instant across all fields. Missing
-/// counters become zero and missing online state becomes true; current
-/// `rx_rate`/`tx_rate` values are zero placeholders. `bitrate` is declared bits
-/// per second, `mtu` is reported bytes, `ifac_size` is configured bytes, and
+/// Interface metadata and sampled counters, as the transport actor reports
+/// them and as a shared instance's `interface_stats` RPC carries them. Driver
+/// counters use independent atomic reads, so this is not a coherent instant
+/// across all fields. Missing counters become zero and missing online state
+/// becomes true; current `rx_rate`/`tx_rate` values are zero placeholders.
+/// `bitrate` is declared bits per second, `mtu` is reported bytes, and
 /// `announce_cap` is a fraction. Names can contain caller-supplied text.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -1286,7 +1287,15 @@ pub struct InterfaceStatRpcEntry {
     pub announce_rate_grace: Option<u32>,
     pub announce_rate_penalty: Option<f64>,
     pub announce_cap: f64,
-    pub ifac_size: usize,
+    /// IFAC tag bytes. The transport actor reports the configured size
+    /// whether or not IFAC is on; a shared instance's reply carries a size
+    /// only with IFAC, and `None` without (Reticulum.py).
+    pub ifac_size: Option<usize>,
+    /// IFAC signature and network name; a signature means IFAC is on. The
+    /// runtime's registration records hold both, so the transport actor
+    /// leaves them `None`.
+    pub ifac_signature: Option<Vec<u8>>,
+    pub ifac_netname: Option<String>,
     pub tx_drops: u64,
     pub tx_dropped_bytes: u64,
     /// Announces counted by the interface ingress controller.
@@ -1299,9 +1308,14 @@ pub struct InterfaceStatRpcEntry {
     pub packet_filter_hits: u64,
     pub gravity: i64,
     pub announces_to_internal: Option<bool>,
-    /// The listener that accepted this interface.
+    /// The listener that accepted this interface. The id is known only to
+    /// the instance that owns the interface; the name also crosses the wire.
     pub parent_id: Option<InterfaceId>,
-    /// How Python names the interface, when the driver says.
+    pub parent_interface_name: Option<String>,
+    /// The network identity, in hex, that announced an auto-connected
+    /// interface (Python `autoconnect_source`), from the runtime's records.
+    pub autoconnect_source: Option<String>,
+    /// How Python names the interface, when the driver or the wire says.
     pub identity: Option<InterfaceIdentity>,
     /// Python `current_rx/tx/arx/atx/prx/ptx_speed` in bits per second, set by
     /// the traffic count on top-level interfaces after their first second.

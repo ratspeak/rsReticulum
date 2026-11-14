@@ -152,7 +152,13 @@ async fn an_autoconnected_interface_names_its_source() {
     let source = |name: &str| {
         stats
             .iter()
-            .find(|entry| entry.name == name || entry.short_name.as_deref() == Some(name))
+            .find(|entry| {
+                entry.name == name
+                    || entry
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.short_name == name)
+            })
             .unwrap_or_else(|| panic!("{name} is listed"))
             .autoconnect_source
             .clone()

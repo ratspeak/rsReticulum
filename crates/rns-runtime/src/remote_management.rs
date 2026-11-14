@@ -431,7 +431,7 @@ mod tests {
         entry.announce_rate_grace = None;
         entry.announce_rate_penalty = None;
         entry.announce_cap = 0.02;
-        entry.ifac_size = 8;
+        entry.ifac_size = Some(8);
         entry.tx_drops = 0;
         entry
     }

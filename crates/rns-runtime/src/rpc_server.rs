@@ -109,108 +109,20 @@ impl TransportStatsSource {
 }
 
 /// Transport stat entries as the control port and remote management report
-/// them: with IFAC, and accepted clients naming their listener.
+/// them: IFAC and the auto-connect source come from the runtime's records,
+/// and are absent without them.
 pub(crate) fn stat_entries(
-    entries: Vec<rns_transport::messages::InterfaceStatRpcEntry>,
+    mut entries: Vec<rns_transport::messages::InterfaceStatRpcEntry>,
     ifac: Option<&InterfaceIfacStats>,
-) -> Vec<rpc::InterfaceStatEntry> {
-    let names: std::collections::HashMap<u64, String> = entries
-        .iter()
-        .map(|entry| {
-            let name = entry
-                .identity
-                .as_ref()
-                .map_or_else(|| entry.name.clone(), |identity| identity.name.clone());
-            (entry.id, name)
-        })
-        .collect();
+) -> Vec<rns_transport::messages::InterfaceStatRpcEntry> {
+    for entry in &mut entries {
+        entry.autoconnect_source = ifac.and_then(|records| records.autoconnect_source(entry.id));
+        let ifac = ifac.map(|ifac| ifac.lookup(entry.id)).unwrap_or_default();
+        entry.ifac_signature = ifac.signature.map(Vec::from);
+        entry.ifac_size = ifac.size;
+        entry.ifac_netname = ifac.netname;
+    }
     entries
-        .into_iter()
-        .map(|e| {
-            let autoconnect_source = ifac.and_then(|records| records.autoconnect_source(e.id));
-            let ifac = ifac.map(|ifac| ifac.lookup(e.id)).unwrap_or_default();
-            let (name, short_name, class_name) = match e.identity {
-                Some(identity) => (
-                    identity.name,
-                    Some(identity.short_name),
-                    Some(identity.class_name),
-                ),
-                None => (e.name, None, None),
-            };
-            rpc::InterfaceStatEntry {
-                autoconnect_source,
-                parent_interface_name: e.parent_id.and_then(|id| names.get(&id).cloned()),
-                id: e.id,
-                name,
-                short_name,
-                class_name,
-                speeds: e.speeds,
-                announce_rx_bytes: e.announce_rx_bytes,
-                announce_tx_bytes: e.announce_tx_bytes,
-                path_request_rx_bytes: e.path_request_rx_bytes,
-                path_request_tx_bytes: e.path_request_tx_bytes,
-                burst_count: e.burst_count,
-                pr_burst_count: e.pr_burst_count,
-                rssi: e.rssi,
-                snr: e.snr,
-                signal_quality: e.signal_quality,
-                peers: e.peers,
-                i2p_connectable: e.i2p_connectable,
-                i2p_b32: e.i2p_b32.map(|b32| format!("{b32}.b32.i2p")),
-                tunnel_state: e.i2p_tunnel_state.map(|state| {
-                    // I2PInterfacePeer.TUNNEL_STATE_* (Reticulum.py).
-                    match state {
-                        0x01 => "Tunnel Active",
-                        0x00 => "Creating Tunnel",
-                        0x02 => "Tunnel Unresponsive",
-                        _ => "Unknown State",
-                    }
-                    .to_string()
-                }),
-                tx_stalled: e.tx_stalled,
-                tx_buffered: e.tx_buffered,
-                rx_bytes: e.rx_bytes,
-                tx_bytes: e.tx_bytes,
-                rx_rate: e.rx_rate,
-                tx_rate: e.tx_rate,
-                online: e.online,
-                bitrate: e.bitrate,
-                mtu: e.mtu,
-                mode: e.mode,
-                role: e.role,
-                announce_queue: e.announce_queue,
-                held_announces: e.held_announces,
-                incoming_announce_frequency: e.incoming_announce_frequency,
-                outgoing_announce_frequency: e.outgoing_announce_frequency,
-                incoming_pr_frequency: e.incoming_pr_frequency,
-                outgoing_pr_frequency: e.outgoing_pr_frequency,
-                burst_active: e.burst_active,
-                burst_activated: e.burst_activated,
-                pr_burst_active: e.pr_burst_active,
-                pr_burst_activated: e.pr_burst_activated,
-                clients: e.clients,
-                blocked_ips: e.blocked_ips,
-                announce_rate_target: e.announce_rate_target,
-                announce_rate_grace: e.announce_rate_grace,
-                announce_rate_penalty: e.announce_rate_penalty,
-                announce_cap: e.announce_cap,
-                ifac_signature: ifac.signature.map(Vec::from),
-                ifac_size: ifac.size,
-                ifac_netname: ifac.netname,
-                tx_drops: e.tx_drops,
-                tx_dropped_bytes: e.tx_dropped_bytes,
-                announces_received: e.announces_received,
-                announces_sent: e.announces_sent,
-                path_requests_received: e.path_requests_received,
-                path_requests_sent: e.path_requests_sent,
-                protocol_violations: e.protocol_violations,
-                ifac_violations: e.ifac_violations,
-                packet_filter_hits: e.packet_filter_hits,
-                gravity: e.gravity,
-                announces_to_internal: e.announces_to_internal,
-            }
-        })
-        .collect()
 }
 
 /// Serve a TCP control endpoint on IPv4 loopback using a bare transport.

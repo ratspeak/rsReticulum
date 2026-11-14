@@ -2154,9 +2154,9 @@ impl ReticulumHandle {
     /// Aggregate traffic counters use saturating sums of returned interface records.
     ///
     /// Transport identity/uptime metadata is available here only for a local
-    /// transport node; probe and process-memory fields are `None`. The RPC bridge
-    /// uses `0` for an absent IFAC size and does not retain parent ids, so it cannot
-    /// preserve every distinction present in local runtime records.
+    /// transport node; probe and process-memory fields are `None`. Entries read
+    /// from a shared instance carry what its RPC reply carries: the parent's
+    /// name without its id, and no driver radio keys.
     pub async fn interface_stats(&self) -> Result<InterfaceStats, ControlError> {
         let interfaces = match self
             .query_control_result(TransportQuery::GetInterfaceStats)
@@ -2810,9 +2810,7 @@ fn rpc_response_to_transport_response(
     response: crate::rpc::RpcResponse,
 ) -> Option<TransportQueryResponse> {
     use crate::rpc::RpcResponse;
-    use rns_transport::messages::{
-        BlackholeRpcEntry, InterfaceStatRpcEntry, PathTableRpcEntry, RateTableRpcEntry,
-    };
+    use rns_transport::messages::{BlackholeRpcEntry, PathTableRpcEntry, RateTableRpcEntry};
 
     Some(match response {
         RpcResponse::PathTable(entries) => {
@@ -2839,62 +2837,7 @@ fn rpc_response_to_transport_response(
                 .collect();
             TransportQueryResponse::PathTable(entries)
         }
-        RpcResponse::InterfaceStats(entries) => {
-            let entries = entries
-                .into_iter()
-                .map(|entry| {
-                    let mut stat = InterfaceStatRpcEntry::default();
-                    stat.id = entry.id;
-                    stat.name = entry.name;
-                    stat.rx_bytes = entry.rx_bytes;
-                    stat.tx_bytes = entry.tx_bytes;
-                    stat.rx_rate = entry.rx_rate;
-                    stat.tx_rate = entry.tx_rate;
-                    stat.online = entry.online;
-                    stat.bitrate = entry.bitrate;
-                    stat.mtu = entry.mtu;
-                    stat.mode = entry.mode;
-                    stat.role = entry.role;
-                    stat.announce_queue = entry.announce_queue;
-                    stat.held_announces = entry.held_announces;
-                    stat.incoming_announce_frequency = entry.incoming_announce_frequency;
-                    stat.outgoing_announce_frequency = entry.outgoing_announce_frequency;
-                    stat.incoming_pr_frequency = entry.incoming_pr_frequency;
-                    stat.outgoing_pr_frequency = entry.outgoing_pr_frequency;
-                    stat.burst_active = entry.burst_active;
-                    stat.burst_activated = entry.burst_activated;
-                    stat.pr_burst_active = entry.pr_burst_active;
-                    stat.pr_burst_activated = entry.pr_burst_activated;
-                    stat.clients = entry.clients;
-                    stat.blocked_ips = entry.blocked_ips;
-                    stat.announce_rate_target = entry.announce_rate_target;
-                    stat.announce_rate_grace = entry.announce_rate_grace;
-                    stat.announce_rate_penalty = entry.announce_rate_penalty;
-                    stat.announce_cap = entry.announce_cap;
-                    stat.ifac_size = entry.ifac_size.unwrap_or(0);
-                    stat.tx_drops = entry.tx_drops;
-                    stat.tx_dropped_bytes = entry.tx_dropped_bytes;
-                    stat.announces_received = entry.announces_received;
-                    stat.announces_sent = entry.announces_sent;
-                    stat.path_requests_received = entry.path_requests_received;
-                    stat.path_requests_sent = entry.path_requests_sent;
-                    stat.protocol_violations = entry.protocol_violations;
-                    stat.ifac_violations = entry.ifac_violations;
-                    stat.packet_filter_hits = entry.packet_filter_hits;
-                    stat.gravity = entry.gravity;
-                    stat.announces_to_internal = entry.announces_to_internal;
-                    stat.parent_id = None;
-                    stat.announce_rx_bytes = entry.announce_rx_bytes;
-                    stat.announce_tx_bytes = entry.announce_tx_bytes;
-                    stat.path_request_rx_bytes = entry.path_request_rx_bytes;
-                    stat.path_request_tx_bytes = entry.path_request_tx_bytes;
-                    stat.burst_count = entry.burst_count;
-                    stat.pr_burst_count = entry.pr_burst_count;
-                    stat
-                })
-                .collect();
-            TransportQueryResponse::InterfaceStats(entries)
-        }
+        RpcResponse::InterfaceStats(entries) => TransportQueryResponse::InterfaceStats(entries),
         RpcResponse::RateTable(entries) => {
             let entries = entries
                 .into_iter()
@@ -14291,7 +14234,7 @@ loglevel = 7
         first.announce_rate_grace = None;
         first.announce_rate_penalty = None;
         first.announce_cap = 0.02;
-        first.ifac_size = 0;
+        first.ifac_size = None;
         first.tx_drops = 0;
         let mut second = first.clone();
         second.id = 2;
@@ -14474,7 +14417,7 @@ loglevel = 7
         master_interface.announce_rate_grace = None;
         master_interface.announce_rate_penalty = None;
         master_interface.announce_cap = 0.02;
-        master_interface.ifac_size = 0;
+        master_interface.ifac_size = None;
         master_interface.tx_drops = 0;
         let mut missing_mtu_interface = master_interface.clone();
         missing_mtu_interface.id = 82;
@@ -18383,7 +18326,8 @@ txpower = 17
             .find(|entry| entry.role == "shared_instance_peer")
             .expect("shared-instance peer interface");
         assert_eq!(
-            peer.ifac_size, 16,
+            peer.ifac_size,
+            Some(16),
             "the local interface admits HW_MTU plus the default IFAC size"
         );
 

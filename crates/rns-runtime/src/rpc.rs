@@ -7,6 +7,7 @@
 //! request/response frames or authenticate the separate packet-IPC socket.
 
 use rns_transport::inbound_queues::InboundQueueSnapshot;
+use rns_transport::messages::{InterfaceIdentity, InterfaceStatRpcEntry};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MP_CHALLENGE: &[u8] = b"#CHALLENGE#";
@@ -173,7 +174,7 @@ impl ManageOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcResponse {
     PathTable(Vec<PathTableEntry>),
-    InterfaceStats(Vec<InterfaceStatEntry>),
+    InterfaceStats(#[serde(with = "interface_stats_serde")] Vec<InterfaceStatRpcEntry>),
     RateTable(Vec<RateTableEntry>),
     StringResult(Option<String>),
     HashResult(Option<Vec<u8>>),
@@ -206,124 +207,330 @@ pub struct PathTableEntry {
     pub interface: String,
 }
 
+/// One interface of Python's `get_interface_stats()` (Reticulum.py), field for
+/// key. [`InterfaceStatRpcEntry`] is the public form; the two `From` impls
+/// below are the only conversion.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct InterfaceStatEntry {
-    pub id: u64,
-    pub name: String,
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
-    pub rx_rate: u64,
-    pub tx_rate: u64,
-    pub online: bool,
-    pub bitrate: u64,
-    pub mtu: u32,
-    pub mode: String,
-    pub role: String,
-    pub announce_queue: Option<u64>,
-    pub held_announces: u64,
-    pub incoming_announce_frequency: f64,
-    pub outgoing_announce_frequency: f64,
+struct InterfaceStatWire {
+    id: u64,
+    name: String,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    rx_rate: u64,
+    tx_rate: u64,
+    online: bool,
+    bitrate: u64,
+    mtu: u32,
+    mode: String,
+    role: String,
+    announce_queue: Option<u64>,
+    held_announces: u64,
+    incoming_announce_frequency: f64,
+    outgoing_announce_frequency: f64,
     #[serde(default)]
-    pub incoming_pr_frequency: f64,
+    incoming_pr_frequency: f64,
     #[serde(default)]
-    pub outgoing_pr_frequency: f64,
+    outgoing_pr_frequency: f64,
     #[serde(default)]
-    pub burst_active: bool,
+    burst_active: bool,
     #[serde(default)]
-    pub burst_activated: f64,
+    burst_activated: f64,
     #[serde(default)]
-    pub pr_burst_active: bool,
+    pr_burst_active: bool,
     #[serde(default)]
-    pub pr_burst_activated: f64,
-    pub clients: Option<u64>,
+    pr_burst_activated: f64,
+    clients: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blocked_ips: Option<u64>,
-    pub announce_rate_target: Option<f64>,
-    pub announce_rate_grace: Option<u32>,
-    pub announce_rate_penalty: Option<f64>,
-    pub announce_cap: f64,
+    blocked_ips: Option<u64>,
+    announce_rate_target: Option<f64>,
+    announce_rate_grace: Option<u32>,
+    announce_rate_penalty: Option<f64>,
+    announce_cap: f64,
     /// IFAC signature supplied by runtime records. IFAC fields can also be
     /// `None` when the stats provider has no IFAC records; absence is not proof
     /// that the interface has no IFAC protection.
     #[serde(default)]
-    pub ifac_signature: Option<Vec<u8>>,
+    ifac_signature: Option<Vec<u8>>,
     #[serde(default)]
-    pub ifac_size: Option<usize>,
+    ifac_size: Option<usize>,
     #[serde(default)]
-    pub ifac_netname: Option<String>,
-    pub tx_drops: u64,
+    ifac_netname: Option<String>,
+    tx_drops: u64,
     #[serde(default)]
-    pub tx_dropped_bytes: u64,
+    tx_dropped_bytes: u64,
     /// Count of received announces, encoded as Python-compatible `arxc`.
     /// The following sent-announce and received/sent-path-request counters map
     /// to `atxc`, `prxc` and `ptxc` respectively.
     #[serde(default)]
-    pub announces_received: u64,
+    announces_received: u64,
     #[serde(default)]
-    pub announces_sent: u64,
+    announces_sent: u64,
     #[serde(default)]
-    pub path_requests_received: u64,
+    path_requests_received: u64,
     #[serde(default)]
-    pub path_requests_sent: u64,
+    path_requests_sent: u64,
     #[serde(default)]
-    pub protocol_violations: u64,
+    protocol_violations: u64,
     #[serde(default)]
-    pub ifac_violations: u64,
+    ifac_violations: u64,
     #[serde(default)]
-    pub packet_filter_hits: u64,
+    packet_filter_hits: u64,
     #[serde(default)]
-    pub gravity: i64,
+    gravity: i64,
     #[serde(default)]
-    pub announces_to_internal: Option<bool>,
+    announces_to_internal: Option<bool>,
     /// Name of the listener that accepted this interface.
     #[serde(default)]
-    pub parent_interface_name: Option<String>,
+    parent_interface_name: Option<String>,
     /// The network identity, in hex, that announced an auto-connected
     /// interface (Python `autoconnect_source`).
     #[serde(default)]
-    pub autoconnect_source: Option<String>,
+    autoconnect_source: Option<String>,
     /// Python `interface.name` and `type(interface).__name__`, when known.
     #[serde(default)]
-    pub short_name: Option<String>,
+    short_name: Option<String>,
     #[serde(default)]
-    pub class_name: Option<String>,
+    class_name: Option<String>,
     /// Python `rxs`, `txs`, `arxs`, `atxs`, `prxs` and `ptxs` in bits per
     /// second; `None` before the interface's first traffic count.
     #[serde(default)]
-    pub speeds: Option<[f64; 6]>,
+    speeds: Option<[f64; 6]>,
     #[serde(default)]
-    pub announce_rx_bytes: u64,
+    announce_rx_bytes: u64,
     #[serde(default)]
-    pub announce_tx_bytes: u64,
+    announce_tx_bytes: u64,
     #[serde(default)]
-    pub path_request_rx_bytes: u64,
+    path_request_rx_bytes: u64,
     #[serde(default)]
-    pub path_request_tx_bytes: u64,
+    path_request_tx_bytes: u64,
     #[serde(default)]
-    pub burst_count: Option<u64>,
+    burst_count: Option<u64>,
     #[serde(default)]
-    pub pr_burst_count: Option<u64>,
+    pr_burst_count: Option<u64>,
     #[serde(default)]
-    pub rssi: Option<f64>,
+    rssi: Option<f64>,
     #[serde(default)]
-    pub snr: Option<f64>,
+    snr: Option<f64>,
     #[serde(default)]
-    pub signal_quality: Option<f64>,
+    signal_quality: Option<f64>,
     #[serde(default)]
-    pub peers: Option<u64>,
+    peers: Option<u64>,
     #[serde(default)]
-    pub i2p_connectable: Option<bool>,
+    i2p_connectable: Option<bool>,
     /// Python `i2p_b32` with its `.b32.i2p` suffix.
     #[serde(default)]
-    pub i2p_b32: Option<String>,
+    i2p_b32: Option<String>,
     /// Python `tunnelstate`.
     #[serde(default)]
-    pub tunnel_state: Option<String>,
+    tunnel_state: Option<String>,
     #[serde(default)]
-    pub tx_stalled: bool,
+    tx_stalled: bool,
     #[serde(default)]
-    pub tx_buffered: u64,
+    tx_buffered: u64,
+}
+
+impl From<&InterfaceStatRpcEntry> for InterfaceStatWire {
+    fn from(e: &InterfaceStatRpcEntry) -> Self {
+        let (name, short_name, class_name) = match &e.identity {
+            Some(identity) => (
+                identity.name.clone(),
+                Some(identity.short_name.clone()),
+                Some(identity.class_name.clone()),
+            ),
+            None => (e.name.clone(), None, None),
+        };
+        Self {
+            id: e.id,
+            name,
+            rx_bytes: e.rx_bytes,
+            tx_bytes: e.tx_bytes,
+            rx_rate: e.rx_rate,
+            tx_rate: e.tx_rate,
+            online: e.online,
+            bitrate: e.bitrate,
+            mtu: e.mtu,
+            mode: e.mode.clone(),
+            role: e.role.clone(),
+            announce_queue: e.announce_queue,
+            held_announces: e.held_announces,
+            incoming_announce_frequency: e.incoming_announce_frequency,
+            outgoing_announce_frequency: e.outgoing_announce_frequency,
+            incoming_pr_frequency: e.incoming_pr_frequency,
+            outgoing_pr_frequency: e.outgoing_pr_frequency,
+            burst_active: e.burst_active,
+            burst_activated: e.burst_activated,
+            pr_burst_active: e.pr_burst_active,
+            pr_burst_activated: e.pr_burst_activated,
+            clients: e.clients,
+            blocked_ips: e.blocked_ips,
+            announce_rate_target: e.announce_rate_target,
+            announce_rate_grace: e.announce_rate_grace,
+            announce_rate_penalty: e.announce_rate_penalty,
+            announce_cap: e.announce_cap,
+            ifac_signature: e.ifac_signature.clone(),
+            ifac_size: e.ifac_size,
+            ifac_netname: e.ifac_netname.clone(),
+            tx_drops: e.tx_drops,
+            tx_dropped_bytes: e.tx_dropped_bytes,
+            announces_received: e.announces_received,
+            announces_sent: e.announces_sent,
+            path_requests_received: e.path_requests_received,
+            path_requests_sent: e.path_requests_sent,
+            protocol_violations: e.protocol_violations,
+            ifac_violations: e.ifac_violations,
+            packet_filter_hits: e.packet_filter_hits,
+            gravity: e.gravity,
+            announces_to_internal: e.announces_to_internal,
+            parent_interface_name: e.parent_interface_name.clone(),
+            autoconnect_source: e.autoconnect_source.clone(),
+            short_name,
+            class_name,
+            speeds: e.speeds,
+            announce_rx_bytes: e.announce_rx_bytes,
+            announce_tx_bytes: e.announce_tx_bytes,
+            path_request_rx_bytes: e.path_request_rx_bytes,
+            path_request_tx_bytes: e.path_request_tx_bytes,
+            burst_count: e.burst_count,
+            pr_burst_count: e.pr_burst_count,
+            rssi: e.rssi,
+            snr: e.snr,
+            signal_quality: e.signal_quality,
+            peers: e.peers,
+            i2p_connectable: e.i2p_connectable,
+            i2p_b32: e
+                .i2p_b32
+                .as_ref()
+                .map(|b32| format!("{b32}{I2P_B32_SUFFIX}")),
+            tunnel_state: e
+                .i2p_tunnel_state
+                .map(|state| i2p_tunnel_state_text(state).to_string()),
+            tx_stalled: e.tx_stalled,
+            tx_buffered: e.tx_buffered,
+        }
+    }
+}
+
+impl From<InterfaceStatWire> for InterfaceStatRpcEntry {
+    fn from(w: InterfaceStatWire) -> Self {
+        let mut e = InterfaceStatRpcEntry::default();
+        // Python always sends its class name; with it the three names are known.
+        e.identity = w.class_name.map(|class_name| {
+            InterfaceIdentity::new(
+                w.name.clone(),
+                w.short_name.unwrap_or_else(|| w.name.clone()),
+                class_name,
+            )
+        });
+        e.id = w.id;
+        e.name = w.name;
+        e.rx_bytes = w.rx_bytes;
+        e.tx_bytes = w.tx_bytes;
+        e.rx_rate = w.rx_rate;
+        e.tx_rate = w.tx_rate;
+        e.online = w.online;
+        e.bitrate = w.bitrate;
+        e.mtu = w.mtu;
+        e.mode = w.mode;
+        e.role = w.role;
+        e.announce_queue = w.announce_queue;
+        e.held_announces = w.held_announces;
+        e.incoming_announce_frequency = w.incoming_announce_frequency;
+        e.outgoing_announce_frequency = w.outgoing_announce_frequency;
+        e.incoming_pr_frequency = w.incoming_pr_frequency;
+        e.outgoing_pr_frequency = w.outgoing_pr_frequency;
+        e.burst_active = w.burst_active;
+        e.burst_activated = w.burst_activated;
+        e.pr_burst_active = w.pr_burst_active;
+        e.pr_burst_activated = w.pr_burst_activated;
+        e.clients = w.clients;
+        e.blocked_ips = w.blocked_ips;
+        e.announce_rate_target = w.announce_rate_target;
+        e.announce_rate_grace = w.announce_rate_grace;
+        e.announce_rate_penalty = w.announce_rate_penalty;
+        e.announce_cap = w.announce_cap;
+        e.ifac_signature = w.ifac_signature;
+        e.ifac_size = w.ifac_size;
+        e.ifac_netname = w.ifac_netname;
+        e.tx_drops = w.tx_drops;
+        e.tx_dropped_bytes = w.tx_dropped_bytes;
+        e.announces_received = w.announces_received;
+        e.announces_sent = w.announces_sent;
+        e.path_requests_received = w.path_requests_received;
+        e.path_requests_sent = w.path_requests_sent;
+        e.protocol_violations = w.protocol_violations;
+        e.ifac_violations = w.ifac_violations;
+        e.packet_filter_hits = w.packet_filter_hits;
+        e.gravity = w.gravity;
+        e.announces_to_internal = w.announces_to_internal;
+        e.parent_interface_name = w.parent_interface_name;
+        e.autoconnect_source = w.autoconnect_source;
+        e.speeds = w.speeds;
+        e.announce_rx_bytes = w.announce_rx_bytes;
+        e.announce_tx_bytes = w.announce_tx_bytes;
+        e.path_request_rx_bytes = w.path_request_rx_bytes;
+        e.path_request_tx_bytes = w.path_request_tx_bytes;
+        e.burst_count = w.burst_count;
+        e.pr_burst_count = w.pr_burst_count;
+        e.rssi = w.rssi;
+        e.snr = w.snr;
+        e.signal_quality = w.signal_quality;
+        e.peers = w.peers;
+        e.i2p_connectable = w.i2p_connectable;
+        e.i2p_b32 = w.i2p_b32.map(|b32| match b32.strip_suffix(I2P_B32_SUFFIX) {
+            Some(bare) => bare.to_string(),
+            None => b32,
+        });
+        e.i2p_tunnel_state = w.tunnel_state.as_deref().map(i2p_tunnel_state_code);
+        e.tx_stalled = w.tx_stalled;
+        e.tx_buffered = w.tx_buffered;
+        e
+    }
+}
+
+const I2P_B32_SUFFIX: &str = ".b32.i2p";
+
+/// Python's text for `I2PInterfacePeer.TUNNEL_STATE_*` (Reticulum.py).
+fn i2p_tunnel_state_text(state: u8) -> &'static str {
+    match state {
+        0x01 => "Tunnel Active",
+        0x00 => "Creating Tunnel",
+        0x02 => "Tunnel Unresponsive",
+        _ => "Unknown State",
+    }
+}
+
+/// The inverse; other text keeps a code that reads back as unknown.
+fn i2p_tunnel_state_code(text: &str) -> u8 {
+    match text {
+        "Tunnel Active" => 0x01,
+        "Creating Tunnel" => 0x00,
+        "Tunnel Unresponsive" => 0x02,
+        _ => 0xFF,
+    }
+}
+
+fn wire_entries(entries: &[InterfaceStatRpcEntry]) -> Vec<InterfaceStatWire> {
+    entries.iter().map(InterfaceStatWire::from).collect()
+}
+
+/// `RpcResponse::InterfaceStats` keeps the serde form of the wire entries.
+mod interface_stats_serde {
+    use super::{InterfaceStatRpcEntry, InterfaceStatWire, wire_entries};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        entries: &[InterfaceStatRpcEntry],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        wire_entries(entries).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<InterfaceStatRpcEntry>, D::Error> {
+        let entries = Vec::<InterfaceStatWire>::deserialize(deserializer)?;
+        Ok(entries.into_iter().map(Into::into).collect())
+    }
 }
 
 /// What a transport instance adds to its interface stats
@@ -822,7 +1029,9 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                 })
                 .collect(),
         ),
-        RpcResponse::InterfaceStats(entries) => interface_stats_value(entries, None, None, None),
+        RpcResponse::InterfaceStats(entries) => {
+            interface_stats_value(&wire_entries(entries), None, None, None)
+        }
         RpcResponse::RateTable(entries) => PyValue::List(
             entries
                 .iter()
@@ -888,25 +1097,35 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
 }
 
 pub(crate) fn encode_interface_stats(
-    entries: &[InterfaceStatEntry],
+    entries: &[InterfaceStatRpcEntry],
     transport: Option<&TransportStats>,
     traffic: Option<&TrafficTotals>,
     queues: Option<&InboundQueueSnapshot>,
 ) -> Result<Vec<u8>, RpcError> {
-    encode_umsgpack(&interface_stats_value(entries, transport, traffic, queues))
+    encode_umsgpack(&interface_stats_value(
+        &wire_entries(entries),
+        transport,
+        traffic,
+        queues,
+    ))
 }
 
 /// Remote management's `/status` answer: `[stats]`, then the link count and
 /// nil profiling results when asked for, in that order (Transport.py).
 pub(crate) fn encode_remote_status(
-    entries: &[InterfaceStatEntry],
+    entries: &[InterfaceStatRpcEntry],
     transport: Option<&TransportStats>,
     traffic: Option<&TrafficTotals>,
     queues: Option<&InboundQueueSnapshot>,
     link_count: Option<u64>,
     profiling: bool,
 ) -> Result<Vec<u8>, RpcError> {
-    let mut response = vec![interface_stats_value(entries, transport, traffic, queues)];
+    let mut response = vec![interface_stats_value(
+        &wire_entries(entries),
+        transport,
+        traffic,
+        queues,
+    )];
     if let Some(link_count) = link_count {
         response.push(PyValue::Int(i128::from(link_count)));
     }
@@ -953,7 +1172,7 @@ fn queue_stats(q: &InboundQueueSnapshot) -> Vec<(&'static str, PyValue)> {
 /// `Reticulum.get_interface_stats()` (Reticulum.py) for the
 /// control port and remote management alike.
 fn interface_stats_value(
-    entries: &[InterfaceStatEntry],
+    entries: &[InterfaceStatWire],
     transport: Option<&TransportStats>,
     traffic: Option<&TrafficTotals>,
     queues: Option<&InboundQueueSnapshot>,
@@ -1009,7 +1228,7 @@ fn interface_stats_value(
             ]);
         }
         None => {
-            let sum = |select: fn(&InterfaceStatEntry) -> u64| {
+            let sum = |select: fn(&InterfaceStatWire) -> u64| {
                 entries.iter().map(select).fold(0u64, u64::saturating_add)
             };
             stats.extend([
@@ -1062,7 +1281,7 @@ fn interface_stats_value(
     py_dict(stats)
 }
 
-fn interface_stat_value(e: &InterfaceStatEntry) -> PyValue {
+fn interface_stat_value(e: &InterfaceStatWire) -> PyValue {
     let int = |value: u64| PyValue::Int(i128::from(value));
     let optional = |value: Option<PyValue>| value.unwrap_or(PyValue::None);
     // Python's `current_*_speed` are unset (reported as 0) until the first
@@ -1369,7 +1588,7 @@ fn parse_path_table(value: &PyValue) -> Result<Vec<PathTableEntry>, RpcError> {
         .collect()
 }
 
-fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, RpcError> {
+fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatRpcEntry>, RpcError> {
     let list = match value {
         PyValue::Dict(entries) => match dict_get(entries, "interfaces") {
             Some(PyValue::List(v)) => v,
@@ -1386,7 +1605,7 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
         .enumerate()
         .map(|(idx, entry)| {
             let m = as_dict(entry)?;
-            Ok(InterfaceStatEntry {
+            Ok(InterfaceStatRpcEntry::from(InterfaceStatWire {
                 id: dict_get(m, "id")
                     .and_then(py_u64)
                     .unwrap_or((idx as u64) + 1),
@@ -1517,7 +1736,7 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
                 tunnel_state: dict_get(m, "tunnelstate").and_then(py_string),
                 tx_stalled: dict_get(m, "txstalled").and_then(py_bool).unwrap_or(false),
                 tx_buffered: dict_get(m, "txbuffered").and_then(py_u64).unwrap_or(0),
-            })
+            }))
         })
         .collect()
 }
@@ -2638,41 +2857,37 @@ mod tests {
         }
     }
 
-    fn interface_stat_entry() -> InterfaceStatEntry {
-        InterfaceStatEntry {
-            id: 7,
-            name: "TestIf".to_string(),
-            rx_bytes: 100,
-            tx_bytes: 200,
-            rx_rate: 10,
-            tx_rate: 20,
-            online: true,
-            bitrate: 115_200,
-            mtu: 500,
-            mode: "Gateway".to_string(),
-            role: "normal".to_string(),
-            announce_queue: Some(2),
-            held_announces: 3,
-            incoming_announce_frequency: 4.0,
-            outgoing_announce_frequency: 5.0,
-            incoming_pr_frequency: 6.0,
-            outgoing_pr_frequency: 7.0,
-            burst_active: true,
-            burst_activated: 1_700_000_001.0,
-            pr_burst_active: true,
-            pr_burst_activated: 1_700_000_002.0,
-            clients: Some(4),
-            blocked_ips: Some(2),
-            announce_rate_target: Some(3600.0),
-            announce_rate_grace: Some(5),
-            announce_rate_penalty: Some(30.0),
-            announce_cap: 0.02,
-            ifac_signature: None,
-            ifac_size: None,
-            ifac_netname: None,
-            tx_drops: 1,
-            ..Default::default()
-        }
+    fn interface_stat_entry() -> InterfaceStatRpcEntry {
+        let mut entry = InterfaceStatRpcEntry::default();
+        entry.id = 7;
+        entry.name = "TestIf".to_string();
+        entry.rx_bytes = 100;
+        entry.tx_bytes = 200;
+        entry.rx_rate = 10;
+        entry.tx_rate = 20;
+        entry.online = true;
+        entry.bitrate = 115_200;
+        entry.mtu = 500;
+        entry.mode = "Gateway".to_string();
+        entry.role = "normal".to_string();
+        entry.announce_queue = Some(2);
+        entry.held_announces = 3;
+        entry.incoming_announce_frequency = 4.0;
+        entry.outgoing_announce_frequency = 5.0;
+        entry.incoming_pr_frequency = 6.0;
+        entry.outgoing_pr_frequency = 7.0;
+        entry.burst_active = true;
+        entry.burst_activated = 1_700_000_001.0;
+        entry.pr_burst_active = true;
+        entry.pr_burst_activated = 1_700_000_002.0;
+        entry.clients = Some(4);
+        entry.blocked_ips = Some(2);
+        entry.announce_rate_target = Some(3600.0);
+        entry.announce_rate_grace = Some(5);
+        entry.announce_rate_penalty = Some(30.0);
+        entry.announce_cap = 0.02;
+        entry.tx_drops = 1;
+        entry
     }
 
     fn stats_dict(encoded: &[u8]) -> Vec<(PyDictKey, PyValue)> {
@@ -2963,6 +3178,88 @@ mod tests {
         assert_eq!(entries[1].ifac_signature, None);
         assert_eq!(entries[1].ifac_size, None);
         assert_eq!(entries[1].ifac_netname, None);
+    }
+
+    /// A decoded reply keeps how the owner names an interface and its I2P
+    /// state, and encodes to the same keys again.
+    #[test]
+    fn a_decoded_reply_reencodes_its_names_and_i2p_state_unchanged() {
+        let sent = vec![
+            (
+                "name",
+                PyValue::String("I2PInterfacePeer[Connected peer to abc]".to_string()),
+            ),
+            (
+                "short_name",
+                PyValue::String("Connected peer to abc".to_string()),
+            ),
+            ("type", PyValue::String("I2PInterfacePeer".to_string())),
+            ("status", PyValue::Bool(true)),
+            (
+                "parent_interface_name",
+                PyValue::String("I2PInterface[Hub]".to_string()),
+            ),
+            ("autoconnect_source", PyValue::String("5a".repeat(16))),
+            ("i2p_connectable", PyValue::Bool(true)),
+            ("i2p_b32", PyValue::String("abc.b32.i2p".to_string())),
+            (
+                "tunnelstate",
+                PyValue::String("Tunnel Unresponsive".to_string()),
+            ),
+        ];
+        let upstream = py_dict(vec![(
+            "interfaces",
+            PyValue::List(vec![py_dict(sent.clone())]),
+        )]);
+        let decoded = decode_response_for_request(
+            &encode_umsgpack(&upstream).unwrap(),
+            &RpcRequest::GetInterfaceStats,
+        )
+        .unwrap();
+        let RpcResponse::InterfaceStats(entries) = &decoded else {
+            panic!("wrong variant");
+        };
+        assert_eq!(
+            entries[0].identity,
+            Some(InterfaceIdentity::new(
+                "I2PInterfacePeer[Connected peer to abc]",
+                "Connected peer to abc",
+                "I2PInterfacePeer",
+            ))
+        );
+        assert_eq!(entries[0].i2p_b32.as_deref(), Some("abc"));
+        assert_eq!(entries[0].i2p_tunnel_state, Some(0x02));
+
+        let reencoded = encode_response(&decoded).unwrap();
+        let interface = &interface_dicts(&stats_dict(&reencoded))[0];
+        for (key, value) in &sent {
+            assert_eq!(dict_get(interface, key), Some(value), "{key}");
+        }
+    }
+
+    /// Serde sees the wire entry, not the transport type.
+    #[test]
+    fn interface_stats_serialize_as_the_wire_entry() {
+        let mut entry = interface_stat_entry();
+        entry.identity = Some(InterfaceIdentity::new(
+            "Tcp[TestIf]",
+            "TestIf",
+            "TCPInterface",
+        ));
+        entry.i2p_tunnel_state = Some(0x01);
+        let json = serde_json::to_value(RpcResponse::InterfaceStats(vec![entry])).unwrap();
+        let wire = &json["InterfaceStats"][0];
+        assert_eq!(wire["name"], "Tcp[TestIf]");
+        assert_eq!(wire["short_name"], "TestIf");
+        assert_eq!(wire["class_name"], "TCPInterface");
+        assert_eq!(wire["tunnel_state"], "Tunnel Active");
+        assert!(wire.get("identity").is_none() && wire.get("parent_id").is_none());
+
+        let RpcResponse::InterfaceStats(back) = serde_json::from_value(json).unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(back[0].name, "Tcp[TestIf]");
+        assert_eq!(back[0].i2p_tunnel_state, Some(0x01));
     }
 
     #[test]

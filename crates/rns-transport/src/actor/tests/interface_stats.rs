@@ -373,6 +373,29 @@ fn an_accepted_client_names_its_listener() {
 
     assert_eq!(stats(&mut actor, 2).parent_id, Some(1));
     assert_eq!(stats(&mut actor, 1).parent_id, None);
+    assert_eq!(
+        stats(&mut actor, 2).parent_interface_name.as_deref(),
+        Some("stats_1")
+    );
+    assert_eq!(stats(&mut actor, 1).parent_interface_name, None);
+}
+
+/// The actor knows the configured IFAC size; the signature, network name,
+/// and auto-connect source are the runtime's records.
+#[test]
+fn stats_carry_the_configured_ifac_size_and_no_runtime_records() {
+    let mut actor = hub();
+    attach_ifac(&mut actor, 1, [0x5a; 64]);
+    let entry = stats(&mut actor, 1);
+    assert_eq!(entry.ifac_size, Some(8));
+    assert_eq!(
+        (
+            entry.ifac_signature,
+            entry.ifac_netname,
+            entry.autoconnect_source
+        ),
+        (None, None, None)
+    );
 }
 
 fn totals(actor: &mut TransportActor) -> crate::messages::TrafficTotalsRpcEntry {

@@ -133,7 +133,9 @@ impl TransportActor {
                             announce_rate_grace: entry.announce_rate_grace,
                             announce_rate_penalty: entry.announce_rate_penalty,
                             announce_cap: entry.announce_cap,
-                            ifac_size: entry.ifac_size,
+                            ifac_size: Some(entry.ifac_size),
+                            ifac_signature: None,
+                            ifac_netname: None,
                             tx_drops: entry.tx_drops.load(std::sync::atomic::Ordering::Relaxed),
                             tx_dropped_bytes: entry.tx_dropped_bytes,
                             announces_received: entry.ingress.announces_received(),
@@ -146,6 +148,8 @@ impl TransportActor {
                             gravity: entry.gravity,
                             announces_to_internal: entry.announces_to_internal,
                             parent_id: entry.parent_id,
+                            parent_interface_name: None,
+                            autoconnect_source: None,
                             identity: entry
                                 .inspection
                                 .as_ref()
@@ -171,6 +175,7 @@ impl TransportActor {
                     })
                     .collect();
                 aggregate_backbone_bursts(&mut stats);
+                name_parents(&mut stats);
                 TransportQueryResponse::InterfaceStats(stats)
             }
             TransportQuery::GetTrafficTotals => {
@@ -1002,6 +1007,24 @@ impl TransportActor {
                 .count() as u64,
             ..self.traffic_count.totals
         }
+    }
+}
+
+/// Python's `parent_interface_name`: `str()` of the listener that accepted
+/// an interface (Reticulum.py).
+fn name_parents(stats: &mut [crate::messages::InterfaceStatRpcEntry]) {
+    let names: HashMap<InterfaceId, String> = stats
+        .iter()
+        .map(|entry| {
+            let name = entry
+                .identity
+                .as_ref()
+                .map_or_else(|| entry.name.clone(), |identity| identity.name.clone());
+            (entry.id, name)
+        })
+        .collect();
+    for entry in stats.iter_mut() {
+        entry.parent_interface_name = entry.parent_id.and_then(|id| names.get(&id).cloned());
     }
 }
 
