@@ -114,7 +114,6 @@ pub fn rns_git::commitsigs::extract_commit_author(&[u8]) -> rns_git::commitsigs:
 pub fn rns_git::commitsigs::extract_commit_committer(&[u8]) -> rns_git::commitsigs::HeaderEmail
 pub fn rns_git::commitsigs::extract_commit_tagger(&[u8]) -> core::option::Option<(alloc::string::String, bool)>
 pub fn rns_git::commitsigs::get_pubkey_wire_format(&rns_identity::identity::Identity) -> alloc::vec::Vec<u8>
-pub fn rns_git::commitsigs::main() -> std::process::ExitCode
 pub fn rns_git::commitsigs::parse_ssh_signature(&[u8]) -> core::result::Result<rns_git::commitsigs::SshSignature, alloc::string::String>
 pub fn rns_git::commitsigs::ssh_string(&[u8]) -> alloc::vec::Vec<u8>
 pub fn rns_git::commitsigs::unarmor_ssh_signature(&str) -> core::result::Result<alloc::vec::Vec<u8>, alloc::string::String>
@@ -396,11 +395,17 @@ pub const rns_git::server::client::DEFAULT_CLIENT_CONFIG: &str
 pub fn rns_git::server::client::client_config_dir(core::option::Option<&std::path::Path>) -> std::path::PathBuf
 pub fn rns_git::server::client::create_outcome(&str, core::option::Option<&[u8]>) -> core::result::Result<alloc::string::String, alloc::string::String>
 pub mod rns_git::server::config
+pub struct rns_git::server::config::FetchLimits
+pub rns_git::server::config::FetchLimits::size: u64
+pub rns_git::server::config::FetchLimits::time: core::time::Duration
+impl core::default::Default for rns_git::server::config::FetchLimits
+pub fn rns_git::server::config::FetchLimits::default() -> Self
 pub struct rns_git::server::config::NodeConfig
 pub rns_git::server::config::NodeConfig::access: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>
 pub rns_git::server::config::NodeConfig::aliases: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
 pub rns_git::server::config::NodeConfig::announce_interval: i64
 pub rns_git::server::config::NodeConfig::blocked_identities: alloc::vec::Vec<alloc::vec::Vec<u8>>
+pub rns_git::server::config::NodeConfig::fetch_limits: rns_git::server::config::FetchLimits
 pub rns_git::server::config::NodeConfig::loglevel: core::option::Option<i64>
 pub rns_git::server::config::NodeConfig::mirror_interval: i64
 pub rns_git::server::config::NodeConfig::node_name: alloc::string::String
@@ -430,6 +435,7 @@ pub fn rns_git::server::forks::handle_mirror(&std::sync::poison::rwlock::RwLock<
 pub fn rns_git::server::forks::handle_sync(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, core::option::Option<&[u8; 16]>, &rmpv::Value) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn rns_git::server::forks::mirror_synced(&std::path::Path) -> i64
 pub fn rns_git::server::forks::set_mirror_synced(&std::path::Path) -> bool
+pub fn rns_git::server::forks::stop_fetches()
 pub fn rns_git::server::forks::sync_mirrors(&std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>, i64, &std::sync::poison::mutex::Mutex<()>)
 pub fn rns_git::server::forks::update_head_to_source_default(&std::path::Path, &str) -> bool
 pub mod rns_git::server::handlers
@@ -456,8 +462,10 @@ pub rns_git::server::layout::Group::repositories: alloc::collections::btree::map
 pub struct rns_git::server::layout::Repositories
 pub rns_git::server::layout::Repositories::aliases: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
 pub rns_git::server::layout::Repositories::blocked: alloc::vec::Vec<alloc::vec::Vec<u8>>
+pub rns_git::server::layout::Repositories::fetch_limits: rns_git::server::config::FetchLimits
 pub rns_git::server::layout::Repositories::groups: alloc::collections::btree::map::BTreeMap<alloc::string::String, rns_git::server::layout::Group>
 impl rns_git::server::layout::Repositories
+pub fn rns_git::server::layout::Repositories::is_blocked(&self, &[u8; 16]) -> bool
 pub fn rns_git::server::layout::Repositories::load(&rns_git::server::config::NodeConfig) -> core::result::Result<Self, rns_git::server::perms::AllowedError>
 pub fn rns_git::server::layout::Repositories::load_group(&mut self, &str, &str, &rns_git::server::config::NodeConfig) -> core::result::Result<(), rns_git::server::perms::AllowedError>
 pub fn rns_git::server::layout::Repositories::load_repository(&mut self, &str, &std::path::Path) -> core::result::Result<bool, rns_git::server::perms::AllowedError>

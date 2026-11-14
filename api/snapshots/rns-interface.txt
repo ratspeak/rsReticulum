@@ -627,7 +627,6 @@ pub const rns_interface::local::KEEPALIVE_INTERVAL: core::time::Duration
 pub const rns_interface::local::LOCAL_BITRATE: u64
 pub const rns_interface::local::LOCAL_MTU: u32
 pub const rns_interface::local::RECONNECT_WAIT: core::time::Duration
-pub fn rns_interface::local::forced_bitrate_delay(usize, u64) -> core::time::Duration
 pub fn rns_interface::local::is_android() -> bool
 pub fn rns_interface::local::python_shared_socket_name(&str) -> alloc::string::String
 pub fn rns_interface::local::socket_path(core::option::Option<&std::path::Path>) -> std::path::PathBuf
@@ -980,7 +979,6 @@ pub const rns_interface::rnode::RNODE_SPREADING_FACTOR_MIN: u8
 pub const rns_interface::rnode::RNODE_TX_POWER_MAX_DBM: u8
 pub const rns_interface::rnode::RNODE_TX_POWER_MIN_DBM: u8
 pub const rns_interface::rnode::RSSI_OFFSET: i32
-pub fn rns_interface::rnode::airtime_lock_word(f64) -> u16
 pub fn rns_interface::rnode::build_airtime_sequence(&rns_interface::rnode::RNodeConfig) -> alloc::vec::Vec<u8>
 pub fn rns_interface::rnode::build_detach_sequence() -> alloc::vec::Vec<u8>
 pub fn rns_interface::rnode::build_detach_sequence_for_platform(core::option::Option<u8>) -> alloc::vec::Vec<u8>
@@ -1027,6 +1025,9 @@ pub fn rns_interface::rnode_admin::parse_bt_pin(&rns_interface::rnode_admin::Adm
 pub fn rns_interface::rnode_admin::parse_u32(&[u8]) -> core::option::Option<u32>
 pub fn rns_interface::rnode_admin::reset_frame() -> rns_interface::rnode_admin::AdminFrame
 pub fn rns_interface::rnode_admin::u32_payload(u32) -> [u8; 4]
+pub fn rns_interface::rnode_admin::wifi_channel_frame(u8) -> rns_interface::rnode_admin::AdminFrame
+pub fn rns_interface::rnode_admin::wifi_psk_frame(core::option::Option<&str>) -> core::option::Option<rns_interface::rnode_admin::AdminFrame>
+pub fn rns_interface::rnode_admin::wifi_ssid_frame(core::option::Option<&str>) -> core::option::Option<rns_interface::rnode_admin::AdminFrame>
 pub mod rns_interface::rnode_capabilities
 #[non_exhaustive] pub enum rns_interface::rnode_capabilities::RNodeCapabilityParseError
 pub rns_interface::rnode_capabilities::RNodeCapabilityParseError::ChecksumMismatch
@@ -1357,7 +1358,6 @@ pub const rns_interface::tcp::TCP_KEEPCNT: u32
 pub const rns_interface::tcp::TCP_KEEPIDLE: u32
 pub const rns_interface::tcp::TCP_KEEPINTVL: u32
 pub fn rns_interface::tcp::frame_for_tcp(&[u8], bool) -> alloc::vec::Vec<u8>
-pub async fn rns_interface::tcp::resolve_bind_address(core::option::Option<&str>, core::option::Option<&str>, u16, bool) -> core::io::error::Result<core::net::socket_addr::SocketAddr>
 pub async fn rns_interface::tcp::spawn_tcp_client(rns_interface::tcp::TcpClientConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
 pub async fn rns_interface::tcp::spawn_tcp_client_observed(rns_interface::tcp::TcpClientConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::tcp::SpawnedClientInterface, rns_interface::traits::InterfaceError>
 pub async fn rns_interface::tcp::spawn_tcp_server(rns_interface::tcp::TcpServerConfig, rns_interface::traits::InterfaceId, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
@@ -1432,7 +1432,6 @@ pub const rns_interface::traits::OP_FREQ_SAMPLES: usize
 pub const rns_interface::traits::PR_FREQ_DECAY: f64
 pub const rns_interface::traits::PR_MINFREQ_HZ: f64
 pub fn rns_interface::traits::apply_autoconfigured_mtu(&mut rns_interface::traits::InterfaceHandle, u64)
-pub fn rns_interface::traits::hardware_mtu_capacity(core::option::Option<u32>, u32) -> (u32, rns_transport::interface_ownership::InterfacePacketCapacity)
 pub fn rns_interface::traits::optimise_mtu(u64) -> core::option::Option<u32>
 pub type rns_interface::traits::InterfaceId = u64
 pub mod rns_interface::udp

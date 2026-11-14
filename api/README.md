@@ -1,8 +1,8 @@
 # Rust API
 
-This guide describes the 1.4.0 API, published as v1.4.0. For the 1.3.0
-tools and libraries, use the documentation at that tag. The [1.4 migration
-guide](migrations/1.4.md) covers source and configuration changes.
+This guide describes the 1.5.0 API, published as v1.5.0. For the 1.4.0
+tools and libraries, use the documentation at that tag. The [1.5 migration
+guide](migrations/1.5.md) covers source and configuration changes.
 
 Application code should begin with `rns_runtime::prelude`. It collects the
 runtime handle and the commonly used identity, destination, packet, Link,
@@ -73,9 +73,16 @@ endpoint, not the identity of the packet socket. Selecting a trustworthy matchin
 pair remains the application's responsibility. These policies do not move
 AutoInterface's interoperable UDP ports or alter Reticulum wire formats.
 
-The [capacity, IFAC and receipt migration guide](migrations/capacity-and-receipts.md) describes the current 1.4 source boundary, including custom-driver ownership and application-controlled admission.
+The [capacity, IFAC, and receipt migration guide](migrations/capacity-and-receipts.md) describes the capacity boundary introduced in 1.4 and still current in 1.5, including custom-driver ownership and application-controlled admission.
 
 ## Stability
+
+The 1.5 line follows Reticulum 1.6.0. It makes the transport actor's state
+private, marks growing enums and structs `#[non_exhaustive]`, keeps known
+destinations, ratchets, and cached announces in upstream's SQLite stores, and
+moves stamp costs and values to `f64`. See the
+[1.5 migration guide](migrations/1.5.md) for each source change and the
+behaviour an operator sees.
 
 The 1.3 line changes the six discovery coordinate fields to `Option<f64>` so
 unknown values remain distinct from real zero. It also replaces publicly mutable
@@ -151,10 +158,11 @@ is not yet a blanket stability promise for every public Rust item.
   packages.
 - `rns-runtime` is provisional because it contains both the application
   prelude and lower-level actor, RPC, manager, and command APIs.
-- `rns-ratkey` is experimental, and the `rns-tools` library target supports the
-  repository's binaries rather than a public library integration.
+- `rns-ratkey` is experimental, and the `rns-tools` and `rns-git` library
+  targets support the repository's binaries rather than a public library
+  integration.
 
-Low-level actor, mailbox, RPC, transport-table, concrete-driver, and Link
+Low-level actor, mailbox, RPC, path-table, concrete-driver, and Link
 endpoint ownership APIs remain available for compatibility. They should not be
 treated as stable merely because they are publicly reachable.
 

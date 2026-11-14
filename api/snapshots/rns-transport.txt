@@ -1,5 +1,8 @@
 pub mod rns_transport
 pub mod rns_transport::actor
+#[non_exhaustive] pub enum rns_transport::actor::StorageRole
+pub rns_transport::actor::StorageRole::Owner
+pub rns_transport::actor::StorageRole::SharedInstanceClient
 pub struct rns_transport::actor::DiscoveryPathRequest
 impl rns_transport::path_discovery::DiscoveryPathRequest
 pub fn rns_transport::path_discovery::DiscoveryPathRequest::deadline(&self) -> f64
@@ -14,6 +17,7 @@ pub async fn rns_transport::actor::PersistenceTrigger::request(&self) -> bool
 pub struct rns_transport::actor::RecentAnnounce
 pub rns_transport::actor::RecentAnnounce::app_data: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::actor::RecentAnnounce::dest_hash: [u8; 16]
+pub rns_transport::actor::RecentAnnounce::facts_known: bool
 pub rns_transport::actor::RecentAnnounce::hops: u8
 pub rns_transport::actor::RecentAnnounce::is_path_response: bool
 pub rns_transport::actor::RecentAnnounce::last_used: core::option::Option<f64>
@@ -28,64 +32,6 @@ pub rns_transport::actor::RecentAnnounce::stamp: core::option::Option<[u8; 14]>
 pub rns_transport::actor::RecentAnnounce::stamp_value: f64
 pub rns_transport::actor::RecentAnnounce::timestamp: f64
 pub struct rns_transport::actor::TransportActor
-pub rns_transport::actor::TransportActor::announce_sweep_in_flight: alloc::sync::Arc<core::sync::atomic::AtomicBool>
-pub rns_transport::actor::TransportActor::announce_table: rns_transport::announce::AnnounceTable
-pub rns_transport::actor::TransportActor::announce_validation: rns_transport::announce_validation::AnnounceValidationCache
-pub rns_transport::actor::TransportActor::blackhole_sources: alloc::vec::Vec<[u8; 16]>
-pub rns_transport::actor::TransportActor::blackhole_table: rns_transport::blackhole::BlackholeTable
-pub rns_transport::actor::TransportActor::blackholed_snapshot: alloc::sync::Arc<std::sync::poison::rwlock::RwLock<std::collections::hash::set::HashSet<[u8; 16]>>>
-pub rns_transport::actor::TransportActor::channel_drops: u64
-pub rns_transport::actor::TransportActor::destination_channels: std::collections::hash::map::HashMap<[u8; 16], tokio::sync::mpsc::bounded::Sender<rns_transport::link_messages::DestinationEvent>>
-pub rns_transport::actor::TransportActor::destination_filter: rns_transport::destination_filter::DestinationTypeFilter
-pub rns_transport::actor::TransportActor::discovery_pr_tags: std::collections::hash::set::HashSet<[u8; 32]>
-pub rns_transport::actor::TransportActor::discovery_pr_tags_prev: std::collections::hash::set::HashSet<[u8; 32]>
-pub rns_transport::actor::TransportActor::ephemeral_identity_hash: core::option::Option<[u8; 16]>
-pub rns_transport::actor::TransportActor::hashlist_save_in_flight: alloc::sync::Arc<core::sync::atomic::AtomicBool>
-pub rns_transport::actor::TransportActor::held_announces: std::collections::hash::map::HashMap<[u8; 16], rns_transport::announce::AnnounceEntry>
-pub rns_transport::actor::TransportActor::hop_limiter: u8
-pub rns_transport::actor::TransportActor::inflight_path_requests: std::collections::hash::map::HashMap<[u8; 16], f64>
-pub rns_transport::actor::TransportActor::interfaces: std::collections::hash::map::HashMap<rns_transport::messages::InterfaceId, rns_transport::messages::InterfaceEntry>
-pub rns_transport::actor::TransportActor::internal_identity_hash: core::option::Option<[u8; 16]>
-pub rns_transport::actor::TransportActor::is_foreground: alloc::sync::Arc<core::sync::atomic::AtomicBool>
-pub rns_transport::actor::TransportActor::is_shared_instance: bool
-pub rns_transport::actor::TransportActor::is_transport_enabled: bool
-pub rns_transport::actor::TransportActor::last_state_save: f64
-pub rns_transport::actor::TransportActor::link_table: rns_transport::link_table::LinkTable
-pub rns_transport::actor::TransportActor::local_destination_keys: std::collections::hash::map::HashMap<[u8; 16], [u8; 64]>
-pub rns_transport::actor::TransportActor::local_destinations: std::collections::hash::set::HashSet<[u8; 16]>
-pub rns_transport::actor::TransportActor::local_hops_delta: u8
-pub rns_transport::actor::TransportActor::packet_hashlist: rns_transport::hashlist::PacketHashlist
-pub rns_transport::actor::TransportActor::packet_q_cache: alloc::collections::vec_deque::VecDeque<([u8; 32], f32)>
-pub rns_transport::actor::TransportActor::packet_rssi_cache: alloc::collections::vec_deque::VecDeque<([u8; 32], f32)>
-pub rns_transport::actor::TransportActor::packet_snr_cache: alloc::collections::vec_deque::VecDeque<([u8; 32], f32)>
-pub rns_transport::actor::TransportActor::path_interface_suppressions: std::collections::hash::map::HashMap<([u8; 16], rns_transport::messages::InterfaceId), f64>
-pub rns_transport::actor::TransportActor::path_pool_last_checked: f64
-pub rns_transport::actor::TransportActor::path_requests: std::collections::hash::map::HashMap<[u8; 16], f64>
-pub rns_transport::actor::TransportActor::path_states: std::collections::hash::map::HashMap<[u8; 16], rns_transport::constants::PathState>
-pub rns_transport::actor::TransportActor::path_table: rns_transport::path_table::PathTable
-pub rns_transport::actor::TransportActor::path_waiters: std::collections::hash::map::HashMap<[u8; 16], alloc::vec::Vec<(tokio::sync::oneshot::Sender<bool>, f64)>>
-pub rns_transport::actor::TransportActor::pending_discovery_prs: alloc::collections::vec_deque::VecDeque<rns_transport::actor::PendingDiscoveryPathRequest>
-pub rns_transport::actor::TransportActor::pending_local_path_requests: std::collections::hash::map::HashMap<[u8; 16], rns_transport::messages::InterfaceId>
-pub rns_transport::actor::TransportActor::pending_path_entries: alloc::vec::Vec<rns_transport::persistence::PersistedPathEntry>
-pub rns_transport::actor::TransportActor::pr_stamper: rns_transport::pr_stamper::PathRequestStamper
-pub rns_transport::actor::TransportActor::rate_table: rns_transport::rate_limit::RateTable
-pub rns_transport::actor::TransportActor::receipt_msg_ids: std::collections::hash::map::HashMap<[u8; 16], alloc::string::String>
-pub rns_transport::actor::TransportActor::receipt_proof_txs: std::collections::hash::map::HashMap<[u8; 16], tokio::sync::mpsc::unbounded::UnboundedSender<rns_transport::link_messages::DestinationEvent>>
-pub rns_transport::actor::TransportActor::receipt_table: std::collections::hash::map::HashMap<[u8; 16], rns_wire::receipt::PacketReceipt>
-pub rns_transport::actor::TransportActor::receipt_updates: std::collections::hash::map::HashMap<[u8; 16], tokio::sync::watch::Sender<rns_transport::messages::ReceiptUpdate>>
-pub rns_transport::actor::TransportActor::recent_announces: std::collections::hash::map::HashMap<[u8; 16], rns_transport::actor::RecentAnnounce>
-pub rns_transport::actor::TransportActor::reverse_table: rns_transport::reverse_table::ReverseTable
-pub rns_transport::actor::TransportActor::routing_save_generation: alloc::sync::Arc<core::sync::atomic::AtomicU64>
-pub rns_transport::actor::TransportActor::routing_save_in_flight: alloc::sync::Arc<core::sync::atomic::AtomicBool>
-pub rns_transport::actor::TransportActor::routing_save_lock: alloc::sync::Arc<std::sync::poison::mutex::Mutex<()>>
-pub rns_transport::actor::TransportActor::shared_instance_client_mode: bool
-pub rns_transport::actor::TransportActor::stamp_policy: rns_transport::stamps::StampPolicy
-pub rns_transport::actor::TransportActor::state_dirty: bool
-pub rns_transport::actor::TransportActor::static_transport_identity: bool
-pub rns_transport::actor::TransportActor::storage_dir: core::option::Option<std::path::PathBuf>
-pub rns_transport::actor::TransportActor::traffic: rns_transport::traffic::TrafficCounter
-pub rns_transport::actor::TransportActor::transport_identity_hash: core::option::Option<[u8; 16]>
-pub rns_transport::actor::TransportActor::tunnel_table: rns_transport::tunnel::TunnelTable
 impl rns_transport::actor::TransportActor
 pub fn rns_transport::actor::TransportActor::announce_dispatch_handle(&self) -> rns_transport::announce_dispatch::AnnounceDispatchHandle
 impl rns_transport::actor::TransportActor
@@ -98,40 +44,21 @@ pub fn rns_transport::actor::TransportActor::has_path(&self, &[u8; 16]) -> bool
 pub fn rns_transport::actor::TransportActor::hops_to(&self, &[u8; 16]) -> core::option::Option<u8>
 pub fn rns_transport::actor::TransportActor::inbound_queues(&self) -> alloc::sync::Arc<rns_transport::inbound_queues::InboundQueues>
 pub fn rns_transport::actor::TransportActor::initialize_storage(&mut self, std::path::PathBuf)
+pub fn rns_transport::actor::TransportActor::initialize_storage_as(&mut self, std::path::PathBuf, rns_transport::actor::StorageRole)
 pub fn rns_transport::actor::TransportActor::link_endpoint_dispatch_handle(&self) -> rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle
 pub fn rns_transport::actor::TransportActor::new() -> (Self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
 pub fn rns_transport::actor::TransportActor::new_with_capacity(usize, usize) -> (Self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
+pub fn rns_transport::actor::TransportActor::new_with_options(usize, usize, rns_transport::inbound_queues::InboundQueueLengths, rns_transport::actor::TransportActorOptions) -> (Self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
 pub fn rns_transport::actor::TransportActor::new_with_queues(usize, usize, rns_transport::inbound_queues::InboundQueueLengths) -> (Self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
 pub fn rns_transport::actor::TransportActor::persistence_trigger(&self) -> rns_transport::actor::PersistenceTrigger
 pub async fn rns_transport::actor::TransportActor::run(self)
 impl rns_transport::actor::TransportActor
 pub fn rns_transport::actor::TransportActor::path_recovery_handle(&mut self) -> rns_transport::path_recovery::PathRecoveryHandle
-pub mod rns_transport::announce
-pub struct rns_transport::announce::AnnounceEntry
-pub rns_transport::announce::AnnounceEntry::attached_interface: core::option::Option<rns_transport::messages::InterfaceId>
-pub rns_transport::announce::AnnounceEntry::block_rebroadcast: bool
-pub rns_transport::announce::AnnounceEntry::hops: u8
-pub rns_transport::announce::AnnounceEntry::local_rebroadcasts: u32
-pub rns_transport::announce::AnnounceEntry::packet_raw: alloc::vec::Vec<u8>
-pub rns_transport::announce::AnnounceEntry::received_from: [u8; 16]
-pub rns_transport::announce::AnnounceEntry::retransmit_timeout: f64
-pub rns_transport::announce::AnnounceEntry::retries: u8
-pub rns_transport::announce::AnnounceEntry::source_interface: core::option::Option<rns_transport::messages::InterfaceId>
-pub rns_transport::announce::AnnounceEntry::timestamp: f64
-pub struct rns_transport::announce::AnnounceTable
-impl rns_transport::announce::AnnounceTable
-pub fn rns_transport::announce::AnnounceTable::cull_exhausted(&mut self, u8) -> usize
-pub fn rns_transport::announce::AnnounceTable::due_for_retransmit(&self, f64) -> alloc::vec::Vec<rns_wire::types::DestHash>
-pub fn rns_transport::announce::AnnounceTable::get(&self, &[u8; 16]) -> core::option::Option<&rns_transport::announce::AnnounceEntry>
-pub fn rns_transport::announce::AnnounceTable::get_mut(&mut self, &[u8; 16]) -> core::option::Option<&mut rns_transport::announce::AnnounceEntry>
-pub fn rns_transport::announce::AnnounceTable::insert(&mut self, impl core::convert::Into<rns_wire::types::DestHash>, rns_transport::announce::AnnounceEntry)
-pub fn rns_transport::announce::AnnounceTable::is_empty(&self) -> bool
-pub fn rns_transport::announce::AnnounceTable::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&rns_wire::types::DestHash, &rns_transport::announce::AnnounceEntry)>
-pub fn rns_transport::announce::AnnounceTable::len(&self) -> usize
-pub fn rns_transport::announce::AnnounceTable::new() -> Self
-pub fn rns_transport::announce::AnnounceTable::remove(&mut self, &[u8; 16]) -> core::option::Option<rns_transport::announce::AnnounceEntry>
-impl core::default::Default for rns_transport::announce::AnnounceTable
-pub fn rns_transport::announce::AnnounceTable::default() -> Self
+#[non_exhaustive] pub struct rns_transport::actor::TransportActorOptions
+pub rns_transport::actor::TransportActorOptions::ephemeral_identity_hash: core::option::Option<[u8; 16]>
+pub rns_transport::actor::TransportActorOptions::is_foreground: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>
+pub rns_transport::actor::TransportActorOptions::local_hops_delta: u8
+pub rns_transport::actor::TransportActorOptions::static_transport_identity: bool
 pub mod rns_transport::announce_dispatch
 #[non_exhaustive] pub enum rns_transport::announce_dispatch::AnnounceDispatchError
 pub rns_transport::announce_dispatch::AnnounceDispatchError::Closed
@@ -144,33 +71,6 @@ pub rns_transport::announce_dispatch::AnnounceDispatchResult::NoEligibleInterfac
 pub struct rns_transport::announce_dispatch::AnnounceDispatchHandle
 impl rns_transport::announce_dispatch::AnnounceDispatchHandle
 pub fn rns_transport::announce_dispatch::AnnounceDispatchHandle::try_dispatch(&self, bytes::bytes::Bytes, core::option::Option<rns_transport::messages::InterfaceId>, core::time::Duration) -> core::result::Result<tokio::sync::oneshot::Receiver<rns_transport::announce_dispatch::AnnounceDispatchResult>, rns_transport::announce_dispatch::AnnounceDispatchError>
-pub mod rns_transport::announce_validation
-pub enum rns_transport::announce_validation::CachedAnnounce
-pub rns_transport::announce_validation::CachedAnnounce::Miss
-pub rns_transport::announce_validation::CachedAnnounce::Rejected(rns_transport::announce_validation::InvalidAnnounce)
-pub rns_transport::announce_validation::CachedAnnounce::Valid(rns_transport::announce_validation::ValidatedAnnounce)
-pub enum rns_transport::announce_validation::InvalidAnnounce
-pub rns_transport::announce_validation::InvalidAnnounce::Blackholed
-pub rns_transport::announce_validation::InvalidAnnounce::Invalid
-pub rns_transport::announce_validation::InvalidAnnounce::InvalidStamp(core::option::Option<f64>)
-pub rns_transport::announce_validation::InvalidAnnounce::NoStamp
-pub struct rns_transport::announce_validation::AnnounceValidationCache
-impl rns_transport::announce_validation::AnnounceValidationCache
-pub fn rns_transport::announce_validation::AnnounceValidationCache::insert_invalid(&mut self, [u8; 32], rns_transport::announce_validation::InvalidAnnounce)
-pub fn rns_transport::announce_validation::AnnounceValidationCache::insert_valid(&mut self, [u8; 32], rns_transport::announce_validation::ValidatedAnnounce)
-pub fn rns_transport::announce_validation::AnnounceValidationCache::invalid_len(&self) -> usize
-pub fn rns_transport::announce_validation::AnnounceValidationCache::lookup(&self, &[u8; 32], f64, bool) -> rns_transport::announce_validation::CachedAnnounce
-pub fn rns_transport::announce_validation::AnnounceValidationCache::new() -> Self
-pub fn rns_transport::announce_validation::AnnounceValidationCache::reset(&mut self)
-pub fn rns_transport::announce_validation::AnnounceValidationCache::valid_len(&self) -> usize
-pub struct rns_transport::announce_validation::ValidatedAnnounce
-pub rns_transport::announce_validation::ValidatedAnnounce::app_data: core::option::Option<alloc::vec::Vec<u8>>
-pub rns_transport::announce_validation::ValidatedAnnounce::identity_hash: [u8; 16]
-pub rns_transport::announce_validation::ValidatedAnnounce::lr_cost: core::option::Option<f64>
-pub rns_transport::announce_validation::ValidatedAnnounce::public_key: [u8; 64]
-pub rns_transport::announce_validation::ValidatedAnnounce::ratchet: core::option::Option<[u8; 32]>
-pub rns_transport::announce_validation::ValidatedAnnounce::stamp: core::option::Option<[u8; 14]>
-pub rns_transport::announce_validation::ValidatedAnnounce::stamp_value: core::option::Option<f64>
 pub mod rns_transport::await_path
 pub enum rns_transport::await_path::AwaitPathError
 pub rns_transport::await_path::AwaitPathError::Timeout
@@ -260,8 +160,6 @@ pub fn rns_transport::constants::InterfaceDirection::bidirectional() -> Self
 pub fn rns_transport::constants::InterfaceDirection::inbound_only() -> Self
 pub fn rns_transport::constants::InterfaceDirection::outbound_only() -> Self
 pub const rns_transport::constants::ANNOUNCES_CHECK_INTERVAL: f64
-pub const rns_transport::constants::ANNOUNCE_CACHE_SWEEP_DEFER: f64
-pub const rns_transport::constants::ANNOUNCE_CACHE_SWEEP_GRACE_SECS: u64
 pub const rns_transport::constants::ANNOUNCE_CACHE_SWEEP_INTERVAL: f64
 pub const rns_transport::constants::ANNOUNCE_CAP: f64
 pub const rns_transport::constants::ANNOUNCE_QUEUE_INTERVAL: f64
@@ -291,14 +189,10 @@ pub const rns_transport::constants::INTERFACE_JOBS_INTERVAL: f64
 pub const rns_transport::constants::IP_FREQ_SAMPLES: usize
 pub const rns_transport::constants::JOB_INTERVAL_BG_MS: u64
 pub const rns_transport::constants::JOB_INTERVAL_MS: u64
-pub const rns_transport::constants::KD_FLUSH_INTERVAL: f64
-pub const rns_transport::constants::KNOWN_DESTINATIONS_INTERVAL: f64
-pub const rns_transport::constants::LINKS_CHECK_INTERVAL: f64
 pub const rns_transport::constants::LINK_ENDPOINT_EGRESS_QUEUE_CAPACITY: usize
 pub const rns_transport::constants::LINK_TIMEOUT: f64
 pub const rns_transport::constants::LOCAL_CLIENT_CACHE_MAXSIZE: usize
 pub const rns_transport::constants::LOCAL_REBROADCASTS_MAX: u32
-pub const rns_transport::constants::MAX_ANNOUNCE_DRAIN_PER_TICK: usize
 pub const rns_transport::constants::MAX_DISCOVERY_PR_TAGS: usize
 pub const rns_transport::constants::MAX_HELD_ANNOUNCES: usize
 pub const rns_transport::constants::MAX_QUEUED_ANNOUNCES: usize
@@ -314,7 +208,6 @@ pub const rns_transport::constants::PATHFINDER_G: f64
 pub const rns_transport::constants::PATHFINDER_M: u8
 pub const rns_transport::constants::PATHFINDER_R: u8
 pub const rns_transport::constants::PATHFINDER_RW: f64
-pub const rns_transport::constants::PATH_POOL_CHECK_INTERVAL: f64
 pub const rns_transport::constants::PATH_POOL_UNUSED_TARGET: usize
 pub const rns_transport::constants::PATH_REQUEST_GATE_TIMEOUT: f64
 pub const rns_transport::constants::PATH_REQUEST_GRACE: f64
@@ -325,11 +218,9 @@ pub const rns_transport::constants::PATH_SLOW_BITRATE: u64
 pub const rns_transport::constants::PATH_SLOW_LINGER_FACTOR: f64
 pub const rns_transport::constants::PENDING_PRS_CHECK_INTERVAL: f64
 pub const rns_transport::constants::PERSIST_RANDOM_BLOBS: usize
-pub const rns_transport::constants::PR_ADMISSION_DEADLINE: f64
 pub const rns_transport::constants::PR_FREQ_DECAY: f64
 pub const rns_transport::constants::PR_MINFREQ_HZ: f64
 pub const rns_transport::constants::QUEUED_ANNOUNCE_LIFE: f64
-pub const rns_transport::constants::RATE_TABLE_CULL_INTERVAL: f64
 pub const rns_transport::constants::RATE_TABLE_RETAIN: f64
 pub const rns_transport::constants::RECEIPTS_CHECK_INTERVAL: f64
 pub const rns_transport::constants::REVERSE_TIMEOUT: u64
@@ -343,23 +234,6 @@ pub const rns_transport::constants::UNUSED_DESTINATION_LINGER: f64
 pub const rns_transport::constants::UNUSED_PATH_LINGER: f64
 pub const rns_transport::constants::UNUSED_PATH_LINGER_LEAF: f64
 pub mod rns_transport::destination_filter
-pub enum rns_transport::destination_filter::AnnounceSource
-pub rns_transport::destination_filter::AnnounceSource::LocalClient
-pub rns_transport::destination_filter::AnnounceSource::Other
-pub rns_transport::destination_filter::AnnounceSource::SharedInstance
-pub struct rns_transport::destination_filter::DestinationTypeFilter
-impl rns_transport::destination_filter::DestinationTypeFilter
-pub fn rns_transport::destination_filter::DestinationTypeFilter::admits(&self, &rns_transport::destination_filter::NameHash, rns_transport::destination_filter::AnnounceSource, u8) -> bool
-pub fn rns_transport::destination_filter::DestinationTypeFilter::allow(&mut self, &str)
-pub fn rns_transport::destination_filter::DestinationTypeFilter::apply_policy(&mut self, &rns_transport::destination_filter::FilterPolicy)
-pub fn rns_transport::destination_filter::DestinationTypeFilter::block(&mut self, &str)
-pub fn rns_transport::destination_filter::DestinationTypeFilter::is_wanted(&self, &rns_transport::destination_filter::NameHash) -> bool
-pub fn rns_transport::destination_filter::DestinationTypeFilter::required_only(&self) -> bool
-pub fn rns_transport::destination_filter::DestinationTypeFilter::set_required_only(&mut self, bool)
-pub fn rns_transport::destination_filter::DestinationTypeFilter::type_name(&self, &rns_transport::destination_filter::NameHash) -> &str
-pub fn rns_transport::destination_filter::DestinationTypeFilter::unwants(&mut self, &str, &[u8]) -> bool
-pub fn rns_transport::destination_filter::DestinationTypeFilter::unwants_all(&mut self, &[u8]) -> bool
-pub fn rns_transport::destination_filter::DestinationTypeFilter::wants(&mut self, &str, alloc::vec::Vec<u8>) -> bool
 pub struct rns_transport::destination_filter::FilterPolicy
 pub rns_transport::destination_filter::FilterPolicy::allowed_types: alloc::vec::Vec<alloc::string::String>
 pub rns_transport::destination_filter::FilterPolicy::hop_limiter: u8
@@ -525,10 +399,6 @@ pub fn rns_transport::discovery::blackhole_subscriber::SubscriberState::update_i
 pub fn rns_transport::discovery::blackhole_subscriber::SubscriberState::with_update_interval(self, core::time::Duration) -> Self
 impl core::default::Default for rns_transport::discovery::blackhole_subscriber::SubscriberState
 pub fn rns_transport::discovery::blackhole_subscriber::SubscriberState::default() -> Self
-pub const rns_transport::discovery::blackhole_subscriber::INITIAL_WAIT: core::time::Duration
-pub const rns_transport::discovery::blackhole_subscriber::JOB_INTERVAL: core::time::Duration
-pub const rns_transport::discovery::blackhole_subscriber::SOURCE_TIMEOUT: core::time::Duration
-pub const rns_transport::discovery::blackhole_subscriber::UPDATE_INTERVAL: core::time::Duration
 pub mod rns_transport::discovery::constants
 pub mod rns_transport::discovery::constants::key
 pub const rns_transport::discovery::constants::key::BANDWIDTH: u8
@@ -559,10 +429,10 @@ pub const rns_transport::discovery::constants::AUTOCONNECT_INTERFACE_TYPES: &[&s
 pub const rns_transport::discovery::constants::AUTOCONNECT_MINIMUM_VERSIONS: &[(&str, core::option::Option<&str>)]
 pub const rns_transport::discovery::constants::BLACKHOLE_ASPECTS: &[&str]
 pub const rns_transport::discovery::constants::BLACKHOLE_ASPECT_FILTER: &str
-pub const rns_transport::discovery::constants::BLACKHOLE_INITIAL_WAIT_SECS: u64
-pub const rns_transport::discovery::constants::BLACKHOLE_JOB_INTERVAL_SECS: u64
-pub const rns_transport::discovery::constants::BLACKHOLE_SOURCE_TIMEOUT_SECS: u64
-pub const rns_transport::discovery::constants::BLACKHOLE_UPDATE_INTERVAL_SECS: u64
+pub const rns_transport::discovery::constants::BLACKHOLE_INITIAL_WAIT: core::time::Duration
+pub const rns_transport::discovery::constants::BLACKHOLE_JOB_INTERVAL: core::time::Duration
+pub const rns_transport::discovery::constants::BLACKHOLE_SOURCE_TIMEOUT: core::time::Duration
+pub const rns_transport::discovery::constants::BLACKHOLE_UPDATE_INTERVAL: core::time::Duration
 pub const rns_transport::discovery::constants::DEFAULT_STAMP_VALUE: f64
 pub const rns_transport::discovery::constants::DETACH_THRESHOLD_TICKS: u64
 pub const rns_transport::discovery::constants::DISCOVERABLE_INTERFACE_TYPES: &[&str]
@@ -579,29 +449,6 @@ pub const rns_transport::discovery::constants::THRESHOLD_REMOVE_SECS: u64
 pub const rns_transport::discovery::constants::THRESHOLD_STALE_SECS: u64
 pub const rns_transport::discovery::constants::THRESHOLD_UNKNOWN_SECS: u64
 pub const rns_transport::discovery::constants::WORKBLOCK_EXPAND_ROUNDS: usize
-pub mod rns_transport::discovery::key
-pub const rns_transport::discovery::key::BANDWIDTH: u8
-pub const rns_transport::discovery::key::CHANNEL: u8
-pub const rns_transport::discovery::key::CODING_RATE: u8
-pub const rns_transport::discovery::key::DST_COST: u8
-pub const rns_transport::discovery::key::FREQUENCY: u8
-pub const rns_transport::discovery::key::HEIGHT: u8
-pub const rns_transport::discovery::key::IFAC_NETKEY: u8
-pub const rns_transport::discovery::key::IFAC_NETNAME: u8
-pub const rns_transport::discovery::key::INTERFACE_TYPE: u8
-pub const rns_transport::discovery::key::LATITUDE: u8
-pub const rns_transport::discovery::key::LONGITUDE: u8
-pub const rns_transport::discovery::key::MODULATION: u8
-pub const rns_transport::discovery::key::NAME: u8
-pub const rns_transport::discovery::key::OP_ADDR: u8
-pub const rns_transport::discovery::key::PORT: u8
-pub const rns_transport::discovery::key::PR_COST: u8
-pub const rns_transport::discovery::key::REACHABLE_ON: u8
-pub const rns_transport::discovery::key::SPREADING_FACTOR: u8
-pub const rns_transport::discovery::key::TRANSPORT: u8
-pub const rns_transport::discovery::key::TRANSPORT_ID: u8
-pub const rns_transport::discovery::key::TRANSPORT_IMPL: u8
-pub const rns_transport::discovery::key::TRANSPORT_VERS: u8
 pub mod rns_transport::discovery::receiver
 pub enum rns_transport::discovery::receiver::Outcome
 pub rns_transport::discovery::receiver::Outcome::Accepted
@@ -664,7 +511,6 @@ impl rns_transport::discovery::stamper::DiscoveryStamper for rns_transport::disc
 pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
 pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> f64
-pub fn rns_transport::discovery::stamper::generation_threads(f64) -> core::num::nonzero::NonZeroUsize
 pub mod rns_transport::discovery::storage
 pub enum rns_transport::discovery::storage::DiscoveryStatus
 pub rns_transport::discovery::storage::DiscoveryStatus::Available
@@ -841,36 +687,6 @@ impl rns_transport::discovery::stamper::DiscoveryStamper for rns_transport::disc
 pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
 pub fn rns_transport::discovery::stamper::RnsDiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> f64
-pub const rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS: u64
-pub const rns_transport::discovery::APP_NAME: &str
-pub const rns_transport::discovery::AUTOCONNECT_INTERFACE_TYPES: &[&str]
-pub const rns_transport::discovery::AUTOCONNECT_MINIMUM_VERSIONS: &[(&str, core::option::Option<&str>)]
-pub const rns_transport::discovery::BLACKHOLE_ASPECTS: &[&str]
-pub const rns_transport::discovery::BLACKHOLE_ASPECT_FILTER: &str
-pub const rns_transport::discovery::BLACKHOLE_INITIAL_WAIT: core::time::Duration
-pub const rns_transport::discovery::BLACKHOLE_INITIAL_WAIT_SECS: u64
-pub const rns_transport::discovery::BLACKHOLE_JOB_INTERVAL: core::time::Duration
-pub const rns_transport::discovery::BLACKHOLE_JOB_INTERVAL_SECS: u64
-pub const rns_transport::discovery::BLACKHOLE_SOURCE_TIMEOUT: core::time::Duration
-pub const rns_transport::discovery::BLACKHOLE_SOURCE_TIMEOUT_SECS: u64
-pub const rns_transport::discovery::BLACKHOLE_UPDATE_INTERVAL: core::time::Duration
-pub const rns_transport::discovery::BLACKHOLE_UPDATE_INTERVAL_SECS: u64
-pub const rns_transport::discovery::DEFAULT_STAMP_VALUE: f64
-pub const rns_transport::discovery::DETACH_THRESHOLD_TICKS: u64
-pub const rns_transport::discovery::DISCOVERABLE_INTERFACE_TYPES: &[&str]
-pub const rns_transport::discovery::DISCOVERED_INTERFACE_TYPES: &[&str]
-pub const rns_transport::discovery::DISCOVERY_ASPECTS: &[&str]
-pub const rns_transport::discovery::DISCOVERY_ASPECT_FILTER: &str
-pub const rns_transport::discovery::FLAG_ENCRYPTED: u8
-pub const rns_transport::discovery::FLAG_SIGNED: u8
-pub const rns_transport::discovery::IMPLEMENTATION_NAME: &str
-pub const rns_transport::discovery::IMPLEMENTATION_VERSION: &str
-pub const rns_transport::discovery::MONITOR_INTERVAL_SECS: u64
-pub const rns_transport::discovery::STAMP_SIZE: usize
-pub const rns_transport::discovery::THRESHOLD_REMOVE_SECS: u64
-pub const rns_transport::discovery::THRESHOLD_STALE_SECS: u64
-pub const rns_transport::discovery::THRESHOLD_UNKNOWN_SECS: u64
-pub const rns_transport::discovery::WORKBLOCK_EXPAND_ROUNDS: usize
 pub trait rns_transport::discovery::DiscoveryDecryptor: core::marker::Send + core::marker::Sync
 pub fn rns_transport::discovery::DiscoveryDecryptor::decrypt(&self, &[u8]) -> core::option::Option<alloc::vec::Vec<u8>>
 pub trait rns_transport::discovery::DiscoveryStamper: core::marker::Send + core::marker::Sync
@@ -1145,49 +961,6 @@ pub rns_transport::link_messages::PacketMetrics::q: core::option::Option<f32>
 pub rns_transport::link_messages::PacketMetrics::rssi: core::option::Option<f32>
 pub rns_transport::link_messages::PacketMetrics::snr: core::option::Option<f32>
 pub async fn rns_transport::link_messages::dispatch_link_request(&tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, rns_transport::messages::OutboundRequest) -> core::result::Result<(), rns_transport::link_messages::LinkRequestDispatchError>
-pub mod rns_transport::link_table
-pub struct rns_transport::link_table::ExpiredLink
-pub rns_transport::link_table::ExpiredLink::destination_hash: [u8; 16]
-pub rns_transport::link_table::ExpiredLink::interface_id: rns_transport::messages::InterfaceId
-pub rns_transport::link_table::ExpiredLink::next_hop: core::option::Option<[u8; 16]>
-pub rns_transport::link_table::ExpiredLink::receiving_interface: rns_transport::messages::InterfaceId
-pub rns_transport::link_table::ExpiredLink::remaining_hops: u8
-pub rns_transport::link_table::ExpiredLink::taken_hops: u8
-impl core::convert::From<&rns_transport::link_table::LinkEntry> for rns_transport::link_table::ExpiredLink
-pub fn rns_transport::link_table::ExpiredLink::from(&rns_transport::link_table::LinkEntry) -> Self
-pub struct rns_transport::link_table::LinkEntry
-pub rns_transport::link_table::LinkEntry::accepted_mtu_ceiling: u32
-pub rns_transport::link_table::LinkEntry::destination_hash: [u8; 16]
-pub rns_transport::link_table::LinkEntry::established: bool
-pub rns_transport::link_table::LinkEntry::interface_id: rns_transport::messages::InterfaceId
-pub rns_transport::link_table::LinkEntry::interface_owner: core::option::Option<rns_transport::interface_ownership::InterfaceOwner>
-pub rns_transport::link_table::LinkEntry::next_hop: core::option::Option<[u8; 16]>
-pub rns_transport::link_table::LinkEntry::proof_timeout: f64
-pub rns_transport::link_table::LinkEntry::receiving_interface: rns_transport::messages::InterfaceId
-pub rns_transport::link_table::LinkEntry::receiving_owner: core::option::Option<rns_transport::interface_ownership::InterfaceOwner>
-pub rns_transport::link_table::LinkEntry::remaining_hops: u8
-pub rns_transport::link_table::LinkEntry::requested_mode: u8
-pub rns_transport::link_table::LinkEntry::taken_hops: u8
-pub rns_transport::link_table::LinkEntry::timestamp: f64
-pub rns_transport::link_table::LinkEntry::validated: bool
-impl core::convert::From<&rns_transport::link_table::LinkEntry> for rns_transport::link_table::ExpiredLink
-pub fn rns_transport::link_table::ExpiredLink::from(&rns_transport::link_table::LinkEntry) -> Self
-pub struct rns_transport::link_table::LinkTable
-impl rns_transport::link_table::LinkTable
-pub fn rns_transport::link_table::LinkTable::contains(&self, &[u8; 16]) -> bool
-pub fn rns_transport::link_table::LinkTable::cull_dead_interfaces(&mut self, &std::collections::hash::set::HashSet<rns_transport::messages::InterfaceId>) -> usize
-pub fn rns_transport::link_table::LinkTable::cull_stale(&mut self, f64) -> (usize, alloc::vec::Vec<rns_transport::link_table::ExpiredLink>)
-pub fn rns_transport::link_table::LinkTable::get(&self, &[u8; 16]) -> core::option::Option<&rns_transport::link_table::LinkEntry>
-pub fn rns_transport::link_table::LinkTable::get_mut(&mut self, &[u8; 16]) -> core::option::Option<&mut rns_transport::link_table::LinkEntry>
-pub fn rns_transport::link_table::LinkTable::insert(&mut self, impl core::convert::Into<rns_wire::types::LinkId>, rns_transport::link_table::LinkEntry)
-pub fn rns_transport::link_table::LinkTable::is_empty(&self) -> bool
-pub fn rns_transport::link_table::LinkTable::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&rns_wire::types::LinkId, &rns_transport::link_table::LinkEntry)>
-pub fn rns_transport::link_table::LinkTable::len(&self) -> usize
-pub fn rns_transport::link_table::LinkTable::new() -> Self
-pub fn rns_transport::link_table::LinkTable::remove(&mut self, &[u8; 16]) -> core::option::Option<rns_transport::link_table::LinkEntry>
-pub fn rns_transport::link_table::LinkTable::remove_interface(&mut self, rns_transport::messages::InterfaceId)
-impl core::default::Default for rns_transport::link_table::LinkTable
-pub fn rns_transport::link_table::LinkTable::default() -> Self
 pub mod rns_transport::link_transit
 pub enum rns_transport::link_transit::LinkTransitError
 pub rns_transport::link_transit::LinkTransitError::Capacity(rns_transport::interface_ownership::InterfaceCapacityError)
@@ -1261,7 +1034,7 @@ pub rns_transport::messages::ReceiptUpdate::Delivered::rtt: core::time::Duration
 pub rns_transport::messages::ReceiptUpdate::Failed
 pub rns_transport::messages::ReceiptUpdate::Sent
 pub rns_transport::messages::ReceiptUpdate::TimedOut
-pub enum rns_transport::messages::TransportMessage
+#[non_exhaustive] pub enum rns_transport::messages::TransportMessage
 pub rns_transport::messages::TransportMessage::ActivateLink
 pub rns_transport::messages::TransportMessage::ActivateLink::link_id: [u8; 16]
 pub rns_transport::messages::TransportMessage::AwaitPath
@@ -1382,6 +1155,8 @@ pub rns_transport::messages::TransportMessage::SetReceiptTimeout::truncated_hash
 pub rns_transport::messages::TransportMessage::SetStampPolicy
 pub rns_transport::messages::TransportMessage::SetStampPolicy::policy: rns_transport::stamps::StampPolicy
 pub rns_transport::messages::TransportMessage::SetStoragePaths
+pub rns_transport::messages::TransportMessage::SetStoragePaths::done: core::option::Option<tokio::sync::oneshot::Sender<()>>
+pub rns_transport::messages::TransportMessage::SetStoragePaths::role: rns_transport::actor::StorageRole
 pub rns_transport::messages::TransportMessage::SetStoragePaths::storage_dir: std::path::PathBuf
 pub rns_transport::messages::TransportMessage::SetTransportEnabled
 pub rns_transport::messages::TransportMessage::SetTransportEnabled::enabled: bool
@@ -1401,7 +1176,7 @@ pub rns_transport::messages::TransportMessage::UnbindLinkEndpoint::result_tx: to
 pub rns_transport::messages::TransportMessage::UnbindLinkEndpoint::role: rns_transport::messages::LinkEndpointRole
 impl core::fmt::Debug for rns_transport::messages::TransportMessage
 pub fn rns_transport::messages::TransportMessage::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub enum rns_transport::messages::TransportQuery
+#[non_exhaustive] pub enum rns_transport::messages::TransportQuery
 pub rns_transport::messages::TransportQuery::ApplyBlackholeManifest
 pub rns_transport::messages::TransportQuery::ApplyBlackholeManifest::payload: alloc::vec::Vec<u8>
 pub rns_transport::messages::TransportQuery::ApplyBlackholeManifest::publisher: [u8; 16]
@@ -1510,7 +1285,7 @@ pub rns_transport::messages::TransportQuery::UseDestination::dest: [u8; 16]
 pub rns_transport::messages::TransportQuery::WantsDestinationType
 pub rns_transport::messages::TransportQuery::WantsDestinationType::full_name: alloc::string::String
 pub rns_transport::messages::TransportQuery::WantsDestinationType::requester: alloc::vec::Vec<u8>
-pub enum rns_transport::messages::TransportQueryResponse
+#[non_exhaustive] pub enum rns_transport::messages::TransportQueryResponse
 pub rns_transport::messages::TransportQueryResponse::Announces(alloc::vec::Vec<rns_transport::messages::AnnounceRpcEntry>)
 pub rns_transport::messages::TransportQueryResponse::BlackholeList(alloc::vec::Vec<rns_transport::messages::BlackholeRpcEntry>)
 pub rns_transport::messages::TransportQueryResponse::BlackholedDests(alloc::vec::Vec<[u8; 16]>)
@@ -1540,9 +1315,10 @@ pub rns_transport::messages::AnnounceHandlerEvent::name_hash: [u8; 10]
 pub rns_transport::messages::AnnounceHandlerEvent::public_key: core::option::Option<[u8; 64]>
 pub rns_transport::messages::AnnounceHandlerEvent::ratchet: core::option::Option<[u8; 32]>
 pub struct rns_transport::messages::AnnounceHandlerId(_)
-pub struct rns_transport::messages::AnnounceRpcEntry
+#[non_exhaustive] pub struct rns_transport::messages::AnnounceRpcEntry
 pub rns_transport::messages::AnnounceRpcEntry::app_data: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::messages::AnnounceRpcEntry::dest_hash: [u8; 16]
+pub rns_transport::messages::AnnounceRpcEntry::facts_known: bool
 pub rns_transport::messages::AnnounceRpcEntry::hops: u8
 pub rns_transport::messages::AnnounceRpcEntry::is_path_response: bool
 pub rns_transport::messages::AnnounceRpcEntry::name_hash: [u8; 10]
@@ -1550,7 +1326,7 @@ pub rns_transport::messages::AnnounceRpcEntry::public_key: core::option::Option<
 pub rns_transport::messages::AnnounceRpcEntry::ratchet: core::option::Option<[u8; 32]>
 pub rns_transport::messages::AnnounceRpcEntry::retained: bool
 pub rns_transport::messages::AnnounceRpcEntry::timestamp: f64
-pub struct rns_transport::messages::BlackholeRpcEntry
+#[non_exhaustive] pub struct rns_transport::messages::BlackholeRpcEntry
 pub rns_transport::messages::BlackholeRpcEntry::created: f64
 pub rns_transport::messages::BlackholeRpcEntry::identity_hash: [u8; 16]
 pub rns_transport::messages::BlackholeRpcEntry::reason: rns_transport::blackhole::BlackholeReason
@@ -1569,7 +1345,7 @@ pub rns_transport::messages::InboundPacket::q: core::option::Option<f32>
 pub rns_transport::messages::InboundPacket::raw: bytes::bytes::Bytes
 pub rns_transport::messages::InboundPacket::rssi: core::option::Option<f32>
 pub rns_transport::messages::InboundPacket::snr: core::option::Option<f32>
-pub struct rns_transport::messages::InterfaceEntry
+#[non_exhaustive] pub struct rns_transport::messages::InterfaceEntry
 pub rns_transport::messages::InterfaceEntry::accepted: bool
 pub rns_transport::messages::InterfaceEntry::announce_allowed_at: f64
 pub rns_transport::messages::InterfaceEntry::announce_cap: f64
@@ -1579,11 +1355,13 @@ pub rns_transport::messages::InterfaceEntry::announce_rate_penalty: core::option
 pub rns_transport::messages::InterfaceEntry::announce_rate_target: core::option::Option<f64>
 pub rns_transport::messages::InterfaceEntry::announces_from_internal: bool
 pub rns_transport::messages::InterfaceEntry::announces_to_internal: core::option::Option<bool>
+pub rns_transport::messages::InterfaceEntry::autoconnect_source: core::option::Option<alloc::string::String>
 pub rns_transport::messages::InterfaceEntry::bitrate: u64
 pub rns_transport::messages::InterfaceEntry::destination_cost: core::option::Option<f64>
 pub rns_transport::messages::InterfaceEntry::direction: rns_transport::constants::InterfaceDirection
 pub rns_transport::messages::InterfaceEntry::gravity: i64
 pub rns_transport::messages::InterfaceEntry::ifac_key: core::option::Option<rns_identity::ifac::IfacKey>
+pub rns_transport::messages::InterfaceEntry::ifac_netname: core::option::Option<alloc::string::String>
 pub rns_transport::messages::InterfaceEntry::ifac_size: usize
 pub rns_transport::messages::InterfaceEntry::ifac_violations: u64
 pub rns_transport::messages::InterfaceEntry::ingress: rns_transport::ingress::IngressController
@@ -1673,7 +1451,7 @@ pub const fn rns_transport::interface_ownership::InterfacePacketCapacity::base(u
 pub fn rns_transport::interface_ownership::InterfacePacketCapacity::effective_clear_mtu(self, usize) -> core::result::Result<u32, rns_transport::interface_ownership::InterfaceCapacityError>
 pub fn rns_transport::interface_ownership::InterfacePacketCapacity::link_ceiling(self, rns_transport::messages::InterfaceId, usize) -> core::result::Result<u32, rns_transport::interface_ownership::InterfaceCapacityError>
 pub const fn rns_transport::interface_ownership::InterfacePacketCapacity::new(u32, u32, bool) -> Self
-pub struct rns_transport::messages::InterfaceStatRpcEntry
+#[non_exhaustive] pub struct rns_transport::messages::InterfaceStatRpcEntry
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_cap: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_queue: core::option::Option<u64>
 pub rns_transport::messages::InterfaceStatRpcEntry::announce_rate_grace: core::option::Option<u32>
@@ -1684,6 +1462,7 @@ pub rns_transport::messages::InterfaceStatRpcEntry::announce_tx_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::announces_received: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::announces_sent: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::announces_to_internal: core::option::Option<bool>
+pub rns_transport::messages::InterfaceStatRpcEntry::autoconnect_source: core::option::Option<alloc::string::String>
 pub rns_transport::messages::InterfaceStatRpcEntry::bitrate: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::blocked_ips: core::option::Option<u64>
 pub rns_transport::messages::InterfaceStatRpcEntry::burst_activated: f64
@@ -1697,7 +1476,9 @@ pub rns_transport::messages::InterfaceStatRpcEntry::i2p_connectable: core::optio
 pub rns_transport::messages::InterfaceStatRpcEntry::i2p_tunnel_state: core::option::Option<u8>
 pub rns_transport::messages::InterfaceStatRpcEntry::id: rns_transport::messages::InterfaceId
 pub rns_transport::messages::InterfaceStatRpcEntry::identity: core::option::Option<rns_transport::messages::InterfaceIdentity>
-pub rns_transport::messages::InterfaceStatRpcEntry::ifac_size: usize
+pub rns_transport::messages::InterfaceStatRpcEntry::ifac_netname: core::option::Option<alloc::string::String>
+pub rns_transport::messages::InterfaceStatRpcEntry::ifac_signature: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_transport::messages::InterfaceStatRpcEntry::ifac_size: core::option::Option<usize>
 pub rns_transport::messages::InterfaceStatRpcEntry::ifac_violations: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::incoming_announce_frequency: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::incoming_pr_frequency: f64
@@ -1709,6 +1490,7 @@ pub rns_transport::messages::InterfaceStatRpcEntry::outgoing_announce_frequency:
 pub rns_transport::messages::InterfaceStatRpcEntry::outgoing_pr_frequency: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::packet_filter_hits: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::parent_id: core::option::Option<rns_transport::messages::InterfaceId>
+pub rns_transport::messages::InterfaceStatRpcEntry::parent_interface_name: core::option::Option<alloc::string::String>
 pub rns_transport::messages::InterfaceStatRpcEntry::path_request_rx_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::path_request_tx_bytes: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::path_requests_received: u64
@@ -1763,7 +1545,7 @@ pub struct rns_transport::messages::PathRequestOptions
 pub rns_transport::messages::PathRequestOptions::on_interface: core::option::Option<rns_transport::messages::InterfaceId>
 pub rns_transport::messages::PathRequestOptions::recursive: bool
 pub rns_transport::messages::PathRequestOptions::tag: core::option::Option<alloc::vec::Vec<u8>>
-pub struct rns_transport::messages::PathTableRpcEntry
+#[non_exhaustive] pub struct rns_transport::messages::PathTableRpcEntry
 pub rns_transport::messages::PathTableRpcEntry::expires: f64
 pub rns_transport::messages::PathTableRpcEntry::hash: [u8; 16]
 pub rns_transport::messages::PathTableRpcEntry::hops: u8
@@ -1776,27 +1558,31 @@ pub rns_transport::messages::PathTableRpcEntry::timestamp: f64
 pub rns_transport::messages::PathTableRpcEntry::used: f64
 pub rns_transport::messages::PathTableRpcEntry::value: core::option::Option<f64>
 pub rns_transport::messages::PathTableRpcEntry::via: core::option::Option<[u8; 16]>
+impl core::default::Default for rns_transport::messages::PathTableRpcEntry
+pub fn rns_transport::messages::PathTableRpcEntry::default() -> Self
 pub struct rns_transport::messages::QueuedAnnounce
 pub rns_transport::messages::QueuedAnnounce::destination_hash: [u8; 16]
 pub rns_transport::messages::QueuedAnnounce::hops: u8
 pub rns_transport::messages::QueuedAnnounce::raw: bytes::bytes::Bytes
 pub rns_transport::messages::QueuedAnnounce::time: f64
-pub struct rns_transport::messages::RateTableRpcEntry
+#[non_exhaustive] pub struct rns_transport::messages::RateTableRpcEntry
 pub rns_transport::messages::RateTableRpcEntry::blocked_until: f64
 pub rns_transport::messages::RateTableRpcEntry::hash: [u8; 16]
 pub rns_transport::messages::RateTableRpcEntry::last: f64
 pub rns_transport::messages::RateTableRpcEntry::rate: f64
 pub rns_transport::messages::RateTableRpcEntry::rate_violations: u32
 pub rns_transport::messages::RateTableRpcEntry::timestamps: alloc::vec::Vec<f64>
-pub struct rns_transport::messages::RecalledDestinationRpcEntry
+#[non_exhaustive] pub struct rns_transport::messages::RecalledDestinationRpcEntry
 pub rns_transport::messages::RecalledDestinationRpcEntry::app_data: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::messages::RecalledDestinationRpcEntry::dest_hash: [u8; 16]
 pub rns_transport::messages::RecalledDestinationRpcEntry::hops: u8
+pub rns_transport::messages::RecalledDestinationRpcEntry::hops_known: bool
 pub rns_transport::messages::RecalledDestinationRpcEntry::public_key: [u8; 64]
 pub rns_transport::messages::RecalledDestinationRpcEntry::ratchet: core::option::Option<[u8; 32]>
 pub rns_transport::messages::RecalledDestinationRpcEntry::timestamp: f64
+impl core::default::Default for rns_transport::messages::RecalledDestinationRpcEntry
+pub fn rns_transport::messages::RecalledDestinationRpcEntry::default() -> Self
 pub struct rns_transport::messages::TimerTick
-pub rns_transport::messages::TimerTick::timestamp: f64
 pub struct rns_transport::messages::TrackedReceiptRegistration
 pub rns_transport::messages::TrackedReceiptRegistration::destination_hash: [u8; 16]
 pub rns_transport::messages::TrackedReceiptRegistration::destination_public_key: [u8; 64]
@@ -1806,7 +1592,7 @@ pub rns_transport::messages::TrackedReceiptRegistration::timeout: core::option::
 pub rns_transport::messages::TrackedReceiptRegistration::truncated_hash: [u8; 16]
 impl core::fmt::Debug for rns_transport::messages::TrackedReceiptRegistration
 pub fn rns_transport::messages::TrackedReceiptRegistration::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct rns_transport::messages::TrafficTotalsRpcEntry
+#[non_exhaustive] pub struct rns_transport::messages::TrafficTotalsRpcEntry
 pub rns_transport::messages::TrafficTotalsRpcEntry::active_link_count: u64
 pub rns_transport::messages::TrafficTotalsRpcEntry::announce_rx_packets: u64
 pub rns_transport::messages::TrafficTotalsRpcEntry::announce_tx_packets: u64
@@ -1935,16 +1721,6 @@ pub rns_transport::persistence::PersistenceError::Serialize(alloc::string::Strin
 pub rns_transport::persistence::PersistenceError::VersionMismatch
 pub rns_transport::persistence::PersistenceError::VersionMismatch::expected: u32
 pub rns_transport::persistence::PersistenceError::VersionMismatch::found: u32
-pub struct rns_transport::persistence::LegacyPersistedAnnounceEntryV5
-pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::app_data: core::option::Option<alloc::vec::Vec<u8>>
-pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::destination_hash: alloc::vec::Vec<u8>
-pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::hops: u8
-pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::name_hash: alloc::vec::Vec<u8>
-pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::public_key: core::option::Option<alloc::vec::Vec<u8>>
-pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::ratchet: core::option::Option<alloc::vec::Vec<u8>>
-pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::raw_packet: alloc::vec::Vec<u8>
-pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::retained: bool
-pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::timestamp: f64
 pub struct rns_transport::persistence::PersistedAnnounceCache
 pub rns_transport::persistence::PersistedAnnounceCache::entries: alloc::vec::Vec<rns_transport::persistence::PersistedAnnounceEntry>
 pub rns_transport::persistence::PersistedAnnounceCache::version: u32
@@ -2062,8 +1838,6 @@ pub rns_transport::persistence::RawHashlistLoad::duplicate_count: usize
 pub rns_transport::persistence::RawHashlistLoad::hashes: alloc::vec::Vec<[u8; 32]>
 pub rns_transport::persistence::RawHashlistLoad::partial_tail_bytes: usize
 pub fn rns_transport::persistence::interface_hash_from_name(&str) -> [u8; 32]
-pub fn rns_transport::persistence::load_announce_cache(&std::path::Path) -> core::result::Result<alloc::vec::Vec<rns_transport::persistence::PersistedAnnounceEntry>, rns_transport::persistence::PersistenceError>
-pub fn rns_transport::persistence::load_announce_cache_legacy_v5(&std::path::Path) -> core::result::Result<alloc::vec::Vec<rns_transport::persistence::LegacyPersistedAnnounceEntryV5>, rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::load_blackhole_table(&std::path::Path) -> core::result::Result<alloc::vec::Vec<rns_transport::persistence::PersistedBlackholeEntry>, rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::load_hashlist(&std::path::Path) -> core::result::Result<alloc::vec::Vec<[u8; 32]>, rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::load_hashlist_legacy(&std::path::Path) -> core::result::Result<alloc::vec::Vec<[u8; 32]>, rns_transport::persistence::PersistenceError>
@@ -2074,8 +1848,6 @@ pub fn rns_transport::persistence::load_python_cached_announce(&std::path::Path,
 pub fn rns_transport::persistence::load_python_destination_table(&std::path::Path) -> core::result::Result<alloc::vec::Vec<rns_transport::persistence::PythonDestinationEntry>, rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::load_python_tunnel_table(&std::path::Path) -> core::result::Result<alloc::vec::Vec<rns_transport::persistence::PythonTunnelEntry>, rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::load_tunnel_table(&std::path::Path) -> core::result::Result<alloc::vec::Vec<rns_transport::persistence::PersistedTunnelEntry>, rns_transport::persistence::PersistenceError>
-pub fn rns_transport::persistence::migrate_legacy_announce_entries(alloc::vec::Vec<rns_transport::persistence::LegacyPersistedAnnounceEntryV5>, &std::path::Path) -> alloc::vec::Vec<rns_transport::persistence::PersistedAnnounceEntry>
-pub fn rns_transport::persistence::save_announce_cache<'a, I>(I, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError> where I: core::iter::traits::collect::IntoIterator<Item = &'a rns_transport::actor::RecentAnnounce>
 pub fn rns_transport::persistence::save_blackhole_source_file([u8; 16], &[u8], &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_blackhole_table(&rns_transport::blackhole::BlackholeTable, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_hashlist(&rns_transport::hashlist::PacketHashlist, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
@@ -2088,8 +1860,6 @@ pub fn rns_transport::persistence::save_python_destination_table(&rns_transport:
 pub fn rns_transport::persistence::save_python_tunnel_table(&rns_transport::tunnel::TunnelTable, &std::collections::hash::map::HashMap<u64, alloc::string::String>, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_raw_hashes(&[[u8; 32]], &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::save_tunnel_table(&rns_transport::tunnel::TunnelTable, &std::collections::hash::map::HashMap<u64, alloc::string::String>, &std::path::Path) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
-pub fn rns_transport::persistence::sweep_announce_cache(&std::path::Path, &std::collections::hash::set::HashSet<[u8; 32]>, core::time::Duration) -> (usize, usize)
-pub fn rns_transport::persistence::write_python_cached_announce(&std::path::Path, &[u8; 32], &[u8], core::option::Option<&str>) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub fn rns_transport::persistence::write_python_cached_announce_if_absent(&std::path::Path, &[u8; 32], &[u8], core::option::Option<&str>) -> core::result::Result<(), rns_transport::persistence::PersistenceError>
 pub mod rns_transport::pr_stamper
 pub enum rns_transport::pr_stamper::PathRequestTarget
@@ -2124,46 +1894,6 @@ pub struct rns_transport::pr_stamper::QueueFull
 pub const rns_transport::pr_stamper::PR_STAMP_CACHE_MAX: usize
 pub fn rns_transport::pr_stamper::pr_stamp_material(&[u8; 16], &[u8]) -> alloc::vec::Vec<u8>
 pub type rns_transport::pr_stamper::PathRequestStamp = [u8; 14]
-pub mod rns_transport::rate_limit
-pub struct rns_transport::rate_limit::RateEntry
-pub rns_transport::rate_limit::RateEntry::blocked_until: f64
-pub rns_transport::rate_limit::RateEntry::last: f64
-pub rns_transport::rate_limit::RateEntry::timestamps: alloc::vec::Vec<f64>
-pub rns_transport::rate_limit::RateEntry::violations: u32
-impl rns_transport::rate_limit::RateEntry
-pub fn rns_transport::rate_limit::RateEntry::rate(&self) -> f64
-pub struct rns_transport::rate_limit::RateTable
-impl rns_transport::rate_limit::RateTable
-pub fn rns_transport::rate_limit::RateTable::check_interface_rate(&mut self, impl core::convert::Into<rns_wire::types::DestHash>, f64, u32, f64) -> bool
-pub fn rns_transport::rate_limit::RateTable::cull(&mut self, f64, f64) -> usize
-pub fn rns_transport::rate_limit::RateTable::is_blocked(&self, &[u8; 16]) -> bool
-pub fn rns_transport::rate_limit::RateTable::is_empty(&self) -> bool
-pub fn rns_transport::rate_limit::RateTable::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&rns_wire::types::DestHash, &rns_transport::rate_limit::RateEntry)>
-pub fn rns_transport::rate_limit::RateTable::last_announce(&self, &[u8; 16]) -> core::option::Option<f64>
-pub fn rns_transport::rate_limit::RateTable::len(&self) -> usize
-pub fn rns_transport::rate_limit::RateTable::new() -> Self
-impl core::default::Default for rns_transport::rate_limit::RateTable
-pub fn rns_transport::rate_limit::RateTable::default() -> Self
-pub mod rns_transport::reverse_table
-pub struct rns_transport::reverse_table::ReverseEntry
-pub rns_transport::reverse_table::ReverseEntry::outbound_interface: core::option::Option<rns_transport::messages::InterfaceId>
-pub rns_transport::reverse_table::ReverseEntry::receiving_interface: rns_transport::messages::InterfaceId
-pub rns_transport::reverse_table::ReverseEntry::remaining_hops: u8
-pub rns_transport::reverse_table::ReverseEntry::timestamp: f64
-pub struct rns_transport::reverse_table::ReverseTable
-impl rns_transport::reverse_table::ReverseTable
-pub fn rns_transport::reverse_table::ReverseTable::cull_dead_interfaces(&mut self, &std::collections::hash::set::HashSet<rns_transport::messages::InterfaceId>) -> usize
-pub fn rns_transport::reverse_table::ReverseTable::cull_expired(&mut self) -> usize
-pub fn rns_transport::reverse_table::ReverseTable::cull_expired_batch(&mut self, usize) -> usize
-pub fn rns_transport::reverse_table::ReverseTable::get(&self, &[u8; 16]) -> core::option::Option<&rns_transport::reverse_table::ReverseEntry>
-pub fn rns_transport::reverse_table::ReverseTable::insert(&mut self, impl core::convert::Into<rns_wire::types::TruncatedHash>, rns_transport::messages::InterfaceId, u8)
-pub fn rns_transport::reverse_table::ReverseTable::insert_with_outbound(&mut self, impl core::convert::Into<rns_wire::types::TruncatedHash>, rns_transport::messages::InterfaceId, u8, core::option::Option<rns_transport::messages::InterfaceId>)
-pub fn rns_transport::reverse_table::ReverseTable::is_empty(&self) -> bool
-pub fn rns_transport::reverse_table::ReverseTable::len(&self) -> usize
-pub fn rns_transport::reverse_table::ReverseTable::new() -> Self
-pub fn rns_transport::reverse_table::ReverseTable::remove(&mut self, &[u8; 16]) -> core::option::Option<rns_transport::reverse_table::ReverseEntry>
-impl core::default::Default for rns_transport::reverse_table::ReverseTable
-pub fn rns_transport::reverse_table::ReverseTable::default() -> Self
 pub mod rns_transport::stamps
 pub use rns_transport::stamps::LINK_COST_CAP
 pub use rns_transport::stamps::STAMP_COST_CAP
@@ -2195,24 +1925,139 @@ pub fn rns_transport::stamps::StampPolicy::default() -> Self
 pub const rns_transport::stamps::STAMPER_AN_QUEUE_LENGTH: usize
 pub const rns_transport::stamps::STAMPER_PR_QUEUE_LENGTH: usize
 pub const rns_transport::stamps::STAMP_TIMEOUT_FLOOR: f64
-pub mod rns_transport::traffic
-pub struct rns_transport::traffic::InterfaceTraffic
-pub rns_transport::traffic::InterfaceTraffic::rx_bytes: u64
-pub rns_transport::traffic::InterfaceTraffic::rx_bytes_prev: u64
-pub rns_transport::traffic::InterfaceTraffic::rx_speed: f64
-pub rns_transport::traffic::InterfaceTraffic::tx_bytes: u64
-pub rns_transport::traffic::InterfaceTraffic::tx_bytes_prev: u64
-pub rns_transport::traffic::InterfaceTraffic::tx_speed: f64
-pub struct rns_transport::traffic::TrafficCounter
-impl rns_transport::traffic::TrafficCounter
-pub fn rns_transport::traffic::TrafficCounter::all(&self) -> &std::collections::hash::map::HashMap<rns_transport::messages::InterfaceId, rns_transport::traffic::InterfaceTraffic>
-pub fn rns_transport::traffic::TrafficCounter::get(&self, &rns_transport::messages::InterfaceId) -> core::option::Option<&rns_transport::traffic::InterfaceTraffic>
-pub fn rns_transport::traffic::TrafficCounter::new() -> Self
-pub fn rns_transport::traffic::TrafficCounter::record_rx(&mut self, rns_transport::messages::InterfaceId, u64)
-pub fn rns_transport::traffic::TrafficCounter::record_tx(&mut self, rns_transport::messages::InterfaceId, u64)
-pub fn rns_transport::traffic::TrafficCounter::update_speeds(&mut self)
-impl core::default::Default for rns_transport::traffic::TrafficCounter
-pub fn rns_transport::traffic::TrafficCounter::default() -> Self
+pub mod rns_transport::store
+pub mod rns_transport::store::legacy
+#[non_exhaustive] pub struct rns_transport::store::legacy::LegacyImport
+impl rns_transport::store::legacy::LegacyImport
+pub fn rns_transport::store::legacy::LegacyImport::imported(&self) -> usize
+pub fn rns_transport::store::legacy::LegacyImport::rejected(&self) -> usize
+pub fn rns_transport::store::legacy::LegacyImport::removable(&self) -> &[std::path::PathBuf]
+pub fn rns_transport::store::legacy::import_python_announce_cache(&std::path::Path, f64, &mut dyn rns_transport::store::AnnounceCacheStore) -> core::result::Result<rns_transport::store::legacy::LegacyImport, rns_transport::store::StoreError>
+pub fn rns_transport::store::legacy::import_python_known_destinations(&std::path::Path, f64, &mut dyn rns_transport::store::KnownDestinationStore) -> core::result::Result<rns_transport::store::legacy::LegacyImport, rns_transport::store::StoreError>
+pub fn rns_transport::store::legacy::import_python_ratchets(&std::path::Path, f64, &std::collections::hash::set::HashSet<rns_transport::store::DestHash>, &mut dyn rns_transport::store::KnownDestinationStore) -> core::result::Result<rns_transport::store::legacy::LegacyImport, rns_transport::store::StoreError>
+pub fn rns_transport::store::legacy::import_rust_announce_cache(&std::path::Path, f64, &mut dyn rns_transport::store::KnownDestinationStore) -> core::result::Result<rns_transport::store::legacy::LegacyImport, rns_transport::store::StoreError>
+#[non_exhaustive] pub enum rns_transport::store::RejectedTable
+pub rns_transport::store::RejectedTable::KnownDestination
+pub rns_transport::store::RejectedTable::Ratchet
+#[non_exhaustive] pub enum rns_transport::store::StoreError
+pub rns_transport::store::StoreError::Backend(alloc::string::String)
+pub rns_transport::store::StoreError::CorruptRow
+pub rns_transport::store::StoreError::CorruptRow::reason: alloc::string::String
+pub rns_transport::store::StoreError::CorruptRow::table: &'static str
+pub rns_transport::store::StoreError::Io(core::io::error::Error)
+pub rns_transport::store::StoreError::Locked
+pub rns_transport::store::StoreError::NewerVersion
+pub rns_transport::store::StoreError::NewerVersion::found: i64
+pub rns_transport::store::StoreError::NewerVersion::supported: i64
+pub rns_transport::store::StoreError::ReadOnly
+#[non_exhaustive] pub struct rns_transport::store::AnnounceFacts
+pub rns_transport::store::AnnounceFacts::hops: u8
+pub rns_transport::store::AnnounceFacts::name_hash: [u8; 10]
+pub rns_transport::store::AnnounceFacts::path_response: bool
+impl rns_transport::store::AnnounceFacts
+pub fn rns_transport::store::AnnounceFacts::new(u8, [u8; 10], bool) -> Self
+#[non_exhaustive] pub struct rns_transport::store::AnnounceRow
+pub rns_transport::store::AnnounceRow::interface_reference: core::option::Option<alloc::string::String>
+pub rns_transport::store::AnnounceRow::packet_hash: rns_transport::store::PacketHash
+pub rns_transport::store::AnnounceRow::raw: alloc::vec::Vec<u8>
+pub rns_transport::store::AnnounceRow::received: f64
+impl rns_transport::store::AnnounceRow
+pub fn rns_transport::store::AnnounceRow::new(rns_transport::store::PacketHash, f64, alloc::vec::Vec<u8>, core::option::Option<alloc::string::String>) -> Self
+#[non_exhaustive] pub struct rns_transport::store::ApplyReport
+pub rns_transport::store::ApplyReport::rejected: alloc::vec::Vec<rns_transport::store::Rejection>
+pub rns_transport::store::ApplyReport::written: usize
+#[non_exhaustive] pub struct rns_transport::store::KdBatch
+pub rns_transport::store::KdBatch::deletes: alloc::vec::Vec<rns_transport::store::DestHash>
+pub rns_transport::store::KdBatch::ratchet_deletes: alloc::vec::Vec<rns_transport::store::DestHash>
+pub rns_transport::store::KdBatch::ratchet_upserts: alloc::vec::Vec<rns_transport::store::RatchetRow>
+pub rns_transport::store::KdBatch::upserts: alloc::vec::Vec<rns_transport::store::KnownDestinationRow>
+impl rns_transport::store::KdBatch
+pub fn rns_transport::store::KdBatch::is_empty(&self) -> bool
+#[non_exhaustive] pub struct rns_transport::store::KnownDestinationRow
+pub rns_transport::store::KnownDestinationRow::announce_facts: core::option::Option<rns_transport::store::AnnounceFacts>
+pub rns_transport::store::KnownDestinationRow::app_data: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_transport::store::KnownDestinationRow::destination_hash: rns_transport::store::DestHash
+pub rns_transport::store::KnownDestinationRow::last_heard: f64
+pub rns_transport::store::KnownDestinationRow::lr_cost: core::option::Option<f64>
+pub rns_transport::store::KnownDestinationRow::packet_hash: core::option::Option<rns_transport::store::PacketHash>
+pub rns_transport::store::KnownDestinationRow::public_key: [u8; 64]
+pub rns_transport::store::KnownDestinationRow::stamp: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_transport::store::KnownDestinationRow::stamp_value: f64
+pub rns_transport::store::KnownDestinationRow::used: f64
+impl rns_transport::store::KnownDestinationRow
+pub fn rns_transport::store::KnownDestinationRow::new(rns_transport::store::DestHash, f64, [u8; 64]) -> Self
+#[non_exhaustive] pub struct rns_transport::store::MemoryStore
+impl rns_transport::store::MemoryStore
+pub fn rns_transport::store::MemoryStore::new() -> Self
+impl rns_transport::store::AnnounceCacheStore for rns_transport::store::MemoryStore
+pub fn rns_transport::store::MemoryStore::fetch(&mut self, &rns_transport::store::PacketHash) -> core::result::Result<core::option::Option<rns_transport::store::CachedAnnounce>, rns_transport::store::StoreError>
+pub fn rns_transport::store::MemoryStore::retain_only(&mut self, &std::collections::hash::set::HashSet<rns_transport::store::PacketHash>) -> core::result::Result<usize, rns_transport::store::StoreError>
+pub fn rns_transport::store::MemoryStore::upsert(&mut self, &[rns_transport::store::AnnounceRow]) -> core::result::Result<(), rns_transport::store::StoreError>
+impl rns_transport::store::KnownDestinationStore for rns_transport::store::MemoryStore
+pub fn rns_transport::store::MemoryStore::apply(&mut self, &rns_transport::store::KdBatch, &dyn core::ops::function::Fn(&rns_transport::store::DestHash) -> bool) -> core::result::Result<rns_transport::store::ApplyReport, rns_transport::store::StoreError>
+pub fn rns_transport::store::MemoryStore::expire_ratchets(&mut self, f64) -> core::result::Result<alloc::vec::Vec<rns_transport::store::DestHash>, rns_transport::store::StoreError>
+pub fn rns_transport::store::MemoryStore::fetch_ratchet(&mut self, &rns_transport::store::DestHash) -> core::result::Result<core::option::Option<(rns_transport::store::Ratchet, f64)>, rns_transport::store::StoreError>
+pub fn rns_transport::store::MemoryStore::load_all(&mut self, &mut dyn core::ops::function::FnMut(rns_transport::store::KnownDestinationRow)) -> core::result::Result<(), rns_transport::store::StoreError>
+#[non_exhaustive] pub struct rns_transport::store::RatchetRow
+pub rns_transport::store::RatchetRow::destination_hash: rns_transport::store::DestHash
+pub rns_transport::store::RatchetRow::ratchet: rns_transport::store::Ratchet
+pub rns_transport::store::RatchetRow::received: f64
+impl rns_transport::store::RatchetRow
+pub fn rns_transport::store::RatchetRow::new(rns_transport::store::DestHash, rns_transport::store::Ratchet, f64) -> Self
+#[non_exhaustive] pub struct rns_transport::store::Rejection
+pub rns_transport::store::Rejection::destination_hash: rns_transport::store::DestHash
+pub rns_transport::store::Rejection::reason: alloc::string::String
+pub rns_transport::store::Rejection::table: rns_transport::store::RejectedTable
+pub struct rns_transport::store::SqliteAnnounceCache
+impl rns_transport::store::SqliteAnnounceCache
+pub fn rns_transport::store::SqliteAnnounceCache::open_ro(&std::path::Path) -> core::result::Result<Self, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteAnnounceCache::open_rw(&std::path::Path) -> core::result::Result<Self, rns_transport::store::StoreError>
+impl rns_transport::store::AnnounceCacheStore for rns_transport::store::SqliteAnnounceCache
+pub fn rns_transport::store::SqliteAnnounceCache::fetch(&mut self, &rns_transport::store::PacketHash) -> core::result::Result<core::option::Option<rns_transport::store::CachedAnnounce>, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteAnnounceCache::retain_only(&mut self, &std::collections::hash::set::HashSet<rns_transport::store::PacketHash>) -> core::result::Result<usize, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteAnnounceCache::upsert(&mut self, &[rns_transport::store::AnnounceRow]) -> core::result::Result<(), rns_transport::store::StoreError>
+pub struct rns_transport::store::SqliteKnownDestinations
+impl rns_transport::store::SqliteKnownDestinations
+pub fn rns_transport::store::SqliteKnownDestinations::open_ro(&std::path::Path) -> core::result::Result<Self, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteKnownDestinations::open_rw(&std::path::Path) -> core::result::Result<Self, rns_transport::store::StoreError>
+impl rns_transport::store::KnownDestinationStore for rns_transport::store::SqliteKnownDestinations
+pub fn rns_transport::store::SqliteKnownDestinations::apply(&mut self, &rns_transport::store::KdBatch, &dyn core::ops::function::Fn(&rns_transport::store::DestHash) -> bool) -> core::result::Result<rns_transport::store::ApplyReport, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteKnownDestinations::expire_ratchets(&mut self, f64) -> core::result::Result<alloc::vec::Vec<rns_transport::store::DestHash>, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteKnownDestinations::fetch_ratchet(&mut self, &rns_transport::store::DestHash) -> core::result::Result<core::option::Option<(rns_transport::store::Ratchet, f64)>, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteKnownDestinations::load_all(&mut self, &mut dyn core::ops::function::FnMut(rns_transport::store::KnownDestinationRow)) -> core::result::Result<(), rns_transport::store::StoreError>
+pub const rns_transport::store::ANNOUNCE_CACHE_USER_VERSION: i64
+pub const rns_transport::store::KNOWN_DESTINATIONS_USER_VERSION: i64
+pub trait rns_transport::store::AnnounceCacheStore: core::marker::Send
+pub fn rns_transport::store::AnnounceCacheStore::fetch(&mut self, &rns_transport::store::PacketHash) -> core::result::Result<core::option::Option<rns_transport::store::CachedAnnounce>, rns_transport::store::StoreError>
+pub fn rns_transport::store::AnnounceCacheStore::retain_only(&mut self, &std::collections::hash::set::HashSet<rns_transport::store::PacketHash>) -> core::result::Result<usize, rns_transport::store::StoreError>
+pub fn rns_transport::store::AnnounceCacheStore::upsert(&mut self, &[rns_transport::store::AnnounceRow]) -> core::result::Result<(), rns_transport::store::StoreError>
+impl rns_transport::store::AnnounceCacheStore for rns_transport::store::MemoryStore
+pub fn rns_transport::store::MemoryStore::fetch(&mut self, &rns_transport::store::PacketHash) -> core::result::Result<core::option::Option<rns_transport::store::CachedAnnounce>, rns_transport::store::StoreError>
+pub fn rns_transport::store::MemoryStore::retain_only(&mut self, &std::collections::hash::set::HashSet<rns_transport::store::PacketHash>) -> core::result::Result<usize, rns_transport::store::StoreError>
+pub fn rns_transport::store::MemoryStore::upsert(&mut self, &[rns_transport::store::AnnounceRow]) -> core::result::Result<(), rns_transport::store::StoreError>
+impl rns_transport::store::AnnounceCacheStore for rns_transport::store::SqliteAnnounceCache
+pub fn rns_transport::store::SqliteAnnounceCache::fetch(&mut self, &rns_transport::store::PacketHash) -> core::result::Result<core::option::Option<rns_transport::store::CachedAnnounce>, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteAnnounceCache::retain_only(&mut self, &std::collections::hash::set::HashSet<rns_transport::store::PacketHash>) -> core::result::Result<usize, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteAnnounceCache::upsert(&mut self, &[rns_transport::store::AnnounceRow]) -> core::result::Result<(), rns_transport::store::StoreError>
+pub trait rns_transport::store::KnownDestinationStore: core::marker::Send
+pub fn rns_transport::store::KnownDestinationStore::apply(&mut self, &rns_transport::store::KdBatch, &dyn core::ops::function::Fn(&rns_transport::store::DestHash) -> bool) -> core::result::Result<rns_transport::store::ApplyReport, rns_transport::store::StoreError>
+pub fn rns_transport::store::KnownDestinationStore::expire_ratchets(&mut self, f64) -> core::result::Result<alloc::vec::Vec<rns_transport::store::DestHash>, rns_transport::store::StoreError>
+pub fn rns_transport::store::KnownDestinationStore::fetch_ratchet(&mut self, &rns_transport::store::DestHash) -> core::result::Result<core::option::Option<(rns_transport::store::Ratchet, f64)>, rns_transport::store::StoreError>
+pub fn rns_transport::store::KnownDestinationStore::load_all(&mut self, &mut dyn core::ops::function::FnMut(rns_transport::store::KnownDestinationRow)) -> core::result::Result<(), rns_transport::store::StoreError>
+impl rns_transport::store::KnownDestinationStore for rns_transport::store::MemoryStore
+pub fn rns_transport::store::MemoryStore::apply(&mut self, &rns_transport::store::KdBatch, &dyn core::ops::function::Fn(&rns_transport::store::DestHash) -> bool) -> core::result::Result<rns_transport::store::ApplyReport, rns_transport::store::StoreError>
+pub fn rns_transport::store::MemoryStore::expire_ratchets(&mut self, f64) -> core::result::Result<alloc::vec::Vec<rns_transport::store::DestHash>, rns_transport::store::StoreError>
+pub fn rns_transport::store::MemoryStore::fetch_ratchet(&mut self, &rns_transport::store::DestHash) -> core::result::Result<core::option::Option<(rns_transport::store::Ratchet, f64)>, rns_transport::store::StoreError>
+pub fn rns_transport::store::MemoryStore::load_all(&mut self, &mut dyn core::ops::function::FnMut(rns_transport::store::KnownDestinationRow)) -> core::result::Result<(), rns_transport::store::StoreError>
+impl rns_transport::store::KnownDestinationStore for rns_transport::store::SqliteKnownDestinations
+pub fn rns_transport::store::SqliteKnownDestinations::apply(&mut self, &rns_transport::store::KdBatch, &dyn core::ops::function::Fn(&rns_transport::store::DestHash) -> bool) -> core::result::Result<rns_transport::store::ApplyReport, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteKnownDestinations::expire_ratchets(&mut self, f64) -> core::result::Result<alloc::vec::Vec<rns_transport::store::DestHash>, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteKnownDestinations::fetch_ratchet(&mut self, &rns_transport::store::DestHash) -> core::result::Result<core::option::Option<(rns_transport::store::Ratchet, f64)>, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteKnownDestinations::load_all(&mut self, &mut dyn core::ops::function::FnMut(rns_transport::store::KnownDestinationRow)) -> core::result::Result<(), rns_transport::store::StoreError>
+pub type rns_transport::store::CachedAnnounce = (alloc::vec::Vec<u8>, core::option::Option<alloc::string::String>)
+pub type rns_transport::store::DestHash = [u8; 16]
+pub type rns_transport::store::PacketHash = [u8; 32]
+pub type rns_transport::store::Ratchet = [u8; 32]
 pub mod rns_transport::tunnel
 pub struct rns_transport::tunnel::TunnelEntry
 pub rns_transport::tunnel::TunnelEntry::expires: f64

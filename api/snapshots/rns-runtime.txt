@@ -137,11 +137,8 @@ pub fn rns_runtime::config::ConfigSection::new() -> Self
 pub fn rns_runtime::config::ConfigSection::set(&mut self, &str, &str)
 pub fn rns_runtime::config::ConfigSection::set_list(&mut self, &str, alloc::vec::Vec<alloc::string::String>)
 pub mod rns_runtime::constants
-pub use rns_runtime::constants::MAX_QUEUED_ANNOUNCES
-pub const rns_runtime::constants::ANNOUNCE_CAP: f64
 pub const rns_runtime::constants::CLEAN_INTERVAL: u64
 pub const rns_runtime::constants::DEFAULT_INSTANCE_NAME: &str
-pub const rns_runtime::constants::GRACIOUS_PERSIST_INTERVAL: u64
 pub const rns_runtime::constants::IFAC_MIN_SIZE: usize
 pub const rns_runtime::constants::JOB_INTERVAL: u64
 pub const rns_runtime::constants::LOCAL_CONTROL_PORT: u16
@@ -149,7 +146,6 @@ pub const rns_runtime::constants::LOCAL_INTERFACE_PORT: u16
 pub const rns_runtime::constants::LOG_MAXSIZE: u64
 pub const rns_runtime::constants::MINIMUM_BITRATE: u64
 pub const rns_runtime::constants::PERSIST_INTERVAL: u64
-pub const rns_runtime::constants::QUEUED_ANNOUNCE_LIFE: u64
 pub const rns_runtime::constants::RESOURCE_CACHE: u64
 pub const rns_runtime::constants::RPC_AUTH_TAG: &[u8]
 pub mod rns_runtime::destination_resolver
@@ -192,6 +188,7 @@ pub fn rns_runtime::destination_runtime::DestinationHandle::app_name(&self) -> &
 pub async fn rns_runtime::destination_runtime::DestinationHandle::close_link(&self, [u8; 16], rns_link::link::CloseReason, bool) -> core::result::Result<(), rns_runtime::destination_runtime::DestinationRuntimeError>
 pub async fn rns_runtime::destination_runtime::DestinationHandle::deregister_request_handler(&self, impl core::convert::Into<alloc::string::String>) -> core::result::Result<bool, rns_runtime::destination_runtime::DestinationRuntimeError>
 pub fn rns_runtime::destination_runtime::DestinationHandle::destination_hash(&self) -> [u8; 16]
+pub async fn rns_runtime::destination_runtime::DestinationHandle::receive_resource_files(&self, impl core::convert::Into<std::path::PathBuf>, usize, usize) -> core::result::Result<tokio::sync::mpsc::bounded::Receiver<rns_runtime::link_manager::ResourceFileCompletion>, rns_runtime::destination_runtime::DestinationRuntimeError>
 pub async fn rns_runtime::destination_runtime::DestinationHandle::register_deferred_request_handler<F>(&self, impl core::convert::Into<alloc::string::String>, rns_identity::destination::AllowPolicy, alloc::vec::Vec<[u8; 16]>, impl core::convert::Into<rns_runtime::resource_source::AutoCompress>, usize, F) -> core::result::Result<bool, rns_runtime::destination_runtime::DestinationRuntimeError> where F: core::ops::function::Fn(rns_runtime::link_manager::DestinationRequest, rns_runtime::link_manager::DeferredRequestResponder) + core::marker::Send + 'static
 pub async fn rns_runtime::destination_runtime::DestinationHandle::register_deferred_request_handler_with<F>(&self, impl core::convert::Into<alloc::string::String>, rns_identity::destination::AllowPolicy, alloc::vec::Vec<[u8; 16]>, impl core::convert::Into<rns_runtime::resource_source::AutoCompress>, rns_runtime::link_manager::DeferredAdmission, F) -> core::result::Result<bool, rns_runtime::destination_runtime::DestinationRuntimeError> where F: core::ops::function::Fn(rns_runtime::link_manager::DestinationRequest, rns_runtime::link_manager::DeferredRequestResponder) + core::marker::Send + 'static
 pub async fn rns_runtime::destination_runtime::DestinationHandle::register_request_handler<F>(&self, impl core::convert::Into<alloc::string::String>, rns_identity::destination::AllowPolicy, alloc::vec::Vec<[u8; 16]>, impl core::convert::Into<rns_runtime::resource_source::AutoCompress>, F) -> core::result::Result<bool, rns_runtime::destination_runtime::DestinationRuntimeError> where F: core::ops::function::Fn(rns_runtime::link_manager::DestinationRequest) -> rns_runtime::link_manager::RequestOutcome + core::marker::Send + 'static
@@ -373,6 +370,7 @@ pub rns_runtime::interface_factory::InterfacePostInit::announce_rate_penalty: co
 pub rns_runtime::interface_factory::InterfacePostInit::announce_rate_target: core::option::Option<u64>
 pub rns_runtime::interface_factory::InterfacePostInit::announces_from_internal: bool
 pub rns_runtime::interface_factory::InterfacePostInit::announces_to_internal: core::option::Option<bool>
+pub rns_runtime::interface_factory::InterfacePostInit::autoconnect_source: core::option::Option<alloc::string::String>
 pub rns_runtime::interface_factory::InterfacePostInit::bitrate: core::option::Option<u64>
 pub rns_runtime::interface_factory::InterfacePostInit::default_ifac_size: usize
 pub rns_runtime::interface_factory::InterfacePostInit::destination_cost: core::option::Option<f64>
@@ -553,7 +551,7 @@ pub rns_runtime::link_manager::LinkManagerAccountingEvent::ResourceCompletion(rn
 pub rns_runtime::link_manager::LinkManagerAccountingEvent::ResourceEvent(rns_runtime::link_manager::LinkResourceEvent)
 impl core::fmt::Debug for rns_runtime::link_manager::LinkManagerAccountingEvent
 pub fn rns_runtime::link_manager::LinkManagerAccountingEvent::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub enum rns_runtime::link_manager::LinkManagerCommand
+#[non_exhaustive] pub enum rns_runtime::link_manager::LinkManagerCommand
 pub rns_runtime::link_manager::LinkManagerCommand::AddChannelHandler
 pub rns_runtime::link_manager::LinkManagerCommand::AddChannelHandler::handler: rns_protocol::channel::MessageCallback
 pub rns_runtime::link_manager::LinkManagerCommand::AddChannelHandler::link_id: [u8; 16]
@@ -635,6 +633,11 @@ pub rns_runtime::link_manager::LinkManagerCommand::SetLinkCost::result_tx: core:
 pub rns_runtime::link_manager::LinkManagerCommand::SetMaxRequestSize
 pub rns_runtime::link_manager::LinkManagerCommand::SetMaxRequestSize::limit: core::option::Option<usize>
 pub rns_runtime::link_manager::LinkManagerCommand::SetMaxRequestSize::result_tx: core::option::Option<tokio::sync::oneshot::Sender<()>>
+pub rns_runtime::link_manager::LinkManagerCommand::SetResourceFileChannel
+pub rns_runtime::link_manager::LinkManagerCommand::SetResourceFileChannel::dir: std::path::PathBuf
+pub rns_runtime::link_manager::LinkManagerCommand::SetResourceFileChannel::files_tx: tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::ResourceFileCompletion>
+pub rns_runtime::link_manager::LinkManagerCommand::SetResourceFileChannel::min_size: usize
+pub rns_runtime::link_manager::LinkManagerCommand::SetResourceFileChannel::result_tx: core::option::Option<tokio::sync::oneshot::Sender<()>>
 pub rns_runtime::link_manager::LinkManagerCommand::SetStampValue
 pub rns_runtime::link_manager::LinkManagerCommand::SetStampValue::result_tx: core::option::Option<tokio::sync::oneshot::Sender<core::result::Result<(), rns_runtime::link_manager::DestinationControlError>>>
 pub rns_runtime::link_manager::LinkManagerCommand::SetStampValue::value: f64
@@ -815,6 +818,7 @@ pub fn rns_runtime::link_manager::LinkManager::set_resource_accept_handler<F>(&m
 pub fn rns_runtime::link_manager::LinkManager::set_resource_completed_channel(&mut self, tokio::sync::mpsc::bounded::Sender<(alloc::vec::Vec<u8>, [u8; 16])>)
 pub fn rns_runtime::link_manager::LinkManager::set_resource_completion_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::ResourceCompletion>)
 pub fn rns_runtime::link_manager::LinkManager::set_resource_event_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkResourceEvent>)
+pub fn rns_runtime::link_manager::LinkManager::set_resource_file_channel(&mut self, impl core::convert::Into<std::path::PathBuf>, usize, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::ResourceFileCompletion>)
 pub fn rns_runtime::link_manager::LinkManager::set_resource_strategy(&mut self, rns_link::link::ResourceStrategy)
 pub fn rns_runtime::link_manager::LinkManager::set_response_channel(&mut self, tokio::sync::mpsc::bounded::Sender<rns_runtime::link_manager::LinkResponse>)
 pub fn rns_runtime::link_manager::LinkManager::set_retained_ratchets(&mut self, usize) -> bool
@@ -855,6 +859,13 @@ pub rns_runtime::link_manager::ResourceCompletion::last_segment_hash: [u8; 32]
 pub rns_runtime::link_manager::ResourceCompletion::link_id: [u8; 16]
 pub rns_runtime::link_manager::ResourceCompletion::metadata: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_runtime::link_manager::ResourceCompletion::resource_hash: [u8; 32]
+#[non_exhaustive] pub struct rns_runtime::link_manager::ResourceFileCompletion
+pub rns_runtime::link_manager::ResourceFileCompletion::last_segment_hash: [u8; 32]
+pub rns_runtime::link_manager::ResourceFileCompletion::link_id: [u8; 16]
+pub rns_runtime::link_manager::ResourceFileCompletion::metadata: core::option::Option<alloc::vec::Vec<u8>>
+pub rns_runtime::link_manager::ResourceFileCompletion::path: std::path::PathBuf
+pub rns_runtime::link_manager::ResourceFileCompletion::resource_hash: [u8; 32]
+pub rns_runtime::link_manager::ResourceFileCompletion::size: u64
 pub fn rns_runtime::link_manager::register_destination(&tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, [u8; 16], &str) -> tokio::sync::mpsc::bounded::Receiver<rns_transport::link_messages::DestinationEvent>
 pub type rns_runtime::link_manager::DestinationRequestHandler = alloc::boxed::Box<(dyn core::ops::function::Fn(rns_runtime::link_manager::DestinationRequest) -> rns_runtime::link_manager::RequestOutcome + core::marker::Send + 'static)>
 pub mod rns_runtime::link_session
@@ -1028,6 +1039,7 @@ pub fn rns_runtime::link_session::LinkSessionResourceHandle::total_segments(&sel
 pub struct rns_runtime::link_session::LinkSessionResourceOffer
 impl rns_runtime::link_session::LinkSessionResourceOffer
 pub async fn rns_runtime::link_session::LinkSessionResourceOffer::accept(self) -> core::result::Result<rns_runtime::link_session::LinkSessionInboundResourceHandle, rns_runtime::link_session::LinkSessionResourceError>
+pub async fn rns_runtime::link_session::LinkSessionResourceOffer::accept_to_file(self, core::option::Option<std::path::PathBuf>) -> core::result::Result<rns_runtime::link_session::LinkSessionInboundResourceHandle, rns_runtime::link_session::LinkSessionResourceError>
 pub fn rns_runtime::link_session::LinkSessionResourceOffer::data_size(&self) -> usize
 pub fn rns_runtime::link_session::LinkSessionResourceOffer::is_request(&self) -> bool
 pub fn rns_runtime::link_session::LinkSessionResourceOffer::is_response(&self) -> bool
@@ -1354,6 +1366,7 @@ pub fn rns_runtime::destination_runtime::DestinationHandle::app_name(&self) -> &
 pub async fn rns_runtime::destination_runtime::DestinationHandle::close_link(&self, [u8; 16], rns_link::link::CloseReason, bool) -> core::result::Result<(), rns_runtime::destination_runtime::DestinationRuntimeError>
 pub async fn rns_runtime::destination_runtime::DestinationHandle::deregister_request_handler(&self, impl core::convert::Into<alloc::string::String>) -> core::result::Result<bool, rns_runtime::destination_runtime::DestinationRuntimeError>
 pub fn rns_runtime::destination_runtime::DestinationHandle::destination_hash(&self) -> [u8; 16]
+pub async fn rns_runtime::destination_runtime::DestinationHandle::receive_resource_files(&self, impl core::convert::Into<std::path::PathBuf>, usize, usize) -> core::result::Result<tokio::sync::mpsc::bounded::Receiver<rns_runtime::link_manager::ResourceFileCompletion>, rns_runtime::destination_runtime::DestinationRuntimeError>
 pub async fn rns_runtime::destination_runtime::DestinationHandle::register_deferred_request_handler<F>(&self, impl core::convert::Into<alloc::string::String>, rns_identity::destination::AllowPolicy, alloc::vec::Vec<[u8; 16]>, impl core::convert::Into<rns_runtime::resource_source::AutoCompress>, usize, F) -> core::result::Result<bool, rns_runtime::destination_runtime::DestinationRuntimeError> where F: core::ops::function::Fn(rns_runtime::link_manager::DestinationRequest, rns_runtime::link_manager::DeferredRequestResponder) + core::marker::Send + 'static
 pub async fn rns_runtime::destination_runtime::DestinationHandle::register_deferred_request_handler_with<F>(&self, impl core::convert::Into<alloc::string::String>, rns_identity::destination::AllowPolicy, alloc::vec::Vec<[u8; 16]>, impl core::convert::Into<rns_runtime::resource_source::AutoCompress>, rns_runtime::link_manager::DeferredAdmission, F) -> core::result::Result<bool, rns_runtime::destination_runtime::DestinationRuntimeError> where F: core::ops::function::Fn(rns_runtime::link_manager::DestinationRequest, rns_runtime::link_manager::DeferredRequestResponder) + core::marker::Send + 'static
 pub async fn rns_runtime::destination_runtime::DestinationHandle::register_request_handler<F>(&self, impl core::convert::Into<alloc::string::String>, rns_identity::destination::AllowPolicy, alloc::vec::Vec<[u8; 16]>, impl core::convert::Into<rns_runtime::resource_source::AutoCompress>, F) -> core::result::Result<bool, rns_runtime::destination_runtime::DestinationRuntimeError> where F: core::ops::function::Fn(rns_runtime::link_manager::DestinationRequest) -> rns_runtime::link_manager::RequestOutcome + core::marker::Send + 'static
@@ -1414,12 +1427,13 @@ impl rns_runtime::destination_runtime::IdentityGatePolicy
 pub fn rns_runtime::destination_runtime::IdentityGatePolicy::new(impl core::ops::function::Fn([u8; 16], [u8; 16]) -> bool + core::marker::Send + core::marker::Sync + 'static) -> Self
 impl core::fmt::Debug for rns_runtime::destination_runtime::IdentityGatePolicy
 pub fn rns_runtime::destination_runtime::IdentityGatePolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct rns_runtime::prelude::InitOptions
+#[non_exhaustive] pub struct rns_runtime::prelude::InitOptions
 pub rns_runtime::prelude::InitOptions::enable_stamping: bool
 pub rns_runtime::prelude::InitOptions::enforce_stamps: bool
 pub rns_runtime::prelude::InitOptions::keep_starting_after_interface_failure: bool
 pub rns_runtime::prelude::InitOptions::require_shared_instance: bool
 pub rns_runtime::prelude::InitOptions::shared_instance_type: core::option::Option<rns_runtime::reticulum::SharedInstanceType>
+pub rns_runtime::prelude::InitOptions::start_interfaces_concurrently: bool
 pub struct rns_runtime::prelude::InterfaceStats
 pub rns_runtime::prelude::InterfaceStats::interfaces: alloc::vec::Vec<rns_transport::messages::InterfaceStatRpcEntry>
 pub rns_runtime::prelude::InterfaceStats::network_id: core::option::Option<[u8; 16]>
@@ -1482,6 +1496,7 @@ pub fn rns_runtime::link_session::LinkSessionHandle::watch_phy_stats(&self) -> t
 pub struct rns_runtime::prelude::LinkSessionResourceOffer
 impl rns_runtime::link_session::LinkSessionResourceOffer
 pub async fn rns_runtime::link_session::LinkSessionResourceOffer::accept(self) -> core::result::Result<rns_runtime::link_session::LinkSessionInboundResourceHandle, rns_runtime::link_session::LinkSessionResourceError>
+pub async fn rns_runtime::link_session::LinkSessionResourceOffer::accept_to_file(self, core::option::Option<std::path::PathBuf>) -> core::result::Result<rns_runtime::link_session::LinkSessionInboundResourceHandle, rns_runtime::link_session::LinkSessionResourceError>
 pub fn rns_runtime::link_session::LinkSessionResourceOffer::data_size(&self) -> usize
 pub fn rns_runtime::link_session::LinkSessionResourceOffer::is_request(&self) -> bool
 pub fn rns_runtime::link_session::LinkSessionResourceOffer::is_response(&self) -> bool
@@ -1820,12 +1835,13 @@ pub rns_runtime::reticulum::BleRnodeRuntimeArgs::tx_power: i8
 pub struct rns_runtime::reticulum::DiscoveryRuntime
 impl core::default::Default for rns_runtime::reticulum::DiscoveryRuntime
 pub fn rns_runtime::reticulum::DiscoveryRuntime::default() -> Self
-pub struct rns_runtime::reticulum::InitOptions
+#[non_exhaustive] pub struct rns_runtime::reticulum::InitOptions
 pub rns_runtime::reticulum::InitOptions::enable_stamping: bool
 pub rns_runtime::reticulum::InitOptions::enforce_stamps: bool
 pub rns_runtime::reticulum::InitOptions::keep_starting_after_interface_failure: bool
 pub rns_runtime::reticulum::InitOptions::require_shared_instance: bool
 pub rns_runtime::reticulum::InitOptions::shared_instance_type: core::option::Option<rns_runtime::reticulum::SharedInstanceType>
+pub rns_runtime::reticulum::InitOptions::start_interfaces_concurrently: bool
 pub struct rns_runtime::reticulum::InterfaceStats
 pub rns_runtime::reticulum::InterfaceStats::interfaces: alloc::vec::Vec<rns_transport::messages::InterfaceStatRpcEntry>
 pub rns_runtime::reticulum::InterfaceStats::network_id: core::option::Option<[u8; 16]>
@@ -1880,7 +1896,7 @@ pub rns_runtime::reticulum::RecalledDestination::ratchet: core::option::Option<[
 pub rns_runtime::reticulum::RecalledDestination::stamp_value: core::option::Option<f64>
 impl core::fmt::Debug for rns_runtime::reticulum::RecalledDestination
 pub fn rns_runtime::reticulum::RecalledDestination::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct rns_runtime::reticulum::ReticulumConfig
+#[non_exhaustive] pub struct rns_runtime::reticulum::ReticulumConfig
 pub rns_runtime::reticulum::ReticulumConfig::autoconnect_announces_to_internal: core::option::Option<bool>
 pub rns_runtime::reticulum::ReticulumConfig::autoconnect_discovered_interfaces: usize
 pub rns_runtime::reticulum::ReticulumConfig::autoconnect_interface_gravity: core::option::Option<i64>
@@ -2176,8 +2192,10 @@ pub const rns_runtime::rncp::FETCH_PATH_NAME: &str
 pub const rns_runtime::rncp::REQ_FETCH_NOT_ALLOWED: u8
 pub fn rns_runtime::rncp::default_rncp_app_name() -> &'static str
 pub async fn rns_runtime::rncp::rncp_fetch_file(rns_runtime::rncp::RncpFetchRequest<'_>) -> core::result::Result<rns_runtime::rncp::RncpFetchOutcome, rns_runtime::rncp::RncpError>
+pub async fn rns_runtime::rncp::rncp_fetch_file_with_resource_dir(rns_runtime::rncp::RncpFetchRequest<'_>, &std::path::Path) -> core::result::Result<rns_runtime::rncp::RncpFetchOutcome, rns_runtime::rncp::RncpError>
 pub async fn rns_runtime::rncp::rncp_send_file(rns_runtime::rncp::RncpSendRequest<'_>) -> core::result::Result<rns_runtime::rncp::RncpOutcome, rns_runtime::rncp::RncpError>
 pub async fn rns_runtime::rncp::spawn_rncp_listener(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, rns_runtime::rncp::RncpListenerConfig, tokio::sync::mpsc::bounded::Sender<rns_runtime::rncp::RncpEvent>) -> core::result::Result<rns_runtime::rncp::RncpListenerHandle, rns_runtime::rncp::RncpError>
+pub async fn rns_runtime::rncp::spawn_rncp_listener_with_resource_dir(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, rns_runtime::rncp::RncpListenerConfig, tokio::sync::mpsc::bounded::Sender<rns_runtime::rncp::RncpEvent>, &std::path::Path) -> core::result::Result<rns_runtime::rncp::RncpListenerHandle, rns_runtime::rncp::RncpError>
 pub mod rns_runtime::rnsh
 pub enum rns_runtime::rnsh::RnshClientProgress
 pub rns_runtime::rnsh::RnshClientProgress::EstablishingLink
@@ -2334,7 +2352,7 @@ pub rns_runtime::rpc::RpcResponse::Error(alloc::string::String)
 pub rns_runtime::rpc::RpcResponse::FloatResult(core::option::Option<f64>)
 pub rns_runtime::rpc::RpcResponse::HashResult(core::option::Option<alloc::vec::Vec<u8>>)
 pub rns_runtime::rpc::RpcResponse::IntResult(i64)
-pub rns_runtime::rpc::RpcResponse::InterfaceStats(alloc::vec::Vec<rns_runtime::rpc::InterfaceStatEntry>)
+pub rns_runtime::rpc::RpcResponse::InterfaceStats(alloc::vec::Vec<rns_transport::messages::InterfaceStatRpcEntry>)
 pub rns_runtime::rpc::RpcResponse::Ok
 pub rns_runtime::rpc::RpcResponse::OptBoolResult(core::option::Option<bool>)
 pub rns_runtime::rpc::RpcResponse::PathTable(alloc::vec::Vec<rns_runtime::rpc::PathTableEntry>)
@@ -2345,68 +2363,6 @@ pub rns_runtime::rpc::BlackholeEntry::identity_hash: alloc::vec::Vec<u8>
 pub rns_runtime::rpc::BlackholeEntry::reason: core::option::Option<alloc::string::String>
 pub rns_runtime::rpc::BlackholeEntry::source: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_runtime::rpc::BlackholeEntry::until: core::option::Option<f64>
-pub struct rns_runtime::rpc::InterfaceStatEntry
-pub rns_runtime::rpc::InterfaceStatEntry::announce_cap: f64
-pub rns_runtime::rpc::InterfaceStatEntry::announce_queue: core::option::Option<u64>
-pub rns_runtime::rpc::InterfaceStatEntry::announce_rate_grace: core::option::Option<u32>
-pub rns_runtime::rpc::InterfaceStatEntry::announce_rate_penalty: core::option::Option<f64>
-pub rns_runtime::rpc::InterfaceStatEntry::announce_rate_target: core::option::Option<f64>
-pub rns_runtime::rpc::InterfaceStatEntry::announce_rx_bytes: u64
-pub rns_runtime::rpc::InterfaceStatEntry::announce_tx_bytes: u64
-pub rns_runtime::rpc::InterfaceStatEntry::announces_received: u64
-pub rns_runtime::rpc::InterfaceStatEntry::announces_sent: u64
-pub rns_runtime::rpc::InterfaceStatEntry::announces_to_internal: core::option::Option<bool>
-pub rns_runtime::rpc::InterfaceStatEntry::autoconnect_source: core::option::Option<alloc::string::String>
-pub rns_runtime::rpc::InterfaceStatEntry::bitrate: u64
-pub rns_runtime::rpc::InterfaceStatEntry::blocked_ips: core::option::Option<u64>
-pub rns_runtime::rpc::InterfaceStatEntry::burst_activated: f64
-pub rns_runtime::rpc::InterfaceStatEntry::burst_active: bool
-pub rns_runtime::rpc::InterfaceStatEntry::burst_count: core::option::Option<u64>
-pub rns_runtime::rpc::InterfaceStatEntry::class_name: core::option::Option<alloc::string::String>
-pub rns_runtime::rpc::InterfaceStatEntry::clients: core::option::Option<u64>
-pub rns_runtime::rpc::InterfaceStatEntry::gravity: i64
-pub rns_runtime::rpc::InterfaceStatEntry::held_announces: u64
-pub rns_runtime::rpc::InterfaceStatEntry::i2p_b32: core::option::Option<alloc::string::String>
-pub rns_runtime::rpc::InterfaceStatEntry::i2p_connectable: core::option::Option<bool>
-pub rns_runtime::rpc::InterfaceStatEntry::id: u64
-pub rns_runtime::rpc::InterfaceStatEntry::ifac_netname: core::option::Option<alloc::string::String>
-pub rns_runtime::rpc::InterfaceStatEntry::ifac_signature: core::option::Option<alloc::vec::Vec<u8>>
-pub rns_runtime::rpc::InterfaceStatEntry::ifac_size: core::option::Option<usize>
-pub rns_runtime::rpc::InterfaceStatEntry::ifac_violations: u64
-pub rns_runtime::rpc::InterfaceStatEntry::incoming_announce_frequency: f64
-pub rns_runtime::rpc::InterfaceStatEntry::incoming_pr_frequency: f64
-pub rns_runtime::rpc::InterfaceStatEntry::mode: alloc::string::String
-pub rns_runtime::rpc::InterfaceStatEntry::mtu: u32
-pub rns_runtime::rpc::InterfaceStatEntry::name: alloc::string::String
-pub rns_runtime::rpc::InterfaceStatEntry::online: bool
-pub rns_runtime::rpc::InterfaceStatEntry::outgoing_announce_frequency: f64
-pub rns_runtime::rpc::InterfaceStatEntry::outgoing_pr_frequency: f64
-pub rns_runtime::rpc::InterfaceStatEntry::packet_filter_hits: u64
-pub rns_runtime::rpc::InterfaceStatEntry::parent_interface_name: core::option::Option<alloc::string::String>
-pub rns_runtime::rpc::InterfaceStatEntry::path_request_rx_bytes: u64
-pub rns_runtime::rpc::InterfaceStatEntry::path_request_tx_bytes: u64
-pub rns_runtime::rpc::InterfaceStatEntry::path_requests_received: u64
-pub rns_runtime::rpc::InterfaceStatEntry::path_requests_sent: u64
-pub rns_runtime::rpc::InterfaceStatEntry::peers: core::option::Option<u64>
-pub rns_runtime::rpc::InterfaceStatEntry::pr_burst_activated: f64
-pub rns_runtime::rpc::InterfaceStatEntry::pr_burst_active: bool
-pub rns_runtime::rpc::InterfaceStatEntry::pr_burst_count: core::option::Option<u64>
-pub rns_runtime::rpc::InterfaceStatEntry::protocol_violations: u64
-pub rns_runtime::rpc::InterfaceStatEntry::role: alloc::string::String
-pub rns_runtime::rpc::InterfaceStatEntry::rssi: core::option::Option<f64>
-pub rns_runtime::rpc::InterfaceStatEntry::rx_bytes: u64
-pub rns_runtime::rpc::InterfaceStatEntry::rx_rate: u64
-pub rns_runtime::rpc::InterfaceStatEntry::short_name: core::option::Option<alloc::string::String>
-pub rns_runtime::rpc::InterfaceStatEntry::signal_quality: core::option::Option<f64>
-pub rns_runtime::rpc::InterfaceStatEntry::snr: core::option::Option<f64>
-pub rns_runtime::rpc::InterfaceStatEntry::speeds: core::option::Option<[f64; 6]>
-pub rns_runtime::rpc::InterfaceStatEntry::tunnel_state: core::option::Option<alloc::string::String>
-pub rns_runtime::rpc::InterfaceStatEntry::tx_buffered: u64
-pub rns_runtime::rpc::InterfaceStatEntry::tx_bytes: u64
-pub rns_runtime::rpc::InterfaceStatEntry::tx_dropped_bytes: u64
-pub rns_runtime::rpc::InterfaceStatEntry::tx_drops: u64
-pub rns_runtime::rpc::InterfaceStatEntry::tx_rate: u64
-pub rns_runtime::rpc::InterfaceStatEntry::tx_stalled: bool
 pub struct rns_runtime::rpc::InterfaceStatsTotals
 pub rns_runtime::rpc::InterfaceStatsTotals::rxb: u64
 pub rns_runtime::rpc::InterfaceStatsTotals::rxpps: u64

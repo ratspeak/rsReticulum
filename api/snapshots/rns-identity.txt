@@ -465,20 +465,6 @@ pub fn rns_identity::ratchet::ReceivedRatchet::new_at([u8; 32], f64) -> Self
 pub fn rns_identity::ratchet::ReceivedRatchet::ratchet_id(&self) -> alloc::vec::Vec<u8>
 pub fn rns_identity::ratchet::ReceivedRatchet::save(&self, &std::path::Path) -> core::io::error::Result<()>
 pub fn rns_identity::ratchet::ReceivedRatchet::save_durable(&self, &std::path::Path) -> core::io::error::Result<()>
-pub struct rns_identity::ratchet::ReceivedRatchetStore
-impl rns_identity::ratchet::ReceivedRatchetStore
-pub fn rns_identity::ratchet::ReceivedRatchetStore::clean_expired(&mut self)
-pub fn rns_identity::ratchet::ReceivedRatchetStore::current_ratchet_id(&mut self, &[u8; 16]) -> core::option::Option<alloc::vec::Vec<u8>>
-pub fn rns_identity::ratchet::ReceivedRatchetStore::get(&mut self, &[u8; 16]) -> core::option::Option<[u8; 32]>
-pub fn rns_identity::ratchet::ReceivedRatchetStore::get_at(&mut self, &[u8; 16], f64) -> core::option::Option<[u8; 32]>
-pub fn rns_identity::ratchet::ReceivedRatchetStore::is_empty(&self) -> bool
-pub fn rns_identity::ratchet::ReceivedRatchetStore::len(&self) -> usize
-pub fn rns_identity::ratchet::ReceivedRatchetStore::new() -> Self
-pub fn rns_identity::ratchet::ReceivedRatchetStore::remember(&mut self, [u8; 16], [u8; 32])
-pub fn rns_identity::ratchet::ReceivedRatchetStore::remember_at(&mut self, [u8; 16], [u8; 32], f64)
-pub fn rns_identity::ratchet::ReceivedRatchetStore::with_storage(std::path::PathBuf) -> Self
-impl core::default::Default for rns_identity::ratchet::ReceivedRatchetStore
-pub fn rns_identity::ratchet::ReceivedRatchetStore::default() -> Self
 pub const rns_identity::ratchet::RATCHET_RING_MAX_KEYS: usize
 pub fn rns_identity::ratchet::clean_received_ratchets_dir(&std::path::Path) -> usize
 pub fn rns_identity::ratchet::get_ratchet_id(&[u8; 32]) -> alloc::vec::Vec<u8>

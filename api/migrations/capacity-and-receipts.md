@@ -61,8 +61,15 @@ Omitting all size keys retains the interface class default. Explicit malformed
 sizes remain errors even when credentials are absent. Disabled interfaces may
 retain old settings, but must be migrated before enabling them.
 
-`InterfacePostInit::try_from_section` replaces the infallible constructor. Use
-the shared `config::ifac::parse_ifac_size` decoder rather than another parser.
+From 1.5 the runtime reads a plain `ifac_size` as bits, as Python does: a value
+of 8 or more is divided by 8 and a smaller one keeps the class default. A value
+from 1 to 64 logs a warning instead of failing; `rnsd-rs config ifac-units`
+still converts it. `ifac_size_unit = bits` keeps the strict rules above, and
+`ifac_size_bytes` is still read, with a warning.
+
+`InterfacePostInit::try_from_section` replaces the infallible constructor and
+reads sizes as the runtime does. The shared `config::ifac::parse_ifac_size`
+decoder keeps the strict 1.4 rules for all three keys.
 `validate_config_capacity` checks explicit driver promises before spawn.
 Malformed file syntax still fails the file; semantic errors isolate the affected
 enabled interface.
@@ -70,7 +77,7 @@ enabled interface.
 Preview an explicitly selected migration without starting the network:
 
 ```sh
-rnsd-rs -c /path/to/config-directory config ifac-units --source-units bytes --interface Radio
+rnsd-rs --config /path/to/config-directory config ifac-units --source-units bytes --interface Radio
 ```
 
 Use `--source-units bits` when that is the known source convention. Add `--write`
