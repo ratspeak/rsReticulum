@@ -1,0 +1,5 @@
+{
+ "provenance": {"generator": "crates/rns-transport/tests/fixtures/transport_api_defaults/generate.py", "rns_version": "1.6.0", "rns_commit": "cb1260891d1b6da8f6e9b21542c4f0cc0725cac4", "rns_path": "upstream Reticulum 1.6.0"},
+ "next_hop_hw_mtu": {"udp": {"hw_mtu": 1064, "result": null}, "tcp": {"hw_mtu": 262144, "result": 262144}},
+ "receipt": {"bitrate": 10000000, "hops": 1, "timeout": 12.000399999999999, "no_path_timeout": 774}
+}

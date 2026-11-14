@@ -1,0 +1,14 @@
+{
+ "generator":"crates/rns-transport/tests/fixtures/path_request_tags/gen_tag_memory.py",
+ "local_destination_hash":"2b4dc9913aea9a56f3af1a8f710b49ef",
+ "max_pr_tags":16000,
+ "rns_commit":"cb1260891d1b6da8f6e9b21542c4f0cc0725cac4",
+ "rns_version":"1.6.0",
+ "tag_cases":[
+  {"answered": true, "case": "first_request", "tag": "02020202020202020202020202020202"},
+  {"answered": false, "case": "replay_after_121s_and_jobs", "tag": "02020202020202020202020202020202"},
+  {"answered": false, "case": "at_max_no_rotation", "current_after_jobs": 16000, "prev_after_jobs": 0, "seeded_tags": 16000, "tag": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+  {"answered": false, "case": "above_max_rotates", "current_after_jobs": 0, "prev_after_jobs": 16001, "seeded_tags": 16001, "tag": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+  {"answered": true, "case": "second_rotation_forgets", "tag": "efefefefefefefefefefefefefefefef"}
+ ]
+}

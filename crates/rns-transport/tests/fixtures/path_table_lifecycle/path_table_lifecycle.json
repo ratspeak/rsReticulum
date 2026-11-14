@@ -1,0 +1,39 @@
+{
+ "provenance": {"generator": "crates/rns-transport/tests/fixtures/path_table_lifecycle/generate.py", "upstream": "Reticulum", "version": "1.6.0", "commit": "cb1260891d1b6da8f6e9b21542c4f0cc0725cac4"},
+ "linger_leaf": {"transport_enabled": false, "linger_s": 720, "entries": [
+    {"label": "fast_young", "iface": "fast", "age_s": 660, "expires_rel_s": 604140.0, "used_age_s": null, "survives": true},
+    {"label": "fast_old", "iface": "fast", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "survives": false},
+    {"label": "fast_old_used", "iface": "fast", "age_s": 14400, "expires_rel_s": 590400.0, "used_age_s": 5.0, "survives": true},
+    {"label": "slow_past_x1", "iface": "slow", "age_s": 780, "expires_rel_s": 604020.0, "used_age_s": null, "survives": true},
+    {"label": "slow_past_x10", "iface": "slow", "age_s": 7201, "expires_rel_s": 597599.0, "used_age_s": null, "survives": false},
+    {"label": "slow_inside_x10", "iface": "slow", "age_s": 7140, "expires_rel_s": 597660.0, "used_age_s": null, "survives": true},
+    {"label": "zero_bitrate_old", "iface": "zero", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "survives": false},
+    {"label": "none_bitrate_old", "iface": "none", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "survives": false},
+    {"label": "edge_bitrate_old", "iface": "edge", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "survives": false},
+    {"label": "expired_used", "iface": "fast", "age_s": 60, "expires_rel_s": -10.0, "used_age_s": 5.0, "survives": false}
+  ]},
+ "linger_transport": {"transport_enabled": true, "linger_s": 6300.0, "entries": [
+    {"label": "fast_young", "iface": "fast", "age_s": 6240.0, "expires_rel_s": 598560.0, "used_age_s": null, "survives": true},
+    {"label": "fast_old", "iface": "fast", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "survives": false},
+    {"label": "fast_old_used", "iface": "fast", "age_s": 126000.0, "expires_rel_s": 478800.0, "used_age_s": 5.0, "survives": true},
+    {"label": "slow_past_x1", "iface": "slow", "age_s": 6360.0, "expires_rel_s": 598440.0, "used_age_s": null, "survives": true},
+    {"label": "slow_past_x10", "iface": "slow", "age_s": 63001.0, "expires_rel_s": 541799.0, "used_age_s": null, "survives": false},
+    {"label": "slow_inside_x10", "iface": "slow", "age_s": 62940.0, "expires_rel_s": 541860.0, "used_age_s": null, "survives": true},
+    {"label": "zero_bitrate_old", "iface": "zero", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "survives": false},
+    {"label": "none_bitrate_old", "iface": "none", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "survives": false},
+    {"label": "edge_bitrate_old", "iface": "edge", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "survives": false},
+    {"label": "expired_used", "iface": "fast", "age_s": 60, "expires_rel_s": -10.0, "used_age_s": 5.0, "survives": false}
+  ]},
+ "pool_cap": {"count": 2100, "slow_every": 3, "expiry_base_s": 3600, "expiry_step_s": 240, "expiry_mod": 700, "used_count": 5, "removed": [16, 32, 64, 80, 179, 211, 227, 259, 275, 358, 374, 406, 422, 553, 569, 601, 617, 700, 716, 748, 764, 796, 895, 911, 943, 959, 1058, 1090, 1106, 1138, 1237, 1253, 1285, 1301, 1400, 1432, 1448, 1480, 1496, 1579, 1595, 1627, 1643, 1675, 1774, 1790, 1822, 1838, 1937, 1969, 1985, 2017], "used_survive": true},
+ "outbound": [
+    {"hops": 1, "age_s": 3600.0, "sent": true, "timestamp_unchanged": true, "expires_unchanged": true, "used_is_send_time": true},
+    {"hops": 3, "age_s": 3600.0, "sent": true, "timestamp_unchanged": true, "expires_unchanged": true, "used_is_send_time": true}
+  ],
+ "pending_link_rediscovery": [
+    {"transport_enabled": false, "shared_client": false, "last_request_age_s": null, "path_kept": false, "rediscovery_queued": true},
+    {"transport_enabled": false, "shared_client": false, "last_request_age_s": 10, "path_kept": false, "rediscovery_queued": false},
+    {"transport_enabled": false, "shared_client": false, "last_request_age_s": 25, "path_kept": false, "rediscovery_queued": true},
+    {"transport_enabled": false, "shared_client": true, "last_request_age_s": null, "path_kept": false, "rediscovery_queued": false},
+    {"transport_enabled": true, "shared_client": false, "last_request_age_s": null, "path_kept": true, "rediscovery_queued": false}
+  ]
+}

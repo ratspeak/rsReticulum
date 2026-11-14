@@ -1,0 +1,29 @@
+{
+ "STAMP_PRS": false,
+ "blocked_rediscovery": {
+  "a_payloads": [],
+  "b_payloads": [
+   "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5eb8105df0dab6859a6bcb03939a33e6fcaf0cc9dfb1015e82195fa2b906752401"
+  ],
+  "b_tags": [
+   "af0cc9dfb1015e82195fa2b906752401"
+  ],
+  "blocked": "a",
+  "c_payloads": [
+   "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5eb8105df0dab6859a6bcb03939a33e6fcaf0cc9dfb1015e82195fa2b906752401"
+  ],
+  "c_tags": [
+   "af0cc9dfb1015e82195fa2b906752401"
+  ],
+  "destination_hash": "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e",
+  "payload_lens": [
+   48,
+   48
+  ],
+  "same_tag_on_all_unblocked": true
+ },
+ "enable_transport": false,
+ "generator": "crates/rns-transport/tests/fixtures/path_request_tags/gen_blocked_rediscovery.py",
+ "rns_commit": "cb1260891d1b6da8f6e9b21542c4f0cc0725cac4",
+ "rns_version": "1.6.0"
+}

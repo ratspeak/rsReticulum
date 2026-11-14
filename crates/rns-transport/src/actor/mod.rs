@@ -81,8 +81,7 @@ struct LinkEndpointQueuedPacket {
 
 /// Owns transport routing tables and processes mailbox/control-channel work
 /// on one task. Configure it before calling `run`; use commands and replies
-/// for running operations. Public table mutations do not automatically perform
-/// command-side housekeeping, mark persistence dirty or refresh shared snapshots.
+/// for running operations.
 ///
 /// Driver counters, the blackhole snapshot and background persistence state
 /// use shared atomics or locks. Sequential command handling is not a claim
@@ -111,8 +110,8 @@ pub struct TransportActor {
     local_link_route_attempts:
         HashMap<crate::path_recovery::FailedRouteAttempt, path_recovery::LocalLinkRouteAttempt>,
 
-    pub path_table: PathTable,
-    pub link_table: LinkTable,
+    path_table: PathTable,
+    link_table: LinkTable,
     pub(crate) announce_table: AnnounceTable,
     /// Queued announces temporarily displaced while a known-path response
     /// occupies `announce_table`.
@@ -176,13 +175,13 @@ pub struct TransportActor {
     /// the transit `link_table`: transit forwarding and local session
     /// ownership have different lifetimes and authority.
     link_endpoints: HashMap<([u8; 16], crate::messages::LinkEndpointRole), LinkEndpointEntry>,
-    pub path_requests: HashMap<[u8; 16], f64>,
+    path_requests: HashMap<[u8; 16], f64>,
     // One canonical owner; detached public snapshots cannot mutate registrations.
     discovery_path_requests: HashMap<[u8; 16], recursive_discovery::DiscoveryOperation>,
     /// Destination hash plus request tag, current generation.
-    pub discovery_pr_tags: HashSet<[u8; 32]>,
+    discovery_pr_tags: HashSet<[u8; 32]>,
     /// Previous tag generation; a tag in either generation is a duplicate.
-    pub discovery_pr_tags_prev: HashSet<[u8; 32]>,
+    discovery_pr_tags_prev: HashSet<[u8; 32]>,
     /// Failed-Link rediscovery requests awaiting throttled emission.
     pub(crate) pending_discovery_prs: VecDeque<PendingDiscoveryPathRequest>,
     // Only rejected driver admissions live here; successfully admitted targets
@@ -195,7 +194,7 @@ pub struct TransportActor {
     pub(crate) path_interface_suppressions: HashMap<([u8; 16], InterfaceId), f64>,
     last_discovery_pr_tx: f64,
     /// External interface waiting for a path response from a local shared client.
-    pub pending_local_path_requests: HashMap<[u8; 16], InterfaceId>,
+    pending_local_path_requests: HashMap<[u8; 16], InterfaceId>,
     /// Legacy separate path-state map, cleared on shared-connection reset.
     /// Current path-state queries use `PathTable`'s state instead.
     pub(crate) path_states: HashMap<[u8; 16], PathState>,
@@ -208,7 +207,7 @@ pub struct TransportActor {
     last_tables_cull: f64,
     /// Last never-used path pool check; starts at construction so the first
     /// check waits one interval (Transport.py).
-    pub path_pool_last_checked: f64,
+    path_pool_last_checked: f64,
     /// Destinations with a path request admitted and not yet answered
     /// (Python `inflight_path_requests`), with the admission time.
     pub(crate) inflight_path_requests: HashMap<[u8; 16], f64>,
@@ -270,11 +269,11 @@ pub struct TransportActor {
 
     /// Whether this actor currently uses a shared-instance peer. Routing policy
     /// uses that peer and reconnect handling invalidates prior routing state.
-    pub is_shared_instance: bool,
+    is_shared_instance: bool,
     /// Sticky process-mode marker for shared-instance clients. It remains true
     /// after a shared connection drops so shutdown cannot persist an empty
     /// local routing table over the real shared instance's cache.
-    pub shared_instance_client_mode: bool,
+    shared_instance_client_mode: bool,
 
     /// Trusted persistence root. Prefer `initialize_storage` to assigning this
     /// field when saved state must also be loaded.
@@ -2601,8 +2600,13 @@ mod tests {
     mod inbound_queues;
     mod interface_stats;
     mod link_endpoint_dispatch;
+    mod local_client_path_response;
+    mod outbound_wrap;
     mod packet_capacity;
+    mod path_request_tags;
+    mod path_table_lifecycle;
     mod slow_media_discovery;
+    mod transport_api_defaults;
     mod tunnels;
 
     fn owned_event(

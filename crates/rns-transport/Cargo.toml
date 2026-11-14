@@ -35,4 +35,6 @@ rusqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+rns-link = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
