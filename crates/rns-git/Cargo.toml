@@ -9,7 +9,7 @@ license-file.workspace = true
 autobins = false
 
 [dependencies]
-rns-tools = { path = "../rns-tools" }
+rns-tools = { path = "../rns-tools", default-features = false }
 rns-identity = { workspace = true }
 rns-runtime = { workspace = true }
 rns-transport = { workspace = true }
