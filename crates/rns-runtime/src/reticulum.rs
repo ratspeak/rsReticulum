@@ -3104,9 +3104,9 @@ pub struct ReticulumConfig {
     /// auto-connect. Receiving discovery and installing a stamper are also
     /// required. Other discovered interface types are not auto-connected.
     pub autoconnect_discovered_interfaces: usize,
-    /// Permit Backbone auto-connect when advertised implementation/version
-    /// metadata does not pass the configured release floor, including rsRNS.
-    /// The default check is metadata matching, not software attestation.
+    /// Permit Backbone auto-connect for any advertised implementation/version.
+    /// Without it only `RNS` 1.5.7 and `rsRNS` 1.5.0 or later qualify. The
+    /// default check is metadata matching, not software attestation.
     pub autoconnect_unverified_implementations: bool,
     /// Python `autoconnect_interface_mode`. Unset gives auto-connected
     /// interfaces Gateway mode on transport nodes and Full mode otherwise.
@@ -8302,9 +8302,9 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
     }
 }
 
-/// Python auto-connects only Backbone interfaces of a transport node running
-/// a trusted stack and release, unless unverified stacks are allowed; the
-/// transport requirement holds either way (Discovery.py).
+/// Auto-connects only Backbone interfaces of a transport node running a
+/// trusted stack and release (Python's, plus rsRNS), unless unverified stacks
+/// are allowed; the transport requirement holds either way (Discovery.py).
 fn autoconnect_admits(record: &DiscoveredInterface, config: &ReticulumConfig) -> bool {
     let admitted = rns_transport::discovery::autoconnect::qualifies(
         &record.info,
@@ -15439,10 +15439,10 @@ loglevel = 7
         assert!(rc.autoconnect_unverified_implementations);
     }
 
-    /// Only Backbone interfaces from Python 1.5.7 or later, unless unverified
-    /// stacks are allowed (Discovery.py).
+    /// Only Backbone interfaces from RNS 1.5.7 or rsRNS 1.5.0 or later, unless
+    /// unverified stacks are allowed (Discovery.py; rsRNS is ours).
     #[test]
-    fn discovered_interfaces_auto_connect_like_python() {
+    fn discovered_interfaces_auto_connect_by_stack_and_release() {
         let record = |interface_type: &str, impl_name: Option<&str>, version: Option<&str>| {
             DiscoveredInterface {
                 info: rns_transport::discovery::app_data::DiscoveryInfo {
@@ -15465,18 +15465,25 @@ loglevel = 7
             }
         };
         let mut config = ReticulumConfig::default();
-        assert!(autoconnect_admits(
-            &record("BackboneInterface", Some("RNS"), Some("1.6.0")),
-            &config
-        ));
-        for rejected in [
-            record("TCPServerInterface", Some("RNS"), Some("1.5.5")),
-            record("BackboneInterface", Some("RNS"), Some("1.5.6")),
+        for admitted in [
+            record("BackboneInterface", Some("RNS"), Some("1.6.0")),
             record(
                 "BackboneInterface",
                 Some("rsRNS"),
-                Some(env!("CARGO_PKG_VERSION")),
+                Some(rns_transport::discovery::constants::IMPLEMENTATION_VERSION),
             ),
+        ] {
+            assert!(
+                autoconnect_admits(&admitted, &config),
+                "{:?}",
+                admitted.info
+            );
+        }
+        for rejected in [
+            record("TCPServerInterface", Some("RNS"), Some("1.5.5")),
+            record("BackboneInterface", Some("RNS"), Some("1.5.6")),
+            record("BackboneInterface", Some("rsRNS"), Some("1.4.0")),
+            record("BackboneInterface", Some("MeshChatX"), Some("9.9.9")),
             record("BackboneInterface", None, None),
         ] {
             assert!(
@@ -15486,10 +15493,18 @@ loglevel = 7
             );
         }
         config.autoconnect_unverified_implementations = true;
-        assert!(autoconnect_admits(
-            &record("BackboneInterface", Some("rsRNS"), Some("1.4.0")),
-            &config
-        ));
+        for admitted in [
+            record("BackboneInterface", Some("RNS"), Some("1.5.6")),
+            record("BackboneInterface", Some("rsRNS"), Some("1.4.0")),
+            record("BackboneInterface", Some("MeshChatX"), Some("9.9.9")),
+            record("BackboneInterface", None, None),
+        ] {
+            assert!(
+                autoconnect_admits(&admitted, &config),
+                "{:?}",
+                admitted.info
+            );
+        }
         assert!(!autoconnect_admits(
             &record("TCPServerInterface", None, None),
             &config

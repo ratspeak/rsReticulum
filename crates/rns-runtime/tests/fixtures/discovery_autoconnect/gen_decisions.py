@@ -28,6 +28,8 @@ for impl, version, transport, unverified in [
     ("RNS", "1.5.7", True, False), ("RNS", "1.5.6", True, False),
     ("rsRNS", "1.4.0", True, False), ("rsRNS", "1.4.0", True, True), ("rsRNS", "1.4.0", False, True),
     ("RNS", "1.5.5", False, True),
+    ("rsRNS", "1.4.9", True, False), ("rsRNS", "1.5.0", True, False), ("rsRNS", "1.6.0", True, False),
+    ("MeshChatX", "9.9.9", True, False), ("MeshChatX", "9.9.9", True, True),
 ]:
     R.should_autoconnect_unverified_implementations = staticmethod(lambda u=unverified: u)
     info = {"type": "BackboneInterface", "transport": transport, "impl_name": impl, "version": version}

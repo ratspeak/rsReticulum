@@ -183,26 +183,44 @@ fn decisions() -> serde_json::Value {
     fixture
 }
 
+/// rsRNS releases in the fixture that Rust auto-connects without the opt-in
+/// and upstream refuses: a deliberate difference, as upstream trusts only RNS.
+const RSRNS_TRUSTED_ONLY_HERE: &[&str] = &["1.5.0", "1.6.0"];
+
 /// Upstream's discovery admission and announce decisions, recorded by
 /// `tests/fixtures/discovery_autoconnect/gen_decisions.py`.
 #[test]
 fn autoconnect_and_announce_decisions_match_upstream() {
     let fixture = decisions();
+    let mut differences = Vec::new();
     for case in fixture["qualified"].as_array().unwrap() {
         let mut record = discovered("hub", "relay.example.org", 4242);
         record.info.impl_name = case["impl_name"].as_str().map(Into::into);
         record.info.impl_version = case["version"].as_str().map(Into::into);
         record.info.transport_enabled = case["transport"].as_bool().unwrap();
+        let allow_unverified = case["allow_unverified"].as_bool().unwrap();
         let config = ReticulumConfig {
-            autoconnect_unverified_implementations: case["allow_unverified"].as_bool().unwrap(),
+            autoconnect_unverified_implementations: allow_unverified,
             ..ReticulumConfig::default()
         };
-        assert_eq!(
+        let (rust, upstream) = (
             autoconnect_admits(&record, &config),
             case["qualified"].as_bool().unwrap(),
-            "{case}"
         );
+        let version = case["version"].as_str().unwrap();
+        if case["impl_name"] == "rsRNS"
+            && record.info.transport_enabled
+            && !allow_unverified
+            && RSRNS_TRUSTED_ONLY_HERE.contains(&version)
+        {
+            assert!(!upstream, "upstream refuses rsRNS: {case}");
+            assert!(rust, "rsRNS 1.5.0 or later is trusted here: {case}");
+            differences.push(version);
+        } else {
+            assert_eq!(rust, upstream, "{case}");
+        }
     }
+    assert_eq!(differences, RSRNS_TRUSTED_ONLY_HERE);
     for case in fixture["costs"].as_array().unwrap() {
         let mut record = discovered("hub", "relay.example.org", 4242);
         record.info.dst_cost = case["dst_cost"].as_f64();

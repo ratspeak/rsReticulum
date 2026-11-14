@@ -7,14 +7,15 @@ use super::constants::{AUTOCONNECT_INTERFACE_TYPES, AUTOCONNECT_MINIMUM_VERSIONS
 /// Check the advertised type, transport state and implementation/version
 /// against the local auto-connect policy. Only a transport-enabled
 /// `BackboneInterface` is eligible. With `allow_unverified`, any advertised
-/// implementation/version qualifies; otherwise `RNS` must advertise at least
-/// version `1.5.7`.
-/// `rsRNS`, unknown implementations and missing versions require the opt-in.
+/// implementation/version qualifies; otherwise only `RNS` 1.5.7 or later and
+/// `rsRNS` 1.5.0 or later do ([`AUTOCONNECT_MINIMUM_VERSIONS`]). Other or
+/// missing implementations and missing or unparsable versions need the opt-in.
 ///
-/// Comparison uses leading numeric components, not full semantic-version
-/// rules: for example, `1.5.2rc1` compares as `1.5.2`. These are sender-supplied
-/// claims, not attestation. This helper does not check
-/// freshness, endpoint validity, source permissions or available connection slots.
+/// Comparison uses leading numeric components, as Python's tuples, not full
+/// semantic-version rules: `1.5.0rc1` compares as `1.5.0`, and `1.5` sorts
+/// below `1.5.0`. These are sender-supplied claims, not attestation. This
+/// helper does not check freshness, endpoint validity, source permissions or
+/// available connection slots.
 pub fn qualifies(info: &DiscoveryInfo, allow_unverified: bool) -> bool {
     if !AUTOCONNECT_INTERFACE_TYPES.contains(&info.interface_type.as_str()) {
         return false;
@@ -85,15 +86,48 @@ mod tests {
         assert!(!qualifies(&backbone(Some("RNS"), None), false));
     }
 
-    /// rsRNS hubs need the unverified opt-in, as unknown stacks and announces
-    /// without an implementation do.
+    /// rsRNS hubs qualify from 1.5.0 without the opt-in; upstream trusts only
+    /// "RNS", so this is a deliberate difference.
     #[test]
-    fn rust_and_unknown_stacks_need_the_unverified_opt_in() {
+    fn rust_backbones_qualify_from_1_5_0() {
+        assert_eq!(
+            AUTOCONNECT_MINIMUM_VERSIONS,
+            &[("RNS", Some("1.5.7")), ("rsRNS", Some("1.5.0"))]
+        );
+        for version in [
+            crate::discovery::constants::IMPLEMENTATION_VERSION,
+            "1.5.0",
+            "1.5.0rc1",
+            "1.5.0-rc1",
+            "1.5.1",
+            "1.6",
+            "1.6.0",
+            "2.0.0",
+        ] {
+            assert!(
+                qualifies(&backbone(Some("rsRNS"), Some(version)), false),
+                "{version}"
+            );
+        }
+    }
+
+    /// Without the opt-in, only the two known names at or above their floors
+    /// qualify; with it, every one of these does.
+    #[test]
+    fn everything_else_needs_the_unverified_opt_in() {
         for info in [
-            backbone(Some("rsRNS"), Some(env!("CARGO_PKG_VERSION"))),
-            backbone(Some("rsRNS"), Some("99.0.0")),
-            backbone(Some("OtherRNS"), Some("9.9.9")),
-            backbone(None, Some("1.5.5")),
+            backbone(Some("rsRNS"), Some("1.4.9")),
+            backbone(Some("rsRNS"), Some("1.4.0")),
+            backbone(Some("rsRNS"), Some("1.5")),
+            backbone(Some("rsRNS"), Some("")),
+            backbone(Some("rsRNS"), Some("next")),
+            backbone(Some("rsRNS"), None),
+            backbone(Some("RNS"), Some("1.5.6")),
+            backbone(Some("RNS"), None),
+            backbone(Some("MeshChatX"), Some("9.9.9")),
+            backbone(Some("rsrns"), Some("1.6.0")),
+            backbone(Some(""), Some("1.6.0")),
+            backbone(None, Some("1.6.0")),
             backbone(None, None),
         ] {
             assert!(!qualifies(&info, false), "{info:?}");
@@ -105,10 +139,12 @@ mod tests {
     /// (Discovery.py).
     #[test]
     fn non_transport_interfaces_never_qualify() {
-        let mut info = backbone(Some("RNS"), Some("1.6.0"));
-        info.transport_enabled = false;
-        assert!(!qualifies(&info, false));
-        assert!(!qualifies(&info, true));
+        for name in ["RNS", "rsRNS"] {
+            let mut info = backbone(Some(name), Some("1.6.0"));
+            info.transport_enabled = false;
+            assert!(!qualifies(&info, false), "{name}");
+            assert!(!qualifies(&info, true), "{name}");
+        }
     }
 
     /// Python auto-connects only Backbone interfaces (Discovery.py).

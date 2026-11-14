@@ -73,11 +73,10 @@ pub const IMPLEMENTATION_NAME: &str = "rsRNS";
 /// This transport crate's package version, emitted in discovery info (`0xFC`).
 pub const IMPLEMENTATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Advertised-version floors for automatic connections. `RNS` has a `1.5.7`
-/// floor; `rsRNS` has none and requires the unverified-implementation opt-in.
-/// This policy checks sender claims, not authenticated software provenance.
+/// Advertised-version floors for auto-connect without the unverified opt-in
+/// (sender claims). Upstream trusts only `RNS`; `rsRNS` is a deliberate addition.
 pub const AUTOCONNECT_MINIMUM_VERSIONS: &[(&str, Option<&str>)] =
-    &[("RNS", Some("1.5.7")), (IMPLEMENTATION_NAME, None)];
+    &[("RNS", Some("1.5.7")), (IMPLEMENTATION_NAME, Some("1.5.0"))];
 
 /// Age in seconds above which a record becomes `Unknown` (24 hours).
 /// Equality remains `Available`.

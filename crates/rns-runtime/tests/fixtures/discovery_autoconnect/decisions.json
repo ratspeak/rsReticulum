@@ -11,7 +11,12 @@
   {"impl_name": "rsRNS", "version": "1.4.0", "transport": true, "allow_unverified": false, "qualified": false},
   {"impl_name": "rsRNS", "version": "1.4.0", "transport": true, "allow_unverified": true, "qualified": true},
   {"impl_name": "rsRNS", "version": "1.4.0", "transport": false, "allow_unverified": true, "qualified": false},
-  {"impl_name": "RNS", "version": "1.5.5", "transport": false, "allow_unverified": true, "qualified": false}
+  {"impl_name": "RNS", "version": "1.5.5", "transport": false, "allow_unverified": true, "qualified": false},
+  {"impl_name": "rsRNS", "version": "1.4.9", "transport": true, "allow_unverified": false, "qualified": false},
+  {"impl_name": "rsRNS", "version": "1.5.0", "transport": true, "allow_unverified": false, "qualified": false},
+  {"impl_name": "rsRNS", "version": "1.6.0", "transport": true, "allow_unverified": false, "qualified": false},
+  {"impl_name": "MeshChatX", "version": "9.9.9", "transport": true, "allow_unverified": false, "qualified": false},
+  {"impl_name": "MeshChatX", "version": "9.9.9", "transport": true, "allow_unverified": true, "qualified": true}
  ],
  "costs": [
   {"dst_cost": 23.5, "pr_cost": 15.8, "dst_value": 25.0, "pr_value": 15.8, "accepted": true},
