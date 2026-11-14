@@ -115,9 +115,7 @@ fn add_local_key(keys: &mut Vec<(String, String)>, der_hex: String) {
 
 /// `padding.PSS.MAX_LENGTH` on verify accepts any salt length.
 fn pss_verify_any_salt(key: &RsaPublicKey, hashed: &[u8], signature: &[u8]) -> bool {
-    let em_len = (key.n().bits() + 6) / 8;
-    let max_salt = em_len.saturating_sub(Sha256::output_size() + 2);
-    (0..=max_salt).any(|salt| {
+    (0..=max_pss_salt(key)).any(|salt| {
         key.verify(Pss::new_with_salt::<Sha256>(salt), hashed, signature)
             .is_ok()
     })
@@ -211,6 +209,25 @@ pub fn sign_device_hash(identity: &Identity, device_hash: &[u8; 32]) -> Result<[
     identity
         .sign(device_hash)
         .ok_or_else(|| "device identity does not contain a private signing key".to_string())
+}
+
+/// Upstream `--rom` EEPROM signature: RSA-PSS over the checksum with SHA-256,
+/// MGF1-SHA-256 and `PSS.MAX_LENGTH` salt.
+pub fn sign_eeprom_checksum(private_bytes: &[u8], checksum: &[u8]) -> Result<Vec<u8>, String> {
+    let key = RsaPrivateKey::from_pkcs8_der(private_bytes)
+        .map_err(|error| format!("{DESERIALIZE_ERROR}{error}"))?;
+    let salt = max_pss_salt(&key.to_public_key());
+    key.sign_with_rng(
+        &mut OsRng,
+        Pss::new_with_salt::<Sha256>(salt),
+        &Sha256::digest(checksum),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn max_pss_salt(key: &RsaPublicKey) -> usize {
+    let em_len = (key.n().bits() + 6) / 8;
+    em_len.saturating_sub(Sha256::output_size() + 2)
 }
 
 pub fn device_signature_frame(signature: &[u8; 64]) -> AdminFrame {

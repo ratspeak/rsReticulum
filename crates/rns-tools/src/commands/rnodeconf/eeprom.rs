@@ -1,7 +1,5 @@
 //! RNode EEPROM layout helpers.
 
-use rns_interface::rnode_admin::{self, AdminFrame};
-
 use super::model;
 
 pub const EEPROM_SIZE: usize = 296;
@@ -255,42 +253,35 @@ pub fn identity_checksum_input(info: &IdentityInfo) -> [u8; 11] {
     input
 }
 
-pub fn identity_write_frames(info: &IdentityInfo) -> Vec<AdminFrame> {
-    let model = model::normalize_eeprom_model(info.model);
-    let checksum = identity_checksum(info);
-    let mut writes = Vec::new();
-    writes.push(write(ADDR_PRODUCT, info.product));
-    writes.push(write(ADDR_MODEL, model));
-    writes.push(write(ADDR_HW_REV, info.hw_rev));
-    writes.extend(write_bytes(ADDR_SERIAL, &info.serial.to_be_bytes()));
-    writes.extend(write_bytes(ADDR_MADE, &info.made.to_be_bytes()));
-    writes.extend(write_bytes(ADDR_CHKSUM, &checksum));
-    writes.push(write(ADDR_INFO_LOCK, INFO_LOCK_BYTE));
-    writes
+/// nRF52 info-block write: every byte, then up to three read-back passes that
+/// rewrite the bytes that differ. `Ok(false)`: never matched, so no lock byte.
+pub fn write_with_read_back<E>(
+    info: &[u8],
+    mut write: impl FnMut(usize, u8) -> Result<(), E>,
+    mut read_back: impl FnMut() -> Result<Option<Vec<u8>>, E>,
+) -> Result<bool, E> {
+    let mut pending = unwritten_info_bytes(info, None);
+    for _ in 0..=3 {
+        for &(address, value) in &pending {
+            write(address, value)?;
+        }
+        pending = unwritten_info_bytes(info, read_back()?.as_deref());
+        if pending.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
-pub fn radio_config_write_frames(config: &RadioConfig) -> Vec<AdminFrame> {
-    let mut writes = vec![
-        write(ADDR_CONF_SF, config.spreading_factor),
-        write(ADDR_CONF_CR, config.coding_rate),
-        write(ADDR_CONF_TXP, config.tx_power),
-    ];
-    writes.extend(write_bytes(ADDR_CONF_BW, &config.bandwidth.to_be_bytes()));
-    writes.extend(write_bytes(ADDR_CONF_FREQ, &config.frequency.to_be_bytes()));
-    writes.push(write(ADDR_CONF_OK, CONF_OK_BYTE));
-    writes
-}
-
-pub fn write(address: usize, value: u8) -> AdminFrame {
-    let address = u8::try_from(address).expect("RNode EEPROM write address must fit in one byte");
-    rnode_admin::eeprom_write_frame(address, value)
-}
-
-pub fn write_bytes(start: usize, bytes: &[u8]) -> Vec<AdminFrame> {
-    bytes
-        .iter()
+/// Info-block bytes (`(address, value)` from address 0) still to write: all of
+/// them before the first write, else those the read-back image lacks.
+fn unwritten_info_bytes(info: &[u8], read_back: Option<&[u8]>) -> Vec<(usize, u8)> {
+    info.iter()
+        .copied()
         .enumerate()
-        .map(|(offset, value)| write(start + offset, *value))
+        .filter(|&(address, value)| {
+            read_back.is_none_or(|image| image.get(address) != Some(&value))
+        })
         .collect()
 }
 
@@ -453,26 +444,66 @@ mod tests {
     }
 
     #[test]
-    fn identity_write_frames_match_upstream_rom_write_shape() {
-        let info = IdentityInfo {
-            product: model::PRODUCT_RNODE,
-            model: model::MODEL_B4_TCXO,
-            hw_rev: 1,
-            serial: 0x01020304,
-            made: 0x6553F100,
+    fn nrf52_info_write_rewrites_dropped_bytes_and_gives_up_after_three_passes() {
+        let info: Vec<u8> = (0..155).map(|i| i as u8 ^ 0x5A).collect();
+        // A device that drops the bytes listed per pass, as a slow flash EEPROM does.
+        let run = |drops: Vec<Vec<usize>>| {
+            let image = std::cell::RefCell::new(vec![0xFF; EEPROM_SIZE]);
+            let passes = std::cell::Cell::new(0);
+            let mut writes = Vec::new();
+            let matched = write_with_read_back::<()>(
+                &info,
+                |address, value| {
+                    writes.push(address);
+                    if !drops
+                        .get(passes.get())
+                        .is_some_and(|d| d.contains(&address))
+                    {
+                        image.borrow_mut()[address] = value;
+                    }
+                    Ok(())
+                },
+                || {
+                    passes.set(passes.get() + 1);
+                    Ok(Some(image.borrow().clone()))
+                },
+            )
+            .unwrap();
+            (matched, writes, passes.get())
         };
-        let frames = identity_write_frames(&info);
+
+        let (matched, writes, passes) = run(vec![]);
+        assert!(matched);
+        assert_eq!(writes, (0..155).collect::<Vec<_>>());
+        assert_eq!(passes, 1);
+
+        // The signature tail dropped first, then one byte again: only those are rewritten.
+        let (matched, writes, passes) = run(vec![(140..155).collect(), vec![154]]);
+        assert!(matched);
         assert_eq!(
-            frames[0],
-            rnode_admin::eeprom_write_frame(ADDR_PRODUCT as u8, 0x03)
+            writes[155..],
+            [(140..155).collect::<Vec<_>>(), vec![154]].concat()
         );
-        assert_eq!(
-            frames[1],
-            rnode_admin::eeprom_write_frame(ADDR_MODEL as u8, 0xB4)
-        );
-        assert_eq!(
-            frames.last().unwrap().payload,
-            vec![ADDR_INFO_LOCK as u8, INFO_LOCK_BYTE]
-        );
+        assert_eq!(passes, 3);
+
+        // Still dropped after the third rewrite: no match, so the caller never locks.
+        let (matched, writes, passes) = run(vec![vec![ADDR_MODEL]; 4]);
+        assert!(!matched);
+        assert_eq!(writes.len(), 155 + 3);
+        assert_eq!(passes, 4);
+
+        // No EEPROM reply counts as nothing written.
+        let mut writes = 0;
+        let matched = write_with_read_back::<()>(
+            &info,
+            |_, _| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(None),
+        )
+        .unwrap();
+        assert!(!matched);
+        assert_eq!(writes, 155 * 4);
     }
 }

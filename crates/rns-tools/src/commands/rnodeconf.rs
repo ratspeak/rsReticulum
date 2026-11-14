@@ -2,8 +2,8 @@
 //!
 //! Device probe, info, configuration summary, EEPROM dump and backup, device
 //! settings, signing and trust, firmware hash readout and TNC/normal startup
-//! mode follow upstream `rnodeconf`. Firmware installation, extraction, EEPROM
-//! wipe and bootstrap are disabled in this build.
+//! mode, EEPROM wipe and EEPROM bootstrap follow upstream `rnodeconf`.
+//! Firmware installation and extraction are disabled in this build.
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -15,6 +15,8 @@ use clap::{CommandFactory, Parser};
 use rns_interface::{rnode, rnode_admin};
 use rns_tools::RS_RETICULUM_VERSION;
 
+#[path = "rnodeconf/bootstrap.rs"]
+mod bootstrap;
 #[allow(dead_code)]
 #[path = "rnodeconf/eeprom.rs"]
 mod eeprom;
@@ -298,9 +300,7 @@ pub(crate) fn main() -> ExitCode {
     }
 
     log(format!("Opening serial port {port_path}..."));
-    let port = match rns_interface::serial::open_port(
-        serialport::new(&port_path, 115200).timeout(Duration::from_millis(100)),
-    ) {
+    let port = match open_serial(&port_path) {
         Ok(port) => port,
         Err(e) => {
             log("Could not open the specified serial port. The contained exception was:");
@@ -308,13 +308,37 @@ pub(crate) fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
-    let mut rnode = RNode::new(port, port_path);
+    let mut rnode = RNode::new(port, port_path.clone());
+    rnode.usb_serial_id = bootstrap::usb_serial_number(&port_path);
     match run_device(&mut rnode, &args) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("rnodeconf-rs: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Upstream `rnode_open_serial`.
+fn open_serial(path: &str) -> serialport::Result<Box<dyn serialport::SerialPort>> {
+    rns_interface::serial::open_port(
+        serialport::new(path, 115200).timeout(Duration::from_millis(100)),
+    )
+}
+
+/// Upstream `print_donation_block`.
+fn print_donation_block() {
+    for line in [
+        "  Ethereum  : 0x91C421DdfB8a30a49A71d63447ddb54cEBe3465E",
+        "  Bitcoin   : bc1pgqgu8h8xvj4jtafslq396v7ju7hkgymyrzyqft4llfslz5vp99psqfk3a6",
+        "  Monero    : 87HcDx6jRSkMQ9nPRd5K9hGGpZLn2s7vWETjMaVM5KfV4TD36NcYa8J8WSxhTSvBzzFpqDwp2fg5GX2moZ7VAP9QMZCZGET",
+        "  Ko-Fi     : https://ko-fi.com/markqvist",
+        "  LiberaPay : https://liberapay.com/reticulum",
+        "",
+        "  Info      : https://reticulum.network",
+        "  Code      : https://github.com/markqvist",
+    ] {
+        out(line);
     }
 }
 
@@ -329,6 +353,10 @@ fn run_device(rnode: &mut RNode, args: &Args) -> Result<ExitCode, String> {
     if rnode.detected == Some(true) && (rnode.platform.is_none() || rnode.mcu.is_none()) {
         rnode.platform = Some(model::PLATFORM_AVR);
         rnode.mcu = Some(model::MCU_1284P);
+    }
+
+    if args.eeprom_wipe {
+        return bootstrap::wipe(rnode);
     }
 
     log("Reading EEPROM...");
@@ -391,6 +419,21 @@ fn run_device(rnode: &mut RNode, args: &Args) -> Result<ExitCode, String> {
         out("");
         rnode.leave()?;
         return Ok(graceful_exit(rnode, 0));
+    }
+
+    if args.rom {
+        let request = bootstrap::Bootstrap {
+            product: args.product.as_deref(),
+            model: args.model.as_deref(),
+            hwrev: args.hwrev,
+            autoinstall: args.autoinstall,
+            mapped_product: model::PRODUCT_RNODE,
+            mapped_model: None,
+            firmware: None,
+            port_path: &rnode.name.clone(),
+        };
+        let signature_valid = device.as_ref().is_some_and(|d| d.signature.valid);
+        return bootstrap::bootstrap(rnode, &request, device.is_some(), signature_valid);
     }
 
     if args.sign {

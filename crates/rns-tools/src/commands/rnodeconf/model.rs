@@ -12,6 +12,8 @@ pub const MCU_2560: u8 = 0x92;
 pub const MCU_ESP32: u8 = 0x81;
 pub const MCU_NRF52: u8 = 0x71;
 
+pub const BOARD_RAK4631: u8 = 0x51;
+
 pub const PRODUCT_RNODE: u8 = 0x03;
 pub const PRODUCT_RAK4631: u8 = 0x10;
 pub const PRODUCT_TECHO: u8 = 0x15;
@@ -29,8 +31,16 @@ pub const PRODUCT_TBEAM_S_V1: u8 = 0xEA;
 pub const PRODUCT_XIAO_S3: u8 = 0xEB;
 pub const PRODUCT_HMBRW: u8 = 0xF0;
 
+pub const MODEL_A1: u8 = 0xA1;
+pub const MODEL_A5: u8 = 0xA5;
+pub const MODEL_A6: u8 = 0xA6;
+pub const MODEL_AA: u8 = 0xAA;
+pub const MODEL_AC: u8 = 0xAC;
 pub const MODEL_B4_TCXO: u8 = 0x04;
 pub const MODEL_B9_TCXO: u8 = 0x09;
+
+/// Upstream `ROM.MANUAL_FLASH_MODELS`, empty at 1.6.0.
+pub const MANUAL_FLASH_MODELS: &[u8] = &[];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelInfo {

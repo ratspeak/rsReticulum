@@ -11,9 +11,11 @@ use rns_interface::{kiss, rnode, rnode_admin};
 use super::{log, model};
 
 pub struct RNode {
-    port: Box<dyn serialport::SerialPort>,
+    /// `None` once upstream would have closed the serial port.
+    port: Option<Box<dyn serialport::SerialPort>>,
     inbox: FrameInbox,
     pub name: String,
+    pub usb_serial_id: Option<String>,
     pub detected: Option<bool>,
     pub platform: Option<u8>,
     pub mcu: Option<u8>,
@@ -30,9 +32,10 @@ pub struct RNode {
 impl RNode {
     pub fn new(port: Box<dyn serialport::SerialPort>, name: String) -> Self {
         Self {
-            port,
+            port: Some(port),
             inbox: FrameInbox::default(),
             name,
+            usb_serial_id: None,
             detected: None,
             platform: None,
             mcu: None,
@@ -56,10 +59,26 @@ impl RNode {
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.port
-            .write_all(bytes)
-            .and_then(|()| self.port.flush())
+        // pyserial's `PortNotOpenError` text, which upstream logs.
+        let port = self
+            .port
+            .as_mut()
+            .ok_or_else(|| "Attempting to use a port that is not open".to_string())?;
+        port.write_all(bytes)
+            .and_then(|()| port.flush())
             .map_err(|error| format!("serial write failed: {error}"))
+    }
+
+    /// Upstream `serial.close()`: its reader thread stops with the port.
+    pub fn close(&mut self) {
+        self.port = None;
+        self.inbox = FrameInbox::default();
+    }
+
+    /// Upstream assigns a newly opened port and starts a new reader thread.
+    pub fn reopen(&mut self, port: Box<dyn serialport::SerialPort>, name: String) {
+        self.port = Some(port);
+        self.name = name;
     }
 
     pub fn send(&mut self, command: u8, payload: &[u8]) -> Result<(), String> {
@@ -107,10 +126,13 @@ impl RNode {
             let wait = deadline
                 .saturating_duration_since(now)
                 .min(Duration::from_millis(50));
-            self.port
-                .set_timeout(wait)
+            let Some(port) = self.port.as_mut() else {
+                std::thread::sleep(deadline.saturating_duration_since(now));
+                return Ok(());
+            };
+            port.set_timeout(wait)
                 .map_err(|error| format!("could not set serial read timeout: {error}"))?;
-            match self.port.read(&mut buffer) {
+            match port.read(&mut buffer) {
                 Ok(count) => self.inbox.feed(&buffer[..count]),
                 Err(error)
                     if matches!(
@@ -269,6 +291,20 @@ impl RNode {
     pub fn hard_reset(&mut self) -> Result<(), String> {
         self.send(rnode::CMD_RESET, &[0xF8])?;
         self.pump(Duration::from_secs(2))
+    }
+
+    pub fn wipe_eeprom(&mut self) -> Result<(), String> {
+        self.send(rnode::CMD_ROM_WIPE, &[0xF8])?;
+        self.pump(Duration::from_secs(13))?;
+        if self.board == Some(model::BOARD_RAK4631) {
+            self.pump(Duration::from_secs(10))?;
+        }
+        Ok(())
+    }
+
+    pub fn write_eeprom(&mut self, address: usize, value: u8) -> Result<(), String> {
+        let address = u8::try_from(address).map_err(|_| "byte must be in range(0, 256)")?;
+        self.send(rnode::CMD_ROM_WRITE, &[address, value])
     }
 }
 

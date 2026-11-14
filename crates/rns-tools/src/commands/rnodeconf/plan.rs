@@ -16,14 +16,8 @@ pub fn refusal_without_port(args: &Args) -> Option<String> {
 
 /// Flows upstream starts only once a port is given.
 pub fn refusal_with_port(args: &Args) -> Option<String> {
-    if args.flash || args.rom || args.update {
+    if args.flash || args.update {
         return Some("firmware flashing is not implemented yet".to_string());
-    }
-    if args.eeprom_wipe {
-        return Some(
-            "--eeprom-wipe is destructive and is disabled until the full provisioning flow is implemented"
-                .to_string(),
-        );
     }
     None
 }
@@ -40,7 +34,7 @@ mod tests {
 
     #[test]
     fn firmware_flows_are_refused_only_once_a_port_is_given() {
-        for list in [&["--eeprom-wipe", "p"][..], &["--rom", "p"][..]] {
+        for list in [&["--flash", "p"][..], &["--update", "p"][..]] {
             assert!(refusal_without_port(&args(list)).is_none(), "{list:?}");
             assert!(refusal_with_port(&args(list)).is_some(), "{list:?}");
         }
@@ -48,6 +42,9 @@ mod tests {
 
     #[test]
     fn options_without_a_firmware_action_are_not_refused() {
+        for list in [&["--eeprom-wipe", "p"][..], &["--rom", "p"][..]] {
+            assert!(refusal_with_port(&args(list)).is_none(), "{list:?}");
+        }
         let parsed = args(&[
             "--nocheck",
             "--fw-url",
