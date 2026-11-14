@@ -460,32 +460,29 @@ fn import_known_sources(
 }
 
 /// Rows already in the database, through a read-only connection, with the legacy
-/// rows staged over them in memory. Nothing is written or renamed.
+/// rows merged over them in memory. Nothing is written or renamed.
 #[cfg(feature = "sqlite-store")]
 fn read_and_stage(path: &Path, now: f64) -> Vec<KnownDestinationRow> {
-    let mut rows: HashMap<DestHash, KnownDestinationRow> = HashMap::new();
+    let mut staged = MemoryStore::new();
     if path.is_file() {
         let read = SqliteKnownDestinations::open_ro(path).and_then(|mut reader| {
-            let mut loaded = Vec::new();
-            reader.load_all(&mut |row| loaded.push(row))?;
-            Ok::<_, StoreError>(loaded)
+            let mut loaded = KdBatch::default();
+            reader.load_all(&mut |row| loaded.upserts.push(row))?;
+            staged.apply(&loaded, &|_| true)
         });
-        match read {
-            Ok(loaded) => rows.extend(loaded.into_iter().map(|r| (r.destination_hash, r))),
-            Err(e) => error!(
+        if let Err(e) = read {
+            error!(
                 "could not read {}: {e}; continuing without its entries",
                 path.display()
-            ),
+            );
         }
     }
-    let mut staged = MemoryStore::new();
     import_known_sources(&LegacyFiles::beside(path), now, &mut staged, false);
-    if let Err(e) = staged.load_all(&mut |row| {
-        rows.insert(row.destination_hash, row);
-    }) {
+    let mut rows = Vec::new();
+    if let Err(e) = staged.load_all(&mut |row| rows.push(row)) {
         error!("could not stage legacy known destinations: {e}");
     }
-    rows.into_values().collect()
+    rows
 }
 
 /// Pending known-destination and ratchet marks (Python `KnownDestinationsStore`
@@ -1551,6 +1548,68 @@ mod tests {
             Some(([2; 32], now - 60.0))
         );
         actor.on_shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn write_python_known_destination(dir: &Path, dest: DestHash, last_heard: f64, app: &[u8]) {
+        use rmpv::Value;
+        let file = Value::Map(vec![(
+            Value::Binary(dest.to_vec()),
+            Value::Array(vec![
+                Value::F64(last_heard),
+                Value::Binary(vec![9; 32]),
+                Value::Binary(vec![dest[0]; 64]),
+                Value::Binary(app.to_vec()),
+                Value::Integer(0.into()),
+            ]),
+        )]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &file).unwrap();
+        std::fs::write(dir.join("known_destinations"), bytes).unwrap();
+    }
+
+    /// Both legacy sources beside a new database: an older Python row must not
+    /// replace the Rust cache's row, its pin and facts included.
+    #[test]
+    fn an_older_python_known_destination_does_not_replace_the_rust_cache_row() {
+        let dir = temp_dir();
+        let now = crate::now_f64();
+        let mut cached = entry([12; 16], None, true);
+        cached.timestamp = now - 60.0;
+        cached.name_hash = [5; 10];
+        crate::persistence::save_announce_cache([&cached], &dir.join("announce_cache.msgpack"))
+            .unwrap();
+        write_python_known_destination(&dir, [12; 16], now - 5.0 * 86_400.0, b"old name");
+        let mut actor = actor_on(&dir);
+        let restored = &actor.recent_announces[&[12; 16]];
+        assert_eq!(restored.app_data.as_deref(), Some(&b"app"[..]));
+        assert_eq!(restored.timestamp, now - 60.0);
+        assert!(restored.retained && restored.facts_known);
+        actor.on_shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A database that is only read still keeps its rows over older legacy files.
+    #[test]
+    fn a_staged_read_keeps_a_stored_row_heard_after_the_legacy_file() {
+        let dir = temp_dir();
+        let now = crate::now_f64();
+        let db = dir.join("known_destinations.db");
+        let mut row = KnownDestinationRow::new([13; 16], now - 60.0, [13; 64]);
+        row.app_data = Some(b"stored".to_vec());
+        let batch = KdBatch {
+            upserts: vec![row],
+            ..KdBatch::default()
+        };
+        SqliteKnownDestinations::open_rw(&db)
+            .unwrap()
+            .apply(&batch, &|_| true)
+            .unwrap();
+        write_python_known_destination(&dir, [13; 16], now - 3600.0, b"old name");
+        let rows = read_and_stage(&db, now);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].app_data.as_deref(), Some(&b"stored"[..]));
+        assert!(dir.join("known_destinations").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

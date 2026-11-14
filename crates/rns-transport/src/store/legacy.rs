@@ -1,9 +1,10 @@
 //! One-way importers for the pre-SQLite files. Each function reads one source,
 //! writes through the given store, and returns the paths the caller may remove
 //! after its own transaction has committed. Only the announce-cache import
-//! removes files itself, chunk by chunk, each after its own commit.
+//! removes files itself, chunk by chunk, each after its own commit. A
+//! destination or ratchet the store already holds is replaced only by a newer one.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rmpv::Value;
@@ -81,20 +82,43 @@ fn num(value: &Value) -> Option<f64> {
     }
 }
 
-/// Writes `rows` (and their ratchets) in one batch. A ratchet is kept only if its
-/// destination is among the rows written here.
+/// Writes `rows` (and their ratchets) in one batch over what `store` holds. A
+/// row heard before the stored one is skipped; a later one keeps the stored pin,
+/// latest use, and the facts it does not carry. A ratchet replaces only an older
+/// one, and is kept only for a destination the store knows after the batch.
 fn write_rows(
     rows: Vec<LegacyRow>,
     removable: Vec<PathBuf>,
     store: &mut dyn KnownDestinationStore,
 ) -> Result<LegacyImport, StoreError> {
-    let known: HashSet<DestHash> = rows.iter().map(|r| r.row.destination_hash).collect();
+    let mut stored = HashMap::new();
+    store.load_all(&mut |row| {
+        stored.insert(row.destination_hash, row);
+    })?;
+    let mut known: HashSet<DestHash> = stored.keys().copied().collect();
     let mut batch = KdBatch::default();
-    for legacy in rows {
-        if let Some(ratchet) = legacy.ratchet {
+    for LegacyRow { mut row, ratchet } in rows {
+        let dest = row.destination_hash;
+        known.insert(dest);
+        if let Some(ratchet) = ratchet
+            && !store
+                .fetch_ratchet(&dest)?
+                .is_some_and(|(_, held)| held >= ratchet.received)
+        {
             batch.ratchet_upserts.push(ratchet);
         }
-        batch.upserts.push(legacy.row);
+        if let Some(held) = stored.get(&dest) {
+            if held.last_heard > row.last_heard {
+                continue;
+            }
+            row.used = if held.used == -1.0 || row.used == -1.0 {
+                -1.0
+            } else {
+                held.used.max(row.used)
+            };
+            row.announce_facts = row.announce_facts.or(held.announce_facts);
+        }
+        batch.upserts.push(row);
     }
     let report = store.apply(&batch, &|h| known.contains(h))?;
     let rejected = report
@@ -474,6 +498,59 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn store_with(row: KnownDestinationRow) -> MemoryStore {
+        let mut store = MemoryStore::new();
+        let batch = KdBatch {
+            upserts: vec![row],
+            ..KdBatch::default()
+        };
+        store.apply(&batch, &|_| true).unwrap();
+        store
+    }
+
+    fn stored_row(store: &mut MemoryStore, dest: DestHash) -> KnownDestinationRow {
+        let mut found = None;
+        store
+            .load_all(&mut |r| {
+                if r.destination_hash == dest {
+                    found = Some(r);
+                }
+            })
+            .unwrap();
+        found.expect("row stored")
+    }
+
+    /// The file's entry for `[1; 16]` was last heard at `NOW`.
+    #[test]
+    fn a_legacy_row_heard_before_the_stored_row_is_skipped() {
+        let dir = unique_dir("kd-older");
+        let path = dir.join("known_destinations");
+        std::fs::write(&path, bytes(KD_FILE_HEX)).unwrap();
+        let mut newer = KnownDestinationRow::new([1; 16], NOW + 10.0, [1; 64]);
+        newer.app_data = Some(b"rust".to_vec());
+        newer.announce_facts = Some(AnnounceFacts::new(2, [7; 10], false));
+        let mut store = store_with(newer.clone());
+        import_python_known_destinations(&path, NOW + 20.0, &mut store).unwrap();
+        assert_eq!(stored_row(&mut store, [1; 16]), newer);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_legacy_row_heard_after_the_stored_row_keeps_its_pin_and_facts() {
+        let dir = unique_dir("kd-newer");
+        let path = dir.join("known_destinations");
+        std::fs::write(&path, bytes(KD_FILE_HEX)).unwrap();
+        let mut older = KnownDestinationRow::new([1; 16], NOW - 10.0, [1; 64]);
+        older.used = -1.0;
+        older.announce_facts = Some(AnnounceFacts::new(2, [7; 10], false));
+        let mut store = store_with(older.clone());
+        import_python_known_destinations(&path, NOW + 20.0, &mut store).unwrap();
+        let row = stored_row(&mut store, [1; 16]);
+        assert_eq!((row.last_heard, row.packet_hash), (NOW, Some([9; 32])));
+        assert_eq!((row.used, row.announce_facts), (-1.0, older.announce_facts));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn python_ratchet_files_keep_only_known_fresh_ratchets_and_remove_all() {
         let dir = unique_dir("ratchets");
@@ -655,6 +732,46 @@ mod tests {
         assert_eq!(
             store.fetch_ratchet(&[6; 16]).unwrap(),
             Some(([0x60; 32], NOW - 3600.0))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cache_ratchet_older_than_the_stored_ratchet_is_not_imported() {
+        let dir = unique_dir("rust-v6-older-ratchet");
+        let path = dir.join("announce_cache.msgpack");
+        let entry = persistence::PersistedAnnounceEntry {
+            destination_hash: vec![4; 16],
+            hops: 1,
+            app_data: None,
+            timestamp: NOW - 3.0,
+            public_key: Some(vec![4; 64]),
+            ratchet: Some(vec![0x40; 32]),
+            packet_hash: None,
+            retained: false,
+            name_hash: vec![0; 10],
+            is_path_response: false,
+            last_used: None,
+            stamp: None,
+            stamp_value: 0.0,
+            lr_cost: None,
+            ratchet_received: Some(NOW - 3.0),
+        };
+        let file = persistence::PersistedAnnounceCache {
+            entries: vec![entry],
+            version: persistence::PersistedAnnounceCache::CURRENT_VERSION,
+        };
+        std::fs::write(&path, rmp_serde::to_vec(&file).unwrap()).unwrap();
+        let mut store = MemoryStore::new();
+        let newer = KdBatch {
+            ratchet_upserts: vec![RatchetRow::new([4; 16], [0x77; 32], NOW)],
+            ..KdBatch::default()
+        };
+        store.apply(&newer, &|_| true).unwrap();
+        import_rust_announce_cache(&path, NOW, &mut store).unwrap();
+        assert_eq!(
+            store.fetch_ratchet(&[4; 16]).unwrap(),
+            Some(([0x77; 32], NOW))
         );
         std::fs::remove_dir_all(&dir).ok();
     }
