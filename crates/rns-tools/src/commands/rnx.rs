@@ -225,7 +225,7 @@ async fn listen(args: &Args, interrupt: &ShutdownSignal) -> ! {
                 }
             }
         }
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = rns_runtime::platform::home_dir();
         let file = rns_tools::rnx::allowed_identity_files(home.as_deref())
             .into_iter()
             .find(|f| f.is_file());

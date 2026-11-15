@@ -563,9 +563,11 @@ fn remote_inputs(remote: &str, identity: Option<&Path>) -> Result<([u8; 16], Ide
 /// Python `os.path.expanduser` for a leading `~`.
 fn expand_user(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
-    match (text.strip_prefix('~'), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
-            PathBuf::from(format!("{}{rest}", PathBuf::from(home).display()))
+    match (text.strip_prefix('~'), rns_runtime::platform::home_dir()) {
+        (Some(rest), Some(home))
+            if rest.is_empty() || rest.starts_with(std::path::is_separator) =>
+        {
+            PathBuf::from(format!("{}{rest}", home.display()))
         }
         _ => path.to_path_buf(),
     }

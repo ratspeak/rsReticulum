@@ -285,12 +285,7 @@ fn abspath(path: &str, cwd: &str) -> String {
 }
 
 fn process_home() -> Option<String> {
-    let home = std::env::var("HOME").ok();
-    if cfg!(windows) {
-        ntpath::home(home, std::env::var("USERPROFILE").ok())
-    } else {
-        home
-    }
+    crate::platform::home_dir().and_then(|home| home.into_os_string().into_string().ok())
 }
 
 fn process_cwd() -> String {
@@ -488,13 +483,6 @@ mod ntpath {
             }
             _ => path.to_string(),
         }
-    }
-
-    /// `HOME`, else `USERPROFILE`, where Windows keeps it.
-    pub(super) fn home(home: Option<String>, userprofile: Option<String>) -> Option<String> {
-        home.into_iter()
-            .chain(userprofile)
-            .find(|dir| !dir.is_empty())
     }
 
     /// `ntpath.basename`.
@@ -2461,14 +2449,6 @@ mod tests {
         assert_eq!(ntpath::expanduser("~/files", home), r"C:\Users\me/files");
         assert_eq!(ntpath::expanduser(r"~other\files", home), r"~other\files");
         assert_eq!(ntpath::expanduser(r"~\files", None), r"~\files");
-        let profile = Some(r"C:\Users\me".to_string());
-        assert_eq!(ntpath::home(None, profile.clone()), profile);
-        assert_eq!(ntpath::home(Some(String::new()), profile.clone()), profile);
-        assert_eq!(
-            ntpath::home(Some(r"H:\".into()), profile),
-            Some(r"H:\".into())
-        );
-        assert_eq!(ntpath::home(None, None), None);
     }
 
     #[test]

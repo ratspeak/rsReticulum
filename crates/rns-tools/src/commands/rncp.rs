@@ -28,10 +28,12 @@ use rns_identity::destination::{DestType, Destination, Direction};
 use rns_transport::messages::{OutboundRequest, TransportMessage};
 
 fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+    if let Some(rest) = p
+        .strip_prefix('~')
+        .and_then(|rest| rest.strip_prefix(std::path::is_separator))
+        && let Some(home) = rns_runtime::platform::home_dir()
     {
-        return PathBuf::from(home).join(rest);
+        return home.join(rest);
     }
     PathBuf::from(p)
 }
@@ -1176,8 +1178,7 @@ fn allowed_identities(cli: &[String], candidates: &[PathBuf]) -> Result<Vec<[u8;
 
 fn rncp_allowed_identity_file_candidates() -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from("/etc/rncp/allowed_identities")];
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = rns_runtime::platform::home_dir() {
         paths.push(home.join(".config/rncp/allowed_identities"));
         paths.push(home.join(".rncp/allowed_identities"));
     }

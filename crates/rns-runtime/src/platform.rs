@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +95,24 @@ pub fn resolve_config_dir(configdir: Option<&str>) -> PathBuf {
     }
 }
 
+/// The directory a leading `~` names: `HOME`, or on Windows `USERPROFILE`
+/// when `HOME` is unset or empty.
+pub fn home_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME");
+    if cfg!(windows) {
+        windows_home(home, std::env::var_os("USERPROFILE"))
+    } else {
+        home.map(PathBuf::from)
+    }
+}
+
+fn windows_home(home: Option<OsString>, userprofile: Option<OsString>) -> Option<PathBuf> {
+    home.into_iter()
+        .chain(userprofile)
+        .find(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
 pub struct StoragePaths {
     pub config_dir: PathBuf,
     pub interface_dir: PathBuf,
@@ -162,6 +181,16 @@ mod tests {
                 || dir.ends_with(".rsReticulum")
                 || dir.ends_with("/data/local/tmp/.rsReticulum")
         );
+    }
+
+    #[test]
+    fn windows_home_falls_back_to_the_user_profile() {
+        let profile = Some(OsString::from(r"C:\Users\me"));
+        let home = |home: Option<&str>| windows_home(home.map(OsString::from), profile.clone());
+        assert_eq!(home(None), Some(PathBuf::from(r"C:\Users\me")));
+        assert_eq!(home(Some("")), Some(PathBuf::from(r"C:\Users\me")));
+        assert_eq!(home(Some(r"H:\")), Some(PathBuf::from(r"H:\")));
+        assert_eq!(windows_home(None, None), None);
     }
 
     #[test]

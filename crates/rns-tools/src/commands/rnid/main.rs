@@ -493,12 +493,12 @@ fn expanduser(path: &str) -> String {
     let Some(rest) = path.strip_prefix('~') else {
         return path.to_string();
     };
-    let (user, tail) = match rest.find('/') {
+    let (user, tail) = match rest.find(std::path::is_separator) {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
     };
     let home = if user.is_empty() {
-        std::env::var("HOME").ok()
+        rns_runtime::platform::home_dir().and_then(|home| home.into_os_string().into_string().ok())
     } else {
         std::fs::read_to_string("/etc/passwd")
             .ok()

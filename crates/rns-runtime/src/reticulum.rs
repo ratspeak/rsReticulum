@@ -3443,10 +3443,12 @@ fn parse_hash16_list(key: &str, list: Option<Vec<String>>) -> Result<Vec<[u8; 16
 }
 
 fn expand_home_path(path: &str) -> PathBuf {
-    if (path == "~" || path.starts_with("~/"))
-        && let Ok(home) = std::env::var("HOME")
+    if let Some(rest) = path.strip_prefix('~')
+        && (rest.is_empty() || rest.starts_with(std::path::is_separator))
+        && let Some(home) = crate::platform::home_dir()
+        && let Ok(home) = home.into_os_string().into_string()
     {
-        return PathBuf::from(format!("{home}{}", &path[1..]));
+        return PathBuf::from(format!("{home}{rest}"));
     }
     PathBuf::from(path)
 }
