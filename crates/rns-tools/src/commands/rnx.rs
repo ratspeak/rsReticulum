@@ -17,7 +17,7 @@ use rns_identity::destination::{AllowPolicy, DestType, Destination, Direction};
 use rns_identity::identity::Identity;
 use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
 use rns_runtime::link_manager::{LinkManager, LinkManagerCommand, RequestOutcome};
-use rns_runtime::link_session::{LinkSession, LinkSessionError, RequestOptions};
+use rns_runtime::link_session::{LinkSession, LinkSessionError, LinkSessionEvent, RequestOptions};
 use rns_runtime::platform::StoragePaths;
 use rns_runtime::reticulum::{LinkConnectOptions, ReticulumHandle};
 use rns_tools::RS_RETICULUM_VERSION;
@@ -135,14 +135,19 @@ pub(crate) async fn main() {
         }
     };
     let handle = start(&args, &interrupt).await;
+    let mut link = None;
     let code = tokio::select! {
         biased;
         _ = interrupt.wait() => {
             println!();
             0
         }
-        code = run_client(&args, &handle, destination_hash) => code,
+        code = run_client(&args, &handle, destination_hash, &mut link) => code,
     };
+    // rnx.py tears the Link down before exiting, on an interrupt too.
+    if let Some(link) = link {
+        link.teardown().await;
+    }
     rns_tools::exit(&handle, code).await;
 }
 
@@ -375,7 +380,12 @@ fn secs(seconds: f64) -> Duration {
     Duration::try_from_secs_f64(seconds.max(0.0)).unwrap_or(Duration::MAX)
 }
 
-async fn run_client(args: &Args, handle: &ReticulumHandle, destination_hash: [u8; 16]) -> i32 {
+async fn run_client(
+    args: &Args,
+    handle: &ReticulumHandle,
+    destination_hash: [u8; 16],
+    link: &mut Option<Connected>,
+) -> i32 {
     // rnx.py
     handle.wants_destination_type(APP_NAME).await;
     let identity = prepare_identity(args.identity.as_deref(), handle);
@@ -383,14 +393,10 @@ async fn run_client(args: &Args, handle: &ReticulumHandle, destination_hash: [u8
         handle,
         identity,
         destination_hash,
-        session: None,
+        session: link,
     };
     let timeout = args.w.map_or(Timeout::Default, Timeout::Given);
-    let code = run_commands(args, &mut client, timeout).await;
-    if let Some((session, _)) = client.session.take() {
-        session.handle.close().await;
-    }
-    code
+    run_commands(args, &mut client, timeout).await
 }
 
 async fn run_commands(args: &Args, client: &mut Client<'_>, timeout: Timeout) -> i32 {
@@ -468,7 +474,23 @@ struct Client<'a> {
     handle: &'a ReticulumHandle,
     identity: Identity,
     destination_hash: [u8; 16],
-    session: Option<(LinkSession, f64)>,
+    session: &'a mut Option<Connected>,
+}
+
+/// An established Link, its measured round trip, and the task draining its
+/// events until the session actor reports it closed.
+struct Connected {
+    session: LinkSession,
+    rtt: f64,
+    closed: tokio::task::JoinHandle<()>,
+}
+
+impl Connected {
+    /// `Link.teardown()` (Link.py): the close is done before this returns.
+    async fn teardown(self) {
+        self.session.handle.close().await;
+        let _ = self.closed.await;
+    }
 }
 
 impl Client<'_> {
@@ -498,8 +520,7 @@ impl Client<'_> {
     }
 
     /// Open the Link with `max(-w, establishment timeout)` (rnx.py).
-    /// Returns the session and its measured round trip.
-    async fn connect(&self, noid: bool, timeout: Timeout) -> Option<(LinkSession, f64)> {
+    async fn connect(&self, noid: bool, timeout: Timeout) -> Option<Connected> {
         let handle = self.handle;
         let hash = self.destination_hash;
         let hops = handle.hops_to(hash).await.unwrap_or(1);
@@ -529,8 +550,12 @@ impl Client<'_> {
             Ok(mut session) => {
                 let rtt = session.handle.rtt();
                 let events = std::mem::replace(&mut session.events, mpsc::channel(1).1);
-                tokio::spawn(drain(events));
-                Some((session, rtt))
+                let closed = tokio::spawn(drain(events));
+                Some(Connected {
+                    session,
+                    rtt,
+                    closed,
+                })
             }
             Err(e) => {
                 tracing::debug!("link establishment failed: {e}");
@@ -561,7 +586,7 @@ impl Client<'_> {
         }
         if self.session.is_none() {
             match self.connect(args.noid, timeout).await {
-                Some(session) => self.session = Some(session),
+                Some(connected) => *self.session = Some(connected),
                 None => {
                     println!(
                         "Could not establish link with <{}>",
@@ -571,8 +596,8 @@ impl Client<'_> {
                 }
             }
         }
-        let (session, rtt) = self.session.as_ref().expect("connected above");
-        let (link, rtt) = (session.handle.clone(), *rtt);
+        let connected = self.session.as_ref().expect("connected above");
+        let (link, rtt) = (connected.session.handle.clone(), connected.rtt);
         let data = rns_tools::rnx::request_value(command, timeout, args.stdout, args.stderr, stdin);
         let request_size = packed_request_size(&data);
         let rexec_timeout = timeout.seconds() + rtt * 4.0 + REMOTE_EXEC_GRACE;
@@ -600,7 +625,7 @@ impl Client<'_> {
             None => return fail("No response", 249),
             Some(Ok(response)) => response,
             Some(Err(LinkSessionError::SessionClosed | LinkSessionError::LinkNotActive)) => {
-                self.session = None;
+                *self.session = None;
                 println!("Could not request remote execution, link was closed");
                 return Outcome::Exit(244);
             }
@@ -641,9 +666,6 @@ impl Client<'_> {
         write_split(&parsed, &rendered);
 
         if !interactive {
-            if let Some((session, _)) = self.session.take() {
-                session.handle.close().await;
-            }
             return Outcome::Exit(code);
         }
         Outcome::Done(if args.mirror { parsed.retcode } else { None })
@@ -678,6 +700,10 @@ fn packed_request_size(data: &rmpv::Value) -> u64 {
     out.len() as u64
 }
 
-async fn drain(mut events: mpsc::Receiver<rns_runtime::link_session::LinkSessionEvent>) {
-    while events.recv().await.is_some() {}
+async fn drain(mut events: mpsc::Receiver<LinkSessionEvent>) {
+    while let Some(event) = events.recv().await {
+        if let LinkSessionEvent::Closed { .. } = event {
+            return;
+        }
+    }
 }
