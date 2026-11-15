@@ -436,7 +436,15 @@ mod tests {
             let platform = case["platform"].as_u64().unwrap() as u8;
             let expected: Option<Vec<String>> =
                 serde_json::from_value(case["argv"].clone()).unwrap();
-            let got = plan_flasher(platform, fw, &ctx).map(|plan| plan.argv());
+            // Upstream's vectors hold POSIX paths; on Windows the same plan joins with `\`.
+            let got = plan_flasher(platform, fw, &ctx).map(|plan| {
+                let argv: Vec<String> = plan.argv();
+                if cfg!(windows) {
+                    argv.into_iter().map(|a| a.replace('\\', "/")).collect()
+                } else {
+                    argv
+                }
+            });
             if got != expected {
                 mismatches.push(format!(
                     "{fw} @ {}\n  upstream {expected:?}\n  rust     {got:?}",
