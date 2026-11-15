@@ -186,17 +186,11 @@ fn poll_shared_server(
         let output = rnstatus_json(tmp);
         last_status = output.status.code();
         (last_stdout, last_stderr) = output_text(&output);
-        if output.status.success() {
-            let value: serde_json::Value = match serde_json::from_slice(&output.stdout) {
-                Ok(value) => value,
-                Err(error) => {
-                    return Err(format!(
-                        "rnstatus-rs succeeded without printing JSON ({error})\n\
-                         --- rnstatus stdout ---\n{last_stdout}\n\
-                         --- rnstatus stderr ---\n{last_stderr}"
-                    ));
-                }
-            };
+        // A client started before the daemon has created its storage logs
+        // upstream's error ahead of the JSON; that only means not up yet.
+        if output.status.success()
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        {
             let ready = value
                 .get("interfaces")
                 .and_then(|v| v.as_array())
@@ -237,8 +231,18 @@ fn read_probe_hash(responder: &mut ChildGuard, tmp: &TempDir) -> Result<[u8; 16]
 
         let output = rnstatus_json(tmp);
         let (stdout, stderr) = output_text(&output);
-        let reported = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .ok()
+        let value = match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            Ok(value) => Some(value),
+            // The daemon is up, so a status it answers must be clean JSON.
+            Err(error) if output.status.success() => {
+                return Err(format!(
+                    "rnstatus-rs succeeded without printing JSON ({error})\n\
+                     stdout: {stdout}\nstderr: {stderr}"
+                ));
+            }
+            Err(_) => None,
+        };
+        let reported = value
             .and_then(|value| value.get("probe_responder")?.as_str().map(str::to_owned))
             .and_then(|text| hex::decode(text).ok())
             .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok());

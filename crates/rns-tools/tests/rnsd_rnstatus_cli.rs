@@ -170,17 +170,11 @@ where
         last_status = output.status.code();
         (last_stdout, last_stderr) = output_text(&output);
 
-        if output.status.success() {
-            let value: serde_json::Value = match serde_json::from_slice(&output.stdout) {
-                Ok(value) => value,
-                Err(error) => {
-                    return Err(format!(
-                        "rnstatus-rs succeeded without printing JSON ({error})\n\
-                         --- rnstatus stdout ---\n{last_stdout}\n\
-                         --- rnstatus stderr ---\n{last_stderr}"
-                    ));
-                }
-            };
+        // A client started before the daemon has created its storage logs
+        // upstream's error ahead of the JSON; that only means not up yet.
+        if output.status.success()
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        {
             let interfaces = value
                 .get("interfaces")
                 .and_then(|v| v.as_array())
