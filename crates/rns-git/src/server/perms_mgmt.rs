@@ -93,7 +93,7 @@ fn read_allowed(path: &Path, what: &str) -> Vec<u8> {
 /// The file part of the `set` step: refuse an executable resolver, then
 /// write through `<path>.tmp` and a rename. `Ok(None)` was written.
 fn write_allowed(path: &Path, content: &str) -> Option<Vec<u8>> {
-    if nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok() {
+    if crate::platform::executable(path) {
         return Some(status(
             RES_DISALLOWED,
             "Executable permission resolvers can only be modified node-side",

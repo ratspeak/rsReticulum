@@ -266,7 +266,7 @@ pub fn load_allowed_permissions(
     if !path.is_file() {
         return Ok((Permissions::default(), false));
     }
-    let executable = nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok();
+    let executable = crate::platform::executable(path);
     let (raw, dynamic) = if executable {
         let output = std::process::Command::new(path)
             .stdin(std::process::Stdio::inherit())

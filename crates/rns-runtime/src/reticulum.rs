@@ -8082,6 +8082,7 @@ async fn resolve_discovery_inputs(
         config.interface_type.as_str(),
         "BackboneInterface" | "TCPServerInterface"
     ) {
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut reachable_on = sanitize(config.reachable_on.as_deref()?);
         #[cfg(unix)]
         {
@@ -8112,6 +8113,7 @@ async fn resolve_discovery_inputs(
 /// (Discovery.py).
 // Plain comparisons let NaN through, as upstream's do.
 #[allow(clippy::manual_range_contains)]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn parse_discovery_location(output: &str) -> Result<(f64, f64, f64), String> {
     let output = output.replace(' ', "");
     let parts: Vec<&str> = output.split(',').collect();

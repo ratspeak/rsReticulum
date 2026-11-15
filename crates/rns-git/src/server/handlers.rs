@@ -653,12 +653,7 @@ pub fn handle_create(
             );
         }
     };
-    use std::os::unix::fs::DirBuilderExt;
-    if let Err(e) = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o755)
-        .create(&repository_path)
-    {
+    if let Err(e) = crate::platform::create_dir_all_755(&repository_path) {
         tracing::error!(
             "Error while creating repository {group}/{repo} for {}: {e}",
             identity_text(identity)

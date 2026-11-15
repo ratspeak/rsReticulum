@@ -36,11 +36,13 @@ const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 const SIZE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What a stopped fetch gets to drop its lock files before it is killed.
+#[cfg(unix)]
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Process groups of the fetches in flight.
+#[cfg(unix)]
 static FETCHES: Mutex<Vec<nix::libc::pid_t>> = Mutex::new(Vec::new());
 
 /// What a clone handler makes: a fork or a mirror.
@@ -115,22 +117,27 @@ fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+#[cfg(unix)]
 fn signal_group(pgid: nix::libc::pid_t, signal: nix::libc::c_int) {
     // SAFETY: killpg takes two integers and touches no memory of this process.
     unsafe { nix::libc::killpg(pgid, signal) };
 }
 
 /// Stop the fetches in flight. They run in their own process groups, so a
-/// terminal interrupt of the node does not reach them.
+/// terminal interrupt of the node does not reach them. On Windows they share
+/// the node's console, so its interrupt reaches them directly.
 pub fn stop_fetches() {
+    #[cfg(unix)]
     for pgid in FETCHES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         signal_group(*pgid, nix::libc::SIGTERM);
     }
 }
 
 /// A fetch's process group, listed in `FETCHES` while it runs.
+#[cfg(unix)]
 struct FetchGroup(nix::libc::pid_t);
 
+#[cfg(unix)]
 impl FetchGroup {
     fn new(child: &std::process::Child) -> Self {
         let pgid = child.id() as nix::libc::pid_t;
@@ -150,12 +157,30 @@ impl FetchGroup {
     }
 }
 
+#[cfg(unix)]
 impl Drop for FetchGroup {
     fn drop(&mut self) {
         FETCHES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|pgid| *pgid != self.0);
+    }
+}
+
+/// Without process groups or signals, a stopped fetch is terminated at once;
+/// git may leave its lock files behind.
+#[cfg(not(unix))]
+struct FetchGroup;
+
+#[cfg(not(unix))]
+impl FetchGroup {
+    fn new(_child: &std::process::Child) -> Self {
+        FetchGroup
+    }
+
+    fn stop(&self, child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -217,19 +242,20 @@ fn fetch_all(
     source: &str,
     limits: FetchLimits,
 ) -> std::io::Result<Fetched> {
-    use std::os::unix::process::CommandExt;
     let packs_before = pack_files(repo_path);
     let size_before = dir_size(repo_path);
     let grown = || dir_size(repo_path).saturating_sub(size_before);
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["fetch", source, "+refs/*:refs/*"])
         .current_dir(repo_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        // Its own group, so the transport helpers it starts are stopped with it.
-        .process_group(0)
-        .spawn()?;
+        .stderr(Stdio::piped());
+    // Its own group, so the transport helpers it starts are stopped with it.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn()?;
     let group = FetchGroup::new(&child);
     let mut stderr = child.stderr.take().expect("piped");
     let reader = std::thread::spawn(move || {
@@ -492,7 +518,7 @@ pub fn sync_mirrors(repos: &RwLock<Repositories>, mirror_interval: i64, sync_loc
 fn move_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     match std::fs::rename(from, to) {
         Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(nix::libc::EXDEV) => {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
             copy_dir(from, to)?;
             std::fs::remove_dir_all(from)
         }
@@ -508,7 +534,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
         let target = to.join(entry.file_name());
         let kind = entry.file_type()?;
         if kind.is_symlink() {
-            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
+            crate::platform::copy_symlink(&entry.path(), &target)?;
         } else if kind.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else {
@@ -662,14 +688,7 @@ fn clone_into(
     let tmpdir = tempfile::TempDir::new().map_err(|e| e.to_string())?;
     tracing::debug!("Created temporary directory {}", tmpdir.path().display());
     let temp_path = tmpdir.path().join(repo);
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(&temp_path)
-            .map_err(|e| e.to_string())?;
-    }
+    crate::platform::create_dir_all_755(&temp_path).map_err(|e| e.to_string())?;
     let run = |args: &[&str]| git(Some(&temp_path), args).map_err(|e| e.to_string());
 
     let result = run(&["init", "--bare"])?;

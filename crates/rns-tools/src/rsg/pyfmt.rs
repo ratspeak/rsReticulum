@@ -175,6 +175,7 @@ pub fn py_fromhex(text: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Python `str(OSError)` for a failed file operation.
+#[cfg(unix)]
 pub fn py_os_error(error: &std::io::Error, path: &str) -> String {
     match error.raw_os_error() {
         Some(code) => format!(
@@ -183,6 +184,21 @@ pub fn py_os_error(error: &std::io::Error, path: &str) -> String {
             py_str_repr(path)
         ),
         None => error.to_string(),
+    }
+}
+
+/// Python `str(OSError)` for a failed file operation, with the system's own
+/// message where Unix has a `strerror` table, as `rnodeconf-rs` prints it.
+#[cfg(not(unix))]
+pub fn py_os_error(error: &std::io::Error, path: &str) -> String {
+    let text = error.to_string();
+    match error.raw_os_error() {
+        Some(code) => format!(
+            "[Errno {code}] {}: {}",
+            text.split(" (os error").next().unwrap_or(&text),
+            py_str_repr(path)
+        ),
+        None => text,
     }
 }
 

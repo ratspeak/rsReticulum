@@ -23,6 +23,9 @@ hex = { workspace = true }
 rns-wire = { workspace = true, features = ["std"] }
 tempfile = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 serde_json = { workspace = true }
 

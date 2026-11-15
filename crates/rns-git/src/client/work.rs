@@ -142,24 +142,15 @@ fn timestamp(value: Option<&Value>) -> f64 {
 
 /// `time.strftime("%Y-%m-%d %H:%M[:%S]", time.localtime(ts))`.
 fn strftime(ts: f64, seconds: bool) -> String {
-    let time = ts.floor() as nix::libc::time_t;
-    let mut tm = std::mem::MaybeUninit::<nix::libc::tm>::zeroed();
-    // SAFETY: both pointers are valid for the call; localtime_r is reentrant.
-    if unsafe { nix::libc::localtime_r(&time, tm.as_mut_ptr()) }.is_null() {
+    let Some(tm) = crate::platform::localtime(ts.floor() as i64) else {
         return String::new();
-    }
-    // SAFETY: localtime_r filled `tm` when it returned non-null.
-    let tm = unsafe { tm.assume_init() };
+    };
     let mut out = format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min
+        tm.year, tm.month, tm.day, tm.hour, tm.minute
     );
     if seconds {
-        out.push_str(&format!(":{:02}", tm.tm_sec));
+        out.push_str(&format!(":{:02}", tm.second));
     }
     out
 }
@@ -211,10 +202,7 @@ fn run_editor(
         .status()
         .map_err(|e| e.to_string())?;
     if !status.success() {
-        let code = status.code().unwrap_or_else(|| {
-            use std::os::unix::process::ExitStatusExt;
-            -status.signal().unwrap_or(0)
-        });
+        let code = crate::platform::return_code(status);
         let _ = writeln!(out, "Editor exited with error code {code}");
         let _ = std::fs::remove_file(&path);
         return Ok(None);

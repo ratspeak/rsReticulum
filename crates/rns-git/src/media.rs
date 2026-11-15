@@ -85,6 +85,7 @@ static WINNER: Mutex<Option<&'static str>> = Mutex::new(None);
 static NO_BACKEND_LOGGED: Mutex<bool> = Mutex::new(false);
 
 /// `shutil.which`: an executable file of that name on `PATH`.
+#[cfg(unix)]
 pub fn which(tool: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let Some(path) = std::env::var_os("PATH") else {
@@ -94,6 +95,27 @@ pub fn which(tool: &str) -> bool {
         std::fs::metadata(dir.join(tool))
             .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     })
+}
+
+/// `shutil.which` on Windows: a file of that name on `PATH`, tried with each
+/// `PATHEXT` extension unless it already ends in one.
+#[cfg(not(unix))]
+pub fn which(tool: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    let extensions: Vec<&str> = pathext.split(';').filter(|e| !e.is_empty()).collect();
+    let lower = tool.to_ascii_lowercase();
+    let names: Vec<String> = if extensions
+        .iter()
+        .any(|e| lower.ends_with(&e.to_ascii_lowercase()))
+    {
+        vec![tool.to_string()]
+    } else {
+        extensions.iter().map(|e| format!("{tool}{e}")).collect()
+    };
+    std::env::split_paths(&path).any(|dir| names.iter().any(|name| dir.join(name).is_file()))
 }
 
 /// `_selected_backend` for a forced name, a tool lookup and the previous

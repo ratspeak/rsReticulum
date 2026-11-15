@@ -506,20 +506,10 @@ fn now_secs() -> i64 {
 
 /// Local calendar time, as Python's `time.localtime`: year, month, day.
 fn local_date(secs: i64) -> (i64, i64, i64) {
-    let time = secs as nix::libc::time_t;
-    let mut tm = std::mem::MaybeUninit::<nix::libc::tm>::zeroed();
-    // SAFETY: both pointers are valid for the call; localtime_r is reentrant.
-    let result = unsafe { nix::libc::localtime_r(&time, tm.as_mut_ptr()) };
-    if result.is_null() {
-        return (1970, 1, 1);
+    match crate::platform::localtime(secs) {
+        Some(t) => (i64::from(t.year), i64::from(t.month), i64::from(t.day)),
+        None => (1970, 1, 1),
     }
-    // SAFETY: localtime_r filled `tm` when it returned non-null.
-    let tm = unsafe { tm.assume_init() };
-    (
-        i64::from(tm.tm_year) + 1900,
-        i64::from(tm.tm_mon) + 1,
-        i64::from(tm.tm_mday),
-    )
 }
 
 /// `_get_day` (`server.py`): `%Y-%m-%d` in local time.
@@ -542,7 +532,7 @@ fn local_midnight(day: &str) -> Option<i64> {
     let mut parts = day.split('-');
     let field = |p: Option<&str>, max: usize| {
         p.filter(|s| !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|s| s.parse::<nix::libc::c_int>().ok())
+            .and_then(|s| s.parse::<i32>().ok())
     };
     let year = field(parts.next(), 4)?;
     let month = field(parts.next(), 2).filter(|m| (1..=12).contains(m))?;
@@ -550,13 +540,5 @@ fn local_midnight(day: &str) -> Option<i64> {
     if parts.next().is_some() {
         return None;
     }
-    // SAFETY: an all-zero `tm` is a valid value of the C struct.
-    let mut tm: nix::libc::tm = unsafe { std::mem::zeroed() };
-    tm.tm_year = year - 1900;
-    tm.tm_mon = month - 1;
-    tm.tm_mday = mday;
-    tm.tm_isdst = -1;
-    // SAFETY: `tm` is initialised; mktime reads and normalises it in place.
-    let secs = unsafe { nix::libc::mktime(&mut tm) };
-    Some(secs as i64)
+    Some(crate::platform::local_midnight(year, month, mday))
 }

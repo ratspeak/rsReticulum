@@ -356,10 +356,9 @@ impl PageNode {
 
     /// `get_template`: `<templates>/<name>.mu`, run when executable.
     fn get_template(&self, name: &str) -> Option<String> {
-        use std::os::unix::fs::PermissionsExt;
         let path = self.templates_dir.join(format!("{name}.mu"));
         let meta = std::fs::metadata(&path).ok().filter(|m| m.is_file())?;
-        if meta.permissions().mode() & 0o111 != 0 {
+        if crate::platform::mode_executable(&meta) {
             let argv = [path.to_string_lossy().into_owned()];
             let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             let output = std::process::Command::new(argv[0])
@@ -724,34 +723,17 @@ pub(crate) fn prettysize(size: u64) -> String {
     rns_tools::format::prettysize(size as f64, "B")
 }
 
-/// Local broken-down time, as `time.localtime`.
-fn local_tm(ts: f64) -> Option<nix::libc::tm> {
-    let time = ts.floor() as nix::libc::time_t;
-    let mut tm = std::mem::MaybeUninit::<nix::libc::tm>::zeroed();
-    // SAFETY: both pointers are valid for the call; localtime_r is reentrant.
-    if unsafe { nix::libc::localtime_r(&time, tm.as_mut_ptr()) }.is_null() {
-        return None;
-    }
-    // SAFETY: localtime_r filled `tm` when it returned non-null.
-    Some(unsafe { tm.assume_init() })
-}
-
 /// `time.strftime` with `%Y-%m-%d`, then `%H:%M` and `:%S` as asked.
 pub(crate) fn local_time(ts: f64, minutes: bool, seconds: bool) -> String {
-    let Some(tm) = local_tm(ts) else {
+    let Some(tm) = crate::platform::localtime(ts.floor() as i64) else {
         return String::new();
     };
-    let mut out = format!(
-        "{:04}-{:02}-{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday
-    );
+    let mut out = format!("{:04}-{:02}-{:02}", tm.year, tm.month, tm.day);
     if minutes {
-        out.push_str(&format!(" {:02}:{:02}", tm.tm_hour, tm.tm_min));
+        out.push_str(&format!(" {:02}:{:02}", tm.hour, tm.minute));
     }
     if seconds {
-        out.push_str(&format!(":{:02}", tm.tm_sec));
+        out.push_str(&format!(":{:02}", tm.second));
     }
     out
 }

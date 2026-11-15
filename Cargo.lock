@@ -1881,6 +1881,7 @@ dependencies = [
  "base64",
  "clap",
  "hex",
+ "libc",
  "nix 0.29.0",
  "rmpv",
  "rns-identity",

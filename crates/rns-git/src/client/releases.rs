@@ -159,24 +159,15 @@ fn first_chars(text: &str, n: usize) -> String {
 
 /// `time.strftime(fmt, time.localtime(ts))` for the two formats used here.
 fn strftime(ts: i64, seconds: bool) -> String {
-    let time = ts as nix::libc::time_t;
-    let mut tm = std::mem::MaybeUninit::<nix::libc::tm>::zeroed();
-    // SAFETY: both pointers are valid for the call; localtime_r is reentrant.
-    if unsafe { nix::libc::localtime_r(&time, tm.as_mut_ptr()) }.is_null() {
+    let Some(tm) = crate::platform::localtime(ts) else {
         return String::new();
-    }
-    // SAFETY: localtime_r filled `tm` when it returned non-null.
-    let tm = unsafe { tm.assume_init() };
+    };
     let mut out = format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min
+        tm.year, tm.month, tm.day, tm.hour, tm.minute
     );
     if seconds {
-        out.push_str(&format!(":{:02}", tm.tm_sec));
+        out.push_str(&format!(":{:02}", tm.second));
     }
     out
 }

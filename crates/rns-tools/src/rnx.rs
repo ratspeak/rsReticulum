@@ -233,12 +233,16 @@ pub async fn execute(request: &CommandRequest) -> CommandResult {
             Err(_) => {
                 killed = true;
                 tracing::info!(target: crate::NOTICE_TARGET, "Command [{}] timed out and is being killed...", request.command);
+                // `Popen.terminate`: SIGTERM, or TerminateProcess on Windows.
+                #[cfg(unix)]
                 if let Some(pid) = child.id() {
                     // SAFETY: signals the child this task still owns.
                     unsafe {
                         nix::libc::kill(pid as i32, nix::libc::SIGTERM);
                     }
                 }
+                #[cfg(not(unix))]
+                let _ = child.start_kill();
                 child.wait().await
             }
         },
@@ -254,8 +258,14 @@ pub async fn execute(request: &CommandRequest) -> CommandResult {
         .filter(|_| !killed)
         .and_then(|t| (now() < started + t).then(now));
     let retcode = status.ok().and_then(|s| {
-        use std::os::unix::process::ExitStatusExt;
-        s.code().or_else(|| s.signal().map(|n| -n)).map(i64::from)
+        #[cfg(unix)]
+        let code = {
+            use std::os::unix::process::ExitStatusExt;
+            s.code().or_else(|| s.signal().map(|n| -n))
+        };
+        #[cfg(not(unix))]
+        let code = s.code();
+        code.map(i64::from)
     });
     CommandResult {
         executed: true,

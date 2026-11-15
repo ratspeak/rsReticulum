@@ -6,6 +6,7 @@ pub mod highlight;
 pub mod md2micron;
 pub mod media;
 pub mod pages;
+mod platform;
 pub mod remote_helper;
 pub mod server;
 pub mod util;
