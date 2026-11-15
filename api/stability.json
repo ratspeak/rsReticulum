@@ -51,8 +51,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
-      "itemCount": 2159,
-      "sha256": "a79bdab640e1b5ca88060bd159a4379102121aac0c89ab8e03cbad1cdd27de23"
+      "itemCount": 2160,
+      "sha256": "18a2a12e0f5ab6de901b7d439708e131e1756db23dafabd117153229067ca882"
     },
     {
       "name": "rns-link",

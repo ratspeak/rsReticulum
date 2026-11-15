@@ -268,6 +268,18 @@ pub trait KnownDestinationStore: Send {
     fn expire_ratchets(&mut self, cutoff: f64) -> Result<Vec<DestHash>, StoreError>;
 }
 
+/// A store that keeps the legacy rows its table cannot load, as upstream's import does.
+pub(crate) trait KeepUnloadable: KnownDestinationStore {
+    fn keep_unloadable(&mut self, rows: &[legacy::RawKnownRow]) -> Result<(), StoreError>;
+}
+
+impl KeepUnloadable for MemoryStore {
+    /// Only a database holds them.
+    fn keep_unloadable(&mut self, _rows: &[legacy::RawKnownRow]) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
 /// Persistent announce cache keyed by packet hash.
 pub trait AnnounceCacheStore: Send {
     /// Inserts or replaces the given announces in one transaction.

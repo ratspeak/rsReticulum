@@ -23,9 +23,30 @@ pub struct LegacyImport {
     imported: usize,
     rejected: usize,
     removable: Vec<PathBuf>,
+    unloadable: Vec<RawKnownRow>,
+}
+
+/// A legacy known-destination row as upstream imports it (Storage.py
+/// `import_legacy`), whatever the length of its public key.
+#[derive(Debug)]
+pub(crate) struct RawKnownRow {
+    pub(crate) destination_hash: DestHash,
+    pub(crate) last_heard: f64,
+    pub(crate) packet_hash: Option<PacketHash>,
+    pub(crate) public_key: Vec<u8>,
+    pub(crate) app_data: Option<Vec<u8>>,
+    pub(crate) used: f64,
+    pub(crate) stamp: Option<Vec<u8>>,
+    pub(crate) stamp_value: f64,
+    pub(crate) lr_cost: Option<f64>,
 }
 
 impl LegacyImport {
+    /// Rows whose public key is not 64 bytes: the database keeps them, the table cannot load them.
+    pub(crate) fn unloadable(&self) -> &[RawKnownRow] {
+        &self.unloadable
+    }
+
     /// Rows the store accepted.
     pub fn imported(&self) -> usize {
         self.imported
@@ -130,13 +151,15 @@ fn write_rows(
         imported: batch.upserts.len() - rejected,
         rejected,
         removable,
+        unloadable: Vec::new(),
     })
 }
 
 /// Imports `storage/known_destinations`, a msgpack map of destination hash to
 /// the 8-field entry Python 1.5.x writes, with the padding of upstream `KnownDestinationsStore.import_legacy`.
-/// Entries with fewer than five fields, or a public key other than 64 bytes, are
-/// skipped. A last-heard time that is missing or not positive becomes `now`.
+/// Entries with fewer than five fields are skipped. One whose public key is not
+/// 64 bytes cannot enter the table; upstream imports it anyway, so this crate's
+/// database keeps it. A last-heard time that is missing or not positive becomes `now`.
 pub fn import_python_known_destinations(
     path: &Path,
     now: f64,
@@ -151,6 +174,7 @@ pub fn import_python_known_destinations(
     };
 
     let mut rows = Vec::new();
+    let mut unloadable = Vec::new();
     for (key, value) in entries {
         let (Some(dest), Value::Array(fields)) = (bin::<16>(&key), value) else {
             continue;
@@ -159,26 +183,40 @@ pub fn import_python_known_destinations(
             continue;
         }
         let field = |i: usize| fields.get(i).unwrap_or(&Value::Nil);
-        let Some(public_key) = bin::<64>(field(2)) else {
+        let blob = |i: usize| match field(i) {
+            Value::Binary(b) => Some(b.clone()),
+            _ => None,
+        };
+        let Some(public_key) = blob(2) else {
             continue;
         };
-        let last_heard = num(field(0)).filter(|t| *t > 0.0).unwrap_or(now);
-        let mut row = KnownDestinationRow::new(dest, last_heard, public_key);
-        row.packet_hash = bin::<32>(field(1));
-        row.app_data = match field(3) {
-            Value::Binary(b) => Some(b.clone()),
-            _ => None,
+        let entry = RawKnownRow {
+            destination_hash: dest,
+            last_heard: num(field(0)).filter(|t| *t > 0.0).unwrap_or(now),
+            packet_hash: bin::<32>(field(1)),
+            public_key,
+            app_data: blob(3),
+            used: num(field(4)).unwrap_or(0.0),
+            stamp: blob(5),
+            stamp_value: num(field(6)).unwrap_or(0.0),
+            lr_cost: num(field(7)),
         };
-        row.used = num(field(4)).unwrap_or(0.0);
-        row.stamp = match field(5) {
-            Value::Binary(b) => Some(b.clone()),
-            _ => None,
+        let Ok(public_key) = <[u8; 64]>::try_from(entry.public_key.as_slice()) else {
+            unloadable.push(entry);
+            continue;
         };
-        row.stamp_value = num(field(6)).unwrap_or(0.0);
-        row.lr_cost = num(field(7));
+        let mut row = KnownDestinationRow::new(dest, entry.last_heard, public_key);
+        row.packet_hash = entry.packet_hash;
+        row.app_data = entry.app_data;
+        row.used = entry.used;
+        row.stamp = entry.stamp;
+        row.stamp_value = entry.stamp_value;
+        row.lr_cost = entry.lr_cost;
         rows.push(LegacyRow { row, ratchet: None });
     }
-    write_rows(rows, vec![path.to_path_buf()], store)
+    let mut imported = write_rows(rows, vec![path.to_path_buf()], store)?;
+    imported.unloadable = unloadable;
+    Ok(imported)
 }
 
 /// Imports the ratchets in `storage/ratchets/<hex>` files, with the filter of
@@ -250,6 +288,7 @@ pub fn import_python_ratchets(
         imported: report.written,
         rejected: report.rejected.len(),
         removable,
+        unloadable: Vec::new(),
     })
 }
 
@@ -305,6 +344,7 @@ pub fn import_python_announce_cache(
         imported,
         rejected: 0,
         removable: Vec::new(),
+        unloadable: Vec::new(),
     })
 }
 

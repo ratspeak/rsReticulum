@@ -23,7 +23,7 @@ use crate::store::{
     RejectedTable, StoreError,
 };
 #[cfg(feature = "sqlite-store")]
-use crate::store::{SqliteAnnounceCache, SqliteKnownDestinations, legacy};
+use crate::store::{KeepUnloadable, SqliteAnnounceCache, SqliteKnownDestinations, legacy};
 
 #[derive(Clone)]
 enum StoreSource {
@@ -396,7 +396,7 @@ impl LegacyFiles {
 fn import_known_sources(
     legacy: &LegacyFiles,
     now: f64,
-    store: &mut dyn KnownDestinationStore,
+    store: &mut impl KeepUnloadable,
     finish: bool,
 ) {
     if legacy.rust_cache.is_file() {
@@ -429,8 +429,12 @@ fn import_known_sources(
                 debug!(
                     rows = imported.imported(),
                     rejected = imported.rejected(),
+                    unloadable = imported.unloadable().len(),
                     "imported Python known destinations"
                 );
+                if let Err(e) = store.keep_unloadable(imported.unloadable()) {
+                    error!("could not keep the known destinations whose keys do not load: {e}");
+                }
                 if finish {
                     rename_imported(&legacy.python_kd, ".imported");
                 }

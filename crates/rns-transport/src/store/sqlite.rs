@@ -9,9 +9,10 @@ use std::time::Duration;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Statement, params};
 use tracing::warn;
 
+use super::legacy::RawKnownRow;
 use super::{
     ANNOUNCE_CACHE_USER_VERSION, AnnounceCacheStore, AnnounceFacts, AnnounceRow, ApplyReport,
-    CHUNK_ROWS, CachedAnnounce, DestHash, KNOWN_DESTINATIONS_USER_VERSION, KdBatch,
+    CHUNK_ROWS, CachedAnnounce, DestHash, KNOWN_DESTINATIONS_USER_VERSION, KdBatch, KeepUnloadable,
     KnownDestinationRow, KnownDestinationStore, PacketHash, Ratchet, RatchetRow, RejectedTable,
     Rejection, StoreError,
 };
@@ -49,6 +50,8 @@ const KD_SELECT_SQL: &str = "SELECT destination_hash, last_heard, packet_hash, p
 const KD_SELECT_WITH_FACTS_SQL: &str = "SELECT k.destination_hash, k.last_heard, k.packet_hash, k.public_key, k.app_data, k.used, k.stamp, k.stamp_value, k.lr_cost, f.hops, f.name_hash, f.path_response FROM known_destinations k LEFT JOIN rs_announce_facts f ON f.destination_hash = k.destination_hash AND f.last_heard = k.last_heard";
 
 const KD_UPSERT_SQL: &str = "INSERT INTO known_destinations (destination_hash, last_heard, packet_hash, public_key, app_data, used, stamp, stamp_value, lr_cost, identity_hash) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(destination_hash) DO UPDATE SET last_heard=excluded.last_heard, packet_hash=excluded.packet_hash, public_key=excluded.public_key, app_data=excluded.app_data, used=excluded.used, stamp=excluded.stamp, stamp_value=excluded.stamp_value, lr_cost=excluded.lr_cost, identity_hash=excluded.identity_hash";
+// A row heard later than the legacy one stays.
+const KD_KEEP_UNLOADABLE_SQL: &str = "INSERT INTO known_destinations (destination_hash, last_heard, packet_hash, public_key, app_data, used, stamp, stamp_value, lr_cost, identity_hash) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(destination_hash) DO UPDATE SET last_heard=excluded.last_heard, packet_hash=excluded.packet_hash, public_key=excluded.public_key, app_data=excluded.app_data, used=excluded.used, stamp=excluded.stamp, stamp_value=excluded.stamp_value, lr_cost=excluded.lr_cost, identity_hash=excluded.identity_hash WHERE excluded.last_heard >= known_destinations.last_heard";
 const KD_DELETE_SQL: &str = "DELETE FROM known_destinations WHERE destination_hash=?";
 const RATCHET_UPSERT_SQL: &str = "INSERT INTO ratchets VALUES (?,?,?) ON CONFLICT(destination_hash) DO UPDATE SET ratchet=excluded.ratchet, received=excluded.received";
 const RATCHET_DELETE_SQL: &str = "DELETE FROM ratchets WHERE destination_hash=?";
@@ -106,7 +109,7 @@ fn fixed<const N: usize>(bytes: Vec<u8>, table: &'static str) -> Result<[u8; N],
         })
 }
 
-fn identity_hash(public_key: &[u8; 64]) -> [u8; 16] {
+fn identity_hash(public_key: &[u8]) -> [u8; 16] {
     let digest = rns_crypto::sha::sha256(public_key);
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest[..16]);
@@ -318,6 +321,47 @@ impl SqliteKnownDestinations {
         Ok(Self {
             conn,
             read_only: true,
+        })
+    }
+
+    /// The public key stored for `destination`, whatever its length: upstream
+    /// recalls a row whose key does not load, which this crate's table skips.
+    pub fn stored_public_key(&self, destination: &DestHash) -> Result<Option<Vec<u8>>, StoreError> {
+        db(self
+            .conn
+            .query_row(
+                "SELECT public_key FROM known_destinations WHERE destination_hash=?1",
+                params![destination.as_slice()],
+                |r| r.get(0),
+            )
+            .optional())
+    }
+}
+
+impl KeepUnloadable for SqliteKnownDestinations {
+    fn keep_unloadable(&mut self, rows: &[RawKnownRow]) -> Result<(), StoreError> {
+        if self.read_only {
+            return Err(StoreError::ReadOnly);
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        with_txn(&self.conn, |conn| {
+            db(run_all(conn, KD_KEEP_UNLOADABLE_SQL, rows, &|s, r| {
+                s.execute(params![
+                    r.destination_hash.as_slice(),
+                    r.last_heard,
+                    r.packet_hash.as_ref().map(|h| h.as_slice()),
+                    r.public_key.as_slice(),
+                    r.app_data.as_deref(),
+                    r.used,
+                    r.stamp.as_deref(),
+                    r.stamp_value,
+                    r.lr_cost,
+                    identity_hash(&r.public_key).as_slice(),
+                ])
+            }))
+            .map(|_| ())
         })
     }
 }

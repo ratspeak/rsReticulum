@@ -2020,6 +2020,7 @@ pub struct rns_transport::store::SqliteKnownDestinations
 impl rns_transport::store::SqliteKnownDestinations
 pub fn rns_transport::store::SqliteKnownDestinations::open_ro(&std::path::Path) -> core::result::Result<Self, rns_transport::store::StoreError>
 pub fn rns_transport::store::SqliteKnownDestinations::open_rw(&std::path::Path) -> core::result::Result<Self, rns_transport::store::StoreError>
+pub fn rns_transport::store::SqliteKnownDestinations::stored_public_key(&self, &rns_transport::store::DestHash) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, rns_transport::store::StoreError>
 impl rns_transport::store::KnownDestinationStore for rns_transport::store::SqliteKnownDestinations
 pub fn rns_transport::store::SqliteKnownDestinations::apply(&mut self, &rns_transport::store::KdBatch, &dyn core::ops::function::Fn(&rns_transport::store::DestHash) -> bool) -> core::result::Result<rns_transport::store::ApplyReport, rns_transport::store::StoreError>
 pub fn rns_transport::store::SqliteKnownDestinations::expire_ratchets(&mut self, f64) -> core::result::Result<alloc::vec::Vec<rns_transport::store::DestHash>, rns_transport::store::StoreError>
