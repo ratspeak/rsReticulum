@@ -52,6 +52,11 @@ fn carries(actor: &TransportActor, tunnel_id: &[u8; 32], dest: &[u8; 16]) -> boo
         .is_some_and(|tunnel| tunnel.tunnel_paths.contains_key(dest))
 }
 
+/// Closes an actor's stores; Windows will not delete a file they hold open.
+fn stop(mut actor: TransportActor) {
+    actor.on_shutdown();
+}
+
 fn cache_announce(dir: &std::path::Path, raw: &[u8], interface: Option<&str>) -> [u8; 32] {
     let packet_hash = rns_wire::hash::packet_hash(raw, HeaderType::Header1);
     crate::store::seed_cached_announce(dir, &packet_hash, raw, interface).unwrap();
@@ -264,6 +269,7 @@ fn persisted_tunnels_load_unbound_even_when_their_interface_returns() {
         !carries(&reader, &tunnel_id, &later),
         "an interface name never rebinds a loaded tunnel; only a synthesis does"
     );
+    stop(reader);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -317,6 +323,7 @@ fn tunnels_without_an_interface_survive_a_reload() {
         carries(&reader, &tunnel_id, &dest),
         "a nil-interface tunnel is valid Python state, not legacy"
     );
+    stop(reader);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -361,6 +368,7 @@ fn legacy_sidecar_tunnels_without_an_interface_survive_a_reload() {
         reader.tunnel_table.get(&tunnel_id).is_some(),
         "tunnels need no interface name to load"
     );
+    stop(reader);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
