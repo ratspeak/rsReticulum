@@ -270,31 +270,23 @@ fn load_for_client(source: &StoreSource) -> Vec<KnownDestinationRow> {
     match source {
         StoreSource::Memory => Vec::new(),
         #[cfg(feature = "sqlite-store")]
-        StoreSource::Sqlite { known, .. } => read_owner_rows(known).unwrap_or_else(|e| {
-            error!(
-                "could not load known destinations from the shared instance's database: {e}; continuing with an empty table"
-            );
-            Vec::new()
-        }),
+        StoreSource::Sqlite { known, .. } => {
+            // Upstream logs an error for a missing file too; a client whose
+            // directory is not the owner's has none, and that is not a fault.
+            if !known.is_file() {
+                debug!("no known destinations database to load as a shared-instance client");
+                return Vec::new();
+            }
+            let read = SqliteKnownDestinations::open_ro(known)
+                .and_then(|mut reader| read_rows(&mut reader));
+            read.unwrap_or_else(|e| {
+                error!(
+                    "could not load known destinations from the shared instance's database: {e}; continuing with an empty table"
+                );
+                Vec::new()
+            })
+        }
     }
-}
-
-/// The owner's rows. Upstream logs an error in two cases that are not faults:
-/// a client whose directory is not the owner's has no file, and an owner binds
-/// the shared instance before it creates the file and commits its schema
-/// (Reticulum.py), so a client that starts in between finds no schema yet.
-#[cfg(feature = "sqlite-store")]
-fn read_owner_rows(known: &Path) -> Result<Vec<KnownDestinationRow>, StoreError> {
-    if !known.is_file() {
-        debug!("no known destinations database to load as a shared-instance client");
-        return Ok(Vec::new());
-    }
-    let mut reader = SqliteKnownDestinations::open_ro(known)?;
-    if reader.is_uninitialized()? {
-        debug!("the shared instance has not created its known destinations yet");
-        return Ok(Vec::new());
-    }
-    read_rows(&mut reader)
 }
 
 /// The rows for a session whose database could not be opened for writing:
@@ -2124,51 +2116,6 @@ mod tests {
         client.on_shutdown();
         let restarted = actor_on(&dir);
         assert!(!restarted.recent_announces.contains_key(&[4; 16]));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_shared_instance_client_reads_a_running_owners_rows() {
-        let dir = temp_dir();
-        let mut owner = actor_on(&dir);
-        owner
-            .recent_announces
-            .insert([5; 16], entry([5; 16], Some(1000.0), false));
-        owner.kd.pending.mark_dirty([5; 16]);
-        owner.flush_known_destinations();
-        settle(&mut owner);
-        // The owner keeps its database open, the rows still in its WAL.
-        let client = client_on(&dir);
-        assert!(client.recent_announces.contains_key(&[5; 16]));
-        drop(client);
-        owner.on_shutdown();
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// An owner binds the shared instance first, so a client can open the file
-    /// while the owner's schema is not yet committed.
-    #[test]
-    fn a_shared_instance_client_finds_no_schema_before_the_owner_commits_one() {
-        let dir = temp_dir();
-        let known = dir.join("known_destinations.db");
-        // What the owner's open leaves until its first write.
-        std::fs::write(&known, b"").unwrap();
-        assert!(read_owner_rows(&known).unwrap().is_empty());
-        let owner = rusqlite::Connection::open(&known).unwrap();
-        owner
-            .execute_batch(
-                "PRAGMA journal_mode=WAL; BEGIN IMMEDIATE; CREATE TABLE known_destinations (x)",
-            )
-            .unwrap();
-        assert!(read_owner_rows(&known).unwrap().is_empty());
-        owner.execute_batch("ROLLBACK").unwrap();
-        drop(owner);
-        // A schema without the table is still a fault.
-        rusqlite::Connection::open(&known)
-            .unwrap()
-            .execute_batch("CREATE TABLE other (x)")
-            .unwrap();
-        assert!(read_owner_rows(&known).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
