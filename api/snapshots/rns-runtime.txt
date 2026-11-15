@@ -147,6 +147,7 @@ pub const rns_runtime::constants::LOG_MAXSIZE: u64
 pub const rns_runtime::constants::MINIMUM_BITRATE: u64
 pub const rns_runtime::constants::PERSIST_INTERVAL: u64
 pub const rns_runtime::constants::RESOURCE_CACHE: u64
+pub const rns_runtime::constants::RETICULUM_COMPAT_VERSION: &str
 pub const rns_runtime::constants::RPC_AUTH_TAG: &[u8]
 pub mod rns_runtime::destination_resolver
 pub enum rns_runtime::destination_resolver::DestinationResolveError

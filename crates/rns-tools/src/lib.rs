@@ -19,7 +19,7 @@ pub const RS_RETICULUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// and given where upstream gives `RNS.__version__` (the `rnsd-rs` console).
 /// It is distinct from this package's release version and is not a Python
 /// installation requirement.
-pub const RETICULUM_COMPAT_VERSION: &str = "1.6.0";
+pub const RETICULUM_COMPAT_VERSION: &str = rns_runtime::constants::RETICULUM_COMPAT_VERSION;
 
 /// A tool's `--version` line: its own name and crate version, then the
 /// releases it follows, `also` first and Reticulum last, as

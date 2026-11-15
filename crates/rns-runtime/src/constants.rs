@@ -13,6 +13,10 @@ pub const DEFAULT_INSTANCE_NAME: &str = "default";
 
 pub const RPC_AUTH_TAG: &[u8] = b"reticulum_rs_rpc_auth_v1";
 
+/// The Reticulum release this port follows, where upstream gives
+/// `RNS.__version__`. It is distinct from this package's release version.
+pub const RETICULUM_COMPAT_VERSION: &str = "1.6.0";
+
 #[cfg(test)]
 mod tests {
     use super::*;
