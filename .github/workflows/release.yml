@@ -23,7 +23,7 @@ env:
   SOURCE_REF: ${{ github.sha }}
   RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
   PACKAGE_ROOT: rsReticulum
-  RETICULUM_BINS: rnsd-rs rnstatus-rs rnpath-rs rnid-rs rnprobe-rs rncp-rs rnsh-rs rnodeconf-rs
+  RETICULUM_BINS: rnsd-rs rnstatus-rs rnpath-rs rnid-rs rnprobe-rs rncp-rs rnsh-rs rnodeconf-rs rnx-rs rnir-rs rnpkg-rs rngit-rs rngcs-rs git-remote-rns
 
 jobs:
   verify:
@@ -87,15 +87,23 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
       - name: Build release binaries
-        run: cargo build -p rns-tools --release --bins --locked
+        run: cargo build -p rns-tools -p rns-git --release --bins --locked
       - name: Stage archive contents
         shell: bash
         run: |
           set -euo pipefail
+          suffix=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then suffix=".exe"; fi
           for bin in ${RETICULUM_BINS}; do
-            suffix=""
-            if [[ "${RUNNER_OS}" == "Windows" ]]; then suffix=".exe"; fi
-            "target/release/${bin}${suffix}" --version
+            case "${bin}" in
+              # As upstream, these two have no --version.
+              rngcs-rs) "target/release/${bin}${suffix}" --help > /dev/null ;;
+              git-remote-rns)
+                usage="$("target/release/${bin}${suffix}" 2>&1 || true)"
+                [[ "${usage}" == "Usage: git-remote-rns <remote-name> <url>"* ]]
+                ;;
+              *) "target/release/${bin}${suffix}" --version ;;
+            esac
           done
           mkdir -p "dist/${PACKAGE_ROOT}/bin"
           for bin in ${RETICULUM_BINS}; do

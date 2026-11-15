@@ -13,7 +13,10 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = "rsReticulum"
-BINS = "rnsd-rs rnstatus-rs rnpath-rs rnid-rs rnprobe-rs rncp-rs rnsh-rs rnodeconf-rs".split()
+BINS = (
+    "rnsd-rs rnstatus-rs rnpath-rs rnid-rs rnprobe-rs rncp-rs rnsh-rs rnodeconf-rs "
+    "rnx-rs rnir-rs rnpkg-rs rngit-rs rngcs-rs git-remote-rns"
+).split()
 DOCS = ("README.md", "LICENSE", "CHANGELOG.md")
 PLATFORMS = {"linux-x86_64": "tar.gz", "macos": "tar.gz", "windows-x86_64": "zip"}
 
