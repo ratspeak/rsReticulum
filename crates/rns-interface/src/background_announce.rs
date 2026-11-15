@@ -78,6 +78,8 @@ pub(crate) fn scheduled_actor_with_backlog(
         tx,
     );
     let identity = rns_identity::identity::Identity::new();
+    // One clock read: a stepped wall clock must not reorder the oldest-first backlog.
+    let oldest = rns_transport::now_f64() - count as f64 * 1e-3;
     let mut first = Bytes::new();
     for index in 0..count {
         let app = format!("test.background.{index}");
@@ -108,7 +110,7 @@ pub(crate) fn scheduled_actor_with_backlog(
         }
         entry.announce_queue.push(QueuedAnnounce {
             destination_hash: dest,
-            time: rns_transport::now_f64(),
+            time: oldest + index as f64 * 1e-3,
             hops: 1,
             raw,
         });
