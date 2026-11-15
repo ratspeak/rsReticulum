@@ -14938,7 +14938,7 @@ loglevel = 7
             vec![local],
         ));
         tokio::time::sleep(Duration::from_secs(61)).await;
-        assert_eq!(stamper.0.load(Ordering::Relaxed), 1);
+        real_time_until("the search runs", || stamper.0.load(Ordering::Relaxed) == 1).await;
         online.store(false, Ordering::Release);
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(sink.recv().await.unwrap(), Bytes::from_static(b"busy"));
@@ -14972,11 +14972,22 @@ loglevel = 7
         actor.await.unwrap();
     }
 
+    /// Waits in real time on a blocking stamp thread: the driven paused clock
+    /// would lapse a tokio timeout before the thread's next poll.
+    async fn real_time_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Holds every search after the first `free` until released or cancelled.
     struct GatedStamper {
         free: u64,
         calls: AtomicU64,
         release: AtomicBool,
+        resumed: AtomicBool,
         cancelled: AtomicBool,
     }
 
@@ -14986,6 +14997,7 @@ loglevel = 7
                 free,
                 calls: AtomicU64::new(0),
                 release: AtomicBool::new(false),
+                resumed: AtomicBool::new(false),
                 cancelled: AtomicBool::new(false),
             })
         }
@@ -15006,6 +15018,7 @@ loglevel = 7
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                self.resumed.store(true, Ordering::Relaxed);
             }
             StaticStamper.generate(hash, value, ctl)
         }
@@ -15038,7 +15051,10 @@ loglevel = 7
         second_online.store(true, Ordering::Release);
         // The next pass picks the never-announced second service.
         tokio::time::sleep(Duration::from_secs(65)).await;
-        assert_eq!(stamper.calls.load(Ordering::Relaxed), 2);
+        real_time_until("the second search starts", || {
+            stamper.calls.load(Ordering::Relaxed) == 2
+        })
+        .await;
         // It is admitted while the second service's stamp is still generating.
         assert_eq!(sink.recv().await.unwrap(), Bytes::from_static(b"busy"));
         let raw = tokio::time::timeout(Duration::from_secs(3), sink.recv())
@@ -15049,6 +15065,10 @@ loglevel = 7
         // Generation outlasts the job interval; Python sleeps a full interval after it.
         tokio::time::sleep(Duration::from_secs(70)).await;
         stamper.release.store(true, Ordering::Relaxed);
+        real_time_until("the held search resumes", || {
+            stamper.resumed.load(Ordering::Relaxed)
+        })
+        .await;
         let raw = tokio::time::timeout(Duration::from_secs(4), sink.recv())
             .await
             .unwrap()
@@ -15085,24 +15105,27 @@ loglevel = 7
                 vec![advertised_service(42, false)],
             ));
             tokio::time::sleep(Duration::from_secs(61)).await;
-            assert_eq!(stamper.calls.load(Ordering::Relaxed), 1);
+            real_time_until("the search starts", || {
+                stamper.calls.load(Ordering::Relaxed) == 1
+            })
+            .await;
             if abort {
                 publisher.abort();
-                let _ = publisher.await;
             } else {
                 handle.shutdown.trigger();
-                tokio::time::timeout(Duration::from_secs(2), publisher)
-                    .await
-                    .unwrap()
-                    .unwrap();
             }
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while !stamper.cancelled.load(Ordering::Relaxed) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+            real_time_until("the search is cancelled", || {
+                stamper.cancelled.load(Ordering::Relaxed)
             })
-            .await
-            .expect("the search is cancelled");
+            .await;
+            let stopped = tokio::time::timeout(Duration::from_secs(2), publisher)
+                .await
+                .unwrap();
+            if abort {
+                assert!(stopped.unwrap_err().is_cancelled());
+            } else {
+                stopped.unwrap();
+            }
             handle
                 .transport_tx
                 .send(TransportMessage::Shutdown)
