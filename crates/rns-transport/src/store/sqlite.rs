@@ -324,6 +324,14 @@ impl SqliteKnownDestinations {
         })
     }
 
+    /// True while the file holds no schema, before its owner first commits one.
+    pub(crate) fn is_uninitialized(&self) -> Result<bool, StoreError> {
+        let tables: i64 = db(self
+            .conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0)))?;
+        Ok(tables == 0)
+    }
+
     /// The public key stored for `destination`, whatever its length: upstream
     /// recalls a row whose key does not load, which this crate's table skips.
     pub fn stored_public_key(&self, destination: &DestHash) -> Result<Option<Vec<u8>>, StoreError> {
