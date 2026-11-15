@@ -451,18 +451,21 @@ async fn cleanup_registered_link(
     role: LinkEndpointRole,
     endpoint_bound: bool,
 ) -> Result<(), LinkEndpointError> {
+    // A stopped transport took the registration down with it.
     if endpoint_bound {
-        match unbind(transport_tx, link_id, role).await? {
-            LinkEndpointUnbindResult::Unbound | LinkEndpointUnbindResult::NotBound => {}
-            result @ LinkEndpointUnbindResult::RoleMismatch => {
+        match unbind(transport_tx, link_id, role).await {
+            Ok(LinkEndpointUnbindResult::Unbound | LinkEndpointUnbindResult::NotBound) => {}
+            Ok(result @ LinkEndpointUnbindResult::RoleMismatch) => {
                 return Err(LinkEndpointError::Unbind(result));
             }
+            Err(LinkEndpointError::TransportUnavailable) => return Ok(()),
+            Err(error) => return Err(error),
         }
     }
-    transport_tx
+    let _ = transport_tx
         .send(TransportMessage::DeregisterDestination { hash: link_id })
-        .await
-        .map_err(|_| LinkEndpointError::TransportUnavailable)
+        .await;
+    Ok(())
 }
 
 pub(crate) fn send_message(
@@ -676,6 +679,17 @@ mod tests {
             transport_rx.recv().await,
             Some(TransportMessage::DeregisterDestination { hash }) if hash == link_id
         ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_after_transport_stopped_leaves_nothing_to_retry() {
+        let (transport_tx, transport_rx) = mpsc::channel(1);
+        drop(transport_rx);
+        let mut guard =
+            LinkEndpointCleanupGuard::new(transport_tx, [0xC4; 16], LinkEndpointRole::Initiator);
+        guard.endpoint_bound();
+        assert!(guard.cleanup().await.is_ok());
+        assert!(!guard.armed);
     }
 
     #[tokio::test]
