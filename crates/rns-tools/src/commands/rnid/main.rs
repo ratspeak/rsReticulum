@@ -796,14 +796,40 @@ async fn recall(
             .iter()
             .find(|(_, key)| rns_crypto::sha::truncated_hash(key) == *hash)
     });
-    let Some((dest, key)) = found else {
-        return Ok(None);
+    let (dest, key) = match found {
+        Some(found) => *found,
+        None => match stored_public_key(args, hash)? {
+            Some(key) => (*hash, key),
+            None => return Ok(None),
+        },
     };
     // Identity.recall marks the matched destination used (Identity.py).
     let _ = handle
-        .query_control(TransportQuery::UseDestination { dest: *dest })
+        .query_control(TransportQuery::UseDestination { dest })
         .await;
-    Ok(Identity::from_public_key(key).ok())
+    Ok(Identity::from_public_key(&key).ok())
+}
+
+/// A `known_destinations.db` row the transport could not load. Upstream recalls
+/// it, and an Identity whose key does not load fails to print (rnid.py).
+fn stored_public_key(args: &Args, destination: &[u8; 16]) -> Result<Option<[u8; 64]>, String> {
+    let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
+    let path = config_dir.join("storage/known_destinations.db");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let stored = rns_transport::store::SqliteKnownDestinations::open_ro(&path)
+        .and_then(|store| store.stored_public_key(destination));
+    let Ok(Some(key)) = stored else {
+        return Ok(None);
+    };
+    match <[u8; 64]>::try_from(key.as_slice()) {
+        Ok(key) if Identity::from_public_key(&key).is_ok() => Ok(Some(key)),
+        _ => Err(format!(
+            "the stored public key of {} is not valid",
+            pretty_hash(destination)
+        )),
+    }
 }
 
 /// `spin()`: animated wait until `done` or the timeout.
