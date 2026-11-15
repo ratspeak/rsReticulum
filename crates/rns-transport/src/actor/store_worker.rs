@@ -2120,6 +2120,24 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_instance_client_reads_a_running_owners_rows() {
+        let dir = temp_dir();
+        let mut owner = actor_on(&dir);
+        owner
+            .recent_announces
+            .insert([5; 16], entry([5; 16], Some(1000.0), false));
+        owner.kd.pending.mark_dirty([5; 16]);
+        owner.flush_known_destinations();
+        settle(&mut owner);
+        // The owner keeps its database open, the rows still in its WAL.
+        let client = client_on(&dir);
+        assert!(client.recent_announces.contains_key(&[5; 16]));
+        drop(client);
+        owner.on_shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_shared_instance_client_writes_nothing() {
         let dir = temp_dir();
         let mut actor = client_on(&dir);
