@@ -1768,7 +1768,8 @@ impl TransportActor {
     }
 
     /// Drop `id` from the interface table and unwind tunnels + paths bound
-    /// to it. Shared by `DeregisterInterface` and the `Closed`-tx auto-drop.
+    /// to it; its Link-table entries go at the next table cull (Transport.py
+    /// `jobs`). Shared by `DeregisterInterface` and the `Closed`-tx auto-drop.
     fn deregister_interface(&mut self, id: InterfaceId) {
         self.deregister_interface_with_link_reason(
             id,
@@ -1785,7 +1786,6 @@ impl TransportActor {
         if let Some(entry) = self.interfaces.get(&id) {
             entry.owner.retire();
         }
-        self.link_table.remove_interface(id);
         let role = self.interfaces.get(&id).map(|entry| entry.role);
         // Flip the driver-shared online flag before dropping the entry:
         // driver tasks gated on it (Auto beacons/discovery, BLE loops) hold
