@@ -171,8 +171,16 @@ where
         (last_stdout, last_stderr) = output_text(&output);
 
         if output.status.success() {
-            let value: serde_json::Value =
-                serde_json::from_slice(&output.stdout).expect("rnstatus-rs JSON output");
+            let value: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(format!(
+                        "rnstatus-rs succeeded without printing JSON ({error})\n\
+                         --- rnstatus stdout ---\n{last_stdout}\n\
+                         --- rnstatus stderr ---\n{last_stderr}"
+                    ));
+                }
+            };
             let interfaces = value
                 .get("interfaces")
                 .and_then(|v| v.as_array())
