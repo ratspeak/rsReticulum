@@ -8,19 +8,16 @@ use std::time::{Duration, Instant};
 use crate::constants::*;
 
 pub struct JobScheduler {
-    last_clean: Instant,
+    /// `None` until the first clean, as Python's `last_cache_clean = 0`.
+    last_clean: Option<Instant>,
     last_persist: Instant,
 }
 
 impl JobScheduler {
     pub fn new() -> Self {
-        let now = Instant::now();
         Self {
-            // Python starts with `last_cache_clean = 0`, so the first tick cleans.
-            last_clean: now
-                .checked_sub(Duration::from_secs(CLEAN_INTERVAL))
-                .unwrap_or(now),
-            last_persist: now,
+            last_clean: None,
+            last_persist: Instant::now(),
         }
     }
 
@@ -31,9 +28,12 @@ impl JobScheduler {
     fn tick_at(&mut self, now: Instant) -> Vec<Job> {
         let mut jobs = Vec::new();
 
-        if now.duration_since(self.last_clean) >= Duration::from_secs(CLEAN_INTERVAL) {
+        if self
+            .last_clean
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(CLEAN_INTERVAL))
+        {
             jobs.push(Job::CleanCache);
-            self.last_clean = now;
+            self.last_clean = Some(now);
         }
 
         if now.duration_since(self.last_persist) >= Duration::from_secs(PERSIST_INTERVAL) {
@@ -72,7 +72,7 @@ mod tests {
     fn test_scheduler_clean_due() {
         let mut scheduler = JobScheduler::new();
         let now = Instant::now();
-        scheduler.last_clean = now;
+        scheduler.last_clean = Some(now);
         let jobs = scheduler.tick_at(now + Duration::from_secs(CLEAN_INTERVAL + 1));
         assert!(jobs.contains(&Job::CleanCache));
     }
