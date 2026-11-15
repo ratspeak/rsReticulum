@@ -67,7 +67,7 @@ pub(crate) fn generation_threads(target_value: f64) -> NonZeroUsize {
 
 impl DiscoveryStamper for RnsDiscoveryStamper {
     /// Uses `ctl`'s cancel flag and deadline; the worker count follows
-    /// [`generation_threads`].
+    /// `generation_threads`.
     fn generate(
         &self,
         infohash: &[u8; 32],

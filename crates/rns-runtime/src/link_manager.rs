@@ -7387,8 +7387,7 @@ impl LinkManager {
 
     /// [`Self::register_deferred_request_handler`] with declared admission
     /// accounting and optional refusal replies. Registration also fails for a
-    /// zero copy count or a refusal reply over
-    /// [`crate::deferred_request::MAX_REFUSAL_REPLY`] bytes.
+    /// zero copy count or a refusal reply over 256 bytes.
     pub fn register_deferred_request_handler_with<F>(
         &mut self,
         path: &str,

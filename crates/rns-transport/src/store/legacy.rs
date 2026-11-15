@@ -259,7 +259,7 @@ const ANNOUNCE_CHUNK_FILES: usize = 4096;
 /// Imports `storage/cache/announces/<hex>` files, each `[raw, interface]`, as
 /// `AnnounceCache.import_legacy` does in `RNS/Storage.py`. Every announce gets
 /// `received = now`. Upstream unlinks every file before its one commit; here the
-/// files go in chunks of [`ANNOUNCE_CHUNK_FILES`], and a chunk's files are removed
+/// files go in chunks of `ANNOUNCE_CHUNK_FILES` (4,096), and a chunk's files are removed
 /// only after its transaction has committed, so an interrupted import loses
 /// nothing and resumes with the files that remain. A file whose name is not a
 /// 32-byte hash, or whose content does not decode, is removed without a row.
