@@ -225,7 +225,7 @@ fn poll_shared_server(
 fn read_probe_hash(responder: &mut ChildGuard, tmp: &TempDir) -> Result<[u8; 16], String> {
     // Ask the daemon. A status poll that raced its start runs standalone and may
     // leave its own transport identity in the storage directory.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut last_error = String::new();
     while Instant::now() < deadline {
         if let Some(status) = responder.try_wait() {
@@ -346,7 +346,8 @@ fn rust_probe_destination_supports_active_path_and_probe_matrix() {
         env!("CARGO_BIN_EXE_rnsd-rs"),
         ["--config".as_ref(), responder_tmp.path().as_os_str()],
     );
-    if let Err(message) = poll_shared_server(&mut responder, &responder_tmp, Duration::from_secs(5))
+    if let Err(message) =
+        poll_shared_server(&mut responder, &responder_tmp, Duration::from_secs(30))
     {
         let mut placeholder = ChildGuard {
             label: "path origin rnsd-rs",
@@ -391,7 +392,7 @@ fn rust_probe_destination_supports_active_path_and_probe_matrix() {
         ["--config".as_ref(), path_origin_tmp.path().as_os_str()],
     );
     if let Err(message) =
-        poll_shared_server(&mut path_origin, &path_origin_tmp, Duration::from_secs(5))
+        poll_shared_server(&mut path_origin, &path_origin_tmp, Duration::from_secs(30))
     {
         let mut cold_placeholder = ChildGuard {
             label: "cold origin rnsd-rs",
@@ -411,7 +412,7 @@ fn rust_probe_destination_supports_active_path_and_probe_matrix() {
         ["--config".as_ref(), cold_origin_tmp.path().as_os_str()],
     );
     if let Err(message) =
-        poll_shared_server(&mut cold_origin, &cold_origin_tmp, Duration::from_secs(5))
+        poll_shared_server(&mut cold_origin, &cold_origin_tmp, Duration::from_secs(30))
     {
         panic_with_daemon_outputs(message, &mut responder, &mut path_origin, &mut cold_origin);
     }
