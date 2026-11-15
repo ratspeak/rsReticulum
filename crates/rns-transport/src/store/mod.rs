@@ -269,10 +269,12 @@ pub trait KnownDestinationStore: Send {
 }
 
 /// A store that keeps the legacy rows its table cannot load, as upstream's import does.
+#[cfg(feature = "sqlite-store")]
 pub(crate) trait KeepUnloadable: KnownDestinationStore {
     fn keep_unloadable(&mut self, rows: &[legacy::RawKnownRow]) -> Result<(), StoreError>;
 }
 
+#[cfg(feature = "sqlite-store")]
 impl KeepUnloadable for MemoryStore {
     /// Only a database holds them.
     fn keep_unloadable(&mut self, _rows: &[legacy::RawKnownRow]) -> Result<(), StoreError> {

@@ -27,8 +27,9 @@ pub struct LegacyImport {
 }
 
 /// A legacy known-destination row as upstream imports it (Storage.py
-/// `import_legacy`), whatever the length of its public key.
+/// `import_legacy`), whatever the length of its public key. Only a SQLite store keeps it.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
 pub(crate) struct RawKnownRow {
     pub(crate) destination_hash: DestHash,
     pub(crate) last_heard: f64,
@@ -43,6 +44,7 @@ pub(crate) struct RawKnownRow {
 
 impl LegacyImport {
     /// Rows whose public key is not 64 bytes: the database keeps them, the table cannot load them.
+    #[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
     pub(crate) fn unloadable(&self) -> &[RawKnownRow] {
         &self.unloadable
     }
