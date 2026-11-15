@@ -58,7 +58,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev libpcsclite-dev pkg-config
       - name: Test (default features)
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
       - name: Build application examples
         run: cargo build -p rns-runtime --examples --locked
       - name: Test BLE interface features
