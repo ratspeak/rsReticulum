@@ -225,7 +225,7 @@ pub fn resolve_config_dir(configdir: Option<&Path>) -> PathBuf {
     if etc.is_dir() && etc.join("config").is_file() {
         return etc.to_path_buf();
     }
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let home = rns_runtime::platform::home_dir().unwrap_or_default();
     let user = home.join(".config/rngit");
     if user.is_dir() && user.join("config").is_file() {
         return user;
@@ -258,11 +258,13 @@ pub fn load_or_create_identity(
     Ok(identity)
 }
 
-/// Python `os.path.expanduser` for `~` and `~/...`.
+/// Python `os.path.expanduser` for `~` and `~/...`, and `~\...` on Windows.
 pub fn expand_user(path: &str) -> PathBuf {
     match path.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            let mut home = std::env::var_os("HOME").unwrap_or_default();
+        Some(rest) if rest.is_empty() || rest.starts_with(std::path::is_separator) => {
+            let mut home = rns_runtime::platform::home_dir()
+                .unwrap_or_default()
+                .into_os_string();
             home.push(rest);
             PathBuf::from(home)
         }

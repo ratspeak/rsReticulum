@@ -18,6 +18,7 @@ mod link_endpoint;
 pub mod link_manager;
 pub mod link_session;
 pub mod link_stamp;
+mod ntpath;
 pub mod platform;
 pub mod probe;
 pub mod remote_management;

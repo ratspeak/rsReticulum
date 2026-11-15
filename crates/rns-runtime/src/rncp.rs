@@ -28,6 +28,7 @@ use crate::lifecycle::ShutdownSignal;
 use crate::link_manager::{
     DestinationRequest, LinkManager, RequestOutcome, ResourceFileCompletion,
 };
+use crate::ntpath;
 use crate::resource_source::{PreparedResourceSource, ResourceOptions, ResourceSource};
 use crate::resource_spool::ResourceSpool;
 use rns_identity::destination::AllowPolicy;
@@ -326,11 +327,6 @@ fn escapes_jail(path: &str, jail: &str) -> bool {
     }
 }
 
-/// `os.path.basename`.
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
 // rncp's paths follow the host's `os.path`: `ntpath` on Windows, where the
 // POSIX string handling cannot name a drive and refuses every jailed fetch.
 
@@ -347,185 +343,28 @@ fn host_jail(jail: &str) -> String {
 fn host_fetch_request_path(jail: Option<&str>, data: &str) -> Option<String> {
     let (home, cwd) = (process_home(), process_cwd());
     if cfg!(windows) {
-        ntpath::fetch_request_path(jail, data, home.as_deref(), &cwd)
+        nt_fetch_request_path(jail, data, home.as_deref(), &cwd)
     } else {
         fetch_request_path(jail, data, home.as_deref(), &cwd)
     }
 }
 
-fn host_basename(path: &str) -> &str {
-    if cfg!(windows) {
-        ntpath::basename(path)
-    } else {
-        basename(path)
-    }
-}
-
-/// Lexical `ntpath`: both separators, drive letters and UNC shares. Plain
-/// string functions, so every host runs their tests.
-mod ntpath {
-    const SEPS: [char; 2] = ['\\', '/'];
-
-    /// `ntpath.splitroot`: drive, root and tail.
-    pub(super) fn splitroot(path: &str) -> (&str, &str, &str) {
-        let unified = path.replace('/', "\\");
-        if unified.starts_with("\\\\") {
-            // `\\server\share`, `\\?\UNC\server\share`, or a `\\?\` device.
-            let start = if unified
-                .get(..8)
-                .is_some_and(|head| head.eq_ignore_ascii_case("\\\\?\\UNC\\"))
-            {
-                8
-            } else {
-                2
-            };
-            let Some(server) = unified[start..].find('\\').map(|i| start + i) else {
-                return (path, "", "");
-            };
-            let Some(share) = unified[server + 1..].find('\\').map(|i| server + 1 + i) else {
-                return (path, "", "");
-            };
-            (&path[..share], &path[share..share + 1], &path[share + 1..])
-        } else if unified.starts_with('\\') {
-            ("", &path[..1], &path[1..])
-        } else if let Some((colon, ':')) = path.char_indices().nth(1) {
-            let drive = colon + 1;
-            if unified[drive..].starts_with('\\') {
-                (&path[..drive], &path[drive..drive + 1], &path[drive + 1..])
-            } else {
-                (&path[..drive], "", &path[drive..])
-            }
-        } else {
-            ("", "", path)
+/// rncp.py's jail rule on Windows: a request already under the jail is
+/// taken relative to it, and the result must stay strictly inside by
+/// component. `jail` is already absolute and normalised.
+fn nt_fetch_request_path(
+    jail: Option<&str>,
+    data: &str,
+    home: Option<&str>,
+    cwd: &str,
+) -> Option<String> {
+    match jail {
+        Some(jail) => {
+            let data = ntpath::below(data, jail).unwrap_or_else(|| data.to_string());
+            let path = ntpath::abspath(&ntpath::expanduser(&format!("{jail}\\{data}"), home), cwd);
+            ntpath::below(&path, jail).is_some().then_some(path)
         }
-    }
-
-    /// `ntpath.isabs` as of Python 3.13: a drive with a root, or a UNC or
-    /// device path. A rooted `\x` takes the working drive, as Windows does.
-    fn isabs(path: &str) -> bool {
-        let head: String = path.chars().take(3).collect::<String>().replace('/', "\\");
-        head.starts_with("\\\\") || head.chars().skip(1).eq([':', '\\'])
-    }
-
-    fn fold(name: &str) -> String {
-        name.replace('/', "\\").to_lowercase()
-    }
-
-    /// `ntpath.join` of two paths.
-    fn join<'a>(base: &'a str, path: &'a str) -> String {
-        let (mut drive, mut root, base_tail) = splitroot(base);
-        let mut tail = base_tail.to_string();
-        let (path_drive, path_root, path_tail) = splitroot(path);
-        if !path_root.is_empty() {
-            if !path_drive.is_empty() || drive.is_empty() {
-                drive = path_drive;
-            }
-            root = path_root;
-            tail = path_tail.to_string();
-        } else if !path_drive.is_empty() && fold(path_drive) != fold(drive) {
-            (drive, root, tail) = (path_drive, path_root, path_tail.to_string());
-        } else {
-            if !path_drive.is_empty() {
-                drive = path_drive;
-            }
-            if !tail.is_empty() && !tail.ends_with(SEPS) {
-                tail.push('\\');
-            }
-            tail.push_str(path_tail);
-        }
-        if !tail.is_empty()
-            && root.is_empty()
-            && !drive.is_empty()
-            && !drive.ends_with([':', '\\', '/'])
-        {
-            return format!("{drive}\\{tail}");
-        }
-        format!("{drive}{root}{tail}")
-    }
-
-    /// `ntpath.normpath`.
-    pub(super) fn normpath(path: &str) -> String {
-        let unified = path.replace('/', "\\");
-        let (drive, root, tail) = splitroot(&unified);
-        let mut comps: Vec<&str> = Vec::new();
-        for comp in tail.split('\\') {
-            match comp {
-                "" | "." => {}
-                ".." if comps.last().is_some_and(|last| *last != "..") => {
-                    comps.pop();
-                }
-                ".." if comps.is_empty() && !root.is_empty() => {}
-                _ => comps.push(comp),
-            }
-        }
-        let prefix = format!("{drive}{root}");
-        if prefix.is_empty() && comps.is_empty() {
-            return ".".into();
-        }
-        format!("{prefix}{}", comps.join("\\"))
-    }
-
-    /// `ntpath.abspath`, lexical only: a path on another drive without a
-    /// root stays relative to that drive's own directory.
-    pub(super) fn abspath(path: &str, cwd: &str) -> String {
-        if isabs(path) {
-            normpath(path)
-        } else {
-            normpath(&join(cwd, path))
-        }
-    }
-
-    /// `ntpath.expanduser` for `~` and `~\...`; `~user` is left unchanged.
-    pub(super) fn expanduser(path: &str, home: Option<&str>) -> String {
-        match (path.strip_prefix('~'), home) {
-            (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with(SEPS) => {
-                format!("{home}{rest}")
-            }
-            _ => path.to_string(),
-        }
-    }
-
-    /// `ntpath.basename`.
-    pub(super) fn basename(path: &str) -> &str {
-        let (_, _, tail) = splitroot(path);
-        tail.rsplit(SEPS).next().unwrap_or(tail)
-    }
-
-    /// What `path` names below `dir`, comparing drives and components
-    /// case-insensitively as Windows does; `None` unless strictly below.
-    pub(super) fn below(path: &str, dir: &str) -> Option<String> {
-        let (path_drive, path_root, path_tail) = splitroot(path);
-        let (dir_drive, dir_root, dir_tail) = splitroot(dir);
-        if fold(path_drive) != fold(dir_drive) || path_root.is_empty() != dir_root.is_empty() {
-            return None;
-        }
-        let mut comps = path_tail.split(SEPS).filter(|comp| !comp.is_empty());
-        for dir_comp in dir_tail.split(SEPS).filter(|comp| !comp.is_empty()) {
-            if fold(comps.next()?) != fold(dir_comp) {
-                return None;
-            }
-        }
-        let rest: Vec<&str> = comps.collect();
-        (!rest.is_empty()).then(|| rest.join("\\"))
-    }
-
-    /// rncp.py's jail rule on Windows: a request already under the jail is
-    /// taken relative to it, and the result must stay strictly inside by
-    /// component. `jail` is already absolute and normalised.
-    pub(super) fn fetch_request_path(
-        jail: Option<&str>,
-        data: &str,
-        home: Option<&str>,
-        cwd: &str,
-    ) -> Option<String> {
-        match jail {
-            Some(jail) => {
-                let data = below(data, jail).unwrap_or_else(|| data.to_string());
-                let path = abspath(&expanduser(&format!("{jail}\\{data}"), home), cwd);
-                below(&path, jail).is_some().then_some(path)
-            }
-            None => Some(abspath(&expanduser(data, home), cwd)),
-        }
+        None => Some(ntpath::abspath(&ntpath::expanduser(data, home), cwd)),
     }
 }
 
@@ -832,7 +671,7 @@ fn serve_fetch(
         return RequestOutcome::ReplyValue(FetchReply::NotFound.packed());
     };
     let bytes = file.metadata().map_or(0, |meta| meta.len() as usize);
-    let name = host_basename(&path).to_string();
+    let name = crate::platform::basename(&path).to_string();
     let metadata = pack_metadata(&name);
     let _ = events.try_send(RncpEvent::FetchServing {
         link_id,
@@ -897,7 +736,7 @@ async fn save_received_file(
 
 fn save_path_for(save_dir: &Path, file_name: &str, overwrite: bool) -> Result<PathBuf, String> {
     // rncp.py: the basename must name an entry directly in save_dir.
-    let basename = host_basename(file_name).to_string();
+    let basename = crate::platform::basename(file_name).to_string();
     if basename.is_empty() || basename == "." || basename == ".." {
         return Err(format!("invalid save path for {file_name:?}"));
     }
@@ -2390,89 +2229,13 @@ mod tests {
     }
 
     #[test]
-    fn rncp_paths_follow_the_host() {
-        let name = r"dir\file.bin";
-        let expected = if cfg!(windows) { "file.bin" } else { name };
-        assert_eq!(host_basename(name), expected);
-    }
-
-    #[test]
-    fn ntpath_splits_drives_shares_and_devices() {
-        for (path, split) in [
-            (r"C:\a\b", ("C:", r"\", r"a\b")),
-            ("C:/a", ("C:", "/", "a")),
-            ("C:a", ("C:", "", "a")),
-            (r"\\server\share\a", (r"\\server\share", r"\", "a")),
-            ("//server/share/a", ("//server/share", "/", "a")),
-            (r"\\?\C:\a", (r"\\?\C:", r"\", "a")),
-            (
-                r"\\?\UNC\server\share\a",
-                (r"\\?\UNC\server\share", r"\", "a"),
-            ),
-            (r"\\server", (r"\\server", "", "")),
-            (r"\a", ("", r"\", "a")),
-            ("a", ("", "", "a")),
-        ] {
-            assert_eq!(ntpath::splitroot(path), split, "{path}");
-        }
-    }
-
-    #[test]
-    fn ntpath_resolves_against_the_working_directory() {
-        let cwd = r"D:\work\dir";
-        for (path, expected) in [
-            ("file.bin", r"D:\work\dir\file.bin"),
-            ("sub/./x/../file.bin", r"D:\work\dir\sub\file.bin"),
-            (r"..\..\..\up", r"D:\up"),
-            (r"\rooted", r"D:\rooted"),
-            ("C:/Temp/.tmpX", r"C:\Temp\.tmpX"),
-            (r"C:\..\x", r"C:\x"),
-            ("d:rel", r"d:\work\dir\rel"),
-            ("C:rel", "C:rel"),
-            (r"\\server\share\..\x", r"\\server\share\x"),
-        ] {
-            assert_eq!(ntpath::abspath(path, cwd), expected, "{path}");
-        }
-        assert_eq!(
-            ntpath::abspath("x", r"\\server\share\dir"),
-            r"\\server\share\dir\x"
-        );
-        assert_eq!(ntpath::normpath(""), ".");
-        assert_eq!(ntpath::normpath(r"a\..\..\b"), r"..\b");
-    }
-
-    #[test]
-    fn ntpath_expands_the_windows_home() {
-        let home = Some(r"C:\Users\me");
-        assert_eq!(ntpath::expanduser("~", home), r"C:\Users\me");
-        assert_eq!(ntpath::expanduser(r"~\files", home), r"C:\Users\me\files");
-        assert_eq!(ntpath::expanduser("~/files", home), r"C:\Users\me/files");
-        assert_eq!(ntpath::expanduser(r"~other\files", home), r"~other\files");
-        assert_eq!(ntpath::expanduser(r"~\files", None), r"~\files");
-    }
-
-    #[test]
-    fn ntpath_basename_takes_the_last_name_after_either_separator() {
-        for (path, name) in [
-            (r"C:\jail\file.bin", "file.bin"),
-            (r"dir/sub\file.bin", "file.bin"),
-            (r"..\..\evil.bin", "evil.bin"),
-            ("C:evil.bin", "evil.bin"),
-            (r"\\server\share", ""),
-            ("plain.bin", "plain.bin"),
-        ] {
-            assert_eq!(ntpath::basename(path), name, "{path}");
-        }
-    }
-
-    #[test]
     fn ntpath_jail_holds_fetches_by_component() {
         // The Windows CI jail: a temporary directory on another drive.
         let cwd = r"D:\a\rsReticulum\rsReticulum\crates\rns-runtime";
         let tmp = r"C:\Users\RUNNER~1\AppData\Local\Temp\.tmpAbC123";
         let jail = ntpath::abspath(&ntpath::expanduser(tmp, None), cwd);
         assert_eq!(jail, tmp);
-        let fetch = |data: &str| ntpath::fetch_request_path(Some(&jail), data, None, cwd);
+        let fetch = |data: &str| nt_fetch_request_path(Some(&jail), data, None, cwd);
         let inside = |rest: &str| Some(format!(r"{jail}\{rest}"));
         assert_eq!(fetch("file.bin"), inside("file.bin"));
         assert_eq!(fetch("sub/file.bin"), inside(r"sub\file.bin"));
@@ -2500,16 +2263,16 @@ mod tests {
         }
 
         let share = r"\\server\share\jail";
-        let fetch = |data: &str| ntpath::fetch_request_path(Some(share), data, None, cwd);
+        let fetch = |data: &str| nt_fetch_request_path(Some(share), data, None, cwd);
         assert_eq!(fetch("x/y"), Some(r"\\server\share\jail\x\y".into()));
         assert_eq!(fetch(r"..\..\other\x"), None);
         assert_eq!(fetch(r"..\jail-other\x"), None);
         assert_eq!(
-            ntpath::fetch_request_path(Some(r"C:\"), "x", None, cwd),
+            nt_fetch_request_path(Some(r"C:\"), "x", None, cwd),
             Some(r"C:\x".into())
         );
         assert_eq!(
-            ntpath::fetch_request_path(None, r"~\x.bin", Some(r"C:\Users\me"), cwd),
+            nt_fetch_request_path(None, r"~\x.bin", Some(r"C:\Users\me"), cwd),
             Some(r"C:\Users\me\x.bin".into())
         );
     }

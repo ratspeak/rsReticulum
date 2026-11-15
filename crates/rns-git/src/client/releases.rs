@@ -85,13 +85,16 @@ pub fn prettyhexrep(hash: &[u8]) -> String {
     format!("<{}>", hex::encode(hash))
 }
 
-/// `os.path.expanduser`.
+/// `os.path.expanduser` for `~` and `~/...`, and `~\...` on Windows.
 pub fn expand_user(path: &str) -> PathBuf {
-    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    let home = rns_runtime::platform::home_dir;
     if path == "~" {
         return home().unwrap_or_else(|| PathBuf::from(path));
     }
-    match (path.strip_prefix("~/"), home()) {
+    let rest = path
+        .strip_prefix('~')
+        .and_then(|rest| rest.strip_prefix(std::path::is_separator));
+    match (rest, home()) {
         (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(path),
     }
@@ -661,8 +664,7 @@ pub fn fetch_release(
         "Release manifest validated, signed by {}",
         prettyhexrep(&manifest.signer)
     );
-    let manifest_out = format!("{}_{}.rsm", manifest.text("name"), manifest.text("version"));
-    let manifest_out = PathBuf::from(py_basename(&manifest_out));
+    let manifest_out = manifest_file(&manifest.text("name"), &manifest.text("version"));
     std::fs::write(&manifest_out, &manifest.rsg)
         .map_err(|e| Fail::Abort(format!("Error fetching release: {e}")))?;
 
@@ -754,6 +756,11 @@ pub fn fetch_release(
         return Ok(1);
     }
     Ok(0)
+}
+
+/// The file a fetched manifest is saved as, in the working directory.
+fn manifest_file(name: &str, version: &str) -> PathBuf {
+    PathBuf::from(py_basename(&format!("{name}_{version}.rsm")))
 }
 
 /// `RELEASE_NOTES_TEMPLATE` (`server.py`).
@@ -1099,4 +1106,48 @@ pub fn run_simple(
         _ => confirm_and_send(out, input, link.as_mut(), &repo_path, operation, target)?,
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Component;
+
+    fn in_working_directory(path: &Path) -> bool {
+        let mut components = path.components();
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+    }
+
+    /// A fetched manifest or artifact is saved under its base name in the
+    /// working directory, whatever separators or drive the manifest names.
+    #[test]
+    fn fetched_release_files_land_in_the_working_directory() {
+        for (name, windows) in [(r"..\..\x", "x"), (r"C:\Users\me\x", "x"), ("C:x", "x")] {
+            let local = py_basename(name);
+            assert_eq!(local, if cfg!(windows) { windows } else { name });
+            assert!(in_working_directory(Path::new(local)), "{name}");
+        }
+        for (name, windows) in [(r"..\..\x", "x_1.0.rsm"), (r"C:\Users\me\x", "x_1.0.rsm")] {
+            let local = manifest_file(name, "1.0");
+            let expected = if cfg!(windows) {
+                windows.to_string()
+            } else {
+                format!("{name}_1.0.rsm")
+            };
+            assert_eq!(local, PathBuf::from(expected));
+            assert!(in_working_directory(&local), "{name}");
+        }
+    }
+
+    #[test]
+    fn expand_user_names_the_home() {
+        if let Some(home) = rns_runtime::platform::home_dir() {
+            assert_eq!(expand_user("~"), home);
+            assert_eq!(expand_user("~/x"), home.join("x"));
+            if cfg!(windows) {
+                assert_eq!(expand_user(r"~\x"), home.join("x"));
+            }
+        }
+        assert_eq!(expand_user("~other/x"), PathBuf::from("~other/x"));
+    }
 }

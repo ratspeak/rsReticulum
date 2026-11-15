@@ -106,6 +106,16 @@ pub fn home_dir() -> Option<PathBuf> {
     }
 }
 
+/// `os.path.basename` on this host: `ntpath` on Windows, so either separator
+/// and a drive end the directory part; `posixpath` elsewhere.
+pub fn basename(path: &str) -> &str {
+    if cfg!(windows) {
+        crate::ntpath::basename(path)
+    } else {
+        path.rsplit('/').next().unwrap_or(path)
+    }
+}
+
 fn windows_home(home: Option<OsString>, userprofile: Option<OsString>) -> Option<PathBuf> {
     home.into_iter()
         .chain(userprofile)
@@ -181,6 +191,15 @@ mod tests {
                 || dir.ends_with(".rsReticulum")
                 || dir.ends_with("/data/local/tmp/.rsReticulum")
         );
+    }
+
+    #[test]
+    fn basename_follows_the_host() {
+        for name in [r"..\..\x", r"C:\Users\me\x"] {
+            let expected = if cfg!(windows) { "x" } else { name };
+            assert_eq!(basename(name), expected);
+        }
+        assert_eq!(basename("dir/x"), "x");
     }
 
     #[test]

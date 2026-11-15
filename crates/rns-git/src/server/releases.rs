@@ -82,9 +82,10 @@ fn is_dot_tag(tag: &str) -> bool {
     matches!(tag, "." | "..")
 }
 
-/// `posixpath.basename`: everything after the last `/`, so `"a/"` gives `""`.
+/// `os.path.basename` on this host: after the last `/`, so `"a/"` gives `""`;
+/// on Windows also after a `\` or a drive.
 pub(crate) fn py_basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    rns_runtime::platform::basename(path)
 }
 
 /// `os.path.join(base, name)` for one component. A component keeps its own
@@ -572,6 +573,13 @@ fn release_fetch(releases_path: &Path, data: &[(Value, Value)]) -> Result<Reply,
         )));
     }
     let tag = basename_of(&tag)?;
+    // On Windows a tag such as `x\..` is `..` only once reduced to its base name.
+    if is_dot_tag(&tag) {
+        return Ok(Reply::Bytes(status(
+            RES_INVALID_REQ,
+            "Invalid tag specified",
+        )));
+    }
     let artifact = basename_of(&artifact)?;
     let tag = match resolve_latest(releases_path, &tag) {
         Ok(tag) => tag,
@@ -973,4 +981,74 @@ pub fn handle_release(
         _ => status(RES_INVALID_REQ, "Invalid request"),
     };
     Some(Reply::Bytes(reply))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(pairs: &[(&str, &str)]) -> Vec<(Value, Value)> {
+        pairs
+            .iter()
+            .map(|(key, value)| (Value::from(*key), Value::from(*value)))
+            .collect()
+    }
+
+    /// A tag names one directory under the releases directory; on Windows its
+    /// base name drops a `\` path or a drive.
+    #[test]
+    fn a_tag_names_one_release_directory() {
+        for (tag, windows) in [(r"..\..\x", "x"), (r"C:\Users\me\x", "x"), ("C:x", "x")] {
+            let found = lookup_tag(&request(&[("tag", tag)]))
+                .ok()
+                .flatten()
+                .expect(tag);
+            assert_eq!(found, if cfg!(windows) { windows } else { tag });
+            let releases = Path::new("releases");
+            assert_eq!(releases.join(&found).parent(), Some(releases), "{tag}");
+        }
+        let dotted = lookup_tag(&request(&[("tag", r"x\..")])).ok().flatten();
+        assert_eq!(dotted.is_none(), cfg!(windows));
+    }
+
+    #[test]
+    fn a_fetched_artifact_stays_in_its_release() {
+        let root = tempfile::tempdir().unwrap();
+        let releases = root.path().join("releases");
+        std::fs::create_dir_all(releases.join("x").join("artifacts")).unwrap();
+        std::fs::write(releases.join("x").join("artifacts").join("a.bin"), b"a").unwrap();
+        // What a tag reduced to `..` would reach.
+        std::fs::create_dir_all(root.path().join("artifacts")).unwrap();
+        std::fs::write(root.path().join("artifacts").join("leak.bin"), b"leak").unwrap();
+        let fetch = |tag: &str, artifact: &str| match release_fetch(
+            &releases,
+            &request(&[("tag", tag), ("artifact", artifact)]),
+        ) {
+            Ok(Reply::File { metadata, .. }) => Ok(metadata),
+            Ok(Reply::Bytes(reply)) => Err(reply[0]),
+            Err(Raised) => panic!("{tag}: raised"),
+        };
+        let served = Value::Map(vec![(
+            Value::from("name"),
+            Value::Binary(b"a.bin".to_vec()),
+        )]);
+        let served = pack(&served).ok();
+        for (tag, artifact) in [
+            (r"..\..\x", r"..\..\a.bin"),
+            (r"C:\Users\me\x", r"C:\a.bin"),
+        ] {
+            let reply = fetch(tag, artifact);
+            if cfg!(windows) {
+                assert_eq!(reply.ok(), served, "{tag}");
+            } else {
+                assert_eq!(reply, Err(RES_NOT_FOUND), "{tag}");
+            }
+        }
+        let dotted = if cfg!(windows) {
+            RES_INVALID_REQ
+        } else {
+            RES_NOT_FOUND
+        };
+        assert_eq!(fetch(r"x\..", "leak.bin"), Err(dotted));
+    }
 }

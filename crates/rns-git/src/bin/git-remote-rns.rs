@@ -184,7 +184,7 @@ fn main() {
     };
     let configdir = std::env::var_os("RNGIT_CONFIG").map(PathBuf::from);
     let rnsconfig = std::env::var("RNS_CONFIG").ok();
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let home = rns_runtime::platform::home_dir().unwrap_or_default();
     let configdir = resolve_config_dir(configdir.as_deref(), &home);
 
     let config = match ClientConfig::load(&configdir) {
