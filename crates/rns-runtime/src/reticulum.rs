@@ -10440,8 +10440,42 @@ async fn finish_interface_shutdown(
     }
 }
 
+type InterfaceSpawnFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<Vec<OwnedInterfaceHandle>, String>> + Send + 'a>>;
+
+/// Type-erased so the spawn arms compile once, here, rather than again in every
+/// crate that awaits a caller.
 #[allow(clippy::too_many_arguments)]
-async fn spawn_interface_with_rnode_startup_options(
+fn spawn_interface_with_rnode_startup_options<'a>(
+    iface_config: &'a interface_factory::InterfaceConfig,
+    id: u64,
+    further_ids: &'a [u64],
+    transport_tx: mpsc::Sender<TransportMessage>,
+    id_gen: Arc<AtomicU64>,
+    handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
+    socket_base: &'a Path,
+    storage_dir: &'a Path,
+    is_foreground: Arc<AtomicBool>,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+    tunnel_identity: &'a rns_interface::traits::TunnelIdentity,
+) -> InterfaceSpawnFuture<'a> {
+    Box::pin(spawn_configured_interface_driver(
+        iface_config,
+        id,
+        further_ids,
+        transport_tx,
+        id_gen,
+        handle_tx,
+        socket_base,
+        storage_dir,
+        is_foreground,
+        rnode_startup_options,
+        tunnel_identity,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_configured_interface_driver(
     iface_config: &interface_factory::InterfaceConfig,
     id: u64,
     further_ids: &[u64],
