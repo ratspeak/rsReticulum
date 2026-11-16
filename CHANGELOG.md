@@ -28,6 +28,7 @@
 
 ### Build and compatibility
 
+- `ifac_size` is read in bits, as in Python Reticulum. A bare value set under 1.3.0 was in bytes, so multiply it by 8 (16 becomes 128), or convert it with `rnsd-rs config ifac-units`.
 - Bluetooth Peer uses new service identifiers, so it doesn't find peers on 1.4.0 or earlier until both update. Bluetooth RNodes aren't affected.
 - Known destinations, ratchets, and cached announces are stored in the same SQLite files as Python Reticulum 1.6.0. Old files are imported on first start, so going back to an older release starts with no known destinations.
 - Breaking API changes are listed in the [1.5 migration guide](api/migrations/1.5.md); use the `~1.5.0` line. The default `sqlite-store` feature builds a bundled SQLite, so builds need a C compiler.
