@@ -740,11 +740,13 @@ pub struct BlePeerConfig {
 }
 
 impl BlePeerConfig {
+    /// Gateway, as upstream configures a discoverable attach point: a transport
+    /// node then looks up paths its BLE peers ask for and does not know.
     pub fn new(name: &str, identity_hash: Vec<u8>) -> Self {
         Self {
             name: name.to_string(),
             identity_hash,
-            mode: InterfaceMode::Full,
+            mode: InterfaceMode::Gateway,
         }
     }
 }
@@ -7401,7 +7403,7 @@ mod tests {
         let cfg = BlePeerConfig::new("mesh0", vec![0u8; 16]);
         assert_eq!(cfg.name, "mesh0");
         assert_eq!(cfg.identity_hash.len(), 16);
-        assert_eq!(cfg.mode, InterfaceMode::Full);
+        assert_eq!(cfg.mode, InterfaceMode::Gateway);
     }
 
     // ── BlePeer struct serialization ──

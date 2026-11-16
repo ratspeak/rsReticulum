@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Bluetooth Peer runs in Gateway mode, so a node with transport on looks up the paths its Bluetooth peers ask for that it doesn't know yet. Nodes with transport off behave as before.
 - Announce handler events carry `emitted`, the time the announcer stamped into the announce, so an application can tell an older cached announce in a path response from a newer one. `AnnounceHandlerEvent` struct literals need the new field.
 
 ## 1.5.0 - 2026-11-13
