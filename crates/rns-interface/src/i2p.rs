@@ -873,6 +873,7 @@ pub async fn spawn_i2p_server(
     let parent_rxb = server_rxb.clone();
     let parent_txb = server_txb.clone();
     let server_identity = InterfaceIdentity::bracketed("I2PInterface", &name);
+    let python_name = server_identity.name.clone();
     let b32 = config.b32.as_ref().map(|b32| b32.subscribe());
 
     let online_task = online.clone();
@@ -962,8 +963,14 @@ pub async fn spawn_i2p_server(
                     "I2P server: failed to store its private key; its address changes with the next session"
                 );
             }
+            let address = destination_b32(&our_dest);
+            if let Some(address) = &address {
+                tracing::debug!(
+                    "{python_name} endpoint setup complete. Now reachable at: {address}.b32.i2p"
+                );
+            }
             if let Some(b32) = &config.b32 {
-                b32.send_replace(destination_b32(&our_dest));
+                b32.send_replace(address);
             }
             online_task.store(true, Ordering::SeqCst);
 
