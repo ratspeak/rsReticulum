@@ -1409,9 +1409,11 @@ pub fn rns_transport::messages::InterfaceIdentity::new(impl core::convert::Into<
 pub struct rns_transport::messages::InterfaceInspectionSnapshot
 pub rns_transport::messages::InterfaceInspectionSnapshot::active_clients: core::option::Option<u64>
 pub rns_transport::messages::InterfaceInspectionSnapshot::blocked_ips: core::option::Option<u64>
+pub rns_transport::messages::InterfaceInspectionSnapshot::connect_failures: u32
 pub rns_transport::messages::InterfaceInspectionSnapshot::i2p_b32: core::option::Option<alloc::string::String>
 pub rns_transport::messages::InterfaceInspectionSnapshot::i2p_connectable: core::option::Option<bool>
 pub rns_transport::messages::InterfaceInspectionSnapshot::i2p_tunnel_state: core::option::Option<u8>
+pub rns_transport::messages::InterfaceInspectionSnapshot::last_connect_error: core::option::Option<&'static str>
 pub rns_transport::messages::InterfaceInspectionSnapshot::peers: core::option::Option<u64>
 pub rns_transport::messages::InterfaceInspectionSnapshot::radio: alloc::vec::Vec<(&'static str, rns_transport::messages::InterfaceStatValue)>
 pub rns_transport::messages::InterfaceInspectionSnapshot::tx_buffered: u64
@@ -1470,6 +1472,7 @@ pub rns_transport::messages::InterfaceStatRpcEntry::burst_activated: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::burst_active: bool
 pub rns_transport::messages::InterfaceStatRpcEntry::burst_count: core::option::Option<u64>
 pub rns_transport::messages::InterfaceStatRpcEntry::clients: core::option::Option<u64>
+pub rns_transport::messages::InterfaceStatRpcEntry::connect_failures: u32
 pub rns_transport::messages::InterfaceStatRpcEntry::gravity: i64
 pub rns_transport::messages::InterfaceStatRpcEntry::held_announces: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::i2p_b32: core::option::Option<alloc::string::String>
@@ -1483,6 +1486,7 @@ pub rns_transport::messages::InterfaceStatRpcEntry::ifac_size: core::option::Opt
 pub rns_transport::messages::InterfaceStatRpcEntry::ifac_violations: u64
 pub rns_transport::messages::InterfaceStatRpcEntry::incoming_announce_frequency: f64
 pub rns_transport::messages::InterfaceStatRpcEntry::incoming_pr_frequency: f64
+pub rns_transport::messages::InterfaceStatRpcEntry::last_connect_error: core::option::Option<alloc::string::String>
 pub rns_transport::messages::InterfaceStatRpcEntry::mode: alloc::string::String
 pub rns_transport::messages::InterfaceStatRpcEntry::mtu: u32
 pub rns_transport::messages::InterfaceStatRpcEntry::name: alloc::string::String

@@ -344,6 +344,141 @@ pub fn frame_for_tcp(data: &[u8], kiss_framing: bool) -> Vec<u8> {
 
 use crate::socket_tuning::set_socket_buffers;
 
+/// Why a reconnecting client's attempt failed, as its interface stats name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectError {
+    Refused,
+    TimedOut,
+    Dns,
+    Unreachable,
+    ClosedByPeer,
+    Other,
+}
+
+impl ConnectError {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::TimedOut => "timed_out",
+            Self::Dns => "dns",
+            Self::Unreachable => "unreachable",
+            Self::ClosedByPeer => "closed_by_peer",
+            Self::Other => "other",
+        }
+    }
+
+    pub(crate) fn from_io(error: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        match error.kind() {
+            ErrorKind::ConnectionRefused => Self::Refused,
+            ErrorKind::TimedOut => Self::TimedOut,
+            ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::NetworkDown
+            | ErrorKind::AddrNotAvailable => Self::Unreachable,
+            ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof => Self::ClosedByPeer,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A connection that ends sooner is a failed attempt, `closed_by_peer` when the
+/// server ended it: an upstream Backbone hub accepts and at once closes an IP it
+/// blocks, and counts connections this short as fast flaps.
+pub(crate) const CONNECTION_STAYS_UP: std::time::Duration =
+    crate::backbone::FAST_FLAPPING_THRESHOLD;
+
+/// The connect outcome a reconnecting client reports in its interface stats.
+#[derive(Debug, Default)]
+pub(crate) struct ConnectDiagnostics(std::sync::Mutex<ConnectState>);
+
+#[derive(Debug, Default)]
+struct ConnectState {
+    last_error: Option<ConnectError>,
+    failures: u32,
+    connected_at: Option<std::time::Instant>,
+}
+
+impl ConnectState {
+    fn stayed_up(&self) -> bool {
+        self.connected_at
+            .is_some_and(|at| at.elapsed() >= CONNECTION_STAYS_UP)
+    }
+
+    fn fail(&mut self, error: ConnectError) {
+        self.last_error = Some(error);
+        self.failures = self.failures.saturating_add(1);
+    }
+}
+
+impl ConnectDiagnostics {
+    fn state(&self) -> std::sync::MutexGuard<'_, ConnectState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn failed(&self, error: ConnectError) {
+        self.state().fail(error);
+    }
+
+    pub(crate) fn connected(&self) {
+        self.state().connected_at = Some(std::time::Instant::now());
+    }
+
+    /// `ended` names how the connection closed.
+    pub(crate) fn disconnected(&self, ended: ConnectError) {
+        let mut state = self.state();
+        if state.stayed_up() {
+            state.last_error = None;
+            state.failures = 0;
+        } else {
+            state.fail(ended);
+        }
+        state.connected_at = None;
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        mut snapshot: InterfaceInspectionSnapshot,
+    ) -> InterfaceInspectionSnapshot {
+        let state = self.state();
+        if !state.stayed_up() {
+            snapshot.last_connect_error = state.last_error.map(ConnectError::as_str);
+            snapshot.connect_failures = state.failures;
+        }
+        snapshot
+    }
+}
+
+/// `TcpStream::connect(addr)` within [`INITIAL_CONNECT_TIMEOUT`], naming the failure.
+async fn connect_tcp_target(addr: &str) -> Result<TcpStream, (ConnectError, std::io::Error)> {
+    use std::io::{Error, ErrorKind};
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(INITIAL_CONNECT_TIMEOUT);
+    let addrs: Vec<std::net::SocketAddr> =
+        match tokio::time::timeout_at(deadline, tokio::net::lookup_host(addr)).await {
+            Ok(Ok(addrs)) => addrs.collect(),
+            Ok(Err(error)) => return Err((ConnectError::Dns, error)),
+            Err(_) => return Err((ConnectError::Dns, ErrorKind::TimedOut.into())),
+        };
+    if addrs.is_empty() {
+        return Err((
+            ConnectError::Dns,
+            Error::new(ErrorKind::NotFound, "could not resolve to any address"),
+        ));
+    }
+    match tokio::time::timeout_at(deadline, TcpStream::connect(&addrs[..])).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => Err((ConnectError::from_io(&error), error)),
+        Err(_) => Err((ConnectError::TimedOut, ErrorKind::TimedOut.into())),
+    }
+}
+
+/// Returns how the connection ended.
 async fn tcp_read_loop(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     interface_id: InterfaceId,
@@ -352,7 +487,8 @@ async fn tcp_read_loop(
     kiss_framing: bool,
     hw_mtu: usize,
     ifac_size: usize,
-) {
+) -> ConnectError {
+    let mut ended = ConnectError::ClosedByPeer;
     let mut buf = [0u8; 32768];
 
     if kiss_framing {
@@ -378,12 +514,13 @@ async fn tcp_read_loop(
                         });
                         if transport_tx.send(msg).await.is_err() {
                             tracing::warn!(interface_id, "transport channel closed");
-                            return;
+                            return ConnectError::Other;
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(interface_id, error = %e, "TCP read error");
+                    ended = ConnectError::from_io(&e);
                     break;
                 }
             }
@@ -421,18 +558,20 @@ async fn tcp_read_loop(
                         });
                         if transport_tx.send(msg).await.is_err() {
                             tracing::warn!(interface_id, "transport channel closed");
-                            return;
+                            return ConnectError::Other;
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(interface_id, error = %e, "TCP read error");
+                    ended = ConnectError::from_io(&e);
                     break;
                 }
             }
         }
     }
     state.online.store(false, Ordering::SeqCst);
+    ended
 }
 
 async fn tcp_write_loop(
@@ -544,21 +683,17 @@ pub async fn spawn_tcp_client_observed(
     let python_name = config.python_name();
     let identity = InterfaceIdentity::new(&python_name, &config.name, "TCPClientInterface");
     let (teardown_tx, teardown) = ClientTeardown::channel();
+    let diagnostics = Arc::new(ConnectDiagnostics::default());
+    let task_diagnostics = diagnostics.clone();
+    let addr = format!("{}:{}", config.target_host, config.target_port);
     // Python connects once, synchronously, before the interface is handed to
     // transport (TCPInterface.py).
-    let mut initial_attempt = Some(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(INITIAL_CONNECT_TIMEOUT),
-            TcpStream::connect(format!("{}:{}", config.target_host, config.target_port)),
-        )
-        .await,
-    );
-    if matches!(initial_attempt, Some(Ok(Ok(_)))) {
+    let mut initial_attempt = Some(connect_tcp_target(&addr).await);
+    if matches!(initial_attempt, Some(Ok(_))) {
         online.store(true, Ordering::SeqCst);
     }
     let read_task = tokio::spawn(async move {
         let max_tries = config.max_reconnect_tries;
-        let addr = format!("{}:{}", config.target_host, config.target_port);
         // Every attempt after the first follows a failure or an outage.
         let mut attempted = false;
         // Retries within the current outage (TCPInterface.py).
@@ -577,22 +712,13 @@ pub async fn spawn_tcp_client_observed(
             attempted = true;
             let attempt = match initial_attempt.take() {
                 Some(attempt) => attempt,
-                None => {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(INITIAL_CONNECT_TIMEOUT),
-                        TcpStream::connect(&addr),
-                    )
-                    .await
-                }
+                None => connect_tcp_target(&addr).await,
             };
             let stream = match attempt {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
+                Ok(s) => s,
+                Err((error, e)) => {
                     tracing::warn!(name = %config.name, error = %e, "TCP connect failed");
-                    continue;
-                }
-                Err(_) => {
-                    tracing::warn!(name = %config.name, "TCP connect timed out");
+                    task_diagnostics.failed(error);
                     continue;
                 }
             };
@@ -606,6 +732,7 @@ pub async fn spawn_tcp_client_observed(
             let state = TcpInterfaceState::with_shared_counters(task_rxb.clone(), task_txb.clone());
             state.online.store(true, Ordering::SeqCst);
             attempts = 0;
+            task_diagnostics.connected();
             // Python synthesizes on every non-KISS connection
             // (TCPInterface.py).
             let synthesis = config
@@ -631,7 +758,7 @@ pub async fn spawn_tcp_client_observed(
                 }
             });
 
-            tcp_read_loop(
+            let ended = tcp_read_loop(
                 reader,
                 id,
                 transport_tx.clone(),
@@ -643,6 +770,7 @@ pub async fn spawn_tcp_client_observed(
             .await;
 
             online2.store(false, Ordering::SeqCst);
+            task_diagnostics.disconnected(ended);
 
             fwd_handle.abort();
             let _ = fwd_handle.await;
@@ -673,7 +801,12 @@ pub async fn spawn_tcp_client_observed(
             online,
             rxb: Some(shared_rxb),
             txb: Some(shared_txb),
-            inspection: Some(InterfaceInspectionSource::identified(identity)),
+            inspection: Some(
+                InterfaceInspectionSource::new(move || {
+                    diagnostics.snapshot(InterfaceInspectionSnapshot::default())
+                })
+                .with_identity(identity),
+            ),
             tx,
             read_task,
         },
@@ -1040,6 +1173,118 @@ mod tests {
             .await
             .unwrap();
         handle.read_task.abort();
+    }
+
+    async fn connect_error(
+        handle: &InterfaceHandle,
+        expected: &str,
+    ) -> InterfaceInspectionSnapshot {
+        let source = handle.inspection.as_ref().unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let snapshot = source.snapshot();
+            if snapshot.last_connect_error == Some(expected) {
+                return snapshot;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected {expected}, got {snapshot:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_report_a_refused_connect() {
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = TcpClientConfig::new("tcp-refused", "127.0.0.1", port);
+        let handle = spawn_tcp_client(config, 78, transport_tx).await.unwrap();
+        handle.owner.mark_registered();
+
+        let snapshot = connect_error(&handle, "refused").await;
+        assert_eq!(snapshot.connect_failures, 1);
+        handle.read_task.abort();
+    }
+
+    #[tokio::test]
+    async fn stats_report_a_name_that_does_not_resolve() {
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let config = TcpClientConfig::new("tcp-dns", "no-such-host.invalid", 4242);
+        let handle = spawn_tcp_client(config, 80, transport_tx).await.unwrap();
+        handle.owner.mark_registered();
+
+        connect_error(&handle, "dns").await;
+        handle.read_task.abort();
+    }
+
+    /// An upstream Backbone hub accepts a blocked IP and closes it at once.
+    #[tokio::test]
+    async fn stats_report_a_server_that_closes_at_once() {
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                drop(listener.accept().await.unwrap());
+            }
+        });
+
+        let config = TcpClientConfig::new("tcp-closed", "127.0.0.1", port);
+        let handle = spawn_tcp_client(config, 79, transport_tx).await.unwrap();
+        handle.owner.mark_registered();
+
+        let snapshot = connect_error(&handle, "closed_by_peer").await;
+        assert!(snapshot.connect_failures >= 1);
+        handle.read_task.abort();
+        server.abort();
+    }
+
+    #[test]
+    fn connect_diagnostics_clear_once_a_connection_stays_up() {
+        let diagnostics = ConnectDiagnostics::default();
+        let report = |d: &ConnectDiagnostics| {
+            let s = d.snapshot(InterfaceInspectionSnapshot::default());
+            (s.last_connect_error, s.connect_failures)
+        };
+        assert_eq!(report(&diagnostics), (None, 0));
+
+        diagnostics.failed(ConnectError::TimedOut);
+        diagnostics.failed(ConnectError::Refused);
+        assert_eq!(report(&diagnostics), (Some("refused"), 2));
+
+        // Still on probation: the last failure stands until the link stays up.
+        diagnostics.connected();
+        assert_eq!(report(&diagnostics), (Some("refused"), 2));
+        diagnostics.disconnected(ConnectError::ClosedByPeer);
+        assert_eq!(report(&diagnostics), (Some("closed_by_peer"), 3));
+
+        let Some(earlier) = std::time::Instant::now().checked_sub(CONNECTION_STAYS_UP) else {
+            return;
+        };
+        diagnostics.connected();
+        diagnostics.state().connected_at = Some(earlier);
+        assert_eq!(report(&diagnostics), (None, 0));
+        diagnostics.disconnected(ConnectError::ClosedByPeer);
+        assert_eq!(report(&diagnostics), (None, 0));
+    }
+
+    #[test]
+    fn connect_errors_classify_io_errors() {
+        use std::io::{Error, ErrorKind};
+        for (kind, expected) in [
+            (ErrorKind::ConnectionRefused, "refused"),
+            (ErrorKind::TimedOut, "timed_out"),
+            (ErrorKind::HostUnreachable, "unreachable"),
+            (ErrorKind::NetworkUnreachable, "unreachable"),
+            (ErrorKind::ConnectionReset, "closed_by_peer"),
+            (ErrorKind::PermissionDenied, "other"),
+        ] {
+            assert_eq!(ConnectError::from_io(&Error::from(kind)).as_str(), expected);
+        }
     }
 
     #[test]

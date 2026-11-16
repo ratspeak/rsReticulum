@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::hdlc;
 use crate::socket_tuning::{set_keepalive_tuned, set_socket_buffers};
+use crate::tcp::{ConnectDiagnostics, ConnectError};
 use crate::traits::{
     ByteCounter, InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode, TunnelIdentity,
     handoff_accepted_interface, open_client_connection, python_address_name, python_host,
@@ -411,7 +412,7 @@ async fn backbone_read_loop(
     online: Arc<AtomicBool>,
     rxb: ByteCounter,
     (bitrate, ifac_size): (u64, usize),
-) {
+) -> ConnectError {
     // ReceiveBuffer(HW_MTU, HEADER_MINSIZE, HW_MTU + ifac_size) (BackboneInterface.py).
     let hw_mtu = crate::tcp::hardware_mtu(bitrate, None) as usize;
     let mut deframer = hdlc::HdlcDeframer::with_limits(
@@ -421,6 +422,7 @@ async fn backbone_read_loop(
     );
     // Large buffer to amortise syscalls.
     let mut buf = vec![0u8; 65536];
+    let mut ended = ConnectError::ClosedByPeer;
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => {
@@ -443,17 +445,19 @@ async fn backbone_read_loop(
                     if transport_tx.send(msg).await.is_err() {
                         tracing::warn!(interface_id, "transport channel closed");
                         online.store(false, Ordering::SeqCst);
-                        return;
+                        return ConnectError::Other;
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!(interface_id, error = %e, "backbone read error");
+                ended = ConnectError::from_io(&e);
                 break;
             }
         }
     }
     online.store(false, Ordering::SeqCst);
+    ended
 }
 
 /// Per-connection dataplane egress control state (Python `_dp_ec_*`).
@@ -543,12 +547,16 @@ struct EgressState {
 }
 
 impl EgressState {
-    fn inspection(state: Arc<Self>) -> InterfaceInspectionSource {
-        InterfaceInspectionSource::new(move || InterfaceInspectionSnapshot {
-            tx_stalled: state.stalled.load(Ordering::Relaxed),
-            tx_buffered: state.buffered.load(Ordering::Relaxed),
+    fn snapshot(&self) -> InterfaceInspectionSnapshot {
+        InterfaceInspectionSnapshot {
+            tx_stalled: self.stalled.load(Ordering::Relaxed),
+            tx_buffered: self.buffered.load(Ordering::Relaxed),
             ..InterfaceInspectionSnapshot::default()
-        })
+        }
+    }
+
+    fn inspection(state: Arc<Self>) -> InterfaceInspectionSource {
+        InterfaceInspectionSource::new(move || state.snapshot())
     }
 }
 
@@ -560,7 +568,7 @@ async fn backbone_write_loop(
     txb: &ByteCounter,
     name: &str,
     state: &EgressState,
-) {
+) -> ConnectError {
     let started = tokio::time::Instant::now();
     let mut control = EgressControl::new(0.0);
     let mut tick = tokio::time::interval_at(started + DP_EC_INTERVAL, DP_EC_INTERVAL);
@@ -583,12 +591,12 @@ async fn backbone_write_loop(
                         DP_EC_DEAD_TIME,
                         name,
                     );
-                    return;
+                    return ConnectError::Other;
                 }
             }
             result = async { writer.write(chunk.as_deref().unwrap_or_default()).await }, if chunk.is_some() => {
                 match result {
-                    Ok(0) => return,
+                    Ok(0) => return ConnectError::ClosedByPeer,
                     Ok(n) => {
                         let written = n as u64;
                         sent += written;
@@ -605,12 +613,12 @@ async fn backbone_write_loop(
                     }
                     Err(e) => {
                         tracing::warn!(name = %name, error = %e, "backbone write error");
-                        return;
+                        return ConnectError::from_io(&e);
                     }
                 }
             }
             item = rx.recv() => {
-                let Some(data) = item else { return };
+                let Some(data) = item else { return ConnectError::Other };
                 let frame = Bytes::from(hdlc::frame(&data));
                 let len = frame.len() as u64;
                 if control.stalled() || buffered + len > TX_HWM {
@@ -633,6 +641,7 @@ async fn backbone_write_loop(
 
 /// Run one connection: the reader and the egress-controlled writer share a
 /// task, so either side ending (or the task being aborted) closes the socket.
+/// Returns how the connection ended.
 #[allow(clippy::too_many_arguments)]
 async fn backbone_connection(
     stream: TcpStream,
@@ -645,14 +654,15 @@ async fn backbone_connection(
     name: &str,
     state: &EgressState,
     sizing: (u64, usize),
-) {
+) -> ConnectError {
     let (reader, mut writer) = stream.into_split();
-    tokio::select! {
-        _ = backbone_read_loop(reader, interface_id, transport_tx, online.clone(), rxb, sizing) => {}
-        _ = backbone_write_loop(&mut writer, rx, &txb, name, state) => {}
-    }
+    let ended = tokio::select! {
+        ended = backbone_read_loop(reader, interface_id, transport_tx, online.clone(), rxb, sizing) => ended,
+        ended = backbone_write_loop(&mut writer, rx, &txb, name, state) => ended,
+    };
     state.buffered.store(0, Ordering::Relaxed);
     online.store(false, Ordering::SeqCst);
+    ended
 }
 
 /// Resolve `host:port` preferring the configured address family.
@@ -916,20 +926,35 @@ fn spawn_backbone_server_on_listener(
     })
 }
 
-/// Resolve and connect, each step bounded by `timeout`.
+/// Resolve and connect, each step bounded by `timeout`, naming the failure.
 async fn connect_backbone_target(
     config: &BackboneClientConfig,
     timeout: Duration,
-) -> std::io::Result<TcpStream> {
-    let target = tokio::time::timeout(
+) -> Result<TcpStream, (ConnectError, std::io::Error)> {
+    use std::io::{Error, ErrorKind};
+    let target = match tokio::time::timeout(
         timeout,
         resolve_target(&config.target_host, config.target_port, config.prefer_ipv6),
     )
     .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "resolve timed out"))??;
-    tokio::time::timeout(timeout, TcpStream::connect(target))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))?
+    {
+        Ok(Ok(target)) => target,
+        Ok(Err(e)) => return Err((ConnectError::Dns, e)),
+        Err(_) => {
+            return Err((
+                ConnectError::Dns,
+                Error::new(ErrorKind::TimedOut, "resolve timed out"),
+            ));
+        }
+    };
+    match tokio::time::timeout(timeout, TcpStream::connect(target)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err((ConnectError::from_io(&e), e)),
+        Err(_) => Err((
+            ConnectError::TimedOut,
+            Error::new(ErrorKind::TimedOut, "connect timed out"),
+        )),
+    }
 }
 
 pub async fn spawn_backbone_client(
@@ -967,6 +992,8 @@ pub async fn spawn_backbone_client_observed(
     let identity = InterfaceIdentity::new(&python_name, &config.name, "BackboneClientInterface");
     let egress = Arc::new(EgressState::default());
     let task_egress = egress.clone();
+    let diagnostics = Arc::new(ConnectDiagnostics::default());
+    let task_diagnostics = diagnostics.clone();
     let (teardown_tx, teardown) = crate::tcp::ClientTeardown::channel();
     // Python connects once, synchronously, before the interface is handed to
     // transport (BackboneInterface.py).
@@ -977,7 +1004,7 @@ pub async fn spawn_backbone_client_observed(
             connect_backbone_target(&config, initial_timeout),
         )
         .await
-        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into())),
+        .unwrap_or_else(|_| Err((ConnectError::TimedOut, std::io::ErrorKind::TimedOut.into()))),
     );
     if matches!(initial_attempt, Some(Ok(_))) {
         online.store(true, Ordering::SeqCst);
@@ -1006,14 +1033,16 @@ pub async fn spawn_backbone_client_observed(
             };
             let stream = match attempt {
                 Ok(s) => s,
-                Err(e) => {
+                Err((error, e)) => {
                     tracing::warn!(name = %config.name, error = %e, "backbone connect failed");
+                    task_diagnostics.failed(error);
                     continue;
                 }
             };
 
             tune_stream(&stream);
             attempts = 0;
+            task_diagnostics.connected();
             // Python synthesizes on every connection (BackboneInterface.py,
             // :1019).
             let synthesis = config
@@ -1022,7 +1051,7 @@ pub async fn spawn_backbone_client_observed(
                 .and_then(|identity| identity.synthesis(&python_name));
             open_client_connection(&rx, &transport_tx, synthesis, &online2).await;
 
-            {
+            let ended = {
                 let mut outbound = rx.lock().await;
                 backbone_connection(
                     stream,
@@ -1036,9 +1065,10 @@ pub async fn spawn_backbone_client_observed(
                     &task_egress,
                     sizing,
                 )
-                .await;
-            }
+                .await
+            };
             online2.store(false, Ordering::SeqCst);
+            task_diagnostics.disconnected(ended);
 
             tracing::info!(
                 name = %config.name,
@@ -1068,7 +1098,10 @@ pub async fn spawn_backbone_client_observed(
             online,
             rxb: Some(shared_rxb),
             txb: Some(shared_txb),
-            inspection: Some(EgressState::inspection(egress).with_identity(identity)),
+            inspection: Some(
+                InterfaceInspectionSource::new(move || diagnostics.snapshot(egress.snapshot()))
+                    .with_identity(identity),
+            ),
             tx,
             read_task,
         },
@@ -1389,6 +1422,66 @@ mod tests {
             .as_ref()
             .expect("backbone listener exposes aggregate inspection")
             .snapshot()
+    }
+
+    /// What a client of an upstream hub sees once the hub blocks its IP:
+    /// accepted, then closed at once.
+    #[tokio::test]
+    async fn client_stats_report_a_hub_that_closes_at_once() {
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                drop(listener.accept().await.unwrap());
+            }
+        });
+
+        let config = BackboneClientConfig::new("bb-closed", "127.0.0.1", port);
+        let handle = spawn_backbone_client(config, 81, transport_tx)
+            .await
+            .unwrap();
+        handle.owner.mark_registered();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let snapshot = loop {
+            let snapshot = inspection_snapshot(&handle);
+            if snapshot.last_connect_error == Some("closed_by_peer") {
+                break snapshot;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{snapshot:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(snapshot.connect_failures >= 1);
+        assert!(!snapshot.tx_stalled);
+        handle.read_task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn client_stats_report_a_refused_connect() {
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = BackboneClientConfig::new("bb-refused", "127.0.0.1", port);
+        let handle = spawn_backbone_client(config, 82, transport_tx)
+            .await
+            .unwrap();
+        handle.owner.mark_registered();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let snapshot = inspection_snapshot(&handle);
+            if snapshot.last_connect_error == Some("refused") {
+                assert_eq!(snapshot.connect_failures, 1);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{snapshot:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        handle.read_task.abort();
     }
 
     #[test]

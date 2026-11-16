@@ -51,6 +51,9 @@ pub struct InterfaceInspectionSnapshot {
     /// Python `tx_stalled` and `len(transmit_buffer)` in bytes.
     pub tx_stalled: bool,
     pub tx_buffered: u64,
+    /// See [`InterfaceStatRpcEntry::last_connect_error`].
+    pub last_connect_error: Option<&'static str>,
+    pub connect_failures: u32,
 }
 
 /// How Python names an interface: `str(interface)`, `interface.name` and
@@ -1365,6 +1368,13 @@ pub struct InterfaceStatRpcEntry {
     pub tx_buffered: u64,
     /// Driver radio keys; these replace the generic `rssi`/`snr`/`signal_quality`.
     pub radio: Vec<(&'static str, InterfaceStatValue)>,
+    /// Why a reconnecting TCP or Backbone client's latest attempt failed:
+    /// `refused`, `timed_out`, `dns`, `unreachable`, `closed_by_peer` or
+    /// `other`; `None` once a connection stays up. Rust-only: the
+    /// shared-instance RPC does not carry it or `connect_failures`.
+    pub last_connect_error: Option<String>,
+    /// Consecutive failed attempts since the last connection that stayed up.
+    pub connect_failures: u32,
 }
 
 /// Python's top-level `get_interface_stats()` counters (Reticulum.py,

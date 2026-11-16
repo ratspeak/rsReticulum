@@ -3344,6 +3344,16 @@ mod tests {
     }
 
     #[test]
+    fn connect_diagnostics_stay_off_the_python_rpc() {
+        let plain = encode_response(&RpcResponse::InterfaceStats(vec![interface_stat_entry()]));
+        let mut entry = interface_stat_entry();
+        entry.last_connect_error = Some("closed_by_peer".to_string());
+        entry.connect_failures = 4;
+        let encoded = encode_response(&RpcResponse::InterfaceStats(vec![entry])).unwrap();
+        assert_eq!(encoded, plain.unwrap());
+    }
+
+    #[test]
     fn interface_stats_ignore_blocked_ip_lists_and_never_reencode_them() {
         let upstream = py_dict(vec![(
             "interfaces",

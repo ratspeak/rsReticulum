@@ -174,6 +174,8 @@ impl TransportActor {
                             tx_stalled: inspection.tx_stalled,
                             tx_buffered: inspection.tx_buffered,
                             radio: inspection.radio,
+                            last_connect_error: inspection.last_connect_error.map(str::to_string),
+                            connect_failures: inspection.connect_failures,
                         })
                     })
                     .collect();

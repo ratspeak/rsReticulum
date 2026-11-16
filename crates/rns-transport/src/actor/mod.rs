@@ -8083,6 +8083,8 @@ mod tests {
             InterfaceInspectionSnapshot {
                 active_clients: Some(7),
                 blocked_ips: Some(2),
+                last_connect_error: Some("refused"),
+                connect_failures: 3,
                 ..Default::default()
             }
         }));
@@ -8096,6 +8098,8 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(stats[0].clients, Some(7));
         assert_eq!(stats[0].blocked_ips, Some(2));
+        assert_eq!(stats[0].last_connect_error.as_deref(), Some("refused"));
+        assert_eq!(stats[0].connect_failures, 3);
     }
 
     #[test]

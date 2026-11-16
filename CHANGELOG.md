@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Bluetooth Peer runs in Gateway mode, so a node with transport on looks up the paths its Bluetooth peers ask for that it doesn't know yet. Nodes with transport off behave as before.
+- TCP and Backbone client interfaces report why they can't connect: `last_connect_error` (`refused`, `timed_out`, `dns`, `unreachable`, `closed_by_peer`, or `other`) and `connect_failures` in the interface stats, so an application can tell a hub that refuses or closes the connection from one still connecting. The shared-instance RPC doesn't carry them.
 - I2P interfaces log their `.b32.i2p` address once reachable, at loglevel 5 or higher, as Python Reticulum does.
 - Announce handler events carry `emitted`, the time the announcer stamped into the announce, so an application can tell an older cached announce in a path response from a newer one. `AnnounceHandlerEvent` struct literals need the new field.
 
