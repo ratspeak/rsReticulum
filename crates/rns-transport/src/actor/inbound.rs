@@ -1090,6 +1090,7 @@ impl TransportActor {
                         announce_packet_hash,
                         is_path_response,
                         hops: header.hops,
+                        emitted: announce_emitted,
                         app_data: handler_app_data.clone(),
                         public_key: announce_public_key,
                         ratchet: announce_ratchet,

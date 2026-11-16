@@ -629,6 +629,8 @@ pub struct AnnounceHandlerEvent {
     pub announce_packet_hash: [u8; 32],
     pub is_path_response: bool,
     pub hops: u8,
+    /// Unix seconds the announcer stamped into the random hash (Python `Transport.announce_emitted`).
+    pub emitted: u64,
     pub app_data: Option<Vec<u8>>,
     /// X25519 || Ed25519 public key from the announce payload.
     pub public_key: Option<[u8; 64]>,

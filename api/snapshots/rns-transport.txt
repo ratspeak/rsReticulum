@@ -1308,6 +1308,7 @@ pub struct rns_transport::messages::AnnounceHandlerEvent
 pub rns_transport::messages::AnnounceHandlerEvent::announce_packet_hash: [u8; 32]
 pub rns_transport::messages::AnnounceHandlerEvent::app_data: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::messages::AnnounceHandlerEvent::destination_hash: [u8; 16]
+pub rns_transport::messages::AnnounceHandlerEvent::emitted: u64
 pub rns_transport::messages::AnnounceHandlerEvent::hops: u8
 pub rns_transport::messages::AnnounceHandlerEvent::identity_hash: core::option::Option<[u8; 16]>
 pub rns_transport::messages::AnnounceHandlerEvent::is_path_response: bool

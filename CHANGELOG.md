@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Announce handler events carry `emitted`, the time the announcer stamped into the announce, so an application can tell an older cached announce in a path response from a newer one. `AnnounceHandlerEvent` struct literals need the new field.
+
 ## 1.5.0 - 2026-11-13
 
 ### Added

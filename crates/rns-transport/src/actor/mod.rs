@@ -13006,6 +13006,7 @@ mod tests {
             rns_wire::context::PacketContext::PathResponse,
         );
         let expected_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        let expected_emitted = announce_emitted_from_raw(&raw).unwrap();
         actor.on_inbound(crate::messages::InboundPacket {
             raw,
             interface_id: 1,
@@ -13024,6 +13025,43 @@ mod tests {
         assert_eq!(event.destination_hash, dest_hash);
         assert_eq!(event.announce_packet_hash, expected_hash);
         assert!(event.is_path_response);
+        assert_eq!(event.emitted, expected_emitted);
+    }
+
+    #[test]
+    fn handler_event_carries_the_stamped_emission_time() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, _rx) = make_test_interface("test_iface");
+        actor.interfaces.insert(1, entry);
+
+        let (htx, mut hrx) = mpsc::channel(8);
+        actor.announce_handlers.push(AnnounceHandlerRegistration {
+            id: crate::messages::AnnounceHandlerId(0),
+            ownership: AnnounceHandlerOwnership::Subscription,
+            aspect_filter: None,
+            receive_path_responses: false,
+            tx: htx,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(AtomicBool::new(false)),
+        });
+
+        let emitted = 1_700_000_000;
+        let identity = rns_identity::identity::Identity::new();
+        let (raw, _) = make_announce_for_with_random_blob(
+            &identity,
+            "test.emitted",
+            1,
+            random_blob(0x33, emitted),
+        );
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert_eq!(hrx.try_recv().unwrap().emitted, emitted);
     }
 
     #[test]
