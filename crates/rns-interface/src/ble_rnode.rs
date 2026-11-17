@@ -2691,6 +2691,19 @@ fn project_ble_rnode_frame(
 /// Apply one active-session frame to both the observer and the generation's
 /// packet-admission latch. Both desktop GATT and Android's native loopback
 /// path use this exact boundary.
+/// Battery, temperature, and channel reports, as the serial RNode keeps them.
+fn observe_radio_frame(
+    stats: &std::sync::Mutex<rnode::RNodeRadioStats>,
+    command: u8,
+    frame: &[u8],
+) {
+    stats.lock().unwrap_or_else(|e| e.into_inner()).observe(
+        rnode::RNodeRadioKind::Single,
+        command,
+        frame,
+    );
+}
+
 fn project_active_ble_rnode_frame(
     publisher: &RNodeSnapshotPublisher,
     protocol_state: &mut RNodeProtocolState,
@@ -2865,6 +2878,8 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
     let task_rxb = shared_rxb.clone();
+    let radio_stats = Arc::new(std::sync::Mutex::new(rnode::RNodeRadioStats::default()));
+    let task_radio_stats = radio_stats.clone();
     let task_txb = shared_txb.clone();
     let (tx, mut outbound_rx) = mpsc::channel::<Bytes>(256);
     let background = crate::background_announce::register(&tx)?;
@@ -3599,6 +3614,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                 match event {
                     GenerationEvent::Notification(Some(n)) if n.uuid == NUS_TX_CHAR_UUID => {
                         for (cmd, frame) in deframer.feed(&n.value) {
+                            observe_radio_frame(&task_radio_stats, cmd, &frame);
                             let data_allowed = project_active_ble_rnode_frame(
                                 &snapshot_publisher,
                                 &mut protocol_state,
@@ -3821,7 +3837,10 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(rnode::RNodeRadioStats::inspection(
+            radio_stats,
+            rnode::RNodeRadioKind::Single,
+        )),
         tx,
         read_task,
     };
@@ -3906,6 +3925,8 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
     let task_rxb = shared_rxb.clone();
+    let radio_stats = Arc::new(std::sync::Mutex::new(rnode::RNodeRadioStats::default()));
+    let task_radio_stats = radio_stats.clone();
     let task_txb = shared_txb.clone();
     let (tx, mut outbound_rx) = mpsc::channel::<Bytes>(256);
     let background = crate::background_announce::register(&tx)?;
@@ -4431,6 +4452,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                 .map(|frame| (kiss::CMD_DATA, frame))
                 .chain(startup_active_frames.drain(..));
             for (command, frame) in startup_ready_frames {
+                observe_radio_frame(&task_radio_stats, command, &frame);
                 let data_allowed = project_active_ble_rnode_frame(
                     &snapshot_publisher,
                     &mut protocol_state,
@@ -4548,6 +4570,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                                 continue;
                             }
 
+                            observe_radio_frame(&task_radio_stats, command, &frame);
                             let data_allowed = project_active_ble_rnode_frame(
                                 &snapshot_publisher,
                                 &mut protocol_state,
@@ -4711,7 +4734,10 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        inspection: None,
+        inspection: Some(rnode::RNodeRadioStats::inspection(
+            radio_stats,
+            rnode::RNodeRadioKind::Single,
+        )),
         tx,
         read_task,
     };
@@ -6749,8 +6775,8 @@ mod tests {
     }
 
     /// Python's `RNodeInterface` also drives BLE: any READY releases the queue
-    /// (RNodeInterface.py), and the last RSSI, SNR and quality stay
-    /// on the interface across packets.
+    /// (RNodeInterface.py), the last RSSI, SNR and quality stay on the
+    /// interface across packets, and battery reports reach its stats.
     #[tokio::test]
     async fn native_ble_any_ready_releases_the_queue_and_signal_stats_persist() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -6798,6 +6824,7 @@ mod tests {
             let mut ready = native_ready_response(&server_config);
             ready.extend(kiss::frame_with_command(rnode::CMD_STAT_RSSI, &[92]));
             ready.extend(kiss::frame_with_command(rnode::CMD_STAT_SNR, &[0xF4]));
+            ready.extend(kiss::frame_with_command(rnode::CMD_STAT_BAT, &[0x01, 63]));
             ready.extend(kiss::frame(b"first inbound"));
             ready.extend(kiss::frame(b"second inbound"));
             stream
@@ -6853,6 +6880,21 @@ mod tests {
                 (Some(-65.0), Some(-3.0), Some(40.0))
             );
         }
+        let radio = spawned
+            .interface
+            .inspection
+            .as_ref()
+            .expect("BLE RNode stats")
+            .snapshot()
+            .radio;
+        assert!(radio.contains(&(
+            "battery_state",
+            rns_transport::messages::InterfaceStatValue::Str("discharging".into())
+        )));
+        assert!(radio.contains(&(
+            "battery_percent",
+            rns_transport::messages::InterfaceStatValue::Int(63)
+        )));
 
         let tx = spawned.interface.tx.clone();
         tx.send(Bytes::from_static(b"first outbound"))
