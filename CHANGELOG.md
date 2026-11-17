@@ -6,6 +6,8 @@
 - TCP and Backbone client interfaces report why they can't connect: `last_connect_error` (`refused`, `timed_out`, `dns`, `unreachable`, `closed_by_peer`, or `other`) and `connect_failures` in the interface stats, so an application can tell a hub that refuses or closes the connection from one still connecting. The shared-instance RPC doesn't carry them.
 - I2P interfaces log their `.b32.i2p` address once reachable, at loglevel 5 or higher, as Python Reticulum does.
 - Interface start-up code is compiled once instead of again in every crate that starts the runtime, which makes `rnsd-rs` about 1.5 MB smaller.
+- Bluetooth RNodes report battery, temperature, and channel load in the interface stats, as USB RNodes already do (`battery_state`, `battery_percent`, `cpu_temp`, `noise_floor`).
+- Bluetooth Peer: on Android, a link the app closes after a failed write reports `Disconnected`, so the peer no longer stays listed as connected. On Linux, disconnecting a peer reports it too, and the Central role keeps looking for a Bluetooth adapter that appears after start-up instead of giving up until restart.
 - Announce handler events carry `emitted`, the time the announcer stamped into the announce, so an application can tell an older cached announce in a path response from a newer one. `AnnounceHandlerEvent` struct literals need the new field.
 
 ## 1.5.0 - 2026-11-13

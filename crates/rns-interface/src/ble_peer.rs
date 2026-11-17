@@ -69,6 +69,12 @@ pub const KEEPALIVE_MAX_MISSES: u32 = 3;
 pub const FRAGMENT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MIN_RSSI: i16 = -85;
 pub const SCAN_ACTIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the Linux and Windows Central role looks again for a missing adapter.
+#[cfg(all(
+    feature = "ble",
+    not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+))]
+const ADAPTER_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 pub const SCAN_IDLE_INTERVAL: Duration = Duration::from_secs(30);
 pub const BLE_FRAGMENT_PACING: Duration = Duration::from_millis(8);
 /// Timeout applied while awaiting a single btleplug fragment write. A timeout
@@ -690,8 +696,14 @@ pub async fn disconnect_mesh_peer(address: &str) {
             .lock()
             .ok()
             .and_then(|reg| reg.get(address).map(|entry| entry.connection_id));
-        if let Some(connection_id) = connection_id {
-            disconnect_central_peripheral(address, connection_id).await;
+        if let Some(connection_id) = connection_id
+            && disconnect_central_peripheral(address, connection_id).await
+        {
+            // The read loop then finds the entry gone and stays quiet, so report it here.
+            dispatch_event(BlePeerEvent::Disconnected {
+                address: address.to_string(),
+                reason: "disconnect requested".into(),
+            });
         }
     }
     #[cfg(not(any(
@@ -3676,9 +3688,10 @@ mod android_peripheral {
         }
     }
 
-    /// A peer client connection dropped (centrally-initiated side).
-    /// We emit a Disconnected event so the mesh-state task can prune it
-    /// without waiting for a keepalive miss.
+    /// A live peer client link ended (centrally-initiated side): Android's
+    /// disconnect callback, or our own close, which gets no callback. We emit
+    /// a Disconnected event so the mesh-state task can prune it without
+    /// waiting for a keepalive miss.
     #[unsafe(no_mangle)]
     pub extern "system" fn Java_org_ratspeak_android_RatspeakBlePeerClient_nativePeerClientDisconnected(
         env: jni::JNIEnv,
@@ -5910,14 +5923,20 @@ pub async fn spawn_ble_peer_interface(
             let mut connected_addrs: HashMap<String, Arc<AtomicBool>> = HashMap::new();
             let mut scan_interval = SCAN_ACTIVE_INTERVAL;
 
-            // Get adapter once, reuse for all scans.
-            let adapter = match crate::ble_rnode::get_adapter().await {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::error!(error = %e, "BLE mesh: failed to get adapter, Central role disabled");
-                    // Keep running (Peripheral role may still work)
-                    loop {
-                        tokio::time::sleep(Duration::from_secs(60)).await;
+            // Get adapter once, reuse for all scans. bluetoothd or the adapter
+            // can come up after us, so keep trying rather than give up for good.
+            let adapter = {
+                let mut warned = false;
+                loop {
+                    match crate::ble_rnode::get_adapter().await {
+                        Ok(a) => break a,
+                        Err(e) => {
+                            if !warned {
+                                tracing::warn!(error = %e, "BLE mesh: no adapter yet, Central role retrying");
+                                warned = true;
+                            }
+                            tokio::time::sleep(ADAPTER_RETRY_INTERVAL).await;
+                        }
                     }
                 }
             };
