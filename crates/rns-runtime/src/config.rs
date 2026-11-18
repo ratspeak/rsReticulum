@@ -796,6 +796,32 @@ const DEFAULT_CONFIG: &str = r#"################################################
     enabled = Yes
 "#;
 
+/// A list file in the config directory as Reticulum.py reads one: the whole
+/// text stripped and split into lines, each line stripped, `#` lines skipped.
+/// `None` when the file is absent.
+pub(crate) fn read_list_file(path: &Path) -> std::io::Result<Option<Vec<String>>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(list_file_lines(&std::fs::read_to_string(path)?)))
+}
+
+/// Python `str.strip().splitlines()`, then per-line `strip()`.
+fn list_file_lines(text: &str) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.replace("\r\n", "\n")
+        .split([
+            '\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}',
+        ])
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,6 +855,22 @@ mod tests {
     fn test_parse_empty() {
         let config = Config::parse("").unwrap();
         assert!(config.sections.is_empty());
+    }
+
+    #[test]
+    fn list_files_read_like_upstream() {
+        assert_eq!(
+            list_file_lines("\n# names\n lxmf.delivery \r\n\n#x\nnomadnetwork.node\n\n"),
+            ["lxmf.delivery", "", "nomadnetwork.node"]
+        );
+        assert!(list_file_lines(" \n\t").is_empty());
+        let dir = std::env::temp_dir().join(format!("rns-list-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_destination_types");
+        assert!(read_list_file(&path).unwrap().is_none());
+        std::fs::write(&path, "a.b\n#c.d\n").unwrap();
+        assert_eq!(read_list_file(&path).unwrap().unwrap(), ["a.b"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

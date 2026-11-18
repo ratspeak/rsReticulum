@@ -531,7 +531,7 @@ impl TransportActor {
         {
             trace!(
                 interface_id,
-                destination_type = self.destination_filter.type_name(&name_hash),
+                destination_type = self.destination_filter.pretty_name(&name_hash),
                 "announce filtered as not required"
             );
             self.filtered_announce(interface_id);

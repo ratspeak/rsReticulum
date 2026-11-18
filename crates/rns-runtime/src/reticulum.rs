@@ -3861,6 +3861,7 @@ pub async fn init_with_policy(
     }
     let mut rc = ReticulumConfig::try_from_config(&config).map_err(ReticulumError::Config)?;
     rc.apply_init_options(&options);
+    load_config_dir_lists(&config_dir, &mut rc);
     match &policy {
         InstancePolicy::Configured => {}
         InstancePolicy::Standalone => rc.share_instance = false,
@@ -11029,6 +11030,24 @@ pub fn get_instance() -> Option<&'static ReticulumHandle> {
     INSTANCE.get()
 }
 
+/// The list files beside `config` (Reticulum.py); a file that cannot be read
+/// is logged and skipped, as upstream does.
+fn load_config_dir_lists(config_dir: &Path, rc: &mut ReticulumConfig) {
+    let read = |name: &str| match crate::config::read_list_file(&config_dir.join(name)) {
+        Ok(lines) => lines,
+        Err(error) => {
+            tracing::error!(file = name, %error, "could not load config directory list");
+            None
+        }
+    };
+    if let Some(names) = read("known_destination_types") {
+        rc.filter.known_types = names;
+    }
+    if let Some(names) = read("flagged_destination_types") {
+        rc.filter.flagged_types = names;
+    }
+}
+
 fn load_or_create_config(path: &Path) -> Result<(Config, bool), ReticulumError> {
     if path.exists() {
         Config::from_file(path)
@@ -11251,6 +11270,7 @@ mod tests {
     mod concurrent_start;
     mod interface_stats;
     mod manage_interfaces;
+    mod paths_and_filters;
     mod tunnels;
 
     #[test]
