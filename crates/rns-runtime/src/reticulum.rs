@@ -10881,6 +10881,7 @@ async fn spawn_configured_interface_driver(
                 config.fast_flapping_threshold = c.fast_flapping_threshold;
                 config.fast_flapping_grace = c.fast_flapping_grace;
                 config.fast_flapping_block_time = c.fast_flapping_block_time;
+                config.client_limit = c.client_limit;
                 config.bitrate = c.bitrate;
                 config.ifac_size = c.ifac_size;
                 rns_interface::backbone::spawn_backbone_server(

@@ -49,6 +49,8 @@ pub const BLOCK_FAST_FLAPPING: bool = true;
 pub const FAST_FLAPPING_THRESHOLD: Duration = Duration::from_secs(20);
 pub const FAST_FLAPPING_GRACE: u64 = 5;
 pub const FAST_FLAPPING_BLOCK_TIME: Duration = Duration::from_secs(12 * 60 * 60);
+/// Python `BackboneInterface.CLIENT_LIMIT`: accepted clients a listener keeps.
+pub const CLIENT_LIMIT: u64 = 500;
 
 const TX_CHANNEL_DEPTH: usize = 1024;
 
@@ -94,6 +96,9 @@ pub struct BackboneServerConfig {
     pub fast_flapping_grace: u64,
     /// Time since the latest short connection before its state expires.
     pub fast_flapping_block_time: Duration,
+    /// A new connection is closed while this many clients are connected;
+    /// zero refuses every client.
+    pub client_limit: u64,
     /// Bitrate the hardware MTU is optimised for; accepted peers inherit it.
     pub bitrate: u64,
     /// IFAC size in bytes; accepted peers inherit it.
@@ -113,6 +118,7 @@ impl BackboneServerConfig {
             fast_flapping_threshold: FAST_FLAPPING_THRESHOLD,
             fast_flapping_grace: FAST_FLAPPING_GRACE,
             fast_flapping_block_time: FAST_FLAPPING_BLOCK_TIME,
+            client_limit: CLIENT_LIMIT,
             bitrate: BITRATE_GUESS,
             ifac_size: crate::tcp::DEFAULT_IFAC_SIZE,
         }
@@ -660,7 +666,9 @@ async fn backbone_connection(
         ended = backbone_read_loop(reader, interface_id, transport_tx, online.clone(), rxb, sizing) => ended,
         ended = backbone_write_loop(&mut writer, rx, &txb, name, state) => ended,
     };
+    // Python's `_dp_ec_reset` before a reconnect (BackboneInterface.py).
     state.buffered.store(0, Ordering::Relaxed);
+    state.stalled.store(false, Ordering::Relaxed);
     online.store(false, Ordering::SeqCst);
     ended
 }
@@ -739,6 +747,7 @@ fn spawn_backbone_server_on_listener(
     let name = config.name.clone();
     let mode = config.mode;
     let fast_flap_policy = FastFlapPolicy::from(&config);
+    let client_limit = config.client_limit;
     let sizing = (config.bitrate, config.ifac_size);
     let active_clients = Arc::new(AtomicU64::new(0));
     let inspection_runtime = fast_flap_runtime.clone();
@@ -783,6 +792,16 @@ fn spawn_backbone_server_on_listener(
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    // Checked before fast flapping, so a refusal is no flap
+                    // (BackboneInterface.py).
+                    if task_active_clients.load(Ordering::Relaxed) >= client_limit {
+                        tracing::debug!(target: "rns::pathing",
+                            remote_ip = %peer.ip(),
+                            client_limit,
+                            "backbone: client limit reached, closing connection",
+                        );
+                        continue;
+                    }
                     let fast_flap_connection =
                         match fast_flap_runtime.admit(peer.ip(), fast_flap_policy) {
                             FastFlapAdmission::Allowed(connection) => connection,
@@ -1497,6 +1516,7 @@ mod tests {
             cfg.fast_flapping_block_time,
             Duration::from_secs(12 * 60 * 60)
         );
+        assert_eq!(cfg.client_limit, 500);
     }
 
     #[test]
@@ -1852,6 +1872,95 @@ mod tests {
         assert_eq!(inspection_snapshot(&parent).blocked_ips, Some(1));
 
         parent.read_task.abort();
+    }
+
+    /// Python 1.6.1 closes a connection once `client_limit` clients are
+    /// spawned, before any fast-flap accounting (BackboneInterface.py:696).
+    #[tokio::test]
+    async fn a_listener_closes_connections_past_its_client_limit() {
+        let (runtime, _clock) = test_runtime(16);
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let mut config = BackboneServerConfig::new("limit-test", "127.0.0.1", listen_addr.port());
+        config.client_limit = 2;
+        let (transport_tx, _transport_rx) = mpsc::channel(8);
+        let (handle_tx, mut handle_rx) = mpsc::channel(8);
+        let parent = spawn_backbone_server_on_listener(
+            config,
+            1,
+            Arc::new(AtomicU64::new(100)),
+            transport_tx,
+            handle_tx,
+            runtime.clone(),
+            listener,
+        )
+        .unwrap();
+        parent.owner.mark_registered();
+
+        async fn accept(handles: &mut mpsc::Receiver<InterfaceHandle>) -> InterfaceHandle {
+            tokio::time::timeout(Duration::from_secs(1), handles.recv())
+                .await
+                .expect("accepted child handle timed out")
+                .expect("child handle channel closed")
+        }
+        let _first = TcpStream::connect(listen_addr).await.unwrap();
+        let first = accept(&mut handle_rx).await;
+        let _second = TcpStream::connect(listen_addr).await.unwrap();
+        let _second_child = accept(&mut handle_rx).await;
+        let flaps = tracked_flaps(&runtime, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        let mut third = TcpStream::connect(listen_addr).await.unwrap();
+        let mut byte = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(1), third.read(&mut byte))
+            .await
+            .expect("the connection past the limit was not closed");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        assert!(handle_rx.try_recv().is_err());
+        assert_eq!(
+            tracked_flaps(&runtime, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            flaps,
+            "a refusal is not a flap"
+        );
+
+        first.read_task.abort();
+        let _ = first.read_task.await;
+        let _fourth = TcpStream::connect(listen_addr).await.unwrap();
+        let _fourth_child = accept(&mut handle_rx).await;
+        parent.read_task.abort();
+    }
+
+    /// Python resets egress control before a client reconnects
+    /// (BackboneInterface.py:1032), so `txstalled` cannot outlive a connection.
+    #[tokio::test]
+    async fn an_ended_connection_clears_its_egress_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (transport_tx, _transport_rx) = mpsc::channel(8);
+        let (_tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let state = EgressState::default();
+        state.stalled.store(true, Ordering::Relaxed);
+        state.buffered.store(7, Ordering::Relaxed);
+        drop(peer);
+        backbone_connection(
+            stream,
+            &mut rx,
+            5,
+            InterfaceTransportSender::new(5, transport_tx),
+            Arc::new(AtomicBool::new(true)),
+            ByteCounter::default(),
+            ByteCounter::default(),
+            "ended",
+            &state,
+            (BITRATE_GUESS, crate::tcp::DEFAULT_IFAC_SIZE),
+        )
+        .await;
+        assert!(!state.stalled.load(Ordering::Relaxed));
+        assert_eq!(state.buffered.load(Ordering::Relaxed), 0);
     }
 
     /// Spending the retry budget tears the client down like Python's

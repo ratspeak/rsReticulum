@@ -315,6 +315,9 @@ pub struct BackboneInterfaceConfig {
     /// Listener-only block duration. The configuration file uses minutes;
     /// the runtime field is a `Duration`. Parser default: 720 minutes.
     pub fast_flapping_block_time: Duration,
+    /// Listener-only `client_limit`: absent or 0 means 500, and a negative
+    /// value refuses every client, as Python's `len(spawned) >= limit` does.
+    pub client_limit: u64,
     /// Bitrate the hardware MTU is optimised for. Parser default: the Backbone guess.
     pub bitrate: u64,
     /// IFAC size in bytes a frame may add to the hardware MTU.
@@ -396,7 +399,6 @@ fn parse_uint_strict(
 }
 
 /// Python `int(c[field])`: a non-integer is a config error (Python raises).
-#[cfg(feature = "serial")]
 fn parse_int_strict(
     name: &str,
     field: &str,
@@ -1944,6 +1946,10 @@ fn synthesize_backbone(
         60.0,
         rns_interface::backbone::FAST_FLAPPING_BLOCK_TIME,
     )?;
+    let client_limit = match parse_int_strict(name, "client_limit", section, 0)? {
+        0 => rns_interface::backbone::CLIENT_LIMIT,
+        limit => u64::try_from(limit).unwrap_or(0),
+    };
     let post_init = InterfacePostInit::try_from_section(section)?.with_default_ifac_size(16);
     let (bitrate, ifac_size) =
         receive_sizing(section, &post_init, rns_interface::backbone::BITRATE_GUESS);
@@ -1963,6 +1969,7 @@ fn synthesize_backbone(
         fast_flapping_threshold,
         fast_flapping_grace,
         fast_flapping_block_time,
+        client_limit,
         bitrate,
         ifac_size,
     }))
@@ -3742,8 +3749,38 @@ mod tests {
                 assert_eq!(c.fast_flapping_threshold, Duration::from_secs(20));
                 assert_eq!(c.fast_flapping_grace, 5);
                 assert_eq!(c.fast_flapping_block_time, Duration::from_secs(720 * 60));
+                assert_eq!(c.client_limit, 500);
             }
             _ => panic!("expected Backbone"),
+        }
+    }
+
+    /// Python `int(c["client_limit"]) or CLIENT_LIMIT` (BackboneInterface.py:140,
+    /// :160): 0 is the default, and a negative limit refuses every client.
+    #[test]
+    fn test_synthesize_backbone_client_limit() {
+        for (value, expected) in [
+            ("0", Some(500)),
+            ("12", Some(12)),
+            (" 7 ", Some(7)),
+            ("-3", Some(0)),
+            ("1.5", None),
+            ("many", None),
+        ] {
+            let mut section = enabled_section();
+            section.set("type", "BackboneInterface");
+            section.set("listen_on", "0.0.0.0");
+            section.set("port", "4242");
+            section.set("client_limit", value);
+            match (synthesize_interface("backbone_limit", &section), expected) {
+                (Ok(InterfaceConfig::Backbone(c)), Some(limit)) => {
+                    assert_eq!(c.client_limit, limit, "{value}")
+                }
+                (Err(InterfaceFactoryError::InvalidValue { field, .. }), None) => {
+                    assert_eq!(field, "backbone_limit.client_limit")
+                }
+                (other, _) => panic!("client_limit={value}: {other:?}"),
+            }
         }
     }
 
