@@ -25,6 +25,11 @@ pub struct AnnounceEntry {
     /// Receiving interface used by egress policy. Shared IPC peers are excluded
     /// from an echo; an eligible broadcast radio may relay on the same interface.
     pub source_interface: Option<InterfaceId>,
+    /// Hash of the announce as received, Python's `IDX_AT_PACKET.packet_hash`.
+    pub packet_hash: [u8; 32],
+    /// Interfaces off a shared medium that already sent us this announce; the
+    /// rebroadcast skips them (Python `IDX_AT_DEDUP_IFS`).
+    pub dedup_interfaces: Vec<InterfaceId>,
 }
 
 /// Destination-keyed rebroadcast records. Insertions replace matching entries;
@@ -119,6 +124,8 @@ mod tests {
                 block_rebroadcast: false,
                 attached_interface: None,
                 source_interface: None,
+                packet_hash: [0; 32],
+                dedup_interfaces: Vec::new(),
             },
         );
         assert_eq!(table.len(), 1);
@@ -140,6 +147,8 @@ mod tests {
                 block_rebroadcast: false,
                 attached_interface: None,
                 source_interface: None,
+                packet_hash: [0; 32],
+                dedup_interfaces: Vec::new(),
             },
         );
         table.insert(
@@ -154,6 +163,8 @@ mod tests {
                 block_rebroadcast: false,
                 attached_interface: None,
                 source_interface: None,
+                packet_hash: [0; 32],
+                dedup_interfaces: Vec::new(),
             },
         );
 

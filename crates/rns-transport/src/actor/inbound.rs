@@ -1000,6 +1000,8 @@ impl TransportActor {
                     block_rebroadcast: false,
                     attached_interface: None,
                     source_interface: Some(interface_id),
+                    packet_hash: announce_packet_hash,
+                    dedup_interfaces: Vec::new(),
                 };
                 self.announce_table
                     .insert(header.destination_hash, announce_entry);
@@ -1095,6 +1097,18 @@ impl TransportActor {
                 "path learned from announce"
             );
         } else {
+            // Transport.py: a copy of the queued announce from an interface
+            // off a shared medium needs no rebroadcast back onto it.
+            if self
+                .interfaces
+                .get(&interface_id)
+                .is_some_and(|entry| !entry.shared_medium)
+                && let Some(queued) = self.announce_table.get_mut(&header.destination_hash)
+                && queued.packet_hash == announce_packet_hash
+                && !queued.dedup_interfaces.contains(&interface_id)
+            {
+                queued.dedup_interfaces.push(interface_id);
+            }
             debug!(
                 dest = hex::encode(header.destination_hash),
                 hops = header.hops,
@@ -1150,6 +1164,8 @@ impl TransportActor {
                     block_rebroadcast: false,
                     attached_interface: None,
                     source_interface: Some(interface_id),
+                    packet_hash: announce_packet_hash,
+                    dedup_interfaces: Vec::new(),
                 },
             );
         }

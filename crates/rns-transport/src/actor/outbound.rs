@@ -920,6 +920,8 @@ impl TransportActor {
                     block_rebroadcast: true,
                     attached_interface: Some(interface_id),
                     source_interface: None,
+                    packet_hash: path.packet_hash.unwrap_or_default(),
+                    dedup_interfaces: Vec::new(),
                 },
             );
             if !self.shared_instance_client_mode {

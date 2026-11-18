@@ -422,6 +422,10 @@ pub struct InterfaceEntry {
     /// Path preference among equal announces; a copy of the same emission
     /// heard on a higher-gravity interface replaces the path.
     pub gravity: i64,
+    /// Python `shared_medium`: other peers may not hear what one peer sent,
+    /// as on a radio, a serial line or UDP. A queued announce heard again on
+    /// an interface that is not shared is not rebroadcast there.
+    pub shared_medium: bool,
     /// Configured announce stamp requirement; `None` follows
     /// `StampPolicy::destination_cost`. Resolve with `StampPolicy::interface_destination_cost`.
     pub destination_cost: Option<f64>,
@@ -490,6 +494,7 @@ impl InterfaceEntry {
             announces_from_internal: true,
             announces_to_internal: None,
             gravity: 0,
+            shared_medium: false,
             destination_cost: None,
             pr_cost: None,
         }
@@ -551,6 +556,12 @@ impl InterfaceEntry {
     /// Store the multipoint metadata flag.
     pub fn with_multipoint(mut self, multipoint: bool) -> Self {
         self.multipoint = multipoint;
+        self
+    }
+
+    /// Mark the interface a shared medium (Python `shared_medium`).
+    pub fn with_shared_medium(mut self, shared_medium: bool) -> Self {
+        self.shared_medium = shared_medium;
         self
     }
 

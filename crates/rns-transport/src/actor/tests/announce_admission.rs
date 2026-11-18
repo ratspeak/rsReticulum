@@ -81,6 +81,8 @@ fn cache_entry(raw: &Bytes, timestamp: f64, attached: bool) -> crate::announce::
         block_rebroadcast: attached,
         attached_interface: attached.then_some(1),
         source_interface: Some(2),
+        packet_hash: [0; 32],
+        dedup_interfaces: Vec::new(),
     }
 }
 

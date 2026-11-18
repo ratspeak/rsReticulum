@@ -2284,8 +2284,14 @@ impl TransportActor {
     /// non-local Internal egress and hop-0 announces send at once, uncapped.
     /// Otherwise an announce sends at once when the queue is empty, the cap
     /// window is open and the bitrate is known; else it is queued, replacing a
-    /// queued copy only when newer, and refused when the queue is full.
-    fn broadcast_announce_on_interfaces(&mut self, raw: &[u8], except: Option<InterfaceId>) {
+    /// queued copy only when newer, and refused when the queue is full. The
+    /// `skip` interfaces are Python's `blocked_interfaces`.
+    fn broadcast_announce_skipping(
+        &mut self,
+        raw: &[u8],
+        except: Option<InterfaceId>,
+        skip: &[InterfaceId],
+    ) {
         let destination_hash = rns_wire::header::PacketHeader::unpack(raw)
             .ok()
             .map(|(h, _)| h.destination_hash)
@@ -2302,7 +2308,9 @@ impl TransportActor {
             .interfaces
             .keys()
             .copied()
-            .filter(|id| self.interface_allows_announce(*id, &destination_hash, except))
+            .filter(|id| {
+                !skip.contains(id) && self.interface_allows_announce(*id, &destination_hash, except)
+            })
             .collect();
 
         for id in ids {
@@ -2363,6 +2371,11 @@ impl TransportActor {
             let allowed_at = entry.announce_allowed_at;
             self.wake_for_announce_at(allowed_at);
         }
+    }
+
+    #[cfg(test)]
+    fn broadcast_announce_on_interfaces(&mut self, raw: &[u8], except: Option<InterfaceId>) {
+        self.broadcast_announce_skipping(raw, except, &[]);
     }
 
     /// Python `Transport.transmit` then `sent_announce`: the announce counts
@@ -2459,9 +2472,10 @@ impl TransportActor {
                     e.source_interface,
                     e.attached_interface,
                     e.block_rebroadcast,
+                    e.dedup_interfaces.clone(),
                 )
             });
-            if let Some((raw, _source_iface, Some(attached_interface), true)) = send_info {
+            if let Some((raw, _source_iface, Some(attached_interface), true, _)) = send_info {
                 self.send_to_interface(attached_interface, &raw);
                 self.announce_table.remove(&hash);
                 if let Some(held_entry) = self.held_announces.remove(hash.as_bytes()) {
@@ -2473,8 +2487,8 @@ impl TransportActor {
                 entry.retries += 1;
                 entry.retransmit_timeout = far_future + PATHFINDER_G + rand_window();
             }
-            if let Some((raw, source_iface, _, _)) = send_info {
-                self.broadcast_announce_on_interfaces(&raw, source_iface);
+            if let Some((raw, source_iface, _, _, skip)) = send_info {
+                self.broadcast_announce_skipping(&raw, source_iface, &skip);
             }
         }
         self.flush_announce_queues();
@@ -2922,6 +2936,7 @@ mod tests {
             announces_from_internal: true,
             announces_to_internal: None,
             gravity: 0,
+            shared_medium: false,
             destination_cost: None,
             pr_cost: None,
             ingress: crate::ingress::IngressController::new(),
@@ -3446,6 +3461,8 @@ mod tests {
                 block_rebroadcast: false,
                 attached_interface: None,
                 source_interface: None,
+                packet_hash: [0; 32],
+                dedup_interfaces: Vec::new(),
             },
         );
 
@@ -5944,6 +5961,8 @@ mod tests {
             block_rebroadcast: false,
             attached_interface: None,
             source_interface: None,
+            packet_hash: [0; 32],
+            dedup_interfaces: Vec::new(),
         };
         actor.announce_table.insert(dest_hash, announce_entry);
 
@@ -12556,6 +12575,8 @@ mod tests {
                 block_rebroadcast: false,
                 attached_interface: None,
                 source_interface: Some(2),
+                packet_hash: [0; 32],
+                dedup_interfaces: Vec::new(),
             },
         );
 

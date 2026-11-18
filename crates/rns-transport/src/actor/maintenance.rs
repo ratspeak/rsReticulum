@@ -93,9 +93,10 @@ impl TransportActor {
                         e.source_interface,
                         e.attached_interface,
                         e.block_rebroadcast,
+                        e.dedup_interfaces.clone(),
                     )
                 });
-                if let Some((raw, _source_iface, Some(attached_interface), true)) = send_info {
+                if let Some((raw, _source_iface, Some(attached_interface), true, _)) = send_info {
                     let timestamp = self.announce_table.get(&hash).unwrap().timestamp;
                     self.admit_cached_response(
                         *hash.as_bytes(),
@@ -112,8 +113,8 @@ impl TransportActor {
                 // The helper excludes an exact shared IPC peer and applies
                 // mode policy. A broadcast radio may need same-interface
                 // retransmission to reach a different physical neighbor.
-                if let Some((raw, source_iface, _, _)) = send_info {
-                    self.broadcast_announce_on_interfaces(&raw, source_iface);
+                if let Some((raw, source_iface, _, _, skip)) = send_info {
+                    self.broadcast_announce_skipping(&raw, source_iface, &skip);
                 }
             }
             self.announce_table.cull_exhausted(PATHFINDER_R);
