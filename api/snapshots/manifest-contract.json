@@ -4,7 +4,7 @@
   "packages": [
     {
       "name": "rns-crypto",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {
@@ -176,7 +176,7 @@
     },
     {
       "name": "rns-git",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {},
@@ -258,7 +258,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -269,7 +269,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -291,7 +291,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -302,7 +302,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -360,7 +360,7 @@
     },
     {
       "name": "rns-identity",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {},
@@ -426,7 +426,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -439,7 +439,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -545,7 +545,7 @@
     },
     {
       "name": "rns-interface",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {
@@ -661,7 +661,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -674,7 +674,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -685,7 +685,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -696,7 +696,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -905,7 +905,7 @@
     },
     {
       "name": "rns-link",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {
@@ -968,7 +968,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [],
@@ -979,7 +979,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -990,7 +990,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [],
@@ -1059,7 +1059,7 @@
     },
     {
       "name": "rns-protocol",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {},
@@ -1125,7 +1125,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -1138,7 +1138,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1149,7 +1149,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -1209,7 +1209,7 @@
     },
     {
       "name": "rns-ratkey",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {
@@ -1326,7 +1326,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -1339,7 +1339,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1445,7 +1445,7 @@
     },
     {
       "name": "rns-runtime",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {
@@ -1560,7 +1560,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -1573,7 +1573,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1584,7 +1584,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1595,7 +1595,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1606,7 +1606,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1617,7 +1617,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1628,7 +1628,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -1734,7 +1734,7 @@
     },
     {
       "name": "rns-tools",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {
@@ -1851,7 +1851,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -1864,7 +1864,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1875,7 +1875,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [
@@ -1888,7 +1888,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": true,
           "defaultFeatures": true,
           "features": [
@@ -1901,7 +1901,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [
@@ -1914,7 +1914,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -1925,7 +1925,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -2055,7 +2055,7 @@
     },
     {
       "name": "rns-transport",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {
@@ -2140,7 +2140,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -2153,7 +2153,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -2164,7 +2164,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [
@@ -2248,7 +2248,7 @@
     },
     {
       "name": "rns-wire",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {
@@ -2277,7 +2277,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.5.0",
+          "requirement": "~1.5.1",
           "optional": false,
           "defaultFeatures": false,
           "features": [],

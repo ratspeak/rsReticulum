@@ -36,13 +36,13 @@ a specification, and tracks the reference's wire behavior release by release.
 
 ## Build It
 
-This guide describes the 1.5.0 release, [v1.5.0](https://github.com/ratspeak/rsReticulum/releases/tag/v1.5.0), the source line Ratspeak builds from.
+This guide describes the 1.5.1 release, [v1.5.1](https://github.com/ratspeak/rsReticulum/releases/tag/v1.5.1), the source line Ratspeak builds from.
 
 From a new working directory:
 
 ```bash
 git clone https://github.com/ratspeak/rsReticulum.git
-git -C rsReticulum checkout --detach v1.5.0
+git -C rsReticulum checkout --detach v1.5.1
 cd rsReticulum
 ```
 
@@ -295,7 +295,7 @@ identity.
 
 ## Compatibility Notes
 
-rsReticulum 1.5.0 follows Python Reticulum 1.6.0, and its tools name that
+rsReticulum 1.5.1 follows Python Reticulum 1.6.0, and its tools name that
 release in `--version`.
 
 Interface discovery announces this stack as `rsRNS`. `rnsd-rs` auto-connects to

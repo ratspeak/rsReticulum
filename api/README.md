@@ -1,6 +1,6 @@
 # Rust API
 
-This guide describes the 1.5.0 API, published as v1.5.0. The [1.5 migration
+This guide describes the 1.5.1 API, published as v1.5.1. The [1.5 migration
 guide](migrations/1.5.md) covers source and configuration changes.
 
 Application code should begin with `rns_runtime::prelude`. It collects the

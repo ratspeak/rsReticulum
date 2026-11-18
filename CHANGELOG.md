@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.1 - 2026-11-18
 
 - Bluetooth Peer runs in Gateway mode, so a node with transport on looks up the paths its Bluetooth peers ask for that it doesn't know yet. Nodes with transport off behave as before.
 - TCP and Backbone client interfaces report why they can't connect: `last_connect_error` (`refused`, `timed_out`, `dns`, `unreachable`, `closed_by_peer`, or `other`) and `connect_failures` in the interface stats, so an application can tell a hub that refuses or closes the connection from one still connecting. The shared-instance RPC doesn't carry them.
