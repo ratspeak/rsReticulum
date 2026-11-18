@@ -428,6 +428,9 @@ pub struct InterfaceEntry {
     /// as on a radio, a serial line or UDP. A queued announce heard again on
     /// an interface that is not shared is not rebroadcast there.
     pub shared_medium: bool,
+    /// Packets arriving with this many wire hops or more are dropped before
+    /// the instance-wide limit; `None` or 0 is off (Transport.py).
+    pub hop_limiter: Option<u8>,
     /// Configured announce stamp requirement; `None` follows
     /// `StampPolicy::destination_cost`. Resolve with `StampPolicy::interface_destination_cost`.
     pub destination_cost: Option<f64>,
@@ -520,6 +523,7 @@ impl InterfaceEntry {
             announces_to_internal: None,
             gravity: 0,
             shared_medium: false,
+            hop_limiter: None,
             destination_cost: None,
             pr_cost: None,
             received: ReceivedBytes::default(),

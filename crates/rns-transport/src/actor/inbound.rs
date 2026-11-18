@@ -300,8 +300,15 @@ impl TransportActor {
             return;
         }
 
-        // Transport.HOP_LIMITER, on wire hops (Transport.py).
-        if parsed.hops >= self.hop_limiter {
+        // Interface.hop_limiter, then Transport.HOP_LIMITER, on wire hops (Transport.py).
+        let interface_limit = self
+            .interfaces
+            .get(&packet.interface_id)
+            .and_then(|entry| entry.hop_limiter)
+            .filter(|limit| *limit > 0);
+        if interface_limit.is_some_and(|limit| parsed.hops >= limit)
+            || parsed.hops >= self.hop_limiter
+        {
             trace!(
                 hops = parsed.hops,
                 interface_id = packet.interface_id,

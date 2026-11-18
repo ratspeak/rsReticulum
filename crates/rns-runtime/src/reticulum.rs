@@ -104,6 +104,7 @@ struct SpawnInheritance {
     announces_from_internal: bool,
     announces_to_internal: Option<bool>,
     gravity: i64,
+    hop_limiter: Option<u8>,
 }
 
 impl SpawnInheritance {
@@ -5252,6 +5253,8 @@ struct OwnedInterfaceHandle {
     /// The address a discoverable interface learns at runtime (I2P b32).
     discovery_address: Option<tokio::sync::watch::Receiver<Option<String>>>,
     hardware_failures: Option<InterfaceFailureWatch>,
+    /// A peer Python spawns for its configured interface (I2PInterface.py).
+    configured_peer: bool,
 }
 
 /// A driver's failures Python answers with `RNS.panic()` when
@@ -5429,6 +5432,7 @@ impl From<rns_interface::traits::InterfaceHandle> for OwnedInterfaceHandle {
             driver: None,
             discovery_address: None,
             hardware_failures: None,
+            configured_peer: false,
         }
     }
 }
@@ -5440,6 +5444,7 @@ impl From<rns_interface::rnode::SpawnedRNodeInterface> for OwnedInterfaceHandle 
             driver: Some(spawned.driver),
             discovery_address: None,
             hardware_failures: None,
+            configured_peer: false,
         }
     }
 }
@@ -6058,6 +6063,7 @@ async fn prepare_interface_with_role_and_overrides(
         entry.announces_from_internal = parent.announces_from_internal;
         entry.announces_to_internal = parent.announces_to_internal;
         entry.gravity = parent.gravity;
+        entry.hop_limiter = parent.hop_limiter;
     }
     entry.destination_cost = child_stamp_costs.0;
     entry.pr_cost = child_stamp_costs.1;
@@ -6198,6 +6204,8 @@ fn clone_interface_post_init(
         announces_from_internal: post_init.announces_from_internal,
         announces_to_internal: post_init.announces_to_internal,
         gravity: post_init.gravity,
+        hop_limiter: post_init.hop_limiter,
+        spawned_hop_limiter: post_init.spawned_hop_limiter,
         destination_cost: post_init.destination_cost,
         pr_cost: post_init.pr_cost,
         autoconnect_source: post_init.autoconnect_source.clone(),
@@ -6272,7 +6280,10 @@ async fn prepare_interface_with_post_init(
         ));
     }
     let OwnedInterfaceHandle {
-        interface, driver, ..
+        interface,
+        driver,
+        configured_peer,
+        ..
     } = owned;
     let handle = interface;
     // Outbound = physical capability AND `outgoing` config flag. An
@@ -6363,6 +6374,9 @@ async fn prepare_interface_with_post_init(
                     announces_from_internal: post_init.announces_from_internal,
                     announces_to_internal: post_init.announces_to_internal,
                     gravity: post_init.gravity.unwrap_or(0),
+                    hop_limiter: post_init
+                        .hop_limiter
+                        .filter(|_| post_init.spawned_hop_limiter),
                 }),
             },
         );
@@ -6395,6 +6409,11 @@ async fn prepare_interface_with_post_init(
     entry.announces_to_internal = post_init.announces_to_internal;
     entry.gravity = post_init.gravity.unwrap_or(0);
     entry.shared_medium = post_init.shared_medium;
+    // Reticulum.py sets it on the configured interface, not on an RNodeMulti
+    // subinterface or an I2P peer.
+    entry.hop_limiter = post_init
+        .hop_limiter
+        .filter(|_| handle.parent_id.is_none() && !configured_peer);
     entry.destination_cost = post_init.destination_cost;
     entry.pr_cost = post_init.pr_cost;
     Ok(PreparedInterfaceRegistration {
@@ -10826,7 +10845,10 @@ async fn spawn_configured_interface_driver(
                 )
                 .await
                 {
-                    Ok(client) => handles.push(client.into()),
+                    Ok(client) => handles.push(OwnedInterfaceHandle {
+                        configured_peer: true,
+                        ..client.into()
+                    }),
                     Err(e) => {
                         for spawned in handles {
                             rollback_unreserved_interface(spawned, InterfaceKind::Standard).await;

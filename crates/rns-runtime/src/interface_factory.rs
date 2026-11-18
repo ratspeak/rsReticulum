@@ -2034,6 +2034,12 @@ pub struct InterfacePostInit {
     pub announces_to_internal: Option<bool>,
     /// Configured `gravity`; `None` takes `[reticulum] default_gravity`.
     pub gravity: Option<i64>,
+    /// Configured `hop_limiter`, clamped to `0..=PATHFINDER_M`; 0 is `None`, off.
+    pub hop_limiter: Option<u8>,
+    /// Whether connections this interface accepts copy `hop_limiter`: TCP
+    /// server, Backbone and I2P listeners do, AutoInterface peers do not
+    /// (TCPInterface.py, BackboneInterface.py, I2PInterface.py).
+    pub spawned_hop_limiter: bool,
     /// Required announce stamp value on this interface, clamped to the stamp
     /// cost cap. `None` follows the global `[stamps] destination_cost`.
     pub destination_cost: Option<f64>,
@@ -2139,6 +2145,13 @@ impl InterfacePostInit {
             announces_from_internal,
             announces_to_internal: config_bool(section, "announces_to_internal")?,
             gravity: config_int(section, "gravity")?,
+            hop_limiter: config_int(section, "hop_limiter")?
+                .map(rns_transport::destination_filter::FilterPolicy::clamp_hop_limiter)
+                .filter(|limit| *limit > 0),
+            spawned_hop_limiter: matches!(
+                section.get("type"),
+                Some("TCPServerInterface" | "BackboneInterface" | "I2PInterface")
+            ),
             destination_cost: section
                 .get_float("destination_cost")
                 .map(rns_transport::stamps::StampPolicy::clamp_cost),
