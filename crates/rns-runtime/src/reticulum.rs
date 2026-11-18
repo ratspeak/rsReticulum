@@ -7701,6 +7701,12 @@ async fn start_on_network_discovery(handle: ReticulumHandle) {
         if !*started {
             *started = true;
             drop(started);
+            // InterfaceDiscovery registers its announce type (Discovery.py).
+            handle
+                .wants_destination_type(
+                    rns_transport::discovery::constants::DISCOVERY_ASPECT_FILTER,
+                )
+                .await;
 
             let (observer_tx, observer_rx) = if handle.config.autoconnect_discovered_interfaces > 0
             {

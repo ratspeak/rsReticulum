@@ -172,3 +172,23 @@ fn blocked_ips_lines_parse_like_upstream() {
         .collect();
     assert_eq!(parsed, ["198.51.100.7", "2001:db8::1", "::1"]);
 }
+
+/// Discovery.py 1.6.1 (884f109b): the receiver wants its announce type, so
+/// `required_only` does not drop discovery announces.
+#[tokio::test]
+async fn interface_discovery_registers_its_announce_type() {
+    let (mut handle, _actor) = discovery_actor();
+    let dir = tempfile::tempdir().unwrap();
+    handle
+        .install_discovery_store_for_tests(Arc::new(DiscoveryStore::open(dir.path()).unwrap()))
+        .await;
+    handle.config.discover_interfaces = true;
+    handle
+        .enable_on_network_discovery(Arc::new(StaticStamper))
+        .await;
+    assert!(
+        handle
+            .unwants_destination_type(rns_transport::discovery::constants::DISCOVERY_ASPECT_FILTER)
+            .await
+    );
+}
