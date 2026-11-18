@@ -181,3 +181,72 @@ fn a_ratchet_heard_again_after_a_restart_keeps_its_stored_receive_time() {
     restarted.on_shutdown();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Restart with `prepare` run after the snapshot is staged and before the
+/// interface binds it, as a blackhole list loaded late would be.
+fn restarted_with(
+    dir: &std::path::Path,
+    prepare: impl FnOnce(&mut TransportActor),
+) -> TransportActor {
+    let (mut actor, _) = TransportActor::new();
+    actor.initialize_storage(dir.to_path_buf());
+    prepare(&mut actor);
+    let (mut entry, _rx) = make_test_interface("uplink");
+    entry.ingress = crate::ingress::IngressController::disabled();
+    actor.handle_message(TransportMessage::RegisterInterface { id: 1, entry });
+    actor
+}
+
+/// Save paths to three destinations, the third's identity to be blackholed.
+fn three_saved_paths(dir: &std::path::Path) -> ([[u8; 16]; 3], [u8; 16]) {
+    let now = crate::now_f64() as u64;
+    let names = ["restored.kept", "restored.spam", "restored.blackholed"];
+    let identities: [_; 3] = std::array::from_fn(|_| rns_identity::identity::Identity::new());
+    let mut before = node(dir);
+    let dests = std::array::from_fn(|i| {
+        let (raw, dest) = announce(&identities[i], names[i], None, now, PacketContext::None);
+        inbound(&mut before, &raw);
+        assert!(before.path_table.has_path(&dest), "{}", names[i]);
+        dest
+    });
+    before.on_shutdown();
+    (dests, identities[2].hash)
+}
+
+/// Transport.py 1.6.1 (20e25a9f, 350b7e26): a restored path skips a
+/// blackholed identity and a filtered destination type; under
+/// `required_only` only allowed types bind.
+#[test]
+fn restored_paths_skip_blackholed_identities_and_filtered_types() {
+    let dir = unique_temp_dir("restored-filtered");
+    let (dests, blackholed) = three_saved_paths(&dir);
+    let mut restarted = restarted_with(&dir, |actor| {
+        actor.handle_message(TransportMessage::SetFilterPolicy {
+            policy: crate::destination_filter::FilterPolicy {
+                ignored_types: vec!["restored.spam".into()],
+                ..Default::default()
+            },
+        });
+        actor.blackhole_table.add(blackholed, None);
+    });
+    let bound = dests.map(|dest| restarted.path_table.has_path(&dest));
+    assert_eq!(bound, [true, false, false]);
+    restarted.on_shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+
+    let dir = unique_temp_dir("restored-required");
+    let (dests, _) = three_saved_paths(&dir);
+    let mut required = restarted_with(&dir, |actor| {
+        actor.handle_message(TransportMessage::SetFilterPolicy {
+            policy: crate::destination_filter::FilterPolicy {
+                required_only: true,
+                allowed_types: vec!["restored.blackholed".into()],
+                ..Default::default()
+            },
+        });
+    });
+    let bound = dests.map(|dest| required.path_table.has_path(&dest));
+    assert_eq!(bound, [false, false, true]);
+    required.on_shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}

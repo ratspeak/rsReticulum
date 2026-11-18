@@ -1060,6 +1060,8 @@ impl TransportActor {
     ) {
         if !self.pending_path_entries.is_empty() {
             let mut promoted = 0usize;
+            let mut filtered = 0usize;
+            let mut blackholed = 0usize;
             let hashes = [
                 crate::persistence::interface_hash_from_name(upstream_name),
                 crate::persistence::interface_hash_from_name(name),
@@ -1081,6 +1083,21 @@ impl TransportActor {
                 }
                 let mut hash = [0u8; 16];
                 hash.copy_from_slice(&pe.destination_hash);
+                // Transport.py: a restored path skips blackholed identities
+                // and filtered destination types.
+                let known = self.recent_announces.get(&hash);
+                if known.and_then(|k| k.public_key).is_some_and(|key| {
+                    self.blackhole_table
+                        .is_blackholed(&rns_crypto::sha::truncated_hash(&key))
+                }) {
+                    blackholed += 1;
+                    return false;
+                }
+                let name_hash = known.filter(|k| k.facts_known).map(|k| &k.name_hash);
+                if !self.destination_filter.admits_stored(name_hash) {
+                    filtered += 1;
+                    return false;
+                }
                 let next_hop = pe.next_hop.as_ref().and_then(|h| {
                     if h.len() == 16 {
                         let mut arr = [0u8; 16];
@@ -1126,11 +1143,13 @@ impl TransportActor {
                 }
                 false
             });
-            if promoted > 0 {
+            if promoted > 0 || filtered > 0 || blackholed > 0 {
                 debug!(
                     interface_id = id,
                     name = %name,
                     promoted,
+                    filtered,
+                    blackholed,
                     "rebound persisted path entries to live interface"
                 );
             }

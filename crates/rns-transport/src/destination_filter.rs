@@ -210,6 +210,19 @@ impl DestinationTypeFilter {
         self.blocked.contains(hash)
     }
 
+    /// Python's rule for a path restored from storage (Transport.py): a
+    /// blocked type goes, and under `required_only` so does any type not
+    /// allowed, client wants included. An unknown type goes only under
+    /// `required_only`.
+    pub fn admits_stored(&self, hash: Option<&NameHash>) -> bool {
+        match hash {
+            Some(hash) => {
+                !self.blocked.contains(hash) && (!self.required_only || self.allowed.contains(hash))
+            }
+            None => !self.required_only,
+        }
+    }
+
     /// The decision inside Python `Transport.inbound` (Transport.py),
     /// given the wire hop count before the inbound increment.
     pub fn admits(&self, hash: &NameHash, source: AnnounceSource, wire_hops: u8) -> bool {
@@ -299,6 +312,21 @@ mod tests {
             f.pretty_name(&unknown),
             format!("<{}>", hex::encode(unknown))
         );
+    }
+
+    /// Transport.py 1.6.1 (20e25a9f): the load rule ignores client wants.
+    #[test]
+    fn stored_paths_follow_the_blocked_and_allowed_types_only() {
+        let mut f = DestinationTypeFilter::default();
+        f.block("a.blocked");
+        f.allow("a.allowed");
+        assert!(f.wants("a.wanted", vec![1]));
+        let [blocked, allowed, wanted] = ["a.blocked", "a.allowed", "a.wanted"].map(name_hash);
+        assert!(!f.admits_stored(Some(&blocked)));
+        assert!(f.admits_stored(Some(&wanted)) && f.admits_stored(None));
+        f.set_required_only(true);
+        assert!(f.admits_stored(Some(&allowed)));
+        assert!(!f.admits_stored(Some(&wanted)) && !f.admits_stored(None));
     }
 
     #[test]
