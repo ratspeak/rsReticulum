@@ -1382,6 +1382,11 @@ pub struct PathTableRpcEntry {
     /// Announced link-request cost, if any.
     pub lr_cost: Option<f64>,
     pub interface: String,
+    /// Upstream's `Interface.get_hash()`, SHA-256 of `str(interface)`: the
+    /// `hash` interface stats report for the same interface.
+    pub interface_hash: [u8; 32],
+    /// Python `Transport.get_path_state`.
+    pub state: crate::constants::PathState,
     pub interface_id: InterfaceId,
     pub interface_mode: InterfaceMode,
     pub interface_role: InterfaceRole,
@@ -1882,6 +1887,8 @@ impl Default for PathTableRpcEntry {
             used: 0.0,
             lr_cost: None,
             interface: String::new(),
+            interface_hash: [0; 32],
+            state: crate::constants::PathState::Unknown,
             interface_id: 0,
             interface_mode: InterfaceMode::Full,
             interface_role: InterfaceRole::Normal,

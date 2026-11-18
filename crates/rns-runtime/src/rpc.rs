@@ -205,6 +205,13 @@ pub struct PathTableEntry {
     #[serde(default)]
     pub lr_cost: Option<f64>,
     pub interface: String,
+    /// SHA-256 of upstream's `str(interface)`; `None` from a peer before 1.6.1.
+    #[serde(default)]
+    pub interface_hash: Option<Vec<u8>>,
+    /// Path state: 0 unknown, 1 unresponsive, 2 responsive (Transport.py);
+    /// `None` from a peer before 1.6.1.
+    #[serde(default)]
+    pub state: Option<u8>,
 }
 
 /// One interface of Python's `get_interface_stats()` (Reticulum.py), field for
@@ -1025,6 +1032,19 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                             e.lr_cost.map(PyValue::Float).unwrap_or(PyValue::None),
                         ),
                         ("interface", PyValue::String(e.interface.clone())),
+                        (
+                            "interface_hash",
+                            e.interface_hash
+                                .clone()
+                                .map(PyValue::Bytes)
+                                .unwrap_or(PyValue::None),
+                        ),
+                        (
+                            "state",
+                            e.state
+                                .map(|state| PyValue::Int(i128::from(state)))
+                                .unwrap_or(PyValue::None),
+                        ),
                     ])
                 })
                 .collect(),
@@ -1583,6 +1603,11 @@ fn parse_path_table(value: &PyValue) -> Result<Vec<PathTableEntry>, RpcError> {
                 interface: dict_get(m, "interface")
                     .and_then(py_string)
                     .unwrap_or_default(),
+                interface_hash: match dict_get(m, "interface_hash") {
+                    Some(PyValue::Bytes(v)) => Some(v.clone()),
+                    _ => None,
+                },
+                state: dict_get(m, "state").and_then(py_u8),
             })
         })
         .collect()
@@ -2844,6 +2869,8 @@ mod tests {
             used: 0.0,
             lr_cost: None,
             interface: "TCPInterface[test]".to_string(),
+            interface_hash: None,
+            state: None,
         };
         let resp = RpcResponse::PathTable(vec![entry]);
         let encoded = encode_response(&resp).unwrap();
@@ -3527,8 +3554,14 @@ mod tests {
     const FX_REQ_IDENTITY_DATA_RETAIN: &str = "82ad6964656e746974795f64617461a672657461696ead6964656e746974795f68617368c410dddddddddddddddddddddddddddddddd";
     // Path-table replies: RNS 1.6.0 umsgpack over the dict get_path_table builds
     // (Reticulum.py), unknown and stamped destinations.
-    const FX_RESP_PATH_TABLE: &str = "9189a468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a576616c7565c0a47573656400a76c725f636f7374c0a9696e74657266616365b2544350496e746572666163655b746573745d";
-    const FX_RESP_PATH_TABLE_STAMPED: &str = "9189a468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a576616c7565cb4018500000000000a475736564cb41d26580cfe00000a76c725f636f7374cb400a000000000000a9696e74657266616365b2544350496e746572666163655b746573745d";
+    const FX_RESP_PATH_TABLE_160: &str = "9189a468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a576616c7565c0a47573656400a76c725f636f7374c0a9696e74657266616365b2544350496e746572666163655b746573745d";
+    const FX_RESP_PATH_TABLE_STAMPED_160: &str = "9189a468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a576616c7565cb4018500000000000a475736564cb41d26580cfe00000a76c725f636f7374cb400a000000000000a9696e74657266616365b2544350496e746572666163655b746573745d";
+    // The same from RNS 1.6.1, which adds `interface_hash` and `state`:
+    // `Reticulum.get_path_table` run on a Transport.path_table entry whose
+    // interface prints as "TCPInterface[test]", with path state 0 and 2,
+    // packed with RNS.vendor.umsgpack.packb.
+    const FX_RESP_PATH_TABLE: &str = "918ba468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a576616c7565c0a47573656400a76c725f636f7374c0a9696e74657266616365b2544350496e746572666163655b746573745dae696e746572666163655f68617368c4206e5082481873def8612282d21b981c90430ecd80bf5a877711f83dabb06ae938a5737461746500";
+    const FX_RESP_PATH_TABLE_STAMPED: &str = "918ba468617368c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa974696d657374616d70cb41d26580b4800000a3766961c410bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba4686f707303a765787069726573cb41d267cf54800000a576616c7565cb4018500000000000a475736564cb41d26580cfe00000a76c725f636f7374cb400a000000000000a9696e74657266616365b2544350496e746572666163655b746573745dae696e746572666163655f68617368c4206e5082481873def8612282d21b981c90430ecd80bf5a877711f83dabb06ae938a5737461746502";
     const FX_RESP_BLACKHOLE_DICT: &str = "81c4104242424242424242424242424242424283a6736f75726365c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5756e74696ccb4093480000000000a6726561736f6ea6706172697479";
     const FX_INT_EDGES: &str = "dc0014007fcc80ccffcd0100cdffffce00010000ceffffffffcf0000000100000000cfffffffffffffffffffe0d0dfd080d1ff7fd18000d2ffff7fffd280000000d3ffffffff7fffffffd38000000000000000";
     const FX_STR_EDGES: &str = "93a0bf61616161616161616161616161616161616161616161616161616161616161d9206161616161616161616161616161616161616161616161616161616161616161";
@@ -3627,6 +3660,8 @@ mod tests {
             used: 0.0,
             lr_cost: None,
             interface: "TCPInterface[test]".to_string(),
+            interface_hash: Some(rns_crypto::sha::sha256(b"TCPInterface[test]").to_vec()),
+            state: Some(0),
         }]);
         assert_eq!(
             hex::encode(encode_response(&resp).unwrap()),
@@ -3644,8 +3679,27 @@ mod tests {
                 assert_eq!(entries[0].interface, "TCPInterface[test]");
                 assert_eq!(entries[0].value, None);
                 assert_eq!(entries[0].lr_cost, None);
+                assert_eq!(entries[0].state, Some(0));
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+        // A 1.6.0 instance sends neither key.
+        for fixture in [FX_RESP_PATH_TABLE_160, FX_RESP_PATH_TABLE_STAMPED_160] {
+            match decode_response_for_request(
+                &hex::decode(fixture).unwrap(),
+                &RpcRequest::GetPathTable { max_hops: None },
+            )
+            .unwrap()
+            {
+                RpcResponse::PathTable(entries) => {
+                    assert_eq!(entries[0].interface, "TCPInterface[test]");
+                    assert_eq!(
+                        (&entries[0].interface_hash, entries[0].state),
+                        (&None, None)
+                    );
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
         }
     }
 
@@ -3661,6 +3715,8 @@ mod tests {
             used: 1234567999.5,
             lr_cost: Some(3.25),
             interface: "TCPInterface[test]".to_string(),
+            interface_hash: Some(rns_crypto::sha::sha256(b"TCPInterface[test]").to_vec()),
+            state: Some(2),
         };
         let resp = RpcResponse::PathTable(vec![entry]);
         assert_eq!(
@@ -3677,6 +3733,11 @@ mod tests {
                 assert_eq!(entries[0].value, Some(6.078125));
                 assert_eq!(entries[0].used, 1234567999.5);
                 assert_eq!(entries[0].lr_cost, Some(3.25));
+                assert_eq!(entries[0].state, Some(2));
+                assert_eq!(
+                    entries[0].interface_hash.as_deref(),
+                    Some(&rns_crypto::sha::sha256(b"TCPInterface[test]")[..])
+                );
             }
             other => panic!("wrong variant: {other:?}"),
         }

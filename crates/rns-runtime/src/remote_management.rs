@@ -197,6 +197,8 @@ fn handle_path(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec<u
                         used: e.used,
                         lr_cost: e.lr_cost,
                         interface: e.interface,
+                        interface_hash: Some(e.interface_hash.to_vec()),
+                        state: Some(e.state as u8),
                     });
                 }
             }
@@ -455,6 +457,8 @@ mod tests {
                                 entry.used = 0.0;
                                 entry.lr_cost = None;
                                 entry.interface = "MockIf".to_string();
+                                entry.interface_hash = rns_crypto::sha::sha256(b"MockIf");
+                                entry.state = rns_transport::constants::PathState::Responsive;
                                 entry.interface_id = 1;
                                 entry.interface_mode =
                                     rns_transport::constants::InterfaceMode::Full;
@@ -754,6 +758,29 @@ mod tests {
             .1
             .as_u64();
         assert_eq!(hops, Some(2));
+        // Transport.py 1.6.1: remote `/path` uses get_path_table's keys.
+        let keys: Vec<&str> = entry.iter().filter_map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "hash",
+                "timestamp",
+                "via",
+                "hops",
+                "expires",
+                "value",
+                "used",
+                "lr_cost",
+                "interface",
+                "interface_hash",
+                "state"
+            ]
+        );
+        assert_eq!(
+            entry[9].1.as_slice(),
+            Some(&rns_crypto::sha::sha256(b"MockIf")[..])
+        );
+        assert_eq!(entry[10].1.as_u64(), Some(2));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

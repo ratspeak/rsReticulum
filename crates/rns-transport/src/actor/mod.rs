@@ -2624,7 +2624,6 @@ mod tests {
     mod discovery_api;
     mod discovery_public_api;
     mod held_announces;
-    mod hop_limiter;
     mod inbound_queues;
     mod interface_stats;
     mod link_endpoint_dispatch;
@@ -2633,6 +2632,7 @@ mod tests {
     mod packet_capacity;
     mod path_request_tags;
     mod path_table_lifecycle;
+    mod paths_and_filters;
     mod restored_state;
     mod slow_media_discovery;
     mod transport_api_defaults;

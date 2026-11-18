@@ -1525,6 +1525,8 @@ mod tests {
             used,
             lr_cost: None,
             interface: String::new(),
+            interface_hash: None,
+            state: None,
         };
         let mut entries = vec![entry(1, 0.0), entry(2, 20.0), entry(3, 0.0), entry(4, 30.0)];
         sort_by_usage(&mut entries);

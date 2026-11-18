@@ -13,11 +13,13 @@ impl TransportActor {
                     .path_table
                     .iter_live()
                     .map(|(hash, entry)| {
-                        let iface_name = self
-                            .interfaces
-                            .get(&entry.interface_id)
+                        let iface = self.interfaces.get(&entry.interface_id);
+                        let iface_name = iface
                             .map(|e| e.name.clone())
                             .unwrap_or_else(|| format!("interface_{}", entry.interface_id));
+                        let interface_hash = crate::persistence::interface_hash_from_name(
+                            iface.map_or(iface_name.as_str(), |e| e.upstream_name()),
+                        );
                         let hash = hash.into_bytes();
                         let known = self.recent_announces.get(&hash);
                         PathTableRpcEntry {
@@ -30,6 +32,8 @@ impl TransportActor {
                             used: entry.used,
                             lr_cost: known.and_then(|k| k.lr_cost),
                             interface: iface_name,
+                            interface_hash,
+                            state: self.path_table.get_state(&hash),
                             interface_id: entry.interface_id,
                             interface_mode: self
                                 .interfaces

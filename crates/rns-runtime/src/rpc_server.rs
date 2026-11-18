@@ -616,6 +616,8 @@ async fn process_rpc_request(
                             used: e.used,
                             lr_cost: e.lr_cost,
                             interface: e.interface,
+                            interface_hash: Some(e.interface_hash.to_vec()),
+                            state: Some(e.state as u8),
                         })
                         .collect();
                     RpcResponse::PathTable(rpc_entries)
