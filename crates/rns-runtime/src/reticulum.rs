@@ -2824,6 +2824,17 @@ fn rpc_response_to_transport_response(
                         out.value = entry.value;
                         out.used = entry.used;
                         out.lr_cost = entry.lr_cost;
+                        // Before 1.6.1 the hash is upstream's, of `str(interface)`.
+                        out.interface_hash = entry
+                            .interface_hash
+                            .as_deref()
+                            .and_then(|hash| hash.try_into().ok())
+                            .unwrap_or_else(|| rns_crypto::sha::sha256(entry.interface.as_bytes()));
+                        out.state = match entry.state {
+                            Some(1) => rns_transport::constants::PathState::Unresponsive,
+                            Some(2) => rns_transport::constants::PathState::Responsive,
+                            _ => rns_transport::constants::PathState::Unknown,
+                        };
                         out.interface = entry.interface;
                         out.interface_id = 0;
                         out.interface_mode = rns_transport::constants::InterfaceMode::Full;

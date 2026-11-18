@@ -192,3 +192,44 @@ async fn interface_discovery_registers_its_announce_type() {
             .await
     );
 }
+
+/// A shared instance's path table keeps 1.6.1's keys; a 1.6.0 instance's
+/// hash is upstream's, of the interface string.
+#[test]
+fn shared_instance_path_tables_carry_interface_hash_and_state() {
+    let entry = |interface_hash: Option<Vec<u8>>, state| crate::rpc::PathTableEntry {
+        hash: vec![0x51; 16],
+        timestamp: 1.0,
+        via: None,
+        hops: 1,
+        expires: 2.0,
+        value: None,
+        used: 0.0,
+        lr_cost: None,
+        interface: "TCPInterface[test]".into(),
+        interface_hash,
+        state,
+    };
+    let response = crate::rpc::RpcResponse::PathTable(vec![
+        entry(Some(vec![0x77; 32]), Some(1)),
+        entry(None, None),
+    ]);
+    let Some(TransportQueryResponse::PathTable(entries)) =
+        rpc_response_to_transport_response(response)
+    else {
+        panic!("expected a path table");
+    };
+    assert_eq!(entries[0].interface_hash, [0x77; 32]);
+    assert_eq!(
+        entries[0].state,
+        rns_transport::constants::PathState::Unresponsive
+    );
+    assert_eq!(
+        entries[1].interface_hash,
+        rns_crypto::sha::sha256(b"TCPInterface[test]")
+    );
+    assert_eq!(
+        entries[1].state,
+        rns_transport::constants::PathState::Unknown
+    );
+}
