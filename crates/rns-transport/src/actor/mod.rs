@@ -12424,6 +12424,64 @@ mod tests {
         }
     }
 
+    /// A requester repeating faster than the grace still gets an answer: the
+    /// queued answer keeps its time instead of restarting the grace.
+    #[test]
+    fn repeated_path_requests_do_not_postpone_the_answer() {
+        let dir = std::env::temp_dir().join("rns_path_response_repeat");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.transport_identity_hash = Some([0x44; 16]);
+        actor.storage_dir = Some(dir.clone());
+        actor.kd.attach_storage(&dir);
+        let (mut requestor, mut requestor_rx) = make_test_interface("requestor");
+        requestor.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, requestor);
+        let (next_hop_iface, _rx2) = make_test_interface("next_hop_iface");
+        actor.interfaces.insert(2, next_hop_iface);
+
+        let (raw, dest) = make_valid_announce("test.path.response.repeat", 1);
+        let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        crate::store::seed_cached_announce(&dir, &ph, &raw, None).unwrap();
+        let mut path_entry =
+            crate::path_table::PathEntry::new(Some([0xAB; 16]), 2, 2, InterfaceMode::Gateway);
+        path_entry.packet_hash = Some(ph);
+        actor.path_table.insert(dest, path_entry);
+
+        // Requests every 0.5 s, ticks every 0.25 s: no tick falls inside a
+        // restarted 0.4 s grace.
+        let start = now_f64();
+        let clock = crate::test_clock::Clock::at(start);
+        actor.last_announces_check = start;
+        let mut answered = false;
+        for step in 0..=80u8 {
+            clock.set(start + f64::from(step) * 0.05);
+            if step % 10 == 0 {
+                let tag = [step.wrapping_add(1); 16];
+                actor.handle_inbound_path_request(
+                    &make_path_request_payload_with_tag(dest, None, tag),
+                    1,
+                );
+            }
+            if step % 5 == 0 {
+                actor.on_tick();
+            }
+            while let Ok(sent) = requestor_rx.try_recv() {
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&sent).unwrap();
+                answered |= header.destination_hash == dest
+                    && header.context == rns_wire::context::PacketContext::PathResponse;
+            }
+            if answered {
+                break;
+            }
+        }
+        assert!(answered, "a path response reaches the requester");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn known_path_response_restores_displaced_announce() {
         let dir = std::env::temp_dir().join("rns_path_request_held");

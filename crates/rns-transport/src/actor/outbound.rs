@@ -889,14 +889,29 @@ impl TransportActor {
                 };
                 PATH_REQUEST_GRACE + roaming_extra
             };
-            if let Some(held_entry) = self.announce_table.remove(&requested_dest) {
-                self.held_announces.insert(requested_dest, held_entry);
-            }
+            // A repeat request keeps the time of an answer already queued to the
+            // same interface; Transport.py restarts the grace, so a requester
+            // repeating faster than grace plus the announce check is never answered.
+            let queued = self.announce_table.get(&requested_dest).filter(|entry| {
+                entry.block_rebroadcast && entry.attached_interface == Some(interface_id)
+            });
+            let (timestamp, retransmit_timeout) = match queued {
+                Some(entry) => (
+                    entry.timestamp,
+                    entry.retransmit_timeout.min(now + response_delay),
+                ),
+                None => {
+                    if let Some(held_entry) = self.announce_table.remove(&requested_dest) {
+                        self.held_announces.insert(requested_dest, held_entry);
+                    }
+                    (now, now + response_delay)
+                }
+            };
             self.announce_table.insert(
                 requested_dest,
                 crate::announce::AnnounceEntry {
-                    timestamp: now,
-                    retransmit_timeout: now + response_delay,
+                    timestamp,
+                    retransmit_timeout,
                     // Transport.py: lets an overheard answer cancel this one.
                     retries: PATHFINDER_R,
                     hops,
