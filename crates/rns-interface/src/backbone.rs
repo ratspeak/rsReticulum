@@ -137,8 +137,8 @@ pub struct BackboneClientConfig {
     /// Retries allowed within one outage; `None` retries forever.
     pub max_reconnect_tries: Option<usize>,
     pub mode: InterfaceMode,
-    /// Identity used to request a signed tunnel synthesis for each connection.
-    /// `None`, or an identity without signing material, sends no synthesis.
+    /// Set when each connection asks transport for a tunnel synthesis;
+    /// transport signs it with its own wire identity.
     pub tunnel_identity: Option<TunnelIdentity>,
     /// Bitrate the hardware MTU is optimised for.
     pub bitrate: u64,
@@ -1064,11 +1064,8 @@ pub async fn spawn_backbone_client_observed(
             task_diagnostics.connected();
             // Python synthesizes on every connection (BackboneInterface.py,
             // :1019).
-            let synthesis = config
-                .tunnel_identity
-                .as_ref()
-                .and_then(|identity| identity.synthesis(&python_name));
-            open_client_connection(&rx, &transport_tx, synthesis, &online2).await;
+            let synthesize = config.tunnel_identity.is_some();
+            open_client_connection(&rx, &transport_tx, synthesize, &online2).await;
 
             let ended = {
                 let mut outbound = rx.lock().await;

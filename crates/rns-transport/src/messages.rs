@@ -437,6 +437,7 @@ pub struct InterfaceEntry {
     /// Python 1.6.1 `rxb` and `frxb`: inbound frame bytes transport accepted
     /// or filtered, a spawned child's included in its parent's.
     pub(crate) received: ReceivedBytes,
+    pub(crate) tunnel: crate::tunnel::InterfaceTunnel,
 }
 
 /// Inbound frame bytes, counted once each as Python's `Transport.inbound`
@@ -522,7 +523,19 @@ impl InterfaceEntry {
             destination_cost: None,
             pr_cost: None,
             received: ReceivedBytes::default(),
+            tunnel: crate::tunnel::InterfaceTunnel::default(),
         }
+    }
+
+    /// Python 1.6.1 `tunnels_allowed`: only TCP, Backbone and I2P interfaces,
+    /// named by their driver, take a tunnel synthesis.
+    pub fn tunnels_allowed(&self) -> bool {
+        self.inspection
+            .as_ref()
+            .and_then(InterfaceInspectionSource::identity)
+            .is_some_and(|identity| {
+                crate::tunnel::TUNNEL_INTERFACE_CLASSES.contains(&identity.class_name.as_str())
+            })
     }
 
     /// Replace admission capacity without changing the separately reported `mtu`.
@@ -914,12 +927,22 @@ pub enum TransportMessage {
     SharedConnectionRestored {
         interface_id: InterfaceId,
     },
-    /// Driver-built tunnel synthesis packet ready for transmission on the
-    /// given interface. The actor does not build these because it does not
-    /// hold the signing identity.
+    /// A client opened a connection: forget its tunnel peer and send its
+    /// synthesis, signed with the `SetTunnelIdentity` identity, before the
+    /// interface reports online (Python 1.6.1 `connect()`).
     SynthesizeTunnel {
         interface_id: InterfaceId,
-        raw_packet: Bytes,
+    },
+    /// The wire-facing transport identity that signs tunnel syntheses (Python
+    /// `Transport.identity`). It signs only while its hash is the actor's
+    /// visible transport hash.
+    SetTunnelIdentity {
+        identity: Arc<rns_identity::identity::Identity>,
+    },
+    /// Where the actor asks its embedder to stop an interface, as Python's
+    /// transport calls `_detach_interface(..., internal_forced=True)`.
+    SetInterfaceControl {
+        tx: mpsc::UnboundedSender<InterfaceControl>,
     },
     /// Register a legacy receipt for later proof matching and destination fan-out.
     /// An existing entry with the same truncated hash is replaced. The caller must
@@ -1020,6 +1043,8 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::SharedConnectionLost => "SharedConnectionLost",
         TransportMessage::SharedConnectionRestored { .. } => "SharedConnectionRestored",
         TransportMessage::SynthesizeTunnel { .. } => "SynthesizeTunnel",
+        TransportMessage::SetTunnelIdentity { .. } => "SetTunnelIdentity",
+        TransportMessage::SetInterfaceControl { .. } => "SetInterfaceControl",
         TransportMessage::RegisterReceipt { .. } => "RegisterReceipt",
         TransportMessage::RegisterReceiptWithProof { .. } => "RegisterReceiptWithProof",
         TransportMessage::RegisterLink { .. } => "RegisterLink",
@@ -1027,6 +1052,28 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::AwaitPath { .. } => "AwaitPath",
         TransportMessage::Shutdown => "Shutdown",
     }
+}
+
+/// A request from the actor to the interface owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InterfaceControl {
+    /// Stop the interface and those it spawned, whatever the interface
+    /// management setting; I2P listeners and local interfaces stay.
+    Detach {
+        interface_id: InterfaceId,
+        reason: DetachReason,
+    },
+}
+
+/// Why transport asked for a detach (Transport.py:3245-3252, :4832-4839).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DetachReason {
+    /// A tunnel synthesis with an invalid signature.
+    InvalidSynthesis,
+    /// The tunnel peer's transport identity is blackholed.
+    BlackholedTransport,
 }
 
 /// Local introspection and mutation operations carried by `TransportMessage::Rpc`.
@@ -1415,6 +1462,14 @@ pub struct InterfaceStatRpcEntry {
     pub speeds: Option<[f64; 6]>,
     /// Python `current_frx_speed` and `current_ftx_speed`, sampled with `speeds`.
     pub filtered_speeds: Option<[f64; 2]>,
+    /// Python `tunnel_id or local_tunnel_id`: the tunnel a peer's synthesis
+    /// named, or the one this client's own synthesis names.
+    pub tunnel_id: Option<[u8; 32]>,
+    /// Python `remote_transport.hash`: the transport identity of the tunnel peer.
+    pub remote_transport_id: Option<[u8; 16]>,
+    /// Python `rem_impl`, `rem_vers`, `rem_is_tn`, `rem_dst_cost` and
+    /// `rem_pr_cost`, from the peer's synthesis extension.
+    pub remote_transport: Option<crate::tunnel::RemoteTransportInfo>,
     /// Python `arxb`, `atxb`, `prxb` and `ptxb`.
     pub announce_rx_bytes: u64,
     pub announce_tx_bytes: u64,
@@ -1761,10 +1816,15 @@ impl std::fmt::Debug for TransportMessage {
                 .debug_struct("SharedConnectionRestored")
                 .field("interface_id", interface_id)
                 .finish(),
-            Self::SynthesizeTunnel { interface_id, .. } => f
+            Self::SynthesizeTunnel { interface_id } => f
                 .debug_struct("SynthesizeTunnel")
                 .field("interface_id", interface_id)
                 .finish(),
+            Self::SetTunnelIdentity { identity } => f
+                .debug_struct("SetTunnelIdentity")
+                .field("identity_hash", &hex::encode(identity.hash))
+                .finish(),
+            Self::SetInterfaceControl { .. } => f.write_str("SetInterfaceControl"),
             Self::RegisterReceipt {
                 truncated_hash,
                 msg_id,

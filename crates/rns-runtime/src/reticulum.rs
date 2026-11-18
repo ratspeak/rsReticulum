@@ -2406,11 +2406,62 @@ impl ReticulumHandle {
     }
 
     async fn detach_running_interface(&self, name: &str) -> Option<bool> {
-        use rns_transport::messages::InterfaceRole;
         let Some((entry, spawned)) = self.running_interface(name).await else {
             tracing::warn!("Attempt to detach non-existing interface \"{name}\"");
             return None;
         };
+        if !self.detach_entry(&entry, spawned).await {
+            return Some(false);
+        }
+        // Upstream's detach is synchronous: a reload attaches straight after it.
+        let gone_by = tokio::time::Instant::now() + Duration::from_secs(5);
+        while self.running_interface(name).await.is_some() && tokio::time::Instant::now() < gone_by
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        rns_transport::notice!("Interface \"{name}\" was detached");
+        Some(true)
+    }
+
+    /// Python `_detach_interface(..., internal_forced=True)`, which transport
+    /// calls for a bad or blackholed tunnel peer: it ignores
+    /// `enable_interface_management`, and a client so detached stays down until
+    /// restart or attach (Reticulum.py:976-1015).
+    pub(crate) async fn detach_interface_by_id(
+        &self,
+        id: rns_transport::messages::InterfaceId,
+    ) -> Option<bool> {
+        let Ok(TransportQueryResponse::InterfaceStats(entries)) = self
+            .query_transport_result(TransportQuery::GetInterfaceStats)
+            .await
+        else {
+            return None;
+        };
+        let entry = entries.iter().find(|entry| entry.id == id)?.clone();
+        let spawned = entries
+            .iter()
+            .filter(|child| child.parent_id == Some(id))
+            .map(|child| child.id)
+            .collect();
+        if !self.detach_entry(&entry, spawned).await {
+            return Some(false);
+        }
+        let name = entry
+            .identity
+            .as_ref()
+            .map_or(entry.name.as_str(), |identity| identity.name.as_str());
+        rns_transport::notice!("Interface {name} was detached");
+        Some(true)
+    }
+
+    /// Tear down an interface and those it spawned; I2P listeners and local
+    /// interfaces refuse (Reticulum.py).
+    async fn detach_entry(
+        &self,
+        entry: &rns_transport::messages::InterfaceStatRpcEntry,
+        spawned: Vec<rns_transport::messages::InterfaceId>,
+    ) -> bool {
+        use rns_transport::messages::InterfaceRole;
         let i2p = entry
             .identity
             .as_ref()
@@ -2423,7 +2474,7 @@ impl ReticulumHandle {
         .iter()
         .any(|role| role.as_str() == entry.role);
         if i2p || local {
-            return Some(false);
+            return false;
         }
         self.discovery
             .bootstrap_interfaces
@@ -2439,14 +2490,7 @@ impl ReticulumHandle {
             teardown_interface(self, id).await;
         }
         teardown_interface(self, entry.id).await;
-        // Upstream's detach is synchronous: a reload attaches straight after it.
-        let gone_by = tokio::time::Instant::now() + Duration::from_secs(5);
-        while self.running_interface(name).await.is_some() && tokio::time::Instant::now() < gone_by
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        rns_transport::notice!("Interface \"{name}\" was detached");
-        Some(true)
+        true
     }
 
     async fn attach_configured_interface(&self, name: &str) -> Option<bool> {
@@ -3936,6 +3980,13 @@ pub async fn init_with_policy(
         Some(ephemeral) => Arc::new(ephemeral),
         None => transport_identity.clone(),
     };
+    let _ = transport_tx.try_send(TransportMessage::SetTunnelIdentity {
+        identity: wire_transport_identity.clone(),
+    });
+    let (interface_control_tx, interface_control_rx) = mpsc::unbounded_channel();
+    let _ = transport_tx.try_send(TransportMessage::SetInterfaceControl {
+        tx: interface_control_tx,
+    });
 
     let network_identity = rc
         .network_identity_path
@@ -4654,6 +4705,7 @@ pub async fn init_with_policy(
         .into());
     }
     let _ = interface_manager.set(handle.clone());
+    tokio::spawn(run_interface_control(handle.clone(), interface_control_rx));
 
     let mut management_announces = Vec::new();
     let mut blackhole_announce = None;
@@ -10938,6 +10990,33 @@ async fn spawn_configured_interface_driver(
                 .map(|h| vec![h.into()])
                 .map_err(|e| format!("Backbone server: {e}"))
             }
+        }
+    }
+}
+
+/// Carry out the transport actor's interface requests until it stops or the
+/// runtime shuts down.
+async fn run_interface_control(
+    handle: ReticulumHandle,
+    mut requests: mpsc::UnboundedReceiver<rns_transport::messages::InterfaceControl>,
+) {
+    use rns_transport::messages::InterfaceControl;
+    let shutdown = handle.shutdown.clone();
+    loop {
+        let request = tokio::select! {
+            request = requests.recv() => request,
+            () = shutdown.wait() => None,
+        };
+        match request {
+            Some(InterfaceControl::Detach {
+                interface_id,
+                reason,
+            }) => {
+                tracing::debug!(interface_id, ?reason, "transport asked for a detach");
+                let _ = handle.detach_interface_by_id(interface_id).await;
+            }
+            Some(_) => {}
+            None => return,
         }
     }
 }

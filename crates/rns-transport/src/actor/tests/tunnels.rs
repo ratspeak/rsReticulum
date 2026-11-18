@@ -63,10 +63,93 @@ fn cache_announce(dir: &std::path::Path, raw: &[u8], interface: Option<&str>) ->
     packet_hash
 }
 
+/// A hub-side child of a TCP listener, which Python lets take a synthesis.
+fn attach_child(actor: &mut TransportActor, id: InterfaceId, name: &str) -> mpsc::Receiver<Bytes> {
+    attach_class(actor, id, name, "TCPClientInterface")
+}
+
+fn attach_class(
+    actor: &mut TransportActor,
+    id: InterfaceId,
+    name: &str,
+    class: &str,
+) -> mpsc::Receiver<Bytes> {
+    let (mut entry, rx) = make_test_interface(name);
+    entry.inspection = Some(InterfaceInspectionSource::identified(
+        crate::messages::InterfaceIdentity::new(name, name, class),
+    ));
+    actor.interfaces.insert(id, entry);
+    rx
+}
+
+/// A node whose wire identity can sign, with a control channel for detaches.
+fn signing(
+    mut actor: TransportActor,
+) -> (
+    TransportActor,
+    Arc<Identity>,
+    mpsc::UnboundedReceiver<crate::messages::InterfaceControl>,
+) {
+    let identity = Arc::new(Identity::new());
+    actor.transport_identity_hash = Some(identity.hash);
+    actor.handle_message(TransportMessage::SetTunnelIdentity {
+        identity: identity.clone(),
+    });
+    let (tx, rx) = mpsc::unbounded_channel();
+    actor.handle_message(TransportMessage::SetInterfaceControl { tx });
+    (actor, identity, rx)
+}
+
+fn extended(identity: &Identity, interface: &str) -> (Bytes, [u8; 32]) {
+    let ext = crate::tunnel::TunnelExt::local(true, 8.0, 4.5);
+    let raw = crate::tunnel::build_tunnel_synthesis_packet_with_ext(
+        identity,
+        crate::tunnel::interface_hash(interface),
+        &ext,
+    )
+    .unwrap();
+    let tunnel_id = TunnelSynthesisData::unpack(&raw[rns_wire::constants::HEADER_MINSIZE..])
+        .unwrap()
+        .tunnel_id();
+    (Bytes::from(raw), tunnel_id)
+}
+
+/// A PLAIN broadcast to `rnstransport.tunnel.synthesize` carrying `payload`.
+fn synthesis_packet(payload: &[u8]) -> Bytes {
+    let mut raw = PacketHeader {
+        flags: PacketFlags {
+            header_type: HeaderType::Header1,
+            context_flag: false,
+            transport_type: TransportType::Broadcast,
+            destination_type: DestinationType::Plain,
+            packet_type: PacketType::Data,
+        },
+        hops: 0,
+        transport_id: None,
+        destination_hash: named_hash("rnstransport.tunnel.synthesize"),
+        context: PacketContext::None,
+    }
+    .pack();
+    raw.extend_from_slice(payload);
+    Bytes::from(raw)
+}
+
+/// The synthesis in a frame the actor sent, if it is one.
+fn sent_synthesis(frame: &[u8]) -> Option<TunnelSynthesisData> {
+    let (header, offset) = PacketHeader::unpack(frame).ok()?;
+    (header.destination_hash == named_hash("rnstransport.tunnel.synthesize"))
+        .then(|| TunnelSynthesisData::unpack(&frame[offset..]))
+        .flatten()
+}
+
+fn violations(actor: &TransportActor, id: InterfaceId) -> u64 {
+    actor.interfaces[&id].protocol_violations
+}
+
 #[test]
 fn valid_synthesis_installs_a_tunnel_that_collects_announces() {
     let mut actor = hub();
-    let _rx = attach(&mut actor, 1, "hub/client_1");
+    let _rx = attach_child(&mut actor, 1, "hub/client_1");
     let (raw, tunnel_id) = synthesis(&Identity::new(), "TCPInterface[Uplink/127.0.0.1:4242]");
     inbound(&mut actor, raw, 1);
     assert!(
@@ -82,62 +165,318 @@ fn valid_synthesis_installs_a_tunnel_that_collects_announces() {
     );
 }
 
+/// Python 1.6.1 runs the handler on its own verdict table; each case is
+/// signed here and must hash to Python's payload (Transport.py:3208-3297).
 #[test]
-fn synthesis_with_a_bad_signature_or_extra_bytes_installs_nothing() {
-    let mut actor = hub();
-    let _rx: Vec<_> = (1..=3)
-        .map(|id| attach(&mut actor, id, &format!("hub/client_{id}")))
-        .collect();
-    let (valid, valid_id) = synthesis(&Identity::new(), "uplink-a");
-    inbound(&mut actor, valid, 1);
-    assert!(
-        actor.tunnel_table.get(&valid_id).is_some(),
-        "control: a valid synthesis installs"
-    );
+fn the_handler_reaches_python_verdicts() {
+    use crate::tunnel::python_vectors::{HANDLER_CASES, identity, payload};
+    for (name, verdict, ext, digest) in HANDLER_CASES {
+        let data = payload(name, ext);
+        assert_eq!(
+            hex::encode(rns_crypto::sha::sha256(&data)),
+            *digest,
+            "{name}: signed as Python signs it"
+        );
+        let (mut actor, _, mut control) = signing(hub());
+        let mut rx = attach_child(&mut actor, 1, "hub/client_1");
+        inbound(&mut actor, synthesis_packet(&data), 1);
 
-    let (raw, tampered_id) = synthesis(&Identity::new(), "uplink-b");
-    let mut tampered = raw.to_vec();
-    *tampered.last_mut().unwrap() ^= 0x01;
-    inbound(&mut actor, Bytes::from(tampered), 2);
-    assert!(
-        actor.tunnel_table.get(&tampered_id).is_none(),
-        "a flipped signature bit is rejected"
-    );
-
-    let (raw, trailing_id) = synthesis(&Identity::new(), "uplink-c");
-    let mut trailing = raw.to_vec();
-    trailing.push(0);
-    inbound(&mut actor, Bytes::from(trailing), 3);
-    assert!(
-        actor.tunnel_table.get(&trailing_id).is_none(),
-        "a payload longer than 176 bytes is rejected (Transport.py:2791)"
-    );
-    assert_eq!(actor.tunnel_table.len(), 1);
+        let tunnel_id = TunnelSynthesisData::unpack(&data[..176])
+            .unwrap()
+            .tunnel_id();
+        let mut outcome = Vec::new();
+        if rx
+            .try_recv()
+            .ok()
+            .as_deref()
+            .and_then(sent_synthesis)
+            .is_some()
+        {
+            outcome.push("reply");
+        }
+        if actor.tunnel_table.get(&tunnel_id).is_some() {
+            outcome.push("tunnel");
+        }
+        if control.try_recv().is_ok() {
+            outcome.push("detach");
+        }
+        if actor
+            .interfaces
+            .get(&1)
+            .is_some_and(|entry| entry.protocol_violations > 0)
+        {
+            outcome.push("violation");
+        }
+        if actor
+            .interfaces
+            .get(&1)
+            .is_some_and(|entry| entry.tunnel.remote_transport == Some(identity().hash))
+        {
+            outcome.push("remote");
+        }
+        let expected = match *name {
+            // Lead decision: costs may be ints.
+            "cost_int" => "reply,tunnel,remote",
+            _ => verdict,
+        };
+        assert_eq!(outcome.join(","), expected, "{name}");
+    }
 }
 
+/// UDP, RNode, serial, KISS, pipe, AX.25, Auto and local interfaces never
+/// take a synthesis (Transport.py:3211-3212).
 #[test]
-fn the_newer_synthesis_on_an_interface_takes_its_later_announces() {
+fn an_interface_without_tunnels_ignores_a_synthesis() {
     let mut actor = hub();
-    let _rx = attach(&mut actor, 1, "hub/client_1");
-    let (older, older_id) = synthesis(&Identity::new(), "uplink");
-    let (newer, newer_id) = synthesis(&Identity::new(), "uplink");
-    inbound(&mut actor, older, 1);
-    inbound(&mut actor, newer, 1);
-    assert!(
-        actor.tunnel_table.get(&older_id).is_some() && actor.tunnel_table.get(&newer_id).is_some(),
-        "both syntheses install"
-    );
+    let _rx = attach_class(&mut actor, 1, "udp", "UDPInterface");
+    let (raw, tunnel_id) = extended(&Identity::new(), "uplink");
+    inbound(&mut actor, raw, 1);
+    assert!(actor.tunnel_table.get(&tunnel_id).is_none());
+    assert_eq!(violations(&actor, 1), 0, "ignored silently");
+    assert!(actor.interfaces[&1].tunnel.remote_transport.is_none());
+}
 
-    let (announce, dest) = make_valid_announce("tunnel.newer", 0);
+/// One synthesis per connection: a second is a violation whether or not the
+/// first established a tunnel, and a malformed first one uses up the chance.
+#[test]
+fn a_connection_takes_one_synthesis() {
+    let mut actor = hub();
+    let _rx: Vec<_> = (1..=2)
+        .map(|id| attach_child(&mut actor, id, &format!("hub/client_{id}")))
+        .collect();
+    let (first, first_id) = synthesis(&Identity::new(), "uplink");
+    let (second, second_id) = synthesis(&Identity::new(), "uplink");
+    inbound(&mut actor, first, 1);
+    inbound(&mut actor, second, 1);
+    assert!(actor.tunnel_table.get(&first_id).is_some());
+    assert!(actor.tunnel_table.get(&second_id).is_none());
+    assert_eq!(violations(&actor, 1), 1, "already established");
+
+    inbound(&mut actor, synthesis_packet(&[0; 175]), 2);
+    assert_eq!(violations(&actor, 2), 1, "undersize");
+    let (valid, valid_id) = synthesis(&Identity::new(), "uplink-b");
+    inbound(&mut actor, valid, 2);
+    assert_eq!(violations(&actor, 2), 2, "the chance is spent");
+    assert!(actor.tunnel_table.get(&valid_id).is_none());
+}
+
+/// A bad signature tears the interface down (Transport.py:3245-3248); with no
+/// one to ask, the actor drops it itself.
+#[test]
+fn a_bad_signature_tears_the_interface_down() {
+    let (mut actor, _, mut control) = signing(hub());
+    let _rx = attach_child(&mut actor, 1, "hub/client_1");
+    let (raw, tunnel_id) = extended(&Identity::new(), "uplink");
+    let mut tampered = raw.to_vec();
+    *tampered.last_mut().unwrap() ^= 0x01;
+    inbound(&mut actor, Bytes::from(tampered), 1);
+    assert_eq!(
+        control.try_recv().unwrap(),
+        crate::messages::InterfaceControl::Detach {
+            interface_id: 1,
+            reason: crate::messages::DetachReason::InvalidSynthesis,
+        }
+    );
+    assert!(actor.tunnel_table.get(&tunnel_id).is_none());
+
+    let (announce, dest) = make_valid_announce("tunnel.detaching", 0);
     inbound(&mut actor, announce, 1);
     assert!(
-        carries(&actor, &newer_id, &dest),
-        "the last synthesis owns the interface (Transport.py:2827, :2834)"
+        !actor.path_table.has_path(&dest),
+        "frames from a detaching interface are dropped"
     );
+    actor.deregister_interface(1);
+    assert!(!actor.is_detaching(1));
+
+    let mut alone = hub();
+    let _rx = attach_child(&mut alone, 2, "hub/client_2");
+    let (raw, _) = synthesis(&Identity::new(), "uplink");
+    let mut tampered = raw.to_vec();
+    tampered[rns_wire::constants::HEADER_MINSIZE + 120] ^= 0x01;
+    inbound(&mut alone, Bytes::from(tampered), 2);
+    assert!(!alone.interfaces.contains_key(&2));
+}
+
+/// A blackholed transport node is torn down at its synthesis, and when it is
+/// blackholed later (Transport.py:3249-3252, :4832-4839).
+#[test]
+fn a_blackholed_tunnel_peer_is_torn_down() {
+    let (mut actor, _, mut control) = signing(hub());
+    let _rx: Vec<_> = (1..=3)
+        .map(|id| attach_child(&mut actor, id, &format!("hub/client_{id}")))
+        .collect();
+    let blackholed = Identity::new();
+    actor.blackhole_table.add(blackholed.hash, None);
+    let (raw, tunnel_id) = extended(&blackholed, "uplink");
+    inbound(&mut actor, raw, 1);
+    assert_eq!(
+        control.try_recv().unwrap(),
+        crate::messages::InterfaceControl::Detach {
+            interface_id: 1,
+            reason: crate::messages::DetachReason::BlackholedTransport,
+        }
+    );
+    assert!(actor.tunnel_table.get(&tunnel_id).is_none());
+
+    let (later, other) = (Identity::new(), Identity::new());
+    inbound(&mut actor, extended(&later, "uplink-2").0, 2);
+    inbound(&mut actor, extended(&other, "uplink-3").0, 3);
+    assert!(control.try_recv().is_err());
+    actor.handle_query(crate::messages::TransportQuery::BlackholeIdentity {
+        hash: later.hash,
+        ttl: None,
+        reason: crate::blackhole::BlackholeReason::Manual,
+        reason_label: None,
+    });
+    assert_eq!(
+        control.try_recv().unwrap(),
+        crate::messages::InterfaceControl::Detach {
+            interface_id: 2,
+            reason: crate::messages::DetachReason::BlackholedTransport,
+        }
+    );
+    assert!(control.try_recv().is_err(), "only the blackholed peer");
+}
+
+/// A receiver answers an extended synthesis once, signed with its own wire
+/// identity and with its own costs; a legacy synthesis gets no answer
+/// (Transport.py:3286).
+#[test]
+fn a_receiver_answers_an_extended_synthesis_once() {
+    let (mut actor, hub_identity, _control) = signing(hub());
+    let mut rx = attach_child(&mut actor, 1, "hub/client_1");
+    actor.interfaces.get_mut(&1).unwrap().destination_cost = Some(12.0);
+    let client = Identity::new();
+    let (raw, tunnel_id) = extended(&client, "uplink");
+    inbound(&mut actor, raw, 1);
+    let reply = sent_synthesis(&rx.try_recv().unwrap()).expect("a reverse synthesis");
+    assert!(reply.is_signed());
+    assert_eq!(reply.transport_identity_hash(), hub_identity.hash);
+    assert_eq!(
+        reply.interface_hash,
+        crate::tunnel::interface_hash("hub/client_1")
+    );
+    let info = crate::tunnel::RemoteTransportInfo::decode(&reply.ext).unwrap();
+    assert_eq!(info.implementation, "rsRNS");
+    assert!(info.transport);
+    assert_eq!(info.destination_cost, 12.0);
+    assert_eq!(
+        info.pr_cost,
+        rns_identity::stamps::quantize_cost(15.8).unwrap()
+    );
+    assert!(actor.tunnel_table.get(&tunnel_id).is_some());
+    assert!(rx.try_recv().is_err(), "answered once");
+
+    let stats = interface_stats(&mut actor, 1);
+    assert_eq!(stats.tunnel_id, Some(tunnel_id));
+    assert_eq!(stats.remote_transport_id, Some(client.hash));
+    let remote = stats.remote_transport.expect("the client's extension");
+    assert_eq!(
+        (remote.implementation.as_str(), remote.version.clone()),
+        (
+            "rsRNS",
+            crate::discovery::constants::IMPLEMENTATION_VERSION
+                .split('.')
+                .map(|part| part.parse().unwrap())
+                .collect::<Vec<u64>>()
+        )
+    );
+    assert_eq!((remote.destination_cost, remote.pr_cost), (8.0, 4.5));
+
+    let mut legacy_rx = attach_child(&mut actor, 2, "hub/client_2");
+    inbound(&mut actor, synthesis(&Identity::new(), "uplink").0, 2);
     assert!(
-        !carries(&actor, &older_id, &dest),
-        "the superseded tunnel takes no new paths"
+        legacy_rx.try_recv().is_err(),
+        "no answer to the legacy form"
     );
+    let legacy = interface_stats(&mut actor, 2);
+    assert!(legacy.remote_transport_id.is_some() && legacy.remote_transport.is_none());
+}
+
+/// An initiator sends the extended form, names its tunnel, records the hub's
+/// answer without binding a tunnel or answering back, and forgets the hub on
+/// its next connection (Transport.py:3205, :3290-3292).
+#[test]
+fn an_initiator_records_its_hub_without_binding_a_tunnel() {
+    let (mut actor, client_identity, _control) = signing(hub());
+    let name = "TCPInterface[Uplink/127.0.0.1:4242]";
+    let mut rx = attach_class(&mut actor, 1, name, "TCPClientInterface");
+    actor.interfaces.get_mut(&1).unwrap().online =
+        Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    actor.handle_message(TransportMessage::SynthesizeTunnel { interface_id: 1 });
+    let sent = sent_synthesis(&rx.try_recv().unwrap())
+        .expect("queued before the interface reports online");
+    assert!(sent.is_signed());
+    assert_eq!(sent.transport_identity_hash(), client_identity.hash);
+    assert_eq!(sent.interface_hash, crate::tunnel::interface_hash(name));
+    let info = crate::tunnel::RemoteTransportInfo::decode(&sent.ext).unwrap();
+    assert_eq!(
+        (info.destination_cost, info.pr_cost),
+        (23.5, rns_identity::stamps::quantize_cost(15.8).unwrap())
+    );
+    assert_eq!(
+        interface_stats(&mut actor, 1).tunnel_id,
+        Some(sent.tunnel_id())
+    );
+
+    let hub_identity = Identity::new();
+    let (reply, reply_tunnel) =
+        extended(&hub_identity, "TCPInterface[Client on Hub/10.0.0.1:5000]");
+    inbound(&mut actor, reply, 1);
+    assert!(rx.try_recv().is_err(), "an initiator never answers");
+    assert!(actor.tunnel_table.get(&reply_tunnel).is_none());
+    assert!(actor.tunnel_table.is_empty());
+    let stats = interface_stats(&mut actor, 1);
+    assert_eq!(stats.remote_transport_id, Some(hub_identity.hash));
+    assert_eq!(stats.tunnel_id, Some(sent.tunnel_id()));
+
+    actor.handle_message(TransportMessage::SynthesizeTunnel { interface_id: 1 });
+    assert!(
+        rx.try_recv()
+            .ok()
+            .as_deref()
+            .and_then(sent_synthesis)
+            .is_some()
+    );
+    assert!(interface_stats(&mut actor, 1).remote_transport_id.is_none());
+    let (again, _) = extended(&hub_identity, "TCPInterface[Client on Hub/10.0.0.1:5001]");
+    inbound(&mut actor, again, 1);
+    assert_eq!(
+        violations(&actor, 1),
+        0,
+        "a new connection takes a new answer"
+    );
+    assert_eq!(
+        interface_stats(&mut actor, 1).remote_transport_id,
+        Some(hub_identity.hash)
+    );
+}
+
+/// Python skips a synthesis without `Transport.identity`; the actor also
+/// refuses to sign with an identity that is not its visible one.
+#[test]
+fn no_synthesis_without_the_wire_identity() {
+    let mut actor = hub();
+    let mut rx = attach_child(&mut actor, 1, "uplink");
+    actor.handle_message(TransportMessage::SynthesizeTunnel { interface_id: 1 });
+    assert!(rx.try_recv().is_err());
+    actor.handle_message(TransportMessage::SetTunnelIdentity {
+        identity: Arc::new(Identity::new()),
+    });
+    actor.handle_message(TransportMessage::SynthesizeTunnel { interface_id: 1 });
+    assert!(rx.try_recv().is_err(), "its hash is not the transport hash");
+}
+
+fn interface_stats(
+    actor: &mut TransportActor,
+    id: InterfaceId,
+) -> crate::messages::InterfaceStatRpcEntry {
+    let crate::messages::TransportQueryResponse::InterfaceStats(entries) =
+        actor.handle_query(crate::messages::TransportQuery::GetInterfaceStats)
+    else {
+        panic!("unexpected interface stats response");
+    };
+    entries.into_iter().find(|entry| entry.id == id).unwrap()
 }
 
 #[test]
@@ -616,4 +955,23 @@ fn shared_owner_ingress_bypasses_the_plain_hop_filter() {
         delivered(&mut deliveries),
         "the shared instance already filtered this packet (Transport.py:1627)"
     );
+}
+
+/// The answer leaves through transport, so it carries the interface's IFAC
+/// (Transport.py `packet.send()`).
+#[test]
+fn a_reverse_synthesis_carries_ifac() {
+    let (mut actor, _, _control) = signing(hub());
+    let mut rx = attach_child(&mut actor, 1, "hub/client_1");
+    let key = rns_identity::ifac::IfacKey::derive(Some("tunnels"), Some("ifac")).unwrap();
+    let entry = actor.interfaces.get_mut(&1).unwrap();
+    entry.ifac_key = Some(key.clone());
+    entry.ifac_size = 16;
+    let (raw, tunnel_id) = extended(&Identity::new(), "uplink");
+    let masked = crate::ifac::try_ifac_sign(&raw, &key, 16).unwrap();
+    inbound(&mut actor, Bytes::from(masked), 1);
+    assert!(actor.tunnel_table.get(&tunnel_id).is_some());
+    let reply = rx.try_recv().unwrap();
+    let clear = crate::ifac::ifac_verify(&reply, &key, 16).expect("IFAC-valid");
+    assert!(sent_synthesis(&clear).is_some_and(|synthesis| synthesis.is_signed()));
 }

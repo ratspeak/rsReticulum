@@ -177,6 +177,12 @@ impl TransportActor {
                             radio: inspection.radio,
                             last_connect_error: inspection.last_connect_error.map(str::to_string),
                             connect_failures: inspection.connect_failures,
+                            tunnel_id: self
+                                .tunnel_table
+                                .interface_tunnel(iface_id)
+                                .or(entry.tunnel.local_tunnel_id),
+                            remote_transport_id: entry.tunnel.remote_transport,
+                            remote_transport: entry.tunnel.remote_info.clone(),
                         })
                     })
                     .collect();
@@ -456,6 +462,7 @@ impl TransportActor {
                 for dest in dropped {
                     self.path_table.remove(&dest);
                 }
+                self.detach_blackholed_tunnel_peers();
                 self.state_dirty = true;
                 self.publish_blackhole_snapshot();
                 TransportQueryResponse::OptBoolResult(Some(true))

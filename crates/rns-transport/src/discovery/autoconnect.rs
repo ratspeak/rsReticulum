@@ -43,7 +43,7 @@ pub fn qualifies(info: &DiscoveryInfo, allow_unverified: bool) -> bool {
 
 /// Python's `version_tuple`: the leading digits of each dot-separated
 /// component, up to the first without any (Discovery.py).
-fn version_tuple(version: &str) -> Option<Vec<u64>> {
+pub(crate) fn version_tuple(version: &str) -> Option<Vec<u64>> {
     let components: Vec<u64> = version
         .trim()
         .split('.')

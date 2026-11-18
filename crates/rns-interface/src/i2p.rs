@@ -549,8 +549,8 @@ pub struct I2PClientConfig {
     pub max_reconnect_tries: Option<usize>,
     pub reconnect_delay: u64,
     pub mode: InterfaceMode,
-    /// Identity used to request a signed tunnel synthesis for each connection.
-    /// `None`, or an identity without signing material, sends no synthesis.
+    /// Set when each connection asks transport for a tunnel synthesis;
+    /// transport signs it with its own wire identity.
     pub tunnel_identity: Option<TunnelIdentity>,
 }
 
@@ -782,11 +782,8 @@ pub async fn spawn_i2p_client(
             pacer.reset();
             // Python synthesizes on every connection (I2PInterface.py,
             // :533).
-            let synthesis = config
-                .tunnel_identity
-                .as_ref()
-                .and_then(|identity| identity.synthesis(&python_name));
-            open_client_connection(&rx, &transport_tx, synthesis, &online_task).await;
+            let synthesize = config.tunnel_identity.is_some();
+            open_client_connection(&rx, &transport_tx, synthesize, &online_task).await;
 
             // BufReader may have prefetched past the handshake; flush its tail first.
             let buffered = stream_buf_reader.buffer().to_vec();

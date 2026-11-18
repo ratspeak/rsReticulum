@@ -855,22 +855,26 @@ fn synthesis_in(frame: &[u8]) -> Option<TunnelSynthesisData> {
         && header.flags.destination_type == DestinationType::Plain
         && header.flags.packet_type == PacketType::Data
         && header.hops == 0
-        && header.context == PacketContext::None
-        && frame.len() == offset + 176;
+        && header.context == PacketContext::None;
     shape
         .then(|| TunnelSynthesisData::unpack(&frame[offset..]))
         .flatten()
 }
 
+/// Python 1.6.1 signs the extension too, and a Rust node sends it always.
 fn assert_signed(synthesis: &TunnelSynthesisData) {
     let signer = Identity::from_public_key(&synthesis.public_key).unwrap();
     let mut signed = synthesis.public_key.to_vec();
     signed.extend_from_slice(&synthesis.interface_hash);
     signed.extend_from_slice(&synthesis.random_hash);
+    signed.extend_from_slice(&synthesis.ext);
     assert!(
         signer.verify(&signed, &synthesis.signature),
         "the synthesis verifies under its own Ed25519 key"
     );
+    let ext = rns_transport::tunnel::RemoteTransportInfo::decode(&synthesis.ext)
+        .expect("an extended synthesis");
+    assert_eq!(ext.implementation, "rsRNS");
 }
 
 /// Python `Interface.get_hash()`: the full hash of `str(interface)`.
@@ -1210,4 +1214,114 @@ async fn a_rust_hub_restores_a_reconnecting_rust_clients_paths() {
     hub.shutdown_and_wait().await;
     let _ = std::fs::remove_dir_all(client_dir);
     let _ = std::fs::remove_dir_all(hub_dir);
+}
+
+fn hub_answer(identity: &Identity) -> Vec<u8> {
+    rns_transport::tunnel::build_tunnel_synthesis_packet_with_ext(
+        identity,
+        python_interface_hash("TCPInterface[Client on Hub/127.0.0.1:4242]"),
+        &rns_transport::tunnel::TunnelExt::local(true, 23.5, 15.8),
+    )
+    .unwrap()
+}
+
+fn tcp_client_config(port: u16) -> String {
+    format!(
+        "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[Uplink]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    target_port = {port}\n"
+    )
+}
+
+/// A Rust client learns its hub from the hub's answer, and its own synthesis
+/// names the tunnel (Transport.py:3205, :3290-3292).
+#[tokio::test]
+async fn a_tcp_client_records_the_hub_that_answers_its_synthesis() {
+    let hub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = hub.local_addr().unwrap().port();
+    let dir = config_dir("tcp-answer", &tcp_client_config(port));
+    let handle = start(&dir).await;
+
+    let mut connection = Frames::accept(&hub, false).await;
+    let opening = connection
+        .next(Duration::from_secs(5))
+        .await
+        .and_then(|frame| synthesis_in(&frame))
+        .expect("the client synthesizes");
+    let hub_identity = Identity::new();
+    connection
+        .reader
+        .get_mut()
+        .write_all(&rns_interface::hdlc::frame(&hub_answer(&hub_identity)))
+        .await
+        .unwrap();
+    let entry = wait_for_interface(&handle, |entry| {
+        entry.name == "Uplink" && entry.remote_transport_id == Some(hub_identity.hash)
+    })
+    .await
+    .expect("the client records its hub");
+    assert_eq!(entry.tunnel_id, Some(opening.tunnel_id()));
+    assert_eq!(
+        entry.remote_transport.map(|remote| remote.implementation),
+        Some("rsRNS".to_string())
+    );
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An answer with a bad signature tears the client down for good, with
+/// interface management off (Transport.py:3245-3248, Reticulum.py:976-1015).
+#[tokio::test]
+async fn a_client_answered_with_a_bad_signature_is_torn_down() {
+    let hub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = hub.local_addr().unwrap().port();
+    let dir = config_dir(
+        "tcp-bad-answer",
+        &tcp_client_config(port).replace(
+            "share_instance = No\n",
+            "share_instance = No\n  enable_interface_management = No\n",
+        ),
+    );
+    let handle = start(&dir).await;
+    assert!(!handle.config.enable_interface_management);
+
+    let mut connection = Frames::accept(&hub, false).await;
+    assert!(
+        connection
+            .next(Duration::from_secs(5))
+            .await
+            .is_some_and(|frame| synthesis_in(&frame).is_some())
+    );
+    let mut answer = hub_answer(&Identity::new());
+    answer[rns_wire::constants::HEADER_MINSIZE + 120] ^= 0x01;
+    connection
+        .reader
+        .get_mut()
+        .write_all(&rns_interface::hdlc::frame(&answer))
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while interfaces(&handle)
+        .await
+        .iter()
+        .any(|entry| entry.name == "Uplink")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the client is detached"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(rns_interface::tcp::RECONNECT_WAIT + 2),
+            hub.accept()
+        )
+        .await
+        .is_err(),
+        "a detached client does not reconnect"
+    );
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
 }

@@ -984,6 +984,7 @@ impl TransportActor {
                 }
                 if count > 0 {
                     self.publish_blackhole_snapshot();
+                    self.detach_blackholed_tunnel_peers();
                     debug!(count, "loaded Python blackhole files");
                 }
             }

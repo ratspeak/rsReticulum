@@ -37,6 +37,7 @@ mod persistence;
 mod recursive_discovery;
 mod rpc;
 mod store_worker;
+mod tunnel_synthesis;
 pub use options::{StorageRole, TransportActorOptions};
 use rpc::InterfaceEvent;
 
@@ -126,6 +127,12 @@ pub struct TransportActor {
     traffic_count: rpc::TrafficCount,
     /// Python `preprocess_inbound`'s verdict on the frame being processed.
     inbound_verdict: inbound::InboundVerdict,
+    /// Python `Transport.identity`, which signs tunnel syntheses.
+    tunnel_identity: Option<Arc<rns_identity::identity::Identity>>,
+    /// Where detach requests go; without one the actor deregisters itself.
+    interface_control: Option<mpsc::UnboundedSender<crate::messages::InterfaceControl>>,
+    /// Interfaces asked to detach; their frames are dropped until they go.
+    detaching: HashSet<InterfaceId>,
     /// Python's `local_client_rssi_cache`, `_snr_cache` and `_q_cache`: one
     /// 512-entry list per metric, first match wins (Transport.py).
     pub(crate) packet_rssi_cache: VecDeque<([u8; 32], f32)>,
@@ -528,6 +535,9 @@ impl TransportActor {
             blackhole_table: BlackholeTable::new(),
             traffic_count: rpc::TrafficCount::default(),
             inbound_verdict: inbound::InboundVerdict::default(),
+            tunnel_identity: None,
+            interface_control: None,
+            detaching: HashSet::new(),
             packet_rssi_cache: VecDeque::new(),
             packet_snr_cache: VecDeque::new(),
             packet_q_cache: VecDeque::new(),
@@ -1171,17 +1181,17 @@ impl TransportActor {
                 self.is_shared_instance = true;
                 self.request_announces_from_local_destinations();
             }
-            TransportMessage::SynthesizeTunnel {
-                interface_id,
-                raw_packet,
-            } => {
-                debug!(
-                    interface_id,
-                    len = raw_packet.len(),
-                    "sending tunnel synthesis packet"
-                );
-                // The driver queues the synthesis just before it reports online.
-                self.send_to_interface_unchecked(interface_id, &raw_packet);
+            TransportMessage::SynthesizeTunnel { interface_id } => {
+                if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+                    entry.tunnel.reconnect();
+                }
+                self.synthesize_tunnel(interface_id, false);
+            }
+            TransportMessage::SetTunnelIdentity { identity } => {
+                self.tunnel_identity = Some(identity);
+            }
+            TransportMessage::SetInterfaceControl { tx } => {
+                self.interface_control = Some(tx);
             }
             TransportMessage::RegisterInterface { id, entry } => {
                 if !entry.owner.is_current() {
@@ -1784,6 +1794,7 @@ impl TransportActor {
             online.store(false, std::sync::atomic::Ordering::SeqCst);
         }
         self.void_tunnel_interface(id);
+        self.detaching.remove(&id);
         let dropped = self.path_table.drop_all_via(id);
         if dropped > 0 {
             debug!(id, dropped, "dropped paths via deregistered interface");
@@ -3342,20 +3353,6 @@ mod tests {
             actor.interfaces.contains_key(&44),
             "offline shared peer should not be auto-deregistered"
         );
-    }
-
-    #[test]
-    fn tunnel_synthesis_is_queued_before_the_interface_reports_online() {
-        let (mut actor, _tx) = TransportActor::new();
-        let (mut entry, mut rx) = make_test_interface("TCPClient");
-        entry.online = Some(Arc::new(AtomicBool::new(false)));
-        actor.interfaces.insert(45, entry);
-
-        actor.handle_message(TransportMessage::SynthesizeTunnel {
-            interface_id: 45,
-            raw_packet: Bytes::from_static(&[0x08, 0x00]),
-        });
-        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(&[0x08, 0x00]));
     }
 
     #[test]

@@ -95,22 +95,11 @@ pub(crate) async fn handoff_accepted_interface(
     }
 }
 
-/// The transport identity a client signs its tunnel syntheses with (Python
-/// `Transport.identity`). Debug shows only its hash.
+/// The wire transport identity (Python `Transport.identity`). A client given
+/// one asks transport for a tunnel synthesis on each connection; transport
+/// signs it with the identity from `SetTunnelIdentity`. Debug shows only its hash.
 #[derive(Clone)]
 pub struct TunnelIdentity(pub Arc<rns_identity::identity::Identity>);
-
-impl TunnelIdentity {
-    /// Build a fresh synthesis using `python_name` as the Python-compatible
-    /// interface name. Returns `None` when the identity cannot sign.
-    pub fn synthesis(&self, python_name: &str) -> Option<Bytes> {
-        rns_transport::tunnel::build_tunnel_synthesis_packet(
-            &self.0,
-            rns_transport::tunnel::interface_hash(python_name),
-        )
-        .map(Bytes::from)
-    }
-}
 
 impl std::fmt::Debug for TunnelIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -137,19 +126,18 @@ pub(crate) fn python_host(host: &str) -> std::borrow::Cow<'_, str> {
 pub(crate) async fn open_client_connection(
     outbound: &tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
     transport_tx: &rns_transport::messages::InterfaceTransportSender,
-    synthesis: Option<Bytes>,
+    synthesize: bool,
     online: &AtomicBool,
 ) {
     if !online.load(std::sync::atomic::Ordering::SeqCst) {
         let mut queued = outbound.lock().await;
         while queued.try_recv().is_ok() {}
     }
-    if let Some(raw_packet) = synthesis {
+    if synthesize {
         let _ = transport_tx
             .send(
                 rns_transport::messages::TransportMessage::SynthesizeTunnel {
                     interface_id: transport_tx.interface_id(),
-                    raw_packet,
                 },
             )
             .await;
@@ -391,7 +379,7 @@ mod tests {
         let transport_tx = rns_transport::messages::InterfaceTransportSender::new(7, actor_tx);
         let online = AtomicBool::new(false);
 
-        open_client_connection(&outbound, &transport_tx, None, &online).await;
+        open_client_connection(&outbound, &transport_tx, false, &online).await;
 
         assert!(
             outbound.lock().await.try_recv().is_err(),
@@ -409,13 +397,38 @@ mod tests {
         let online = AtomicBool::new(true);
         frame_tx.send(Bytes::from_static(b"first")).await.unwrap();
 
-        open_client_connection(&outbound, &transport_tx, None, &online).await;
+        open_client_connection(&outbound, &transport_tx, false, &online).await;
 
         assert_eq!(
             outbound.lock().await.try_recv().ok(),
             Some(Bytes::from_static(b"first")),
             "a frame sent once the interface reported online is written"
         );
+    }
+
+    /// Each connection asks transport for its synthesis before it reports
+    /// online; transport builds and signs it.
+    #[tokio::test]
+    async fn a_connection_asks_for_its_synthesis_before_it_is_online() {
+        let (_frame_tx, frame_rx) = mpsc::channel::<Bytes>(4);
+        let outbound = tokio::sync::Mutex::new(frame_rx);
+        let (actor_tx, mut actor_rx) = mpsc::channel(4);
+        let transport_tx = rns_transport::messages::InterfaceTransportSender::new(7, actor_tx);
+        let owner = transport_tx.owner();
+        owner.mark_registered();
+        let online = AtomicBool::new(false);
+
+        open_client_connection(&outbound, &transport_tx, true, &online).await;
+
+        let message = match actor_rx.try_recv().unwrap() {
+            rns_transport::messages::TransportMessage::InterfaceEvent { message, .. } => *message,
+            message => message,
+        };
+        assert!(matches!(
+            message,
+            rns_transport::messages::TransportMessage::SynthesizeTunnel { interface_id: 7 }
+        ));
+        assert!(online.load(Ordering::SeqCst));
     }
 
     #[test]

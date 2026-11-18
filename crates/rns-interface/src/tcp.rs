@@ -195,8 +195,8 @@ pub struct TcpClientConfig {
     pub bitrate: u64,
     /// IFAC size in bytes; frames may exceed the hardware MTU by this much.
     pub ifac_size: usize,
-    /// Identity used to request a signed tunnel synthesis for each non-KISS
-    /// connection. `None`, or an identity without signing material, sends none.
+    /// Set when each non-KISS connection asks transport for a tunnel
+    /// synthesis; transport signs it with its own wire identity.
     pub tunnel_identity: Option<TunnelIdentity>,
 }
 
@@ -735,12 +735,8 @@ pub async fn spawn_tcp_client_observed(
             task_diagnostics.connected();
             // Python synthesizes on every non-KISS connection
             // (TCPInterface.py).
-            let synthesis = config
-                .tunnel_identity
-                .as_ref()
-                .filter(|_| !kiss_framing)
-                .and_then(|identity| identity.synthesis(&python_name));
-            open_client_connection(&rx, &transport_tx, synthesis, &online2).await;
+            let synthesize = config.tunnel_identity.is_some() && !kiss_framing;
+            open_client_connection(&rx, &transport_tx, synthesize, &online2).await;
 
             let (reader, writer) = stream.into_split();
 

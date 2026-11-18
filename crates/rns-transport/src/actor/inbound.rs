@@ -163,6 +163,9 @@ impl TransportActor {
         origin: InboundOrigin,
     ) {
         let (interface_id, len) = (packet.interface_id, packet.raw.len() as u64);
+        if self.is_detaching(interface_id) {
+            return;
+        }
         let outer = std::mem::take(&mut self.inbound_verdict);
         self.on_inbound_inner(packet, origin);
         let verdict = std::mem::replace(&mut self.inbound_verdict, outer);
@@ -1353,31 +1356,9 @@ impl TransportActor {
             return;
         }
 
-        // Tunnel synthesis: install the tunnel, and replay its cached paths,
-        // once the signature verifies (Transport.py).
         if header.destination_hash == tunnel_synth_dest {
             if let Some(payload_start) = self.data_payload_offset(raw, header) {
-                match crate::tunnel::TunnelSynthesisData::unpack(&raw[payload_start..])
-                    .filter(crate::tunnel::TunnelSynthesisData::is_signed)
-                {
-                    Some(synthesis) => {
-                        let tunnel_id = synthesis.tunnel_id();
-                        debug!(
-                            tunnel_id = hex::encode(&tunnel_id[..16]),
-                            interface_id, "tunnel synthesis request validated"
-                        );
-                        crate::tunnel::handle_tunnel(
-                            &mut self.tunnel_table,
-                            tunnel_id,
-                            interface_id,
-                        );
-                        self.state_dirty = true;
-                        self.restore_tunnel_paths(&tunnel_id, interface_id);
-                    }
-                    // Wrong length or a bad signature is a silent drop
-                    // (Transport.py).
-                    None => debug!(interface_id, "invalid tunnel synthesis"),
-                }
+                self.tunnel_synthesize_handler(&raw[payload_start..], interface_id);
             }
             return;
         }
