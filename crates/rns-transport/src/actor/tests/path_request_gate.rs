@@ -1,5 +1,6 @@
 //! The path-request in-flight gate (Transport.py `inflight_path_requests`):
-//! a request that leaves nothing pending releases it.
+//! a request that leaves nothing pending releases it, and a local client's
+//! request for a live path is answered from the table instead of batched.
 use super::*;
 use rns_wire::header::PacketHeader;
 
@@ -160,4 +161,39 @@ fn an_unreadable_cached_announce_releases_the_gate() {
     assert!(answered(&mut requester, dest), "answered once readable");
     assert!(!actor.discovery_path_requests.contains_key(&dest));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Transport.py batches every request for an in-flight destination
+/// (:2244-2259@1.6.1), so a local client waited for a new announce although
+/// the shared instance held the path. The gate is held here by a network
+/// request that a leaf only forwards to its local clients (:4166-4177), or
+/// one a relay has deferred behind an ingress burst.
+#[test]
+fn a_local_client_is_answered_from_the_table_behind_a_network_request() {
+    for transport in [false, true] {
+        let mut actor = relay();
+        actor.is_transport_enabled = transport;
+        let mut client = network(&mut actor, 1, InterfaceMode::Full);
+        actor.interfaces.get_mut(&1).unwrap().role = InterfaceRole::LocalClient;
+        let _network = network(&mut actor, 2, InterfaceMode::Full);
+        let (dest, _) = known_path(&mut actor, &format!("local_client_{transport}"), |_| {});
+        if transport {
+            actor.interfaces.get_mut(&2).unwrap().ingress =
+                crate::ingress::IngressController::new();
+            prime_ingress_pr_burst(&mut actor, 2);
+        }
+        request(&mut actor, dest, 1, 2);
+        assert_eq!(
+            requested(&mut client, dest),
+            !transport,
+            "a leaf forwards it to local clients"
+        );
+        assert!(actor.inflight_path_requests.contains_key(&dest));
+
+        request(&mut actor, dest, 2, 1);
+        actor.flush_pending_announces();
+        assert!(answered(&mut client, dest), "transport={transport}");
+        assert!(!actor.inflight_path_requests.contains_key(&dest));
+        let _ = std::fs::remove_dir_all(actor.storage_dir.clone().unwrap());
+    }
 }

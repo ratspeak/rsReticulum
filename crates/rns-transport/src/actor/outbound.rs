@@ -725,7 +725,10 @@ impl TransportActor {
 
         // Transport.py: a request for a destination already
         // in flight joins the waiting requesters instead of being processed.
-        if self.inflight_path_requests.contains_key(&requested_dest) {
+        // A local client's request for a live path is answered from the table.
+        let answer_from_table =
+            is_from_local_client && self.path_table.get_live(&requested_dest).is_some();
+        if !answer_from_table && self.inflight_path_requests.contains_key(&requested_dest) {
             // A leaf answers batched requesters only for its local clients;
             // upstream would also emit PATH_RESPONSEs naming the leaf as relay.
             if (self.is_transport_enabled || is_from_local_client) && !ingress_limited {
