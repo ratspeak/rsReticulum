@@ -767,6 +767,8 @@ impl TransportActor {
                     .is_some_and(|entry| !interface_marked_offline(entry))
                 {
                     self.path_request(*request, true);
+                } else {
+                    self.release_path_request_gate(&request.destination);
                 }
             }
             Queued::Message(msg) => self.handle_message(*msg),
@@ -2630,6 +2632,7 @@ mod tests {
     mod local_client_path_response;
     mod outbound_wrap;
     mod packet_capacity;
+    mod path_request_gate;
     mod path_request_tags;
     mod path_table_lifecycle;
     mod paths_and_filters;

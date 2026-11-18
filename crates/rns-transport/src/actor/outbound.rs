@@ -752,10 +752,12 @@ impl TransportActor {
         };
         if ingress_limited {
             // Transport.py: answered after every other class, still in flight.
-            self.inbound_rx.push_ingress_limited(
+            if !self.inbound_rx.push_ingress_limited(
                 &self.inbound_queues,
                 crate::inbound_queues::Queued::PathRequest(Box::new(request)),
-            );
+            ) {
+                self.release_path_request_gate(&requested_dest);
+            }
             return;
         }
         self.path_request(request, false);
@@ -855,11 +857,11 @@ impl TransportActor {
                 self.inflight_path_requests.remove(&requested_dest);
                 return;
             }
-            // Transport.py: an unparseable cached announce aborts the answer,
-            // leaving the request in flight.
+            // Transport.py returns here before the pop; this is a miss like any other.
             let Some(response) =
                 self.path_response_from_cached_announce(&raw, requested_dest, path.hops)
             else {
+                self.inflight_path_requests.remove(&requested_dest);
                 return;
             };
             if requestor_is_next_hop {
@@ -961,6 +963,7 @@ impl TransportActor {
                     interface_id,
                     "not forwarding recursive path request — ingress PR burst active"
                 );
+                self.release_path_request_gate(&requested_dest);
                 return;
             }
 
@@ -971,6 +974,7 @@ impl TransportActor {
                     dest = %hex::encode(requested_dest),
                     "reached rebroadcast decision for unstamped path request under stamp enforcement"
                 );
+                self.release_path_request_gate(&requested_dest);
                 return;
             }
             if self.begin_or_join_recursive_discovery(requested_dest, interface_id, now) {
@@ -983,6 +987,8 @@ impl TransportActor {
                     true,
                     search.flatten(),
                 );
+            } else {
+                self.release_path_request_gate(&requested_dest);
             }
         } else if self.has_local_client_interfaces() {
             pathing!(
@@ -1005,6 +1011,7 @@ impl TransportActor {
                 interface_id,
                 "ignoring unknown path request on non-discovery interface"
             );
+            self.release_path_request_gate(&requested_dest);
         }
     }
 

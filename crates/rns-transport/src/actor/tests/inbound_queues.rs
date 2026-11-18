@@ -204,6 +204,37 @@ fn a_queued_ingress_limited_path_request_is_already_in_flight() {
     );
 }
 
+/// Transport.py:2271,2294@1.6.1 drops a request at a full queue or from an
+/// interface gone offline, and leaves it in flight; nothing is pending here.
+#[test]
+fn a_dropped_ingress_limited_path_request_releases_the_gate() {
+    let (mut actor, sender) = registered(lengths(8, 8, 8, 1));
+    actor.is_transport_enabled = true;
+    prime_ingress_pr_burst(&mut actor, 1);
+    for dest in [0x41u8, 0x42] {
+        let payload = make_path_request_payload_with_tag([dest; 16], None, [dest; 16]);
+        sender
+            .try_send(inbound(path_request_for(&payload)))
+            .unwrap();
+        let (_, msg) = next(&mut actor).unwrap();
+        actor.handle_inbound_event(msg);
+    }
+    assert!(actor.inflight_path_requests.contains_key(&[0x41; 16]));
+    assert!(
+        !actor.inflight_path_requests.contains_key(&[0x42; 16]),
+        "dropped at the full queue"
+    );
+
+    actor.interfaces.get_mut(&1).unwrap().online = Some(Arc::new(AtomicBool::new(false)));
+    let (class, msg) = next(&mut actor).unwrap();
+    assert_eq!(class, TrafficClass::IngressLimited);
+    actor.handle_inbound_event(msg);
+    assert!(
+        !actor.inflight_path_requests.contains_key(&[0x41; 16]),
+        "dropped from an offline interface"
+    );
+}
+
 /// Python decides at preprocess time and passes `ingress_limited` into
 /// `path_request`, so a queued ingress-limited request is never forwarded
 /// recursively even if the burst ended meanwhile (Transport.py).

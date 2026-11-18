@@ -191,6 +191,20 @@ impl TransportActor {
         let _ = self.admit_discovery_requester(destination, requester, now, false);
     }
 
+    /// Release the in-flight gate after a request that left nothing pending,
+    /// unless a search for the destination still is. Transport.py keeps it
+    /// for 45 s, batching every later request.
+    pub(super) fn release_path_request_gate(&mut self, destination: &[u8; 16]) {
+        let now = now_f64();
+        let searching = self
+            .discovery_path_requests
+            .get(destination)
+            .is_some_and(|operation| operation.engaged && now < operation.timeout);
+        if !searching {
+            self.inflight_path_requests.remove(destination);
+        }
+    }
+
     /// `engage` starts a fan-out unless one is already engaged; an entry that
     /// only batched requesters is engaged with a fresh deadline
     /// (Transport.py).

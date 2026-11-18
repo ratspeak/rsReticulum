@@ -133,14 +133,15 @@ impl InboundReceivers {
     }
 
     /// Queue an item as ingress limited, dropping and counting it when that
-    /// queue is full (Transport.py).
-    pub(crate) fn push_ingress_limited(&mut self, queues: &InboundQueues, event: Queued) {
+    /// queue is full (Transport.py); false when it was dropped.
+    pub(crate) fn push_ingress_limited(&mut self, queues: &InboundQueues, event: Queued) -> bool {
         if self.ingress_limited.len() >= queues.lengths.il {
             queues.count_drop(TrafficClass::IngressLimited);
-        } else {
-            self.ingress_limited.push_back(event);
-            queues.set_ingress_limited_height(self.ingress_limited.len());
+            return false;
         }
+        self.ingress_limited.push_back(event);
+        queues.set_ingress_limited_height(self.ingress_limited.len());
+        true
     }
 }
 
