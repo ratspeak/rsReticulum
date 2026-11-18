@@ -499,21 +499,21 @@ fn record_from_lookup(lookup: &HashMap<String, Value>) -> DiscoveredInterface {
 }
 
 /// The configuration snippet upstream stores with each record and
-/// `rnstatus -D` prints (RNS/Discovery.py).
+/// `rnstatus -D` prints (RNS/Discovery.py). Unlike upstream, announced strings
+/// lose control characters other than tab, and line separators, so none can
+/// add a line to the entry; the record's own fields are unchanged.
 pub fn config_entry(rec: &DiscoveredInterface) -> Option<String> {
     let i = &rec.info;
     let opt = |v: Option<String>| v.unwrap_or_else(|| "None".to_string());
     let num = |v: Option<u64>| opt(v.map(|n| n.to_string()));
-    let netname = i
-        .ifac_netname
-        .as_deref()
-        .map_or(String::new(), |n| format!("\n  network_name = {n}"));
-    let netkey = i
-        .ifac_netkey
-        .as_deref()
-        .map_or(String::new(), |k| format!("\n  passphrase = {k}"));
+    let netname = i.ifac_netname.as_deref().map_or(String::new(), |n| {
+        format!("\n  network_name = {}", config_text(n))
+    });
+    let netkey = i.ifac_netkey.as_deref().map_or(String::new(), |k| {
+        format!("\n  passphrase = {}", config_text(k))
+    });
     let identity = format!("\n  transport_identity = {}", hex::encode(i.transport_id));
-    let name = &i.name;
+    let name = config_text(&i.name);
     Some(match i.interface_type.as_str() {
         "BackboneInterface" | "TCPServerInterface" => {
             let (kind, remote) = if cfg!(any(windows, target_vendor = "apple")) {
@@ -545,10 +545,18 @@ pub fn config_entry(rec: &DiscoveredInterface) -> Option<String> {
             "[[{name}]]\n  type = KISSInterface\n  enabled = yes\n  port = \n  # Frequency: {}\n  # Bandwidth: {}\n  # Modulation: {}{identity}{netname}{netkey}",
             num(i.frequency),
             num(i.bandwidth),
-            opt(i.modulation.as_ref().map(ToString::to_string))
+            opt(i.modulation.as_ref().map(|m| config_text(&m.to_string())))
         ),
         _ => return None,
     })
+}
+
+/// Drops every character Python's `str.splitlines` breaks on, ESC, and the
+/// other C0/C1 controls; tab stays, as upstream writes it.
+fn config_text(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\t' || !(c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')))
+        .collect()
 }
 
 fn s(x: &str) -> Value {
@@ -966,6 +974,72 @@ mod tests {
         std::fs::write(&garbage, b"not valid msgpack").unwrap();
         assert!(store.list(None).unwrap().is_empty());
         assert!(garbage.is_file());
+    }
+
+    /// Python `str.splitlines` boundaries, which ConfigObj splits a pasted entry on.
+    fn config_lines(entry: &str) -> Vec<&str> {
+        entry
+            .split([
+                '\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}',
+                '\u{2029}',
+            ])
+            .collect()
+    }
+
+    /// Announced strings reach `config_entry` after decoding as a receiver
+    /// stores them, and none of them can add a line to the pasted entry.
+    #[test]
+    fn announced_strings_cannot_add_config_lines() {
+        use crate::discovery::app_data::{decode_info, encode_info};
+        let inject = "\n[[Evil]]\n  type = PipeInterface\n  command = touch /tmp/pwned";
+        let breaks = "\r\x0b\x0c\x1c\x1d\x1e\u{85}\u{2028}\u{2029}\x1b[2J\u{9b}31m";
+        for interface_type in DISCOVERED_INTERFACE_TYPES {
+            let mut benign = record("Relay", [0x41; 16]);
+            benign.info.interface_type = interface_type.to_string();
+            benign.info.reachable_on = Some("relay.example.org".into());
+            benign.info.ifac_netname = Some("net".into());
+            benign.info.ifac_netkey = Some("key".into());
+            benign.info.frequency = Some(869_525_000);
+            benign.info.bandwidth = Some(125_000);
+            benign.info.spreading_factor = Some(8);
+            benign.info.coding_rate = Some(5);
+            benign.info.channel = Some(1);
+            benign.info.modulation = Some(DiscoveryModulation::Str("GFSK".into()));
+
+            let mut announced = benign.info.clone();
+            announced.name = format!("Relay{inject}{breaks}x");
+            announced.ifac_netname = Some(format!("net{inject}{breaks}"));
+            announced.ifac_netkey = Some(format!("key{inject}{breaks}"));
+            announced.modulation = Some(DiscoveryModulation::Str(format!("GFSK{inject}{breaks}")));
+            let mut evil = benign.clone();
+            evil.info = decode_info(&encode_info(&announced).unwrap().packed).unwrap();
+            assert!(evil.info.name.contains("\n[[Evil]]"), "stored as decoded");
+
+            let benign_entry = config_entry(&benign).unwrap();
+            let entry = config_entry(&evil).unwrap();
+            let lines = config_lines(&entry);
+            assert_eq!(
+                lines.len(),
+                config_lines(&benign_entry).len(),
+                "{interface_type}: {entry:?}"
+            );
+            assert_eq!(lines.iter().filter(|l| l.starts_with("[[")).count(), 1);
+            assert!(
+                !entry.chars().any(|c| c != '\n' && c.is_control()),
+                "{interface_type}: {entry:?}"
+            );
+            assert!(lines[0].starts_with("[[Relay[[Evil]] type = PipeInterface"));
+        }
+    }
+
+    /// Tab is not a line boundary; upstream's entry keeps it (discovery-decode golden).
+    #[test]
+    fn config_entry_keeps_tabs_as_upstream_does() {
+        let mut r = record("A\tB  C (x)", [0x42; 16]);
+        r.info.ifac_netkey = Some("k\tv".into());
+        let entry = config_entry(&r).unwrap();
+        assert!(entry.starts_with("[[A\tB  C (x)]]\n"));
+        assert!(entry.ends_with("\n  passphrase = k\tv"));
     }
 
     #[test]
