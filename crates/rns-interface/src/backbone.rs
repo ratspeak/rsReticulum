@@ -5,10 +5,10 @@
 //! encoded frame; this is not a bound on total connection memory.
 
 use rns_transport::messages::InterfaceTransportSender;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -74,6 +74,30 @@ pub const DP_IC_RCVBUF: usize = 32768;
 /// be reclaimed. This prevents an address spray from turning the abuse
 /// safeguard itself into an unbounded allocation.
 const MAX_TRACKED_FAST_FLAP_IPS: usize = 4096;
+
+/// The flap count Python gives an address from `blocked_ips` (Reticulum.py).
+const BLOCKED_IP_FLAPS: u64 = 0xFFFF;
+
+type BlockedIps = Arc<RwLock<HashSet<IpAddr>>>;
+
+fn process_blocked_ips() -> &'static BlockedIps {
+    static BLOCKED: OnceLock<BlockedIps> = OnceLock::new();
+    BLOCKED.get_or_init(BlockedIps::default)
+}
+
+/// Replace the process-wide addresses from the config directory's
+/// `blocked_ips` file (Reticulum.py). Listeners with `block_fast_flapping`
+/// refuse them for good, unless `fast_flapping_grace` reaches 65535.
+/// Addresses compare canonically, so an IPv4 entry also blocks its
+/// IPv4-mapped IPv6 form. Returns the number of distinct addresses.
+pub fn set_blocked_ips(ips: impl IntoIterator<Item = IpAddr>) -> usize {
+    let ips: HashSet<IpAddr> = ips.into_iter().map(|ip| ip.to_canonical()).collect();
+    let count = ips.len();
+    *process_blocked_ips()
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = ips;
+    count
+}
 
 #[derive(Debug, Clone)]
 pub struct BackboneServerConfig {
@@ -234,6 +258,7 @@ impl FastFlapTable {
 struct FastFlapRuntime {
     clock: Arc<dyn MonotonicClock>,
     table: Arc<Mutex<FastFlapTable>>,
+    blocked: BlockedIps,
 }
 
 impl FastFlapRuntime {
@@ -244,7 +269,17 @@ impl FastFlapRuntime {
             table: Arc::clone(TABLE.get_or_init(|| {
                 Arc::new(Mutex::new(FastFlapTable::new(MAX_TRACKED_FAST_FLAP_IPS)))
             })),
+            blocked: Arc::clone(process_blocked_ips()),
         }
+    }
+
+    /// Addresses from `blocked_ips`, when this listener's policy refuses them.
+    fn blocked_ips(
+        &self,
+        policy: FastFlapPolicy,
+    ) -> Option<std::sync::RwLockReadGuard<'_, HashSet<IpAddr>>> {
+        (policy.enabled && policy.grace < BLOCKED_IP_FLAPS)
+            .then(|| self.blocked.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn admit(&self, remote_ip: IpAddr, policy: FastFlapPolicy) -> FastFlapAdmission {
@@ -258,6 +293,14 @@ impl FastFlapRuntime {
             });
         }
 
+        if self
+            .blocked_ips(policy)
+            .is_some_and(|blocked| blocked.contains(&remote_ip.to_canonical()))
+        {
+            return FastFlapAdmission::Rejected {
+                flaps: BLOCKED_IP_FLAPS,
+            };
+        }
         let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = table.entries.get(&remote_ip).copied() {
             if started_at.saturating_sub(entry.last_flap) > policy.block_time {
@@ -320,14 +363,22 @@ impl FastFlapRuntime {
         active_clients: &AtomicU64,
     ) -> InterfaceInspectionSnapshot {
         let blocked_ips = if policy.enabled {
+            let listed = self.blocked_ips(policy);
+            let listed_count = listed.as_ref().map_or(0, |listed| listed.len());
             let now = self.clock.now();
             let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
             table.prune_expired(now, policy.block_time);
-            table
+            let flapping = table
                 .entries
-                .values()
-                .filter(|entry| entry.flaps > policy.grace)
-                .count() as u64
+                .iter()
+                .filter(|(ip, entry)| {
+                    entry.flaps > policy.grace
+                        && !listed
+                            .as_ref()
+                            .is_some_and(|listed| listed.contains(&ip.to_canonical()))
+                })
+                .count();
+            (listed_count + flapping) as u64
         } else {
             0
         };
@@ -1377,6 +1428,7 @@ mod tests {
             FastFlapRuntime {
                 clock: Arc::new(clock.clone()),
                 table: Arc::new(Mutex::new(FastFlapTable::new(capacity))),
+                blocked: BlockedIps::default(),
             },
             clock,
         )
@@ -1732,6 +1784,49 @@ mod tests {
         other.disconnected();
     }
 
+    /// Reticulum.py 1.6.1 (5f2dbc16): a `blocked_ips` address stands at
+    /// 0xFFFF flaps, never expires, is counted, and binds only listeners that
+    /// block fast flapping.
+    #[test]
+    fn listed_ips_are_refused_for_good_and_counted() {
+        let (runtime, clock) = test_runtime(1);
+        let listed = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        runtime.blocked.write().unwrap().insert(listed);
+        let policy = default_policy();
+        let active = AtomicU64::new(0);
+
+        assert_rejected(&runtime, listed, policy);
+        let mapped = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 7).to_ipv6_mapped());
+        assert_rejected(&runtime, mapped, policy);
+        assert_eq!(
+            runtime.inspection_snapshot(policy, &active).blocked_ips,
+            Some(1)
+        );
+
+        // A full table and a long wait change nothing.
+        let mut flapping = policy;
+        flapping.grace = 0;
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8));
+        record_short_connection(&runtime, &clock, other, flapping);
+        clock.advance(policy.block_time * 4);
+        assert_rejected(&runtime, listed, policy);
+        assert_eq!(
+            runtime.inspection_snapshot(flapping, &active).blocked_ips,
+            Some(1)
+        );
+
+        let mut off = policy;
+        off.enabled = false;
+        allow_connection(&runtime, listed, off).disconnected();
+        assert_eq!(
+            runtime.inspection_snapshot(off, &active).blocked_ips,
+            Some(0)
+        );
+        let mut lenient = policy;
+        lenient.grace = BLOCKED_IP_FLAPS;
+        allow_connection(&runtime, listed, lenient).disconnected();
+    }
+
     #[test]
     fn listeners_share_one_process_global_ip_keyspace() {
         let clock = TestClock::new();
@@ -1739,10 +1834,12 @@ mod tests {
         let first_listener = FastFlapRuntime {
             clock: Arc::new(clock.clone()),
             table: Arc::clone(&table),
+            blocked: BlockedIps::default(),
         };
         let second_listener = FastFlapRuntime {
             clock: Arc::new(clock.clone()),
             table,
+            blocked: BlockedIps::default(),
         };
         let policy = default_policy();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));

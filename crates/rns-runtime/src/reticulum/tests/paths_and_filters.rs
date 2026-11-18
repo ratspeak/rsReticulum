@@ -152,3 +152,23 @@ async fn hop_limiter_reaches_the_interfaces_upstream_gives_it() {
     .unwrap();
     assert_eq!(registered_hop_limiter(&mut transport_rx).await, None);
 }
+
+#[test]
+fn blocked_ips_lines_parse_like_upstream() {
+    let lines: Vec<String> = [
+        "198.51.100.7",
+        "2001:db8::1",
+        "0:0:0:0:0:0:0:1",
+        "198.51.100.0/24",
+        "example.org",
+        "198.51.100.8 # spammer",
+        "",
+    ]
+    .map(String::from)
+    .into();
+    let parsed: Vec<String> = parse_blocked_ips(&lines)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(parsed, ["198.51.100.7", "2001:db8::1", "::1"]);
+}

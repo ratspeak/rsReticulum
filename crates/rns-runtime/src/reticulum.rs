@@ -11052,8 +11052,8 @@ pub fn get_instance() -> Option<&'static ReticulumHandle> {
     INSTANCE.get()
 }
 
-/// The list files beside `config` (Reticulum.py); a file that cannot be read
-/// is logged and skipped, as upstream does.
+/// The list files beside `config` (Reticulum.py), read before any interface
+/// starts; a file that cannot be read is logged and skipped, as upstream does.
 fn load_config_dir_lists(config_dir: &Path, rc: &mut ReticulumConfig) {
     let read = |name: &str| match crate::config::read_list_file(&config_dir.join(name)) {
         Ok(lines) => lines,
@@ -11068,6 +11068,17 @@ fn load_config_dir_lists(config_dir: &Path, rc: &mut ReticulumConfig) {
     if let Some(names) = read("flagged_destination_types") {
         rc.filter.flagged_types = names;
     }
+    let blocked = read("blocked_ips").map_or_else(Vec::new, |lines| parse_blocked_ips(&lines));
+    let count = rns_interface::backbone::set_blocked_ips(blocked);
+    if count > 0 {
+        tracing::debug!(count, "loaded blocked IPs");
+    }
+}
+
+/// `blocked_ips` lines that `ipaddress.ip_address` accepts: no CIDR, no
+/// hostnames, no inline comments (Discovery.py).
+fn parse_blocked_ips(lines: &[String]) -> Vec<std::net::IpAddr> {
+    lines.iter().filter_map(|line| line.parse().ok()).collect()
 }
 
 fn load_or_create_config(path: &Path) -> Result<(Config, bool), ReticulumError> {
