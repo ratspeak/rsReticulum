@@ -1,6 +1,18 @@
 use super::*;
 use tracing::info;
 
+/// Python's `storagepath/announce_rate_table` (Transport.py).
+const ANNOUNCE_RATE_TABLE_FILE: &str = "announce_rate_table";
+
+/// Python `save_announce_rate_table`: write through a temporary file and a
+/// rename, logging a failure (Transport.py, Storage.py).
+fn save_announce_rate_table(dir: &std::path::Path, blob: &[u8]) {
+    let path = dir.join(ANNOUNCE_RATE_TABLE_FILE);
+    if let Err(e) = rns_identity::persistence::atomic_write(&path, blob) {
+        tracing::warn!(path = %path.display(), error = %e, "could not persist announce rate table");
+    }
+}
+
 /// Wall-clock helper kept here so tests can inject a fake clock without
 /// dragging it through the actor.
 fn now() -> f64 {
@@ -419,6 +431,7 @@ impl TransportActor {
             } else {
                 info!(entries = hashes.len(), "flushed hashlist");
             }
+            save_announce_rate_table(dir, &self.rate_table.to_bytes());
         }
     }
 
@@ -444,6 +457,7 @@ impl TransportActor {
         self.hashlist_save_in_flight
             .store(true, std::sync::atomic::Ordering::Release);
         let hashes = self.packet_hashlist.current_hashes();
+        let rate_table = self.rate_table.to_bytes();
         let in_flight = self.hashlist_save_in_flight.clone();
         let entries = hashes.len();
         let write = move || {
@@ -453,6 +467,7 @@ impl TransportActor {
             } else {
                 info!(entries, "flushed hashlist");
             }
+            save_announce_rate_table(&dir, &rate_table);
             in_flight.store(false, std::sync::atomic::Ordering::Release);
         };
         match tokio::runtime::Handle::try_current() {
@@ -477,6 +492,29 @@ impl TransportActor {
         self.is_transport_enabled && !self.storage_client()
     }
 
+    /// Python `Transport.start` loads the table with the hashlist; a file it
+    /// rejects leaves the table empty (Transport.py).
+    fn load_announce_rate_table(&mut self, dir: &std::path::Path) {
+        let path = dir.join(ANNOUNCE_RATE_TABLE_FILE);
+        if !path.is_file() {
+            return;
+        }
+        match std::fs::read(&path)
+            .ok()
+            .and_then(|blob| crate::rate_limit::RateTable::from_bytes(&blob))
+        {
+            Some(loaded) => {
+                let entries = loaded.len();
+                self.rate_table.absorb(loaded);
+                debug!(entries, "loaded announce rate table from storage");
+            }
+            None => tracing::warn!(
+                path = %path.display(),
+                "could not load announce rate table from storage, initialized empty"
+            ),
+        }
+    }
+
     /// Restore the canonical packet hashlist once both storage and the
     /// actor's transport authority are known. Shared-instance clients and
     /// non-transport leaves must never load or overwrite the authoritative
@@ -489,6 +527,7 @@ impl TransportActor {
             return;
         };
         self.hashlist_load_attempted = true;
+        self.load_announce_rate_table(&dir);
 
         let raw_path = dir.join("packet_hashlist.raw");
         if raw_path.exists() {
@@ -1650,6 +1689,48 @@ mod async_save_tests {
                 .routing_save_in_flight
                 .load(std::sync::atomic::Ordering::Acquire)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Python 1.6.1 saves and loads `announce_rate_table` only on a transport
+    /// instance that owns its storage (Transport.py).
+    #[test]
+    fn a_transport_instance_keeps_its_announce_rate_table_across_restarts() {
+        let dir = temp_storage();
+        let file = dir.join(ANNOUNCE_RATE_TABLE_FILE);
+        let (mut leaf, _) = TransportActor::new();
+        leaf.storage_dir = Some(dir.clone());
+        leaf.rate_table
+            .check_interface_rate([0x31; 16], 60.0, 0, 0.0);
+        leaf.save_state();
+        assert!(!file.exists(), "a leaf persists no rate table");
+
+        let (mut actor, _) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.storage_dir = Some(dir.clone());
+        for _ in 0..2 {
+            actor
+                .rate_table
+                .check_interface_rate([0x31; 16], 60.0, 0, 0.0);
+        }
+        actor.save_state();
+        assert!(file.exists());
+
+        let (mut restarted, _) = TransportActor::new();
+        restarted.is_transport_enabled = true;
+        restarted.initialize_storage(dir.clone());
+        let (_, entry) = restarted.rate_table.iter().next().expect("loaded");
+        let (_, saved) = actor.rate_table.iter().next().unwrap();
+        assert_eq!(
+            (&entry.timestamps, entry.violations, entry.blocked_until),
+            (&saved.timestamps, 1, saved.blocked_until)
+        );
+
+        std::fs::write(&file, b"RNSART").unwrap();
+        let (mut damaged, _) = TransportActor::new();
+        damaged.is_transport_enabled = true;
+        damaged.initialize_storage(dir.clone());
+        assert_eq!(damaged.rate_table.len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
