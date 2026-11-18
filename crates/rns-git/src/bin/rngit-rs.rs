@@ -212,6 +212,8 @@ async fn start_page_node(
         Destination::hash_from_name_and_identity(rns_git::pages::APP_NAME, Some(&identity.hash));
     let options = DestinationRuntimeOptions {
         endpoint_dispatch: Some(handle.link_endpoint_dispatch_handle()),
+        stamp_value: node.options.stamp_value.filter(|value| *value > 0.0),
+        link_cost: Some(node.options.link_cost),
         ..DestinationRuntimeOptions::default()
     };
     let registered = match handle
@@ -1238,6 +1240,8 @@ async fn main() {
 
     let options = DestinationRuntimeOptions {
         endpoint_dispatch: Some(handle.link_endpoint_dispatch_handle()),
+        stamp_value: config.stamp_value.filter(|value| *value > 0.0),
+        link_cost: Some(config.link_cost),
         ..DestinationRuntimeOptions::default()
     };
     let page_identity = identity.clone();

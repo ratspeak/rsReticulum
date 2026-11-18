@@ -111,10 +111,14 @@ const PLAIN_TEMPLATES: [&str; 12] = [
 ];
 
 /// The `[pages]` keys `NomadNetworkNode.__init__` reads (`pages.py`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageOptions {
     pub use_nerdfonts: bool,
     pub media_conversion: bool,
+    /// Quantized; applied to the node destination only when above 0.
+    pub stamp_value: Option<f64>,
+    /// Quantized announced link request cost.
+    pub link_cost: f64,
 }
 
 impl Default for PageOptions {
@@ -122,13 +126,15 @@ impl Default for PageOptions {
         Self {
             use_nerdfonts: true,
             media_conversion: true,
+            stamp_value: None,
+            link_cost: crate::server::config::DEFAULT_LINK_COST,
         }
     }
 }
 
 impl PageOptions {
-    /// Read `unicode_icons` and `media_conversion` from the node config text;
-    /// a value `as_bool` rejects is an error, as upstream raises.
+    /// Read the `[pages]` keys from the node config text; a value `as_bool`
+    /// or `as_float` rejects is an error, as upstream raises.
     pub fn from_config_text(text: &str) -> Result<Self, rns_runtime::config::ConfigError> {
         let mut options = Self::default();
         let config = rns_runtime::config::Config::parse(text)?;
@@ -149,6 +155,16 @@ impl PageOptions {
         }
         if section.has("media_conversion") {
             options.media_conversion = as_bool("media_conversion")?;
+        }
+        if section.has("link_cost") {
+            options.link_cost = crate::server::config::as_cost(section, "pages", "link_cost")?;
+        }
+        if section.has("stamp_value") {
+            options.stamp_value = Some(crate::server::config::as_cost(
+                section,
+                "pages",
+                "stamp_value",
+            )?);
         }
         Ok(options)
     }
@@ -796,5 +812,24 @@ pub(crate) fn field_num(value: &Value, key: &str) -> f64 {
         Some(Value::F32(f)) => f64::from(*f),
         Some(Value::Boolean(b)) => f64::from(u8::from(*b)),
         _ => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PageOptions;
+
+    #[test]
+    fn page_stamp_keys_follow_upstream() {
+        let options = PageOptions::from_config_text("[pages]\nserve_nomadnet = yes\n").unwrap();
+        assert_eq!((options.stamp_value, options.link_cost), (None, 18.0));
+        let options =
+            PageOptions::from_config_text("[pages]\nstamp_value = 27.5\nlink_cost = 18.7\n")
+                .unwrap();
+        assert_eq!(
+            (options.stamp_value, options.link_cost),
+            (Some(27.5), 4787.0 / 256.0)
+        );
+        assert!(PageOptions::from_config_text("[pages]\nlink_cost = x\n").is_err());
     }
 }

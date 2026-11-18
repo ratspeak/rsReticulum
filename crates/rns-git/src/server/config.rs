@@ -17,6 +17,8 @@ use super::py_len;
 pub const DEFAULT_CONFIG: &str = include_str!("default_config.txt");
 
 pub const DEFAULT_NODE_NAME: &str = "Anonymous Git Node";
+/// `DEFAULT_LINK_COST` of both rngit destinations (`server.py`, `pages.py`).
+pub const DEFAULT_LINK_COST: f64 = 18.0;
 const LOG_NONE: i64 = -1;
 const LOG_EXTREME: i64 = 8;
 
@@ -40,11 +42,16 @@ impl Default for FetchLimits {
 }
 
 /// What `__apply_config` takes from the config file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeConfig {
     pub node_name: String,
     /// Seconds; 0 never announces.
     pub announce_interval: i64,
+    /// `[rngit] stamp_value`, quantized; applied to the repositories
+    /// destination only when above 0, as upstream tests it for truth.
+    pub stamp_value: Option<f64>,
+    /// `[rngit] link_cost`, quantized: the announced link request cost.
+    pub link_cost: f64,
     /// Seconds; 0 disables periodic mirror sync.
     pub mirror_interval: i64,
     pub record_stats: bool,
@@ -68,6 +75,8 @@ impl Default for NodeConfig {
         Self {
             node_name: DEFAULT_NODE_NAME.to_string(),
             announce_interval: 0,
+            stamp_value: None,
+            link_cost: DEFAULT_LINK_COST,
             mirror_interval: 24 * 60 * 60,
             record_stats: false,
             serve_nomadnet: false,
@@ -105,6 +114,15 @@ fn as_limit(section: &ConfigSection, name: &str, key: &str) -> Result<u64, Confi
         tracing::warn!("{key} = {value} in configuration file is below 1, using 1");
     }
     Ok(value.max(1) as u64)
+}
+
+/// `Stamps.quantize_cost(section.as_float(key))`, which raises on a value
+/// `float()` rejects and on NaN or infinity.
+pub(crate) fn as_cost(section: &ConfigSection, name: &str, key: &str) -> Result<f64, ConfigError> {
+    let value = section
+        .get_float(key)
+        .ok_or_else(|| invalid(name, key, "not a float"))?;
+    rns_identity::stamps::quantize_cost(value).map_err(|e| invalid(name, key, &e.to_string()))
 }
 
 /// ConfigObj `as_bool`, which raises on anything but its boolean words.
@@ -153,6 +171,12 @@ impl NodeConfig {
             }
             if section.has("announce_interval") {
                 node.announce_interval = as_int(section, name, "announce_interval")? * 60;
+            }
+            if section.has("stamp_value") {
+                node.stamp_value = Some(as_cost(section, name, "stamp_value")?);
+            }
+            if section.has("link_cost") {
+                node.link_cost = as_cost(section, name, "link_cost")?;
             }
             if section.has("mirror_interval") {
                 node.mirror_interval = (as_int(section, name, "mirror_interval")? * 3600).max(0);
@@ -269,5 +293,44 @@ pub fn expand_user(path: &str) -> PathBuf {
             PathBuf::from(home)
         }
         _ => PathBuf::from(path),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamp_value_and_link_cost_follow_upstream() {
+        let node = NodeConfig::parse("[rngit]\n", 0).unwrap();
+        assert_eq!((node.stamp_value, node.link_cost), (None, 18.0));
+        let node = NodeConfig::parse("[rngit]\nstamp_value = 27.5\nlink_cost = 18.7\n", 0).unwrap();
+        // quantize_cost: 18.7 is 4787/256.
+        assert_eq!(
+            (node.stamp_value, node.link_cost),
+            (Some(27.5), 4787.0 / 256.0)
+        );
+        let node = NodeConfig::parse("[rngit]\nstamp_value = -3\nlink_cost = 150\n", 0).unwrap();
+        assert_eq!((node.stamp_value, node.link_cost), (Some(0.0), 100.0));
+        for body in ["stamp_value = high", "link_cost = nan", "link_cost = inf"] {
+            assert!(
+                NodeConfig::parse(&format!("[rngit]\n{body}\n"), 0).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_carries_the_upstream_stamp_lines() {
+        for (section, destination) in [("[rngit]", "repository node"), ("[pages]", "page node")] {
+            let start = DEFAULT_CONFIG.find(section).unwrap();
+            let text = &DEFAULT_CONFIG[start..];
+            assert!(text.contains(&format!(
+                "# You can configure the required link stamp cost for\n# connecting to the {destination}.\n\n# link_cost = 18.0\n"
+            )));
+        }
+        assert_eq!(DEFAULT_CONFIG.matches("# stamp_value = 25.0\n").count(), 2);
+        let node = NodeConfig::parse(DEFAULT_CONFIG, 0).unwrap();
+        assert_eq!((node.stamp_value, node.link_cost), (None, 18.0));
     }
 }
