@@ -327,6 +327,65 @@ fn tunnels_without_an_interface_survive_a_reload() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Python 1.6.1 caps a loaded tunnel's expiry at the reconnect window
+/// (Transport.py:636-637).
+#[test]
+fn loaded_tunnels_expire_within_the_reconnect_window() {
+    let dir = unique_temp_dir("tunnel-reconnect-window");
+    let now = now_f64();
+    let window = crate::constants::TUNNEL_RECONNECT_WINDOW as f64;
+    let path = |dest: u8| PersistedTunnelPath {
+        used: None,
+        destination_hash: vec![dest; 16],
+        next_hop: None,
+        hops: 1,
+        expires: now + 600.0,
+        timestamp: now,
+        random_blobs: vec![vec![0x11; 10]],
+        packet_hash: Some(vec![0x41; 32]),
+    };
+    let entry = |tunnel: u8, expires: f64| PersistedTunnelEntry {
+        tunnel_id: vec![tunnel; 32],
+        interface_id: 3,
+        expires,
+        paths: vec![path(tunnel)],
+        interface_name: None,
+        interface_hash: None,
+    };
+    let table = PersistedTunnelTable {
+        entries: vec![
+            entry(0x01, now + crate::constants::TUNNEL_TIMEOUT as f64),
+            entry(0x02, now + 120.0),
+        ],
+        version: PersistedTunnelTable::CURRENT_VERSION,
+    };
+    std::fs::write(
+        dir.join("tunnel_table.msgpack"),
+        rmp_serde::to_vec(&table).unwrap(),
+    )
+    .unwrap();
+
+    let mut reader = hub();
+    reader.handle_message(TransportMessage::SetStoragePaths {
+        storage_dir: dir.clone(),
+        role: crate::actor::StorageRole::Owner,
+        done: None,
+    });
+    let long = reader.tunnel_table.get(&[0x01; 32]).unwrap().expires;
+    assert!(
+        long <= now_f64() + window && long > now + window - 5.0,
+        "an eight-hour expiry loads capped at the window: {}",
+        long - now
+    );
+    assert_eq!(
+        reader.tunnel_table.get(&[0x02; 32]).unwrap().expires,
+        now + 120.0,
+        "a sooner expiry is kept"
+    );
+    stop(reader);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn legacy_sidecar_tunnels_without_an_interface_survive_a_reload() {
     let dir = unique_temp_dir("sidecar-tunnel");

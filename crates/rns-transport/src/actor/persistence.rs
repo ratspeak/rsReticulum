@@ -993,8 +993,9 @@ impl TransportActor {
         }
     }
 
-    /// Load a persisted tunnel unbound; only a later synthesis binds it.
-    /// Python keeps a tunnel only when one of its paths loads.
+    /// Load a persisted tunnel unbound, within the reconnect window; only a
+    /// later synthesis binds it. Python keeps a tunnel only when one of its
+    /// paths loads.
     fn load_unbound_tunnel(
         &mut self,
         tunnel_id: &[u8],
@@ -1033,11 +1034,12 @@ impl TransportActor {
         if tunnel_paths.is_empty() {
             return false;
         }
+        let window = now_f64() + crate::constants::TUNNEL_RECONNECT_WINDOW as f64;
         self.tunnel_table.insert(crate::tunnel::TunnelEntry {
             tunnel_id,
             interface_id: None,
             tunnel_paths,
-            expires,
+            expires: expires.min(window),
         });
         true
     }

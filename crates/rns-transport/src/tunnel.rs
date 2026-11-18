@@ -92,14 +92,16 @@ impl TunnelTable {
     }
 
     /// Forget `interface_id`: it names no tunnel, and the tunnels bound to it
-    /// become unbound but keep their paths. Returns
-    /// how many tunnels were unbound.
+    /// become unbound, keep their paths, and expire after the reconnect window
+    /// unless a synthesis rebinds them. Returns how many tunnels were unbound.
     pub fn void_interface(&mut self, interface_id: InterfaceId) -> usize {
         self.by_interface.remove(&interface_id);
+        let expires = crate::now_f64() + crate::constants::TUNNEL_RECONNECT_WINDOW as f64;
         let mut voided = 0;
         for entry in self.entries.values_mut() {
             if entry.interface_id == Some(interface_id) {
                 entry.interface_id = None;
+                entry.expires = expires;
                 voided += 1;
             }
         }
@@ -433,6 +435,40 @@ mod tests {
         assert_eq!(
             table.get_mut_by_interface(2).map(|tunnel| tunnel.tunnel_id),
             Some(newer)
+        );
+    }
+
+    /// Python 1.6.1 gives an orphaned tunnel `TUNNEL_RECONNECT_WINDOW` from
+    /// the moment its interface goes, longer or shorter than before
+    /// (Transport.py:1285-1288); a synthesis restores the full timeout.
+    #[test]
+    fn voiding_an_interface_starts_the_reconnect_window() {
+        let now = 1_000_000.0;
+        let _clock = crate::test_clock::Clock::at(now);
+        let window = crate::constants::TUNNEL_RECONNECT_WINDOW as f64;
+        let mut table = TunnelTable::new();
+        handle_tunnel(&mut table, [0x01; 32], 1);
+        table.insert(TunnelEntry {
+            tunnel_id: [0x02; 32],
+            interface_id: Some(1),
+            tunnel_paths: HashMap::new(),
+            expires: now + 60.0,
+        });
+        handle_tunnel(&mut table, [0x03; 32], 2);
+
+        assert_eq!(table.void_interface(1), 2);
+        assert_eq!(table.get(&[0x01; 32]).unwrap().expires, now + window);
+        assert_eq!(table.get(&[0x02; 32]).unwrap().expires, now + window);
+        assert_eq!(
+            table.get(&[0x03; 32]).unwrap().expires,
+            now + crate::constants::TUNNEL_TIMEOUT as f64,
+            "a tunnel on another interface keeps its expiry"
+        );
+
+        handle_tunnel(&mut table, [0x01; 32], 3);
+        assert_eq!(
+            table.get(&[0x01; 32]).unwrap().expires,
+            now + crate::constants::TUNNEL_TIMEOUT as f64
         );
     }
 

@@ -261,6 +261,10 @@ pub const TUNNEL_TIMEOUT: u64 = 28_800;
 /// Tunnel path timeout (8 hours, in seconds).
 pub const TUNNEL_PATH_TIMEOUT: u64 = 28_800;
 
+/// How long an unbound tunnel awaits its interface's return (10 minutes, in
+/// seconds; Python `TUNNEL_RECONNECT_WINDOW`).
+pub const TUNNEL_RECONNECT_WINDOW: u64 = 600;
+
 /// Exported announce-queue interval, in seconds. The current actor processes
 /// interface announce queues on its maintenance tick instead.
 pub const ANNOUNCE_QUEUE_INTERVAL: f64 = 1.0;
