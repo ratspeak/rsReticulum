@@ -1331,6 +1331,10 @@ pub struct InterfaceStatRpcEntry {
     pub announces_sent: u64,
     pub path_requests_received: u64,
     pub path_requests_sent: u64,
+    /// Python `afrxc`: announces dropped by the type filter, the prefilter,
+    /// a stamp or blackhole check, or a refused hold; a parent counts its
+    /// children's.
+    pub announces_filtered: u64,
     pub protocol_violations: u64,
     pub ifac_violations: u64,
     pub packet_filter_hits: u64,
@@ -1409,6 +1413,8 @@ pub struct TrafficTotalsRpcEntry {
     pub tx_packets: u64,
     pub announce_rx_packets: u64,
     pub announce_tx_packets: u64,
+    /// Python `Transport.filtered_arxc`, which upstream does not export.
+    pub announce_filtered_packets: u64,
     pub pr_rx_packets: u64,
     pub pr_tx_packets: u64,
     pub link_count: u64,

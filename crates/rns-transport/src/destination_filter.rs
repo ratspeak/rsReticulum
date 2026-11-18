@@ -137,6 +137,11 @@ impl DestinationTypeFilter {
         self.names.get(hash).map_or("unknown", String::as_str)
     }
 
+    /// Python drops a blocked type silently, ahead of the required-only check.
+    pub fn is_blocked(&self, hash: &NameHash) -> bool {
+        self.blocked.contains(hash)
+    }
+
     /// The decision inside Python `Transport.inbound` (Transport.py),
     /// given the wire hop count before the inbound increment.
     pub fn admits(&self, hash: &NameHash, source: AnnounceSource, wire_hops: u8) -> bool {

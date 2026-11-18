@@ -117,6 +117,25 @@ pub struct HeldAnnounce {
     pub receiving_interface_id: u64,
 }
 
+/// What [`IngressController::hold_announce`] did with an announce. Python
+/// counts a replacement and a refusal as filtered (Interface.py).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldOutcome {
+    /// Stored in a free slot.
+    Held,
+    /// Replaced the announce held for the same destination.
+    Replaced,
+    /// Not stored: at the hop limit, or the buffer is full.
+    Refused,
+}
+
+impl HoldOutcome {
+    /// Whether Python's `hold_announce` calls `filtered_announce` (Interface.py).
+    pub fn is_filtered(self) -> bool {
+        self != Self::Held
+    }
+}
+
 /// Monotonic-clock samples and limiter state for one interface. Record events
 /// through the `received_*`/`sent_*` methods before consulting limiters. Every
 /// frequency read, status getters included, drops at most one stale sample.
@@ -150,6 +169,8 @@ pub struct IngressController {
     announces_sent: u64,
     path_requests_received: u64,
     path_requests_sent: u64,
+    /// Python `afrxc`, including spawned children's.
+    announces_filtered: u64,
     /// Python `arxb`/`atxb`/`prxb`/`ptxb`, including spawned children's.
     announce_rx_bytes: u64,
     announce_tx_bytes: u64,
@@ -193,6 +214,7 @@ impl IngressController {
             announces_sent: 0,
             path_requests_received: 0,
             path_requests_sent: 0,
+            announces_filtered: 0,
             announce_rx_bytes: 0,
             announce_tx_bytes: 0,
             path_request_rx_bytes: 0,
@@ -428,6 +450,17 @@ impl IngressController {
         self.path_requests_sent
     }
 
+    /// Python `filtered_announce` on this interface, or a spawned child's on
+    /// its parent: the count only (Interface.py).
+    pub fn filtered_announce(&mut self) {
+        self.announces_filtered = self.announces_filtered.saturating_add(1);
+    }
+
+    /// Python `afrxc`.
+    pub fn announces_filtered(&self) -> u64 {
+        self.announces_filtered
+    }
+
     pub fn incoming_announce_frequency(&mut self) -> f64 {
         frequency_from_deque_mut(
             &mut self.ia_freq_deque,
@@ -575,11 +608,11 @@ impl IngressController {
     /// its packet. Discard hop counts of 127 or more and new destinations when
     /// `max_held` is reached; existing destinations can still be replaced.
     /// This does not consult the enabled flag or a limiter decision.
-    pub fn hold_announce(&mut self, announce: HeldAnnounce) {
+    pub fn hold_announce(&mut self, announce: HeldAnnounce) -> HoldOutcome {
         // Python 1.3.8 Interface.py: announces already at the hop cap
         // would be dropped by every receiver on release — don't hold them.
         if announce.hops >= PATHFINDER_M - 1 {
-            return;
+            return HoldOutcome::Refused;
         }
         if let Some(held) = self
             .held_announces
@@ -587,8 +620,12 @@ impl IngressController {
             .find(|held| held.destination_hash == announce.destination_hash)
         {
             *held = announce;
+            HoldOutcome::Replaced
         } else if self.held_announces.len() < self.max_held {
             self.held_announces.push(announce);
+            HoldOutcome::Held
+        } else {
+            HoldOutcome::Refused
         }
     }
 
@@ -599,25 +636,37 @@ impl IngressController {
     /// while burst state remains set. The returned entry is removed; the caller
     /// must process it, since this helper does not send packets.
     pub fn try_release_held(&mut self) -> Option<HeldAnnounce> {
-        if self.held_announces.is_empty() {
+        if !self.release_due() {
             return None;
         }
+        self.cull_and_release(&[])
+    }
 
-        let now = Instant::now();
-        if now < self.held_release {
-            return None;
+    /// The release gate of [`Self::try_release_held`]: something is held, the
+    /// release time has come and the frequency is below the threshold.
+    pub fn release_due(&mut self) -> bool {
+        if self.held_announces.is_empty() || Instant::now() < self.held_release {
+            return false;
         }
-
         let freq_threshold = if self.age() < self.new_time {
             self.burst_freq_new
         } else {
             self.burst_freq
         };
+        self.incoming_announce_frequency() < freq_threshold
+    }
 
-        if self.incoming_announce_frequency() >= freq_threshold {
-            return None;
-        }
+    /// Held announces in the order they were first held.
+    pub fn held_announces(&self) -> impl Iterator<Item = &HeldAnnounce> {
+        self.held_announces.iter()
+    }
 
+    /// Drop the held announces for `culled` destinations, then release the
+    /// rest as [`Self::try_release_held`] does, without its gate. Python culls
+    /// only when a release is due (Interface.py).
+    pub fn cull_and_release(&mut self, culled: &[[u8; 16]]) -> Option<HeldAnnounce> {
+        self.held_announces
+            .retain(|held| !culled.contains(&held.destination_hash));
         let mut best: Option<usize> = None;
         for (idx, held) in self.held_announces.iter().enumerate() {
             if best.is_none_or(|b| held.hops < self.held_announces[b].hops) {
@@ -625,6 +674,7 @@ impl IngressController {
             }
         }
         let announce = self.held_announces.remove(best?);
+        let now = Instant::now();
         self.held_release = now
             .checked_add(Duration::from_secs_f64(self.held_release_interval))
             .unwrap_or(now);
@@ -979,7 +1029,7 @@ mod tests {
             hops: 1,
             receiving_interface_id: 1,
         };
-        ctrl.hold_announce(a);
+        assert_eq!(ctrl.hold_announce(a), HoldOutcome::Held);
         assert_eq!(ctrl.held_count(), 1);
 
         let a2 = HeldAnnounce {
@@ -988,7 +1038,7 @@ mod tests {
             hops: 2,
             receiving_interface_id: 1,
         };
-        ctrl.hold_announce(a2);
+        assert_eq!(ctrl.hold_announce(a2), HoldOutcome::Replaced);
         assert_eq!(ctrl.held_count(), 1);
 
         let a3 = HeldAnnounce {
@@ -997,7 +1047,7 @@ mod tests {
             hops: 0,
             receiving_interface_id: 1,
         };
-        ctrl.hold_announce(a3);
+        assert_eq!(ctrl.hold_announce(a3), HoldOutcome::Held);
         assert_eq!(ctrl.held_count(), 2);
     }
 
@@ -1005,12 +1055,13 @@ mod tests {
     fn hold_announce_ignores_max_hop_announces() {
         // Python 1.3.8 Interface.py: hops >= PATHFINDER_M-1 not held.
         let mut ctrl = IngressController::new();
-        ctrl.hold_announce(HeldAnnounce {
+        let outcome = ctrl.hold_announce(HeldAnnounce {
             raw: Bytes::from_static(&[1, 2, 3]),
             destination_hash: [0xA1; 16],
             hops: PATHFINDER_M - 1,
             receiving_interface_id: 1,
         });
+        assert_eq!(outcome, HoldOutcome::Refused);
         assert_eq!(ctrl.held_count(), 0);
 
         ctrl.hold_announce(HeldAnnounce {
@@ -1038,12 +1089,15 @@ mod tests {
         }
         assert_eq!(ctrl.held_count(), MAX_HELD_ANNOUNCES);
 
-        ctrl.hold_announce(HeldAnnounce {
+        let outcome = ctrl.hold_announce(HeldAnnounce {
             raw: Bytes::new(),
             destination_hash: [0xFF; 16],
             hops: 0,
             receiving_interface_id: 1,
         });
+        assert_eq!(outcome, HoldOutcome::Refused);
+        assert!(outcome.is_filtered() && HoldOutcome::Replaced.is_filtered());
+        assert!(!HoldOutcome::Held.is_filtered());
         assert_eq!(ctrl.held_count(), MAX_HELD_ANNOUNCES);
     }
 }

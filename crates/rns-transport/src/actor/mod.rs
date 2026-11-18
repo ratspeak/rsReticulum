@@ -2589,6 +2589,7 @@ fn mode_discovers_unknown_paths(mode: InterfaceMode) -> bool {
 mod tests {
     mod announce_admission;
     mod announce_identity;
+    mod announce_ingress;
     mod bitrate_timing;
     mod discovery_api;
     mod discovery_public_api;

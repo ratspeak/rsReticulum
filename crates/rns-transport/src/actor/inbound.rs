@@ -69,8 +69,8 @@ impl TransportActor {
         }
     }
 
-    /// Upstream drops stamp and blackhole rejections silently; anything else
-    /// is a protocol violation (Transport.py).
+    /// Upstream counts stamp and blackhole rejections as filtered; anything
+    /// else is a protocol violation (Transport.py).
     fn reject_announce(
         &mut self,
         header: &rns_wire::header::PacketHeader,
@@ -89,6 +89,8 @@ impl TransportActor {
         );
         if reason == InvalidAnnounce::Invalid {
             self.protocol_violation(interface_id);
+        } else {
+            self.filtered_announce(interface_id);
         }
     }
 
@@ -382,18 +384,11 @@ impl TransportActor {
             self.count_rx_packet();
         }
 
-        // Destination-type filtering runs after the packet filter and before
-        // the hash is remembered (Transport.py).
+        // Announce gates run after the packet filter and before the hash is
+        // remembered (Transport.py).
         if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
-            && !self.admit_announce_type(&raw[data_offset..], parsed.hops, packet.interface_id)
+            && !self.admit_announce_ingress(&raw, &parsed, data_offset, packet.interface_id)
         {
-            return;
-        }
-        // Transport.py: announce frames above the base MTU.
-        if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
-            && raw.len() > rns_wire::constants::MTU
-        {
-            self.protocol_violation(packet.interface_id);
             return;
         }
 
@@ -430,28 +425,46 @@ impl TransportActor {
         }
     }
 
-    /// Python's announce ingress filter: a short name hash is a protocol
-    /// violation, blocked and unrequired types are dropped silently.
-    fn admit_announce_type(
+    /// Python's announce ingress in `preprocess_inbound`, in its order: the
+    /// frame and payload sizes (protocol violations), a blocked type (silent),
+    /// then an unrequired type (filtered) (Transport.py).
+    fn admit_announce_ingress(
         &mut self,
-        payload: &[u8],
-        wire_hops: u8,
+        raw: &[u8],
+        header: &rns_wire::header::PacketHeader,
+        data_offset: usize,
         interface_id: InterfaceId,
     ) -> bool {
         use crate::destination_filter::{AnnounceSource, NAME_HASH_LEN, NameHash};
-        const KEYSIZE: usize = 64;
-        let Some(name_hash) = payload
-            .get(KEYSIZE..KEYSIZE + NAME_HASH_LEN)
-            .and_then(|bytes| NameHash::try_from(bytes).ok())
-        else {
+        use rns_wire::constants::{KEYSIZE, MTU, TRUNCATED_HASHLENGTH};
+        const KEY_LEN: usize = KEYSIZE / 8;
+        const RANDOM_BLOB_LEN: usize = 10;
+        let payload = &raw[data_offset..];
+        // A HEADER_1 announce must leave room for a relay's transport id.
+        let oversize = raw.len() > MTU
+            || (header.flags.header_type == rns_wire::flags::HeaderType::Header1
+                && raw.len() > MTU - TRUNCATED_HASHLENGTH / 8);
+        if oversize || payload.len() < KEY_LEN + NAME_HASH_LEN + RANDOM_BLOB_LEN {
             debug!(
                 interface_id,
-                size = payload.len(),
-                "malformed announce packet"
+                frame = raw.len(),
+                payload = payload.len(),
+                "announce size violation"
             );
             self.protocol_violation(interface_id);
             return false;
-        };
+        }
+        let name_hash: NameHash = payload[KEY_LEN..KEY_LEN + NAME_HASH_LEN]
+            .try_into()
+            .expect("payload length checked");
+        if self.destination_filter.is_blocked(&name_hash) {
+            trace!(
+                interface_id,
+                destination_type = self.destination_filter.type_name(&name_hash),
+                "announce dropped by destination type filter"
+            );
+            return false;
+        }
         let source = if self.is_local_client_interface(interface_id) {
             AnnounceSource::LocalClient
         } else if self.is_shared_instance_peer_interface(interface_id) {
@@ -459,17 +472,19 @@ impl TransportActor {
         } else {
             AnnounceSource::Other
         };
-        let admitted = self
+        if !self
             .destination_filter
-            .admits(&name_hash, source, wire_hops);
-        if !admitted {
+            .admits(&name_hash, source, header.hops)
+        {
             trace!(
                 interface_id,
                 destination_type = self.destination_filter.type_name(&name_hash),
-                "announce dropped by destination type filter"
+                "announce filtered as not required"
             );
+            self.filtered_announce(interface_id);
+            return false;
         }
-        admitted
+        true
     }
 
     fn process_announce(
@@ -612,27 +627,34 @@ impl TransportActor {
                 .discovery_path_requests
                 .get(&header.destination_hash)
                 .is_some_and(|request| now_f64() < request.timeout);
-        self.record_interface_event(interface_id, InterfaceEvent::ReceivedAnnounce, raw.len());
-        self.count_transport_event(InterfaceEvent::ReceivedAnnounce);
+        // A held announce samples the frequency after the limiter decision,
+        // with no bytes and no transport count (Transport.py).
         if let Some(entry) = self.interfaces.get_mut(&interface_id)
             && !is_from_local_client
             && !announced_destination_known
             && !answers_path_request
             && entry.ingress.should_ingress_limit()
         {
-            entry.ingress.hold_announce(crate::ingress::HeldAnnounce {
+            let outcome = entry.ingress.hold_announce(crate::ingress::HeldAnnounce {
                 raw: bytes::Bytes::copy_from_slice(raw),
                 destination_hash: header.destination_hash,
                 hops: header.hops,
                 receiving_interface_id: interface_id,
             });
+            if outcome.is_filtered() {
+                self.filtered_announce(interface_id);
+            }
+            self.record_interface_event(interface_id, InterfaceEvent::ReceivedAnnounce, 0);
             debug!(
                 dest = hex::encode(header.destination_hash),
                 interface = interface_id,
+                ?outcome,
                 "announce held by ingress controller (burst active)"
             );
             return;
         }
+        self.record_interface_event(interface_id, InterfaceEvent::ReceivedAnnounce, raw.len());
+        self.count_transport_event(InterfaceEvent::ReceivedAnnounce);
 
         if let Some(validated_identity) = validated_identity.as_ref() {
             let known_public_key = self

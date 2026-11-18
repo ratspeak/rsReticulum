@@ -145,6 +145,7 @@ impl TransportActor {
                             announces_sent: entry.ingress.announces_sent(),
                             path_requests_received: entry.ingress.path_requests_received(),
                             path_requests_sent: entry.ingress.path_requests_sent(),
+                            announces_filtered: entry.ingress.announces_filtered(),
                             protocol_violations: entry.protocol_violations,
                             ifac_violations: entry.ifac_violations,
                             packet_filter_hits: entry.packet_filter_hits,
@@ -878,6 +879,20 @@ impl TransportActor {
                 parent.ingress.spawned_received_path_request(size)
             }
             InterfaceEvent::SentPathRequest => parent.ingress.spawned_sent_path_request(size),
+        }
+    }
+
+    /// Python `Interface.filtered_announce`: the interface, its parent and the
+    /// transport total (Interface.py).
+    pub(super) fn filtered_announce(&mut self, id: InterfaceId) {
+        let Some(entry) = self.interfaces.get_mut(&id) else {
+            return;
+        };
+        entry.ingress.filtered_announce();
+        let parent_id = entry.parent_id;
+        self.traffic_count.totals.announce_filtered_packets += 1;
+        if let Some(parent) = parent_id.and_then(|parent| self.interfaces.get_mut(&parent)) {
+            parent.ingress.filtered_announce();
         }
     }
 
