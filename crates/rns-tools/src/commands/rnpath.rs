@@ -73,13 +73,34 @@ struct Args {
     #[arg(short, long)]
     table: bool,
 
-    /// Sort the path table by last use, most recent first
+    /// Show in-use paths only
+    #[arg(short = 'a', long)]
+    active: bool,
+
+    /// Show path usage time
     #[arg(short = 'u', long)]
     usage: bool,
+
+    /// Show via transport IDs
+    #[arg(short = 'V', long)]
+    vias: bool,
+
+    /// Show path expiry times
+    #[arg(short = 'E', long)]
+    expiry: bool,
 
     /// Maximum hops to filter path table by
     #[arg(short = 'm', long, value_name = "hops", allow_negative_numbers = true)]
     max: Option<i64>,
+
+    /// Minimum value to filter path table by
+    #[arg(
+        short = 'M',
+        long = "min-value",
+        value_name = "value",
+        allow_negative_numbers = true
+    )]
+    min_value: Option<f64>,
 
     /// Show announce rate info
     #[arg(short, long)]
@@ -126,11 +147,11 @@ struct Args {
     unblackhole: bool,
 
     /// Duration of blackhole enforcement in hours
-    #[arg(long)]
+    #[arg(long, value_name = "hours")]
     duration: Option<f64>,
 
     /// Reason for blackholing identity
-    #[arg(long)]
+    #[arg(long, value_name = "reason")]
     reason: Option<String>,
 
     /// View published blackhole list for remote transport instance
@@ -140,6 +161,14 @@ struct Args {
     /// Output in JSON format
     #[arg(short, long)]
     json: bool,
+
+    /// Analyze tables
+    #[arg(short = 'A', long)]
+    analyze: bool,
+
+    /// Path to capture file for analyze mode
+    #[arg(long, value_name = "path")]
+    capture: Option<String>,
 
     /// Hexadecimal hash of the destination
     destination: Option<String>,
@@ -180,7 +209,8 @@ pub(crate) async fn main() -> ExitCode {
         || args.rates
         || destination.is_some()
         || args.drop_via
-        || args.blackholed)
+        || args.blackholed
+        || args.analyze)
     {
         let help = <Args as clap::CommandFactory>::command()
             .render_help()
@@ -229,8 +259,11 @@ async fn dispatch_local(args: &Args, ctx: &ClientCtx, destination: Option<&str>)
     if args.unblackhole {
         return do_unblackhole(ctx, destination).await;
     }
+    if args.analyze {
+        return analyze_tables(ctx).await;
+    }
     if args.table {
-        return show_path_table(ctx, destination, args.max, args.json, args.usage).await;
+        return show_path_table(ctx, destination, args).await;
     }
     if args.rates {
         return show_rate_table(ctx, destination, args.json).await;
@@ -620,14 +653,50 @@ fn table_filter(destination: Option<&str>) -> Result<Option<[u8; 16]>, ExitCode>
     }
 }
 
-/// rnpath.py, local shared instance.
-async fn show_path_table(
-    ctx: &ClientCtx,
-    destination: Option<&str>,
-    max_hops: Option<i64>,
+/// rnpath.py `-A`: the tables are fetched, then the stub upstream ships at
+/// 1.6.1 prints its line; `--capture` is accepted and unused.
+async fn analyze_tables(ctx: &ClientCtx) -> ExitCode {
+    for table in [
+        RpcRequest::GetPathTable { max_hops: None },
+        RpcRequest::GetRateTable,
+        RpcRequest::GetLinkDistribution,
+    ] {
+        if let Err(e) = request(ctx, &table).await {
+            tracing::debug!("Shared instance RPC failed while analyzing tables: {e}");
+        }
+    }
+    println!("Not yet implemented");
+    ExitCode::SUCCESS
+}
+
+/// How rnpath.py renders `-t`.
+#[derive(Clone, Copy, Default)]
+struct TableView {
+    filter: Option<[u8; 16]>,
     json: bool,
     usage: bool,
-) -> ExitCode {
+    active: bool,
+    vias: bool,
+    expiry: bool,
+    min_value: Option<f64>,
+}
+
+impl TableView {
+    fn new(args: &Args, filter: Option<[u8; 16]>) -> Self {
+        Self {
+            filter,
+            json: args.json,
+            usage: args.usage,
+            active: args.active,
+            vias: args.vias,
+            expiry: args.expiry,
+            min_value: args.min_value,
+        }
+    }
+}
+
+/// rnpath.py, local shared instance.
+async fn show_path_table(ctx: &ClientCtx, destination: Option<&str>, args: &Args) -> ExitCode {
     let filter = match table_filter(destination) {
         Ok(filter) => filter,
         Err(code) => return code,
@@ -637,89 +706,149 @@ async fn show_path_table(
         Ok(other) => return unexpected(other),
         Err(e) => return rpc_failed(e),
     };
-    if let Some(max) = max_hops {
+    if let Some(max) = args.max {
         table.retain(|e| i64::from(e.hops) <= max);
     }
     table.sort_by(|a, b| (&a.interface, a.hops).cmp(&(&b.interface, b.hops)));
-    print_path_table(table, filter, json, usage, now_epoch())
+    print_path_table(table, TableView::new(args, filter), now_epoch())
 }
 
-fn print_path_table(
-    mut table: Vec<rpc::PathTableEntry>,
-    filter: Option<[u8; 16]>,
-    json: bool,
-    usage: bool,
-    now: f64,
-) -> ExitCode {
+fn print_path_table(mut table: Vec<rpc::PathTableEntry>, view: TableView, now: f64) -> ExitCode {
     // rnpath.py dumps the whole table, filter or not.
-    if json {
+    if view.json {
         println!("{}", path_table_json(&table));
         return ExitCode::SUCCESS;
     }
-    if usage {
+    if view.usage {
         sort_by_usage(&mut table);
     }
     let mut displayed = 0;
     for entry in &table {
-        if filter.is_none_or(|f| entry.hash == f) {
+        if view.filter.is_none_or(|f| entry.hash == f) {
             displayed += 1;
-            println!("{}", path_table_line(entry, now));
+            if let Some(line) = path_table_line(entry, view, now) {
+                println!("{line}");
+            }
         }
     }
-    if filter.is_some() && displayed == 0 {
+    if view.filter.is_some() && displayed == 0 {
         println!("No path known");
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
 
-/// rnpath.py.
-fn path_table_line(entry: &rpc::PathTableEntry, now: f64) -> String {
-    format!(
-        "{} {:>3}h via {} on {} expires in {} {}",
+/// rnpath.py; `None` for a row `-M` or `-a` filters out.
+fn path_table_line(entry: &rpc::PathTableEntry, view: TableView, now: f64) -> Option<String> {
+    if let Some(min_value) = view.min_value.filter(|v| *v != 0.0) {
+        let value = entry.value.unwrap_or(0.0);
+        if value == 0.0 || value < min_value {
+            return None;
+        }
+    }
+    let state = match entry.state {
+        Some(2) => " (R)",
+        Some(1) => " (u)",
+        _ => " (?)",
+    };
+    let usage = match entry.used {
+        None => ", no usage info".to_string(),
+        Some(used) => {
+            if view.active && used == 0.0 {
+                return None;
+            }
+            match (view.usage, used != 0.0) {
+                (true, true) => format!(
+                    ", last used {} ago",
+                    prettytime(PyNum::Float(now - used), false)
+                ),
+                (true, false) => ", never used".to_string(),
+                (false, _) => String::new(),
+            }
+        }
+    };
+    let via = if view.vias {
+        format!(
+            " via {}",
+            pretty_hex_rep(entry.via.as_deref().unwrap_or_default())
+        )
+    } else {
+        String::new()
+    };
+    let expiry = if view.expiry {
+        format!(
+            " expires in {}",
+            prettytime(PyNum::Float(entry.expires - now), true)
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{} {:>3}h{state}{via} on {}{expiry} {}{usage}",
         pretty_hex_rep(&entry.hash),
         entry.hops,
-        pretty_hex_rep(entry.via.as_deref().unwrap_or_default()),
         entry.interface,
-        prettytime(PyNum::Float(entry.expires - now), true),
         cost_suffix(entry.value, entry.lr_cost)
-    )
+    ))
 }
 
-/// rnpath.py: most recently used first.
+/// rnpath.py: most recently used first; a table missing `used` stays as it
+/// is, as upstream's sort raises and is skipped.
 fn sort_by_usage(entries: &mut [rpc::PathTableEntry]) {
-    entries.sort_by(|a, b| b.used.total_cmp(&a.used));
+    if entries.iter().all(|e| e.used.is_some()) {
+        entries.sort_by(|a, b| b.used.unwrap_or(0.0).total_cmp(&a.used.unwrap_or(0.0)));
+    }
 }
 
-/// The `(dv:<value>/lc:<lr_cost>)` tail of an rnpath 1.6.0 table line (rnpath.py).
+/// The `(dv:<value>/lc:<lr_cost>)` part of an rnpath table line (rnpath.py).
 fn cost_suffix(value: Option<f64>, lr_cost: Option<f64>) -> String {
     format!("(dv:{}/lc:{})", pretty_cost(value), pretty_cost(lr_cost))
 }
 
-/// `json.dumps` of the path table rows with bytes as hex (rnpath.py).
-/// Upstream sends `value` and `used` as int 0 when unset, and floats otherwise.
+/// `json.dumps` of the path table rows with bytes as hex (rnpath.py), keys a
+/// peer leaves out omitted. Upstream sends `value` and `used` as int 0 when
+/// unset, and floats otherwise.
 fn path_table_json(entries: &[rpc::PathTableEntry]) -> String {
-    let rows: Vec<String> = entries
-        .iter()
-        .map(|e| {
-            let via = e
-                .via
-                .as_ref()
-                .map(|v| py_json_str(&hex::encode(v)))
-                .unwrap_or_else(|| "null".to_string());
-            format!(
-                "{{\"hash\": {}, \"timestamp\": {}, \"via\": {via}, \"hops\": {}, \"expires\": {}, \"value\": {}, \"used\": {}, \"lr_cost\": {}, \"interface\": {}}}",
-                py_json_str(&hex::encode(&e.hash)),
-                py_float_repr(e.timestamp),
-                e.hops,
-                py_float_repr(e.expires),
-                e.value.map(py_int_or_float).unwrap_or_else(|| "null".to_string()),
-                py_int_or_float(e.used),
-                e.lr_cost.map(py_float_repr).unwrap_or_else(|| "null".to_string()),
-                py_json_str(&e.interface)
-            )
-        })
-        .collect();
+    let rows: Vec<String> =
+        entries
+            .iter()
+            .map(|e| {
+                let via = e
+                    .via
+                    .as_ref()
+                    .map(|v| py_json_str(&hex::encode(v)))
+                    .unwrap_or_else(|| "null".to_string());
+                let mut fields = vec![
+                    format!("\"hash\": {}", py_json_str(&hex::encode(&e.hash))),
+                    format!("\"timestamp\": {}", py_float_repr(e.timestamp)),
+                    format!("\"via\": {via}"),
+                    format!("\"hops\": {}", e.hops),
+                    format!("\"expires\": {}", py_float_repr(e.expires)),
+                    format!(
+                        "\"value\": {}",
+                        e.value
+                            .map(py_int_or_float)
+                            .unwrap_or_else(|| "null".to_string())
+                    ),
+                ];
+                fields.extend(
+                    e.used
+                        .map(|used| format!("\"used\": {}", py_int_or_float(used))),
+                );
+                fields.push(format!(
+                    "\"lr_cost\": {}",
+                    e.lr_cost
+                        .map(py_float_repr)
+                        .unwrap_or_else(|| "null".to_string())
+                ));
+                fields.push(format!("\"interface\": {}", py_json_str(&e.interface)));
+                fields.extend(e.interface_hash.as_ref().map(|hash| {
+                    format!("\"interface_hash\": {}", py_json_str(&hex::encode(hash)))
+                }));
+                fields.extend(e.state.map(|state| format!("\"state\": {state}")));
+                format!("{{{}}}", fields.join(", "))
+            })
+            .collect();
     format!("[{}]", rows.join(", "))
 }
 
@@ -1296,6 +1425,11 @@ async fn run_remote(args: &Args, remote: &str) -> ExitCode {
         println!("{OUTPUT_RST}{message}");
         return stop_runtime(handle, ExitCode::from(255)).await;
     }
+    // rnpath.py analyzes the local tables even with -R.
+    if args.analyze {
+        println!("{OUTPUT_RST}Not yet implemented");
+        return stop_runtime(handle, ExitCode::SUCCESS).await;
+    }
     let destination = args.destination.as_deref().filter(|d| !d.is_empty());
     let filter = match table_filter(destination) {
         Ok(filter) => filter,
@@ -1311,7 +1445,7 @@ fn remote_unimplemented(args: &Args) -> Option<&'static str> {
         Some("Listing blackholed identities on remote instances not yet implemented")
     } else if args.blackhole || args.unblackhole {
         Some("Blackholing identity on remote instances not yet implemented")
-    } else if args.table || args.rates {
+    } else if args.analyze || args.table || args.rates {
         None
     } else if args.drop_announces {
         Some("Dropping announce queues on remote instances not yet implemented")
@@ -1360,7 +1494,7 @@ async fn remote_management(
         {
             Ok(RpcResponse::PathTable(table)) if !table.is_empty() => {
                 print!("{OUTPUT_RST}");
-                print_path_table(table, filter, args.json, args.usage, now)
+                print_path_table(table, TableView::new(args, filter), now)
             }
             _ => remote_request_failed(),
         }
@@ -1522,7 +1656,7 @@ mod tests {
             hops: 1,
             expires: 0.0,
             value: None,
-            used,
+            used: Some(used),
             lr_cost: None,
             interface: String::new(),
             interface_hash: None,

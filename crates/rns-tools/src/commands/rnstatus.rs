@@ -87,6 +87,10 @@ struct Args {
     #[arg(short = 'P', long = "pr-stats")]
     pr_stats: bool,
 
+    /// Show filtered traffic stats.
+    #[arg(short = 'F', long = "filter-stats")]
+    filter_stats: bool,
+
     /// Show link stats.
     #[arg(short, long)]
     link_stats: bool,
@@ -103,6 +107,10 @@ struct Args {
     #[arg(short, long)]
     totals: bool,
 
+    /// Display tunnel information.
+    #[arg(short = 'T', long)]
+    tunnels: bool,
+
     /// Display packets per second in totals.
     #[arg(short = 'p', long)]
     pps: bool,
@@ -115,8 +123,8 @@ struct Args {
     #[arg(short = 'z', long)]
     profiling: bool,
 
-    /// Sort interfaces by [rate, traffic, rx, tx, rxs, txs, anns, arx, atx, arxc, atxc, held,
-    /// prx, ptx, prxc, ptxc, pvs, ivs, flt, txdrp, txdrb, txbuf].
+    /// Sort interfaces by [rate, traffic, rx, tx, rxs, txs, frx, ftx, anns, arx, atx, arxc,
+    /// atxc, afrxc, held, prx, ptx, prxc, ptxc, pvs, ivs, flt, txdrp, txdrb, txbuf].
     #[arg(short, long)]
     sort: Option<String>,
 
@@ -925,8 +933,12 @@ fn sort_key(name: &str) -> Option<fn(&Value) -> f64> {
         "rate" | "bitrate" => |i| k(i, "bitrate"),
         "rx" => |i| k(i, "rxb"),
         "tx" => |i| k(i, "txb"),
+        "frx" => |i| k(i, "frxb"),
+        "ftx" => |i| k(i, "ftxb"),
         "rxs" => |i| k(i, "rxs"),
         "txs" => |i| k(i, "txs"),
+        "frxs" => |i| k(i, "frxs"),
+        "ftxs" => |i| k(i, "ftxs"),
         "traffic" => |i| k(i, "rxb") + k(i, "txb"),
         "anns" | "announces" => {
             |i| k(i, "incoming_announce_frequency") + k(i, "outgoing_announce_frequency")
@@ -935,6 +947,7 @@ fn sort_key(name: &str) -> Option<fn(&Value) -> f64> {
         "atx" => |i| k(i, "outgoing_announce_frequency"),
         "arxc" => |i| k(i, "arxc"),
         "atxc" => |i| k(i, "atxc"),
+        "afrxc" => |i| k(i, "afrxc"),
         "prx" => |i| k(i, "incoming_pr_frequency"),
         "ptx" => |i| k(i, "outgoing_pr_frequency"),
         "prxc" => |i| k(i, "prxc"),
@@ -979,8 +992,6 @@ fn render_status(
         outln!(out, "{}", py_json(stats));
         return;
     }
-    let astats = args.announce_stats;
-    let pstats = args.pr_stats;
 
     let mut interfaces: Vec<Value> = match get(stats, "interfaces") {
         Some(Value::Array(list)) => list.clone(),
@@ -1044,7 +1055,7 @@ fn render_status(
     }
 
     if args.totals {
-        render_totals(out, stats, astats, pstats, args.pps);
+        render_totals(out, stats, args);
     }
     if args.queues {
         render_queues(out, stats);
@@ -1163,6 +1174,9 @@ fn render_interface(out: &mut Out, ifstat: &Value, name: &str, args: &Args) {
             speed_str(num(Some(bitrate)).f()),
             py_str_opt(get(ifstat, "mtu"))
         );
+    }
+    if args.tunnels {
+        render_tunnel_lines(out, ifstat, clients);
     }
 
     render_radio_lines(out, ifstat);
@@ -1405,9 +1419,13 @@ fn render_interface(out: &mut Out, ifstat: &Value, name: &str, args: &Args) {
     }
     if asr {
         if truthy(get(ifstat, "arxc")) && truthy(get(ifstat, "atxc")) {
+            let filtered = match get(ifstat, "afrxc").filter(|v| truthy(Some(v))) {
+                Some(count) => format!(", {} filtered", py_str(count)),
+                None => String::new(),
+            };
             outln!(
                 out,
-                "    Announces : {}↓ {}↑ total",
+                "    Announces : {}↓ {}↑ total{filtered}",
                 py_str_opt(get(ifstat, "arxc")),
                 py_str_opt(get(ifstat, "atxc"))
             );
@@ -1436,6 +1454,73 @@ fn render_interface(out: &mut Out, ifstat: &Value, name: &str, args: &Args) {
         ));
     }
     outln!(out, "    Traffic   : {txstat}\n                {rxstat}");
+
+    if args.filter_stats {
+        let mut frxstat = format!("↓{}", prettysize(num(get(ifstat, "frxb")).f(), "B"));
+        let mut ftxstat = format!("↑{}", prettysize(num(get(ifstat, "ftxb")).f(), "B"));
+        if has(ifstat, "frxs") && has(ifstat, "ftxs") {
+            frxstat.push_str(&format!("  {}", prettyspeed(num(get(ifstat, "frxs")).f())));
+            ftxstat.push_str(&format!("  {}", prettyspeed(num(get(ifstat, "ftxs")).f())));
+        }
+        outln!(out, "    Filtered  : {ftxstat}\n                {frxstat}");
+    }
+}
+
+/// `-T` (rnstatus.py): the tunnel id, and for a tunnel the peer's transport.
+fn render_tunnel_lines(out: &mut Out, ifstat: &Value, clients: Option<Num>) {
+    let tunnel_id = get(ifstat, "tunnel_id").filter(|v| truthy(Some(v)));
+    if clients.is_none_or(|c| c.f() == 0.0) {
+        let shown = tunnel_id
+            .and_then(Value::as_slice)
+            .map_or_else(|| "None".to_string(), hex::encode);
+        outln!(out, "    Tunnel ID : {shown}");
+    }
+    if tunnel_id.is_none() {
+        return;
+    }
+    let remote_id = match get(ifstat, "remote_transport_id").filter(|v| truthy(Some(v))) {
+        Some(id) => pretty_hex_value(id),
+        None => "Unknown".to_string(),
+    };
+    outln!(out, "    Rem.Tr.ID : {remote_id}");
+    let transport = if truthy(get(ifstat, "rem_is_tn")) {
+        ", transport enabled"
+    } else {
+        ", no transport"
+    };
+    let implementation = match get(ifstat, "rem_impl").filter(|v| truthy(Some(v))) {
+        Some(name) => py_str(name),
+        None => "Unknown implementation".to_string(),
+    };
+    let version = match get(ifstat, "rem_vers").filter(|v| truthy(Some(v))) {
+        Some(Value::Array(parts)) => {
+            let parts: Vec<String> = parts.iter().map(py_str).collect();
+            format!(" {}{transport}", parts.join("."))
+        }
+        Some(other) => format!(" {}{transport}", py_str(other)),
+        None => ", unknown version".to_string(),
+    };
+    outln!(out, "    Rem.Vers. : {implementation}{version}");
+    let cost = |key: &str, label: &str| match not_none(ifstat, key) {
+        Some(value) => format!("{label} {}", pretty_cost_value(value)),
+        None => format!("{label} ?"),
+    };
+    outln!(
+        out,
+        "    Rem.Csts. : {}, {}",
+        cost("rem_dst_cost", "Dst"),
+        cost("rem_pr_cost", "PR")
+    );
+}
+
+/// `RNS.prettycost`: "n" for anything but an int or a float.
+fn pretty_cost_value(value: &Value) -> String {
+    match value {
+        Value::Integer(_) | Value::F32(_) | Value::F64(_) => {
+            pretty_cost(Some(num(Some(value)).f()))
+        }
+        _ => "n".to_string(),
+    }
 }
 
 /// The optional radio, Weave and I2P lines (rnstatus.py), with
@@ -1551,30 +1636,33 @@ fn render_radio_lines(out: &mut Out, ifstat: &Value) {
 }
 
 /// The traffic totals blocks (rnstatus.py).
-fn render_totals(out: &mut Out, stats: &Value, astats: bool, pstats: bool, pps: bool) {
+fn render_totals(out: &mut Out, stats: &Value, args: &Args) {
+    let (astats, pstats) = (args.announce_stats, args.pr_stats);
     let n = |k: &str| num(get(stats, k)).f();
     let (mut rxb_str, mut txb_str) = pair(n("rxb"), n("txb"));
     let rxs = n("rxs");
     let txs = n("txs");
     let mut rxstat = format!("{rxb_str}  {}", prettyspeed(rxs));
     let mut txstat = format!("{txb_str}  {}", prettyspeed(txs));
+    // Data flow: the share of traffic that is neither announces nor path requests.
+    let data_pct = |rx: bool| {
+        let (whole, parts) = if rx {
+            ("rxs", n("prxs") + n("arxs"))
+        } else {
+            ("txs", n("ptxs") + n("atxs"))
+        };
+        if truthy(get(stats, whole)) {
+            100.0 - (100.0f64).min(parts / n(whole) * 100.0)
+        } else {
+            100.0
+        }
+    };
     if (pstats || astats)
         && ["prxs", "ptxs", "arxs", "atxs"]
             .iter()
             .all(|k| has(stats, k))
     {
-        let parxs = n("prxs") + n("arxs");
-        let patxs = n("ptxs") + n("atxs");
-        let drxpct = if truthy(get(stats, "rxs")) {
-            100.0 - (100.0f64).min(parxs / rxs * 100.0)
-        } else {
-            100.0
-        };
-        let dtxpct = if truthy(get(stats, "txs")) {
-            100.0 - (100.0f64).min(patxs / txs * 100.0)
-        } else {
-            100.0
-        };
+        let (drxpct, dtxpct) = (data_pct(true), data_pct(false));
         if rxs > 0.0 {
             rxstat = format!(
                 "{rxstat}, {}% data ({})",
@@ -1590,11 +1678,48 @@ fn render_totals(out: &mut Out, stats: &Value, astats: bool, pstats: bool, pps: 
             );
         }
     }
-    if pps {
+    if args.pps {
         rxstat = format!("{rxstat}, {}", prettysize(n("rxpps"), "pps"));
         txstat = format!("{txstat}, {}", prettysize(n("txpps"), "pps"));
     }
     outln!(out, "\n Totals       : {txstat}\n                {rxstat}");
+
+    if args.filter_stats {
+        let (mut frxstat, mut ftxstat) = pair(n("frxb"), n("ftxb"));
+        if has(stats, "frxs") && has(stats, "ftxs") {
+            frxstat.push_str(&format!("  {}", prettyspeed(n("frxs"))));
+            ftxstat.push_str(&format!("  {}", prettyspeed(n("ftxs"))));
+        }
+        outln!(
+            out,
+            "\n Filtered     : {ftxstat}\n                {frxstat}"
+        );
+    }
+
+    if args.link_stats
+        && ["lrxb", "ltxb", "lrxs", "ltxs"]
+            .iter()
+            .all(|k| has(stats, k))
+    {
+        let (lrxb_str, ltxb_str) = pair(n("lrxb"), n("ltxb"));
+        let link_pct = |link: &str, data: f64| {
+            if data != 0.0 && truthy(get(stats, link)) {
+                (100.0f64).min(n(link) / data * 100.0) as i64
+            } else {
+                0
+            }
+        };
+        let drxs = rxs * (data_pct(true) / 100.0);
+        let dtxs = txs * (data_pct(false) / 100.0);
+        outln!(
+            out,
+            "\n Links        : {ltxb_str}  {}, {}% of data flow\n                {lrxb_str}  {}, {}% of data flow",
+            prettyspeed(n("ltxs")),
+            link_pct("ltxs", dtxs),
+            prettyspeed(n("lrxs")),
+            link_pct("lrxs", drxs)
+        );
+    }
 
     let flow_pct = |part: &str, whole: &str| -> i64 {
         if truthy(get(stats, whole)) && truthy(get(stats, part)) {
@@ -2243,3 +2368,4 @@ fn truncate_ellipsis(s: &str, limit: usize) -> String {
         s.to_string()
     }
 }
+

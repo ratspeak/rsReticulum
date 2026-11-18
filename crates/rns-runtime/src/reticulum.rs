@@ -126,6 +126,8 @@ struct TransportCompletion {
 }
 
 const RUNTIME_INTERFACE_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+/// Python `Reticulum.RPC_EXIT_TIMEOUT`: the exit deregistration's whole budget.
+const RPC_EXIT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Python `Transport.application_identity.hash`: one random requester per
 /// process for destination type requests (Transport.py).
@@ -293,8 +295,12 @@ impl RuntimeShutdownCoordinator {
                 requester: application_requester().to_vec(),
                 signature: None,
             };
-            if let Err(error) = target.request(&request).await {
-                tracing::debug!(%error, "shared instance RPC failed while deregistering destination types");
+            match tokio::time::timeout(RPC_EXIT_TIMEOUT, target.request(&request)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::debug!("Could not deregister destination types at exit: {error}")
+                }
+                Err(_) => tracing::debug!("Shared instance RPC timed out during exit"),
             }
         }
         let drain = match self.inner.interface_registry.begin_drain() {
@@ -2406,22 +2412,69 @@ impl ReticulumHandle {
         Some((entry, spawned))
     }
 
+    /// Python 1.6.1 `_detach_interface`: by name, or else by the tunnel id the
+    /// text spells in hex (Reticulum.py:976-1015).
     async fn detach_running_interface(&self, name: &str) -> Option<bool> {
-        let Some((entry, spawned)) = self.running_interface(name).await else {
-            tracing::warn!("Attempt to detach non-existing interface \"{name}\"");
-            return None;
+        let (entry, spawned) = match self.running_interface(name).await {
+            Some(found) => found,
+            None => {
+                let tunnel_id = python_fromhex(name)?;
+                let Some(found) = self.tunnel_interface(&tunnel_id).await else {
+                    tracing::warn!("Attempt to detach non-existing interface \"{name}\"");
+                    return None;
+                };
+                found
+            }
         };
         if !self.detach_entry(&entry, spawned).await {
             return Some(false);
         }
         // Upstream's detach is synchronous: a reload attaches straight after it.
         let gone_by = tokio::time::Instant::now() + Duration::from_secs(5);
-        while self.running_interface(name).await.is_some() && tokio::time::Instant::now() < gone_by
-        {
+        while self.interface_registered(entry.id).await && tokio::time::Instant::now() < gone_by {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        rns_transport::notice!("Interface \"{name}\" was detached");
+        let shown = entry
+            .identity
+            .as_ref()
+            .map_or(entry.name.as_str(), |identity| identity.name.as_str());
+        rns_transport::notice!("Interface {shown} was detached");
         Some(true)
+    }
+
+    /// The last interface whose `tunnel_id or local_tunnel_id` is `tunnel_id`,
+    /// with every interface it spawned.
+    async fn tunnel_interface(
+        &self,
+        tunnel_id: &[u8],
+    ) -> Option<(
+        rns_transport::messages::InterfaceStatRpcEntry,
+        Vec<rns_transport::messages::InterfaceId>,
+    )> {
+        let Ok(TransportQueryResponse::InterfaceStats(entries)) = self
+            .query_transport_result(TransportQuery::GetInterfaceStats)
+            .await
+        else {
+            return None;
+        };
+        let entry = entries
+            .iter()
+            .rfind(|entry| entry.tunnel_id.is_some_and(|id| id[..] == *tunnel_id))?
+            .clone();
+        let spawned = entries
+            .iter()
+            .filter(|child| child.parent_id == Some(entry.id))
+            .map(|child| child.id)
+            .collect();
+        Some((entry, spawned))
+    }
+
+    async fn interface_registered(&self, id: rns_transport::messages::InterfaceId) -> bool {
+        matches!(
+            self.query_transport_result(TransportQuery::GetInterfaceStats).await,
+            Ok(TransportQueryResponse::InterfaceStats(entries))
+                if entries.iter().any(|entry| entry.id == id)
+        )
     }
 
     /// Python `_detach_interface(..., internal_forced=True)`, which transport
@@ -2799,6 +2852,8 @@ fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::
         TransportQuery::UnretainDestination { dest } => RpcRequest::UnretainDestination {
             destination_hash: dest.to_vec(),
         },
+        TransportQuery::GetLinkDistribution => RpcRequest::GetLinkDistribution,
+        TransportQuery::GetKnownDestinations => RpcRequest::GetKnownDestinations,
         _ => return None,
     })
 }
@@ -2822,7 +2877,7 @@ fn rpc_response_to_transport_response(
                         out.hops = entry.hops;
                         out.expires = entry.expires;
                         out.value = entry.value;
-                        out.used = entry.used;
+                        out.used = entry.used.unwrap_or(0.0);
                         out.lr_cost = entry.lr_cost;
                         // Before 1.6.1 the hash is upstream's, of `str(interface)`.
                         out.interface_hash = entry
@@ -2900,9 +2955,51 @@ fn rpc_response_to_transport_response(
                 .collect();
             TransportQueryResponse::BlackholeList(entries)
         }
+        RpcResponse::LinkDistribution(entries) => TransportQueryResponse::LinkDistribution(
+            entries
+                .into_iter()
+                .filter_map(|entry| {
+                    let mut out = rns_transport::messages::LinkDistributionRpcEntry::default();
+                    out.destination_hash = entry.destination_hash.as_slice().try_into().ok()?;
+                    out.active = entry.active;
+                    out.pending = entry.pending;
+                    out.traffic = entry.traffic;
+                    out.from_interfaces = entry
+                        .from_interfaces
+                        .iter()
+                        .filter_map(|hash| hash.as_slice().try_into().ok())
+                        .collect();
+                    Some(out)
+                })
+                .collect(),
+        ),
+        RpcResponse::KnownDestinations(entries) => TransportQueryResponse::KnownDestinations(
+            entries
+                .iter()
+                .filter_map(crate::rpc::KnownDestinationEntry::to_row)
+                .collect(),
+        ),
         RpcResponse::Ok => TransportQueryResponse::Ok,
         RpcResponse::Error(e) => TransportQueryResponse::Error(e),
     })
+}
+
+/// Python `bytes.fromhex`: pairs of hex digits, ASCII whitespace allowed
+/// between pairs.
+fn python_fromhex(text: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chars = text.chars();
+    loop {
+        let high = loop {
+            match chars.next() {
+                None => return Some(bytes),
+                Some(' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c') => {}
+                Some(c) => break c,
+            }
+        };
+        let low = chars.next()?;
+        bytes.push((high.to_digit(16)? * 16 + low.to_digit(16)?) as u8);
+    }
 }
 
 fn vec_to_16(bytes: &[u8]) -> Option<[u8; 16]> {
@@ -3068,6 +3165,8 @@ fn shared_tcp_port_is_free(port: u16) -> bool {
 struct TransportStorageStart<'a> {
     transport_tx: &'a mpsc::Sender<TransportMessage>,
     storage_dir: &'a Path,
+    /// Where a client without the owner's database loads known destinations.
+    rpc: Option<SharedRpcTarget>,
     started: bool,
 }
 
@@ -3085,6 +3184,63 @@ impl TransportStorageStart<'_> {
         if self.transport_tx.send(message).await.is_ok() {
             let _ = loaded.await;
         }
+        if role == StorageRole::SharedInstanceClient {
+            self.load_known_destinations_over_rpc().await;
+        }
+    }
+
+    async fn query(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
+        let (response_tx, response) = tokio::sync::oneshot::channel();
+        self.transport_tx
+            .send(TransportMessage::Rpc { query, response_tx })
+            .await
+            .ok()?;
+        response.await.ok()
+    }
+
+    /// Python 1.6.1 `Identity.load_known_destinations`: a client that could
+    /// not read the owner's database, as in split mode, asks the shared
+    /// instance; a failed RPC leaves the table empty.
+    async fn load_known_destinations_over_rpc(&self) {
+        if matches!(
+            self.query(TransportQuery::KnownDestinationsLoaded).await,
+            Some(TransportQueryResponse::BoolResult(true))
+        ) {
+            return;
+        }
+        let Some(target) = &self.rpc else {
+            return;
+        };
+        tracing::debug!(
+            "Potentially running in split mode, attempting to load known destinations over RPC..."
+        );
+        let entries = match target
+            .request(&crate::rpc::RpcRequest::GetKnownDestinations)
+            .await
+        {
+            Ok(crate::rpc::RpcResponse::KnownDestinations(entries)) => entries,
+            Ok(other) => {
+                tracing::error!(
+                    ?other,
+                    "Shared instance RPC failed while getting known destinations"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Shared instance RPC failed while getting known destinations: {error}"
+                );
+                return;
+            }
+        };
+        let rows: Vec<_> = entries
+            .iter()
+            .filter_map(crate::rpc::KnownDestinationEntry::to_row)
+            .collect();
+        let count = rows.len();
+        self.query(TransportQuery::LoadKnownDestinations { rows })
+            .await;
+        tracing::debug!("Loaded {count} known destinations from shared instance");
     }
 }
 
@@ -4050,6 +4206,10 @@ pub async fn init_with_policy(
     let mut storage = TransportStorageStart {
         transport_tx: &transport_tx,
         storage_dir: &paths.storage_dir,
+        rpc: rc.rpc_key.clone().map(|rpc_key| SharedRpcTarget {
+            endpoint: rc.shared_rpc_endpoint(&socket_base),
+            rpc_key,
+        }),
         started: false,
     };
     let configured_policy = matches!(policy, InstancePolicy::Configured);
@@ -11613,6 +11773,133 @@ mod tests {
             transport_rx.try_recv().is_err(),
             "already-stopped actor must not receive a redundant Shutdown"
         );
+    }
+
+    /// Python 1.6.1 `Identity.load_known_destinations`: a client without the
+    /// owner's database loads the table over RPC; one that read it does not ask.
+    #[tokio::test]
+    async fn a_client_without_the_owners_database_loads_known_destinations_over_rpc() {
+        let row = {
+            let mut row = rns_transport::store::KnownDestinationRow::new([0x5a; 16], 7.5, [9; 64]);
+            row.app_data = Some(b"shared".to_vec());
+            row.stamp_value = 4.0;
+            row
+        };
+        let (owner_tx, mut owner_rx) = mpsc::channel::<TransportMessage>(4);
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = {
+            let (row, asked) = (row.clone(), asked.clone());
+            tokio::spawn(async move {
+                while let Some(TransportMessage::Rpc { query, response_tx }) = owner_rx.recv().await
+                {
+                    if matches!(query, TransportQuery::GetKnownDestinations) {
+                        asked.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = response_tx
+                        .send(TransportQueryResponse::KnownDestinations(vec![row.clone()]));
+                }
+            })
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = ShutdownSignal::new();
+        tokio::spawn(crate::rpc_server::run_rpc_server_with_listener(
+            listener,
+            vec![0x42; 32],
+            crate::rpc_server::RpcBackend::new(owner_tx),
+            shutdown.clone(),
+        ));
+
+        async fn client_storage(
+            dir: &Path,
+            port: u16,
+        ) -> Vec<rns_transport::store::KnownDestinationRow> {
+            let (actor, transport_tx) = rns_transport::actor::TransportActor::new();
+            tokio::spawn(actor.run());
+            let mut storage = TransportStorageStart {
+                transport_tx: &transport_tx,
+                storage_dir: dir,
+                rpc: Some(SharedRpcTarget {
+                    endpoint: SharedInstanceRpcEndpoint::Tcp(port),
+                    rpc_key: vec![0x42; 32],
+                }),
+                started: false,
+            };
+            storage.start(StorageRole::SharedInstanceClient).await;
+            let (response_tx, response) = oneshot::channel();
+            transport_tx
+                .send(TransportMessage::Rpc {
+                    query: TransportQuery::GetKnownDestinations,
+                    response_tx,
+                })
+                .await
+                .unwrap();
+            let _ = transport_tx.send(TransportMessage::Shutdown).await;
+            match response.await.unwrap() {
+                TransportQueryResponse::KnownDestinations(rows) => rows,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        let split = std::env::temp_dir().join(format!(
+            "rns-split-client-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&split).unwrap();
+        assert_eq!(client_storage(&split, port).await, vec![row]);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        // The owner's directory holds the database, so the client reads it.
+        let owned = split.join("owned");
+        std::fs::create_dir_all(&owned).unwrap();
+        let mut owner = rns_transport::actor::TransportActor::new().0;
+        owner.initialize_storage(owned.clone());
+        drop(owner);
+        assert!(owned.join("known_destinations.db").is_file());
+        assert!(client_storage(&owned, port).await.is_empty());
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "no RPC with a database");
+
+        shutdown.trigger();
+        served.abort();
+        let _ = std::fs::remove_dir_all(split);
+    }
+
+    /// A shared instance that accepts the exit deregistration and never
+    /// answers cannot hold shutdown past `RPC_EXIT_TIMEOUT` (Reticulum.py).
+    #[tokio::test]
+    async fn exit_deregistration_is_bounded_by_the_rpc_exit_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, mut accepted) = oneshot::channel();
+        let silent = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let (transport_tx, transport_rx) = mpsc::channel::<TransportMessage>(1);
+        drop(transport_rx);
+        let completion = Arc::new(TransportCompletion::default());
+        completion.mark_stopped();
+        let coordinator = RuntimeShutdownCoordinator::new(
+            ShutdownSignal::new(),
+            transport_tx,
+            completion,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+            InterfaceRegistry::default(),
+        );
+        coordinator.install_exit_unwants(SharedRpcTarget {
+            endpoint: SharedInstanceRpcEndpoint::Tcp(port),
+            rpc_key: vec![0x42; 32],
+        });
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(1), coordinator.start_and_wait())
+            .await
+            .expect("a silent shared instance must not hold shutdown");
+        assert!(started.elapsed() >= RPC_EXIT_TIMEOUT);
+        assert!(accepted.try_recv().is_ok(), "the deregistration connected");
+        silent.abort();
     }
 
     #[tokio::test]

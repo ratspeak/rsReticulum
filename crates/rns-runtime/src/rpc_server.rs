@@ -372,7 +372,6 @@ async fn respond(request: RpcRequest, backend: &RpcBackend) -> Result<Vec<u8>, R
                 Err(response) => rpc::encode_response(&response),
             };
         }
-        RpcRequest::GetLinkDistribution => return rpc::encode_empty_dict(),
         RpcRequest::GetProfilingResults => return rpc::encode_none(),
         RpcRequest::ManageInterface { operation, name } => {
             let Some(handle) = backend.interface_manager.as_ref().and_then(|m| m.get()) else {
@@ -613,7 +612,7 @@ async fn process_rpc_request(
                             hops: e.hops,
                             expires: e.expires,
                             value: e.value,
-                            used: e.used,
+                            used: Some(e.used),
                             lr_cost: e.lr_cost,
                             interface: e.interface,
                             interface_hash: Some(e.interface_hash.to_vec()),
@@ -667,9 +666,27 @@ async fn process_rpc_request(
                 _ => unexpected_transport_response("active link count query"),
             }
         }
+        // Upstream answers `{}` when the table cannot be read (Transport.py).
+        RpcRequest::GetLinkDistribution => {
+            match query_transport(transport_tx, TransportQuery::GetLinkDistribution).await {
+                Ok(TransportQueryResponse::LinkDistribution(entries)) => {
+                    RpcResponse::LinkDistribution(entries.iter().map(Into::into).collect())
+                }
+                _ => RpcResponse::LinkDistribution(Vec::new()),
+            }
+        }
+        // An error dictionary would become a Python client's table, so a
+        // failure answers `{}` too.
+        RpcRequest::GetKnownDestinations => {
+            match query_transport(transport_tx, TransportQuery::GetKnownDestinations).await {
+                Ok(TransportQueryResponse::KnownDestinations(rows)) => {
+                    RpcResponse::KnownDestinations(rows.iter().map(Into::into).collect())
+                }
+                _ => RpcResponse::KnownDestinations(Vec::new()),
+            }
+        }
         RpcRequest::GetLowestInterfaceBitrate
         | RpcRequest::GetMediumPathTimeout
-        | RpcRequest::GetLinkDistribution
         | RpcRequest::GetProfilingResults
         | RpcRequest::ManageInterface { .. } => {
             RpcResponse::Error("request needs the control server's state".to_string())
@@ -1110,6 +1127,8 @@ mod tests {
             RpcRequest::UnretainDestination {
                 destination_hash: vec![0; 16],
             },
+            RpcRequest::GetLinkDistribution,
+            RpcRequest::GetKnownDestinations,
         ]
     }
 
@@ -1292,7 +1311,13 @@ mod tests {
         let rpc_key = b"closed_actor_key".to_vec();
         let port = spawn_test_rpc_server(rpc_key.clone(), tx, shutdown.clone()).await;
 
-        for request in all_rpc_requests() {
+        // The table getters answer `{}` instead, as upstream's do.
+        for request in all_rpc_requests().into_iter().filter(|request| {
+            !matches!(
+                request,
+                RpcRequest::GetLinkDistribution | RpcRequest::GetKnownDestinations
+            )
+        }) {
             let response = rpc_client_request(port, &rpc_key, request).await;
             assert!(
                 matches!(response, RpcResponse::Error(_)),
@@ -1623,12 +1648,61 @@ listener.close()
                             })
                             .collect(),
                     ),
+                    TransportQuery::GetLinkDistribution => {
+                        let mut entry =
+                            rns_transport::messages::LinkDistributionRpcEntry::default();
+                        entry.destination_hash = [0x11; 16];
+                        entry.active = 1;
+                        TransportQueryResponse::LinkDistribution(vec![entry])
+                    }
+                    TransportQuery::GetKnownDestinations => {
+                        let mut row = rns_transport::store::KnownDestinationRow::new(
+                            [0x22; 16], 7.5, [3; 64],
+                        );
+                        row.used = -1.0;
+                        TransportQueryResponse::KnownDestinations(vec![row])
+                    }
                     _ => TransportQueryResponse::Error("unexpected".into()),
                 };
                 let _ = response_tx.send(response);
             }
         });
         tx
+    }
+
+    /// The link table and known destinations come from the transport; a
+    /// transport that cannot answer leaves `{}`, as upstream's fallbacks do.
+    #[tokio::test]
+    async fn link_distribution_and_known_destinations_answer_from_the_transport() {
+        let backend = RpcBackend::new(stats_transport(Vec::new()));
+        for request in [
+            RpcRequest::GetLinkDistribution,
+            RpcRequest::GetKnownDestinations,
+        ] {
+            let reply = respond(request.clone(), &backend).await.unwrap();
+            match rpc::decode_response_for_request(&reply, &request).unwrap() {
+                RpcResponse::LinkDistribution(entries) => {
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].destination_hash, vec![0x11; 16]);
+                    assert_eq!(entries[0].active, 1);
+                }
+                RpcResponse::KnownDestinations(entries) => {
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].destination_hash, vec![0x22; 16]);
+                    assert_eq!((entries[0].last_heard, entries[0].used), (7.5, -1.0));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let (closed, _) = mpsc::channel(1);
+        let backend = RpcBackend::new(closed);
+        for request in [
+            RpcRequest::GetLinkDistribution,
+            RpcRequest::GetKnownDestinations,
+        ] {
+            let reply = respond(request, &backend).await.unwrap();
+            assert_eq!(hex::encode(reply), "80");
+        }
     }
 
     /// Expected bytes are upstream 1.6.0 replies.
@@ -1684,10 +1758,6 @@ listener.close()
     async fn stub_replies_match_upstream() {
         let backend = RpcBackend::new(stats_transport(Vec::new()));
         let reply = |request| respond(request, &backend);
-        assert_eq!(
-            hex::encode(reply(RpcRequest::GetLinkDistribution).await.unwrap()),
-            "80"
-        );
         assert_eq!(
             hex::encode(reply(RpcRequest::GetProfilingResults).await.unwrap()),
             "c0"

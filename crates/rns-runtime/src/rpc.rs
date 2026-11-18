@@ -8,6 +8,7 @@
 
 use rns_transport::inbound_queues::InboundQueueSnapshot;
 use rns_transport::messages::{InterfaceIdentity, InterfaceStatRpcEntry};
+use rns_transport::tunnel::RemoteTransportInfo;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MP_CHALLENGE: &[u8] = b"#CHALLENGE#";
@@ -119,8 +120,12 @@ pub enum RpcRequest {
     /// Reply: seconds as a float, or integer 0 without a known bitrate.
     GetMediumPathTimeout,
     GetActiveLinkCount,
-    /// Reply: a dictionary; upstream's implementation is a stub answering `{}`.
+    /// Reply: `{destination: {"active", "pending", "traffic", "from_ifs"}}`.
     GetLinkDistribution,
+    /// Python 1.6.1 `Reticulum.get_known_destinations`; reply:
+    /// `{destination: [last_heard, packet_hash, public_key, app_data, used,
+    /// stamp, stamp_value, lr_cost]}`.
+    GetKnownDestinations,
     /// Reply: profiler results, or nil when no profiler ran.
     GetProfilingResults,
     /// Reply: true, false, or nil when the interface does not exist.
@@ -184,6 +189,8 @@ pub enum RpcResponse {
     /// True, False or None, as upstream's blackhole mutations answer.
     OptBoolResult(Option<bool>),
     BlackholeList(Vec<BlackholeEntry>),
+    LinkDistribution(Vec<LinkDistributionEntry>),
+    KnownDestinations(Vec<KnownDestinationEntry>),
     Ok,
     Error(String),
 }
@@ -199,9 +206,10 @@ pub struct PathTableEntry {
     /// known but unstamped (Reticulum.py).
     #[serde(default)]
     pub value: Option<f64>,
-    /// Last use in Unix seconds; 0 when never used.
+    /// Last use in Unix seconds; 0 when never used, `None` from a peer
+    /// before 1.6.0.
     #[serde(default)]
-    pub used: f64,
+    pub used: Option<f64>,
     #[serde(default)]
     pub lr_cost: Option<f64>,
     pub interface: String,
@@ -334,6 +342,31 @@ struct InterfaceStatWire {
     tx_stalled: bool,
     #[serde(default)]
     tx_buffered: u64,
+    /// Python 1.6.1 `frxb`, `ftxb` and `afrxc`.
+    #[serde(default)]
+    filtered_rx_bytes: u64,
+    #[serde(default)]
+    filtered_tx_bytes: u64,
+    #[serde(default)]
+    announces_filtered: u64,
+    /// Python `frxs` and `ftxs`; `None` before the first traffic count.
+    #[serde(default)]
+    filtered_speeds: Option<[f64; 2]>,
+    #[serde(default)]
+    tunnel_id: Option<Vec<u8>>,
+    #[serde(default)]
+    remote_transport_id: Option<Vec<u8>>,
+    /// Python `rem_impl`, `rem_vers`, `rem_is_tn`, `rem_dst_cost` and `rem_pr_cost`.
+    #[serde(default)]
+    remote_implementation: Option<String>,
+    #[serde(default)]
+    remote_version: Option<Vec<u64>>,
+    #[serde(default)]
+    remote_is_transport: Option<bool>,
+    #[serde(default)]
+    remote_destination_cost: Option<f64>,
+    #[serde(default)]
+    remote_pr_cost: Option<f64>,
 }
 
 impl From<&InterfaceStatRpcEntry> for InterfaceStatWire {
@@ -413,6 +446,20 @@ impl From<&InterfaceStatRpcEntry> for InterfaceStatWire {
                 .map(|state| i2p_tunnel_state_text(state).to_string()),
             tx_stalled: e.tx_stalled,
             tx_buffered: e.tx_buffered,
+            filtered_rx_bytes: e.filtered_rx_bytes,
+            filtered_tx_bytes: e.filtered_tx_bytes,
+            announces_filtered: e.announces_filtered,
+            filtered_speeds: e.filtered_speeds,
+            tunnel_id: e.tunnel_id.map(|id| id.to_vec()),
+            remote_transport_id: e.remote_transport_id.map(|id| id.to_vec()),
+            remote_implementation: e
+                .remote_transport
+                .as_ref()
+                .map(|r| r.implementation.clone()),
+            remote_version: e.remote_transport.as_ref().map(|r| r.version.clone()),
+            remote_is_transport: e.remote_transport.as_ref().map(|r| r.transport),
+            remote_destination_cost: e.remote_transport.as_ref().map(|r| r.destination_cost),
+            remote_pr_cost: e.remote_transport.as_ref().map(|r| r.pr_cost),
         }
     }
 }
@@ -490,6 +537,25 @@ impl From<InterfaceStatWire> for InterfaceStatRpcEntry {
         e.i2p_tunnel_state = w.tunnel_state.as_deref().map(i2p_tunnel_state_code);
         e.tx_stalled = w.tx_stalled;
         e.tx_buffered = w.tx_buffered;
+        e.filtered_rx_bytes = w.filtered_rx_bytes;
+        e.filtered_tx_bytes = w.filtered_tx_bytes;
+        e.announces_filtered = w.announces_filtered;
+        e.filtered_speeds = w.filtered_speeds;
+        e.tunnel_id = w.tunnel_id.and_then(|id| id.try_into().ok());
+        e.remote_transport_id = w.remote_transport_id.and_then(|id| id.try_into().ok());
+        // Python sets the five together from one synthesis extension (Transport.py).
+        e.remote_transport = match (
+            w.remote_implementation,
+            w.remote_version,
+            w.remote_is_transport,
+            w.remote_destination_cost,
+            w.remote_pr_cost,
+        ) {
+            (Some(implementation), Some(version), Some(transport), Some(dst), Some(pr)) => Some(
+                RemoteTransportInfo::new(implementation, version, transport, dst, pr),
+            ),
+            _ => None,
+        };
         e
     }
 }
@@ -570,6 +636,81 @@ pub struct BlackholeEntry {
     pub source: Option<Vec<u8>>,
     pub until: Option<f64>,
     pub reason: Option<String>,
+}
+
+/// Relayed Links toward one destination (Python `Transport.link_distribution`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkDistributionEntry {
+    pub destination_hash: Vec<u8>,
+    pub active: u64,
+    pub pending: u64,
+    pub traffic: u64,
+    /// `Interface.get_hash()` of each interface a link request arrived on.
+    pub from_interfaces: Vec<Vec<u8>>,
+}
+
+impl From<&rns_transport::messages::LinkDistributionRpcEntry> for LinkDistributionEntry {
+    fn from(e: &rns_transport::messages::LinkDistributionRpcEntry) -> Self {
+        Self {
+            destination_hash: e.destination_hash.to_vec(),
+            active: e.active,
+            pending: e.pending,
+            traffic: e.traffic,
+            from_interfaces: e.from_interfaces.iter().map(|hash| hash.to_vec()).collect(),
+        }
+    }
+}
+
+/// One `Identity.known_destinations` entry under its destination hash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KnownDestinationEntry {
+    pub destination_hash: Vec<u8>,
+    pub last_heard: f64,
+    pub packet_hash: Option<Vec<u8>>,
+    pub public_key: Vec<u8>,
+    pub app_data: Option<Vec<u8>>,
+    /// 0 never used, -1 retained, otherwise the Unix time of last use.
+    pub used: f64,
+    pub stamp: Option<Vec<u8>>,
+    pub stamp_value: f64,
+    pub lr_cost: Option<f64>,
+}
+
+impl From<&rns_transport::store::KnownDestinationRow> for KnownDestinationEntry {
+    fn from(row: &rns_transport::store::KnownDestinationRow) -> Self {
+        Self {
+            destination_hash: row.destination_hash.to_vec(),
+            last_heard: row.last_heard,
+            packet_hash: row.packet_hash.map(|hash| hash.to_vec()),
+            public_key: row.public_key.to_vec(),
+            app_data: row.app_data.clone(),
+            used: row.used,
+            stamp: row.stamp.clone(),
+            stamp_value: row.stamp_value,
+            lr_cost: row.lr_cost,
+        }
+    }
+}
+
+impl KnownDestinationEntry {
+    /// The store row, or `None` for a malformed hash or key.
+    pub fn to_row(&self) -> Option<rns_transport::store::KnownDestinationRow> {
+        let mut row = rns_transport::store::KnownDestinationRow::new(
+            self.destination_hash.as_slice().try_into().ok()?,
+            self.last_heard,
+            self.public_key.as_slice().try_into().ok()?,
+        );
+        row.packet_hash = match &self.packet_hash {
+            Some(hash) => Some(hash.as_slice().try_into().ok()?),
+            None => None,
+        };
+        row.app_data = self.app_data.clone();
+        row.used = self.used;
+        row.stamp = self.stamp.clone();
+        row.stamp_value = self.stamp_value;
+        row.lr_cost = self.lr_cost;
+        Some(row)
+    }
 }
 
 pub fn encode_request(req: &RpcRequest) -> Result<Vec<u8>, RpcError> {
@@ -752,6 +893,7 @@ fn request_to_py_value(req: &RpcRequest) -> PyValue {
         RpcRequest::GetMediumPathTimeout => py_get("medium_path_timeout"),
         RpcRequest::GetActiveLinkCount => py_get("active_link_count"),
         RpcRequest::GetLinkDistribution => py_get("link_distribution"),
+        RpcRequest::GetKnownDestinations => py_get("known_destinations"),
         RpcRequest::GetProfilingResults => py_get("profiling_results"),
         RpcRequest::ManageInterface { operation, name } => py_dict(vec![
             ("manage", PyValue::String(operation.as_str().to_string())),
@@ -842,6 +984,7 @@ fn py_value_to_request(value: &PyValue) -> Result<RpcRequest, RpcError> {
             "medium_path_timeout" => Ok(RpcRequest::GetMediumPathTimeout),
             "active_link_count" => Ok(RpcRequest::GetActiveLinkCount),
             "link_distribution" => Ok(RpcRequest::GetLinkDistribution),
+            "known_destinations" => Ok(RpcRequest::GetKnownDestinations),
             "profiling_results" => Ok(RpcRequest::GetProfilingResults),
             other => Err(RpcError::Deserialize(format!(
                 "unknown Python RPC get path: {other}"
@@ -1005,18 +1148,14 @@ pub(crate) fn encode_medium_path_timeout(seconds: Option<f64>) -> Result<Vec<u8>
     encode_umsgpack(&seconds.map(PyValue::Float).unwrap_or(PyValue::Int(0)))
 }
 
-/// An empty dictionary, as upstream's stub `link_distribution` answers.
-pub(crate) fn encode_empty_dict() -> Result<Vec<u8>, RpcError> {
-    encode_umsgpack(&PyValue::Dict(Vec::new()))
-}
-
 fn response_to_py_value(resp: &RpcResponse) -> PyValue {
     match resp {
         RpcResponse::PathTable(entries) => PyValue::List(
             entries
                 .iter()
                 .map(|e| {
-                    py_dict(vec![
+                    // A key an older peer lacks stays absent, as in its dict.
+                    let mut fields = vec![
                         ("hash", PyValue::Bytes(e.hash.clone())),
                         ("timestamp", PyValue::Float(e.timestamp)),
                         (
@@ -1026,26 +1165,23 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                         ("hops", PyValue::Int(i128::from(e.hops))),
                         ("expires", PyValue::Float(e.expires)),
                         ("value", e.value.map(py_number).unwrap_or(PyValue::None)),
-                        ("used", py_number(e.used)),
-                        (
-                            "lr_cost",
-                            e.lr_cost.map(PyValue::Float).unwrap_or(PyValue::None),
-                        ),
-                        ("interface", PyValue::String(e.interface.clone())),
-                        (
-                            "interface_hash",
-                            e.interface_hash
-                                .clone()
-                                .map(PyValue::Bytes)
-                                .unwrap_or(PyValue::None),
-                        ),
-                        (
-                            "state",
-                            e.state
-                                .map(|state| PyValue::Int(i128::from(state)))
-                                .unwrap_or(PyValue::None),
-                        ),
-                    ])
+                    ];
+                    fields.extend(e.used.map(|used| ("used", py_number(used))));
+                    fields.push((
+                        "lr_cost",
+                        e.lr_cost.map(PyValue::Float).unwrap_or(PyValue::None),
+                    ));
+                    fields.push(("interface", PyValue::String(e.interface.clone())));
+                    fields.extend(
+                        e.interface_hash
+                            .clone()
+                            .map(|hash| ("interface_hash", PyValue::Bytes(hash))),
+                    );
+                    fields.extend(
+                        e.state
+                            .map(|state| ("state", PyValue::Int(i128::from(state)))),
+                    );
+                    py_dict(fields)
                 })
                 .collect(),
         ),
@@ -1106,6 +1242,60 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                                     .map(PyValue::String)
                                     .unwrap_or(PyValue::None),
                             ),
+                        ]),
+                    )
+                })
+                .collect(),
+        ),
+        RpcResponse::LinkDistribution(entries) => PyValue::Dict(
+            entries
+                .iter()
+                .map(|e| {
+                    let int = |value: u64| PyValue::Int(i128::from(value));
+                    (
+                        PyDictKey::Bytes(e.destination_hash.clone()),
+                        py_dict(vec![
+                            ("active", int(e.active)),
+                            ("pending", int(e.pending)),
+                            ("traffic", int(e.traffic)),
+                            (
+                                "from_ifs",
+                                PyValue::List(
+                                    e.from_interfaces
+                                        .iter()
+                                        .map(|hash| PyValue::Bytes(hash.clone()))
+                                        .collect(),
+                                ),
+                            ),
+                        ]),
+                    )
+                })
+                .collect(),
+        ),
+        RpcResponse::KnownDestinations(entries) => PyValue::Dict(
+            entries
+                .iter()
+                .map(|e| {
+                    let bytes = |value: &Option<Vec<u8>>| {
+                        value.clone().map(PyValue::Bytes).unwrap_or(PyValue::None)
+                    };
+                    // Upstream keeps the never-used and retained markers as ints.
+                    let used = if e.used == -1.0 {
+                        PyValue::Int(-1)
+                    } else {
+                        py_number(e.used)
+                    };
+                    (
+                        PyDictKey::Bytes(e.destination_hash.clone()),
+                        PyValue::List(vec![
+                            PyValue::Float(e.last_heard),
+                            bytes(&e.packet_hash),
+                            PyValue::Bytes(e.public_key.clone()),
+                            bytes(&e.app_data),
+                            used,
+                            bytes(&e.stamp),
+                            py_number(e.stamp_value),
+                            e.lr_cost.map(PyValue::Float).unwrap_or(PyValue::None),
                         ]),
                     )
                 })
@@ -1225,6 +1415,14 @@ fn interface_stats_value(
                 ("txb", int(t.txb)),
                 ("rxs", speed(t.rxs)),
                 ("txs", speed(t.txs)),
+                ("lrxb", int(t.lrxb)),
+                ("ltxb", int(t.ltxb)),
+                ("lrxs", speed(t.lrxs)),
+                ("ltxs", speed(t.ltxs)),
+                ("frxb", int(t.frxb)),
+                ("ftxb", int(t.ftxb)),
+                ("frxs", speed(t.frxs)),
+                ("ftxs", speed(t.ftxs)),
                 ("arxb", int(t.arxb)),
                 ("atxb", int(t.atxb)),
                 ("arxs", speed(t.arxs)),
@@ -1258,9 +1456,9 @@ fn interface_stats_value(
                 ("txs", PyValue::Int(i128::from(sum(|e| e.tx_rate)))),
             ]);
             for key in [
-                "arxb", "atxb", "arxs", "atxs", "arxf", "atxf", "prxb", "ptxb", "prxs", "ptxs",
-                "prxf", "ptxf", "rxpps", "txpps", "rxpkts", "txpkts", "arxpkts", "atxpkts",
-                "prxpkts", "ptxpkts",
+                "lrxb", "ltxb", "lrxs", "ltxs", "frxb", "ftxb", "frxs", "ftxs", "arxb", "atxb",
+                "arxs", "atxs", "arxf", "atxf", "prxb", "ptxb", "prxs", "ptxs", "prxf", "ptxf",
+                "rxpps", "txpps", "rxpkts", "txpkts", "arxpkts", "atxpkts", "prxpkts", "ptxpkts",
             ] {
                 stats.push((key, PyValue::Int(0)));
             }
@@ -1310,6 +1508,10 @@ fn interface_stat_value(e: &InterfaceStatWire) -> PyValue {
         Some(speeds) => PyValue::Float(speeds[index]),
         None => int(fallback),
     };
+    let filtered_speed = |index: usize| match e.filtered_speeds {
+        Some(speeds) => PyValue::Float(speeds[index]),
+        None => int(0),
+    };
     let mut fields = vec![
         ("id", int(e.id)),
         ("name", PyValue::String(e.name.clone())),
@@ -1327,8 +1529,12 @@ fn interface_stat_value(e: &InterfaceStatWire) -> PyValue {
         ),
         ("rxb", int(e.rx_bytes)),
         ("txb", int(e.tx_bytes)),
+        ("frxb", int(e.filtered_rx_bytes)),
+        ("ftxb", int(e.filtered_tx_bytes)),
         ("rxs", speed(0, e.rx_rate)),
         ("txs", speed(1, e.tx_rate)),
+        ("frxs", filtered_speed(0)),
+        ("ftxs", filtered_speed(1)),
         ("arxb", int(e.announce_rx_bytes)),
         ("atxb", int(e.announce_tx_bytes)),
         ("arxs", speed(2, 0)),
@@ -1345,6 +1551,7 @@ fn interface_stat_value(e: &InterfaceStatWire) -> PyValue {
         ),
         ("arxc", int(e.announces_received)),
         ("atxc", int(e.announces_sent)),
+        ("afrxc", int(e.announces_filtered)),
         ("prxc", int(e.path_requests_received)),
         ("ptxc", int(e.path_requests_sent)),
         ("status", PyValue::Bool(e.online)),
@@ -1420,6 +1627,41 @@ fn interface_stat_value(e: &InterfaceStatWire) -> PyValue {
         ("protocol_violations", int(e.protocol_violations)),
         ("ifac_violations", int(e.ifac_violations)),
         ("packet_filter_hits", int(e.packet_filter_hits)),
+        (
+            "tunnel_id",
+            optional(e.tunnel_id.clone().map(PyValue::Bytes)),
+        ),
+        (
+            "remote_transport_id",
+            optional(e.remote_transport_id.clone().map(PyValue::Bytes)),
+        ),
+        (
+            "rem_impl",
+            optional(e.remote_implementation.clone().map(PyValue::String)),
+        ),
+        (
+            "rem_vers",
+            optional(e.remote_version.as_ref().map(|version| {
+                PyValue::List(
+                    version
+                        .iter()
+                        .map(|v| PyValue::Int(i128::from(*v)))
+                        .collect(),
+                )
+            })),
+        ),
+        (
+            "rem_is_tn",
+            optional(e.remote_is_transport.map(PyValue::Bool)),
+        ),
+        (
+            "rem_dst_cost",
+            optional(e.remote_destination_cost.map(PyValue::Float)),
+        ),
+        (
+            "rem_pr_cost",
+            optional(e.remote_pr_cost.map(PyValue::Float)),
+        ),
     ];
     if let Some(parent) = &e.parent_interface_name {
         fields.push(("parent_interface_name", PyValue::String(parent.clone())));
@@ -1522,13 +1764,12 @@ fn py_value_to_response_for_request(
             py_optional_float(value)?.unwrap_or(0.0),
         ))),
         RpcRequest::GetActiveLinkCount => Ok(RpcResponse::IntResult(py_required_int(value)?)),
-        // Upstream's link distribution is a stub that answers `{}`.
-        RpcRequest::GetLinkDistribution => match value {
-            PyValue::Dict(_) => Ok(RpcResponse::Ok),
-            _ => Err(RpcError::Deserialize(
-                "expected link distribution dictionary".to_string(),
-            )),
-        },
+        RpcRequest::GetLinkDistribution => Ok(RpcResponse::LinkDistribution(
+            parse_link_distribution(value)?,
+        )),
+        RpcRequest::GetKnownDestinations => Ok(RpcResponse::KnownDestinations(
+            parse_known_destinations(value)?,
+        )),
         // `None` means no profiler ran; results themselves are not decoded.
         RpcRequest::GetProfilingResults => Ok(match value {
             PyValue::None => RpcResponse::StringResult(None),
@@ -1598,7 +1839,7 @@ fn parse_path_table(value: &PyValue) -> Result<Vec<PathTableEntry>, RpcError> {
                 hops: dict_get(m, "hops").and_then(py_u8).unwrap_or(0),
                 expires: dict_get(m, "expires").and_then(py_f64).unwrap_or(0.0),
                 value: dict_get(m, "value").and_then(py_f64),
-                used: dict_get(m, "used").and_then(py_f64).unwrap_or(0.0),
+                used: dict_get(m, "used").and_then(py_f64),
                 lr_cost: dict_get(m, "lr_cost").and_then(py_f64),
                 interface: dict_get(m, "interface")
                     .and_then(py_string)
@@ -1761,6 +2002,29 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatRpcEntry>, 
                 tunnel_state: dict_get(m, "tunnelstate").and_then(py_string),
                 tx_stalled: dict_get(m, "txstalled").and_then(py_bool).unwrap_or(false),
                 tx_buffered: dict_get(m, "txbuffered").and_then(py_u64).unwrap_or(0),
+                filtered_rx_bytes: dict_get(m, "frxb").and_then(py_u64).unwrap_or(0),
+                filtered_tx_bytes: dict_get(m, "ftxb").and_then(py_u64).unwrap_or(0),
+                announces_filtered: dict_get(m, "afrxc").and_then(py_u64).unwrap_or(0),
+                filtered_speeds: match (dict_get(m, "frxs"), dict_get(m, "ftxs")) {
+                    (Some(PyValue::Float(rx)), Some(tx)) => Some([*rx, py_f64(tx).unwrap_or(0.0)]),
+                    _ => None,
+                },
+                tunnel_id: match dict_get(m, "tunnel_id") {
+                    Some(PyValue::Bytes(id)) => Some(id.clone()),
+                    _ => None,
+                },
+                remote_transport_id: match dict_get(m, "remote_transport_id") {
+                    Some(PyValue::Bytes(id)) => Some(id.clone()),
+                    _ => None,
+                },
+                remote_implementation: dict_get(m, "rem_impl").and_then(py_string),
+                remote_version: match dict_get(m, "rem_vers") {
+                    Some(PyValue::List(parts)) => parts.iter().map(py_u64).collect(),
+                    _ => None,
+                },
+                remote_is_transport: dict_get(m, "rem_is_tn").and_then(py_bool),
+                remote_destination_cost: dict_get(m, "rem_dst_cost").and_then(py_f64),
+                remote_pr_cost: dict_get(m, "rem_pr_cost").and_then(py_f64),
             }))
         })
         .collect()
@@ -1834,6 +2098,86 @@ fn parse_blackhole_list(value: &PyValue) -> Result<Vec<BlackholeEntry>, RpcError
             "expected blackhole list or dictionary".to_string(),
         )),
     }
+}
+
+/// `{destination: {"active", "pending", "traffic", "from_ifs"}}`; nil, a
+/// Python client's failed call, reads as empty.
+fn parse_link_distribution(value: &PyValue) -> Result<Vec<LinkDistributionEntry>, RpcError> {
+    let entries = match value {
+        PyValue::None => return Ok(Vec::new()),
+        PyValue::Dict(entries) => entries,
+        _ => {
+            return Err(RpcError::Deserialize(
+                "expected link distribution dictionary".to_string(),
+            ));
+        }
+    };
+    entries
+        .iter()
+        .map(|(key, entry)| {
+            let PyDictKey::Bytes(hash) = key else {
+                return Err(RpcError::Deserialize(
+                    "expected destination hash key".to_string(),
+                ));
+            };
+            let m = as_dict(entry)?;
+            let count = |key: &str| dict_get(m, key).and_then(py_u64).unwrap_or(0);
+            Ok(LinkDistributionEntry {
+                destination_hash: hash.clone(),
+                active: count("active"),
+                pending: count("pending"),
+                traffic: count("traffic"),
+                from_interfaces: match dict_get(m, "from_ifs") {
+                    Some(PyValue::List(hashes)) => hashes
+                        .iter()
+                        .filter_map(|hash| match hash {
+                            PyValue::Bytes(hash) => Some(hash.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
+            })
+        })
+        .collect()
+}
+
+/// `{destination: [last_heard, packet_hash, public_key, app_data, used, stamp,
+/// stamp_value, lr_cost]}` (Identity.py); an entry without a key is skipped.
+fn parse_known_destinations(value: &PyValue) -> Result<Vec<KnownDestinationEntry>, RpcError> {
+    let entries = match value {
+        PyValue::None => return Ok(Vec::new()),
+        PyValue::Dict(entries) => entries,
+        _ => {
+            return Err(RpcError::Deserialize(
+                "expected known destinations dictionary".to_string(),
+            ));
+        }
+    };
+    Ok(entries
+        .iter()
+        .filter_map(|(key, entry)| {
+            let (PyDictKey::Bytes(hash), PyValue::List(fields)) = (key, entry) else {
+                return None;
+            };
+            let field = |index: usize| fields.get(index).unwrap_or(&PyValue::None);
+            let bytes = |index: usize| match field(index) {
+                PyValue::Bytes(bytes) => Some(bytes.clone()),
+                _ => None,
+            };
+            Some(KnownDestinationEntry {
+                destination_hash: hash.clone(),
+                last_heard: py_f64(field(0)).unwrap_or(0.0),
+                packet_hash: bytes(1),
+                public_key: bytes(2)?,
+                app_data: bytes(3),
+                used: py_f64(field(4)).unwrap_or(0.0),
+                stamp: bytes(5),
+                stamp_value: py_f64(field(6)).unwrap_or(0.0),
+                lr_cost: py_f64(field(7)),
+            })
+        })
+        .collect())
 }
 
 fn as_dict(value: &PyValue) -> Result<&[(PyDictKey, PyValue)], RpcError> {
@@ -2710,7 +3054,7 @@ pub enum RpcError {
     Io(#[from] std::io::Error),
 }
 
-/// Keys Python 1.5.5 `get_interface_stats()` gives every interface
+/// Keys Python 1.6.1 `get_interface_stats()` gives every interface
 /// (Reticulum.py); `rnstatus` indexes most of them unguarded.
 #[cfg(test)]
 pub(crate) const PYTHON_INTERFACE_KEYS: &[&str] = &[
@@ -2766,9 +3110,22 @@ pub(crate) const PYTHON_INTERFACE_KEYS: &[&str] = &[
     "protocol_violations",
     "ifac_violations",
     "packet_filter_hits",
+    "frxs",
+    "ftxs",
+    "frxb",
+    "ftxb",
+    "afrxc",
+    "announce_queue",
+    "tunnel_id",
+    "remote_transport_id",
+    "rem_impl",
+    "rem_vers",
+    "rem_is_tn",
+    "rem_dst_cost",
+    "rem_pr_cost",
 ];
 
-/// Totals in every Python 1.5.5 stats dict (Reticulum.py).
+/// Totals in every Python 1.6.1 stats dict (Reticulum.py).
 #[cfg(test)]
 pub(crate) const PYTHON_TOTAL_KEYS: &[&str] = &[
     "interfaces",
@@ -2776,6 +3133,14 @@ pub(crate) const PYTHON_TOTAL_KEYS: &[&str] = &[
     "txb",
     "rxs",
     "txs",
+    "lrxb",
+    "ltxb",
+    "lrxs",
+    "ltxs",
+    "frxb",
+    "ftxb",
+    "frxs",
+    "ftxs",
     "arxb",
     "atxb",
     "arxs",
@@ -2866,7 +3231,7 @@ mod tests {
             hops: 3,
             expires: 1234567890.0 + 604800.0,
             value: None,
-            used: 0.0,
+            used: Some(0.0),
             lr_cost: None,
             interface: "TCPInterface[test]".to_string(),
             interface_hash: None,
@@ -2935,7 +3300,7 @@ mod tests {
     }
 
     #[test]
-    fn interface_stats_carry_every_python_155_key() {
+    fn interface_stats_carry_every_python_161_key() {
         let encoded =
             encode_response(&RpcResponse::InterfaceStats(vec![interface_stat_entry()])).unwrap();
         let stats = stats_dict(&encoded);
@@ -3261,6 +3626,199 @@ mod tests {
         let interface = &interface_dicts(&stats_dict(&reencoded))[0];
         for (key, value) in &sent {
             assert_eq!(dict_get(interface, key), Some(value), "{key}");
+        }
+    }
+
+    /// Python 1.6.1's filtered, tunnel and remote transport keys decode and
+    /// encode again unchanged; without a remote transport all `rem_*` are nil.
+    #[test]
+    fn python_161_tunnel_and_filtered_keys_round_trip() {
+        let sent = vec![
+            ("name", PyValue::String("TCPInterface[Hub]".to_string())),
+            ("type", PyValue::String("TCPInterface".to_string())),
+            ("status", PyValue::Bool(true)),
+            ("frxb", PyValue::Int(31)),
+            ("ftxb", PyValue::Int(0)),
+            ("frxs", PyValue::Float(8.5)),
+            ("ftxs", PyValue::Float(0.0)),
+            ("afrxc", PyValue::Int(3)),
+            ("tunnel_id", PyValue::Bytes(vec![0xab; 32])),
+            ("remote_transport_id", PyValue::Bytes(vec![0xcd; 16])),
+            ("rem_impl", PyValue::String("rns".to_string())),
+            (
+                "rem_vers",
+                PyValue::List(vec![PyValue::Int(1), PyValue::Int(6), PyValue::Int(1)]),
+            ),
+            ("rem_is_tn", PyValue::Bool(true)),
+            ("rem_dst_cost", PyValue::Float(8.0)),
+            ("rem_pr_cost", PyValue::Float(0.5)),
+        ];
+        let upstream = py_dict(vec![(
+            "interfaces",
+            PyValue::List(vec![py_dict(sent.clone())]),
+        )]);
+        let decoded = decode_response_for_request(
+            &encode_umsgpack(&upstream).unwrap(),
+            &RpcRequest::GetInterfaceStats,
+        )
+        .unwrap();
+        let RpcResponse::InterfaceStats(entries) = &decoded else {
+            panic!("wrong variant");
+        };
+        assert_eq!(entries[0].announces_filtered, 3);
+        assert_eq!(entries[0].tunnel_id, Some([0xab; 32]));
+        assert_eq!(
+            entries[0]
+                .remote_transport
+                .as_ref()
+                .map(|r| r.version.clone()),
+            Some(vec![1, 6, 1])
+        );
+        let reencoded = encode_response(&decoded).unwrap();
+        let interface = &interface_dicts(&stats_dict(&reencoded))[0];
+        for (key, value) in &sent {
+            assert_eq!(dict_get(interface, key), Some(value), "{key}");
+        }
+
+        let encoded =
+            encode_response(&RpcResponse::InterfaceStats(vec![interface_stat_entry()])).unwrap();
+        let interface = &interface_dicts(&stats_dict(&encoded))[0];
+        for key in [
+            "tunnel_id",
+            "remote_transport_id",
+            "rem_impl",
+            "rem_vers",
+            "rem_is_tn",
+            "rem_dst_cost",
+            "rem_pr_cost",
+        ] {
+            assert_eq!(dict_get(interface, key), Some(&PyValue::None), "{key}");
+        }
+        assert_eq!(dict_get(interface, "frxs"), Some(&PyValue::Int(0)));
+    }
+
+    /// The link and filtered totals follow the transport's counters.
+    #[test]
+    fn interface_stats_totals_carry_link_and_filtered_traffic() {
+        let mut totals = TrafficTotals::default();
+        totals.measured = true;
+        totals.lrxb = 41;
+        totals.ltxb = 42;
+        totals.lrxs = 4.5;
+        totals.frxb = 43;
+        totals.frxs = 1.5;
+        totals.rx_packets = 44;
+        let encoded = encode_interface_stats(&[], None, Some(&totals), None).unwrap();
+        let stats = stats_dict(&encoded);
+        for (key, value) in [
+            ("lrxb", PyValue::Int(41)),
+            ("ltxb", PyValue::Int(42)),
+            ("lrxs", PyValue::Float(4.5)),
+            ("ltxs", PyValue::Float(0.0)),
+            ("frxb", PyValue::Int(43)),
+            ("ftxb", PyValue::Int(0)),
+            ("frxs", PyValue::Float(1.5)),
+            ("ftxs", PyValue::Float(0.0)),
+            ("rxpkts", PyValue::Int(44)),
+        ] {
+            assert_eq!(dict_get(&stats, key), Some(&value), "{key}");
+        }
+    }
+
+    /// Expected bytes are upstream 1.6.1 `umsgpack.packb` of the same values.
+    #[test]
+    fn link_distribution_and_known_destinations_round_trip_as_upstream() {
+        for (request, hex) in [
+            (
+                RpcRequest::GetKnownDestinations,
+                "81a3676574b26b6e6f776e5f64657374696e6174696f6e73",
+            ),
+            (
+                RpcRequest::GetLinkDistribution,
+                "81a3676574b16c696e6b5f646973747269627574696f6e",
+            ),
+        ] {
+            let encoded = encode_request(&request).unwrap();
+            assert_eq!(hex::encode(&encoded), hex);
+            let decoded = decode_request(&encoded).unwrap();
+            assert_eq!(format!("{decoded:?}"), format!("{request:?}"));
+        }
+
+        let distribution = vec![LinkDistributionEntry {
+            destination_hash: vec![0x11; 16],
+            active: 2,
+            pending: 1,
+            traffic: 4096,
+            from_interfaces: vec![vec![0x22; 32]],
+        }];
+        let encoded =
+            encode_response(&RpcResponse::LinkDistribution(distribution.clone())).unwrap();
+        assert_eq!(
+            hex::encode(&encoded),
+            "81c4101111111111111111111111111111111184a661637469766502a770656e64696e6701a77472616666\
+             6963cd1000a866726f6d5f69667391c42022222222222222222222222222222222222222222222222222\
+             22222222222222"
+        );
+        match decode_response_for_request(&encoded, &RpcRequest::GetLinkDistribution).unwrap() {
+            RpcResponse::LinkDistribution(decoded) => assert_eq!(decoded, distribution),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let known = vec![
+            KnownDestinationEntry {
+                destination_hash: vec![0x33; 16],
+                last_heard: 1_700_000_000.5,
+                packet_hash: Some(vec![0x44; 32]),
+                public_key: vec![0x55; 64],
+                app_data: Some(b"app".to_vec()),
+                used: 0.0,
+                stamp: None,
+                stamp_value: 0.0,
+                lr_cost: None,
+            },
+            KnownDestinationEntry {
+                destination_hash: vec![0x66; 16],
+                last_heard: 1_700_000_001.25,
+                packet_hash: None,
+                public_key: vec![0x77; 64],
+                app_data: None,
+                used: -1.0,
+                stamp: Some(vec![0x88; 32]),
+                stamp_value: 8.5,
+                lr_cost: Some(3.25),
+            },
+        ];
+        let encoded = encode_response(&RpcResponse::KnownDestinations(known.clone())).unwrap();
+        assert_eq!(
+            hex::encode(&encoded),
+            "82c4103333333333333333333333333333333398cb41d954fc40200000c420444444444444444444\
+             4444444444444444444444444444444444444444444444c440555555555555555555555555555555\
+             55555555555555555555555555555555555555555555555555555555555555555555555555555555\
+             555555555555555555c40361707000c000c0c4106666666666666666666666666666666698cb41d9\
+             54fc40500000c0c44077777777777777777777777777777777777777777777777777777777777777\
+             777777777777777777777777777777777777777777777777777777777777777777c0ffc420888888\
+             8888888888888888888888888888888888888888888888888888888888cb4021000000000000cb40\
+             0a000000000000"
+        );
+        match decode_response_for_request(&encoded, &RpcRequest::GetKnownDestinations).unwrap() {
+            RpcResponse::KnownDestinations(decoded) => assert_eq!(decoded, known),
+            other => panic!("unexpected {other:?}"),
+        }
+        let row = known[1].to_row().unwrap();
+        assert_eq!(KnownDestinationEntry::from(&row), known[1]);
+
+        // nil, a Python client's failed call, and an empty table read as empty.
+        for (request, bytes) in [
+            (RpcRequest::GetLinkDistribution, [0xc0]),
+            (RpcRequest::GetKnownDestinations, [0x80]),
+        ] {
+            let decoded = decode_response_for_request(&bytes, &request).unwrap();
+            assert!(
+                matches!(
+                    decoded,
+                    RpcResponse::LinkDistribution(ref e) if e.is_empty()
+                ) || matches!(decoded, RpcResponse::KnownDestinations(ref e) if e.is_empty())
+            );
         }
     }
 
@@ -3657,7 +4215,7 @@ mod tests {
             hops: 3,
             expires: 1235172690.0,
             value: None,
-            used: 0.0,
+            used: Some(0.0),
             lr_cost: None,
             interface: "TCPInterface[test]".to_string(),
             interface_hash: Some(rns_crypto::sha::sha256(b"TCPInterface[test]").to_vec()),
@@ -3712,7 +4270,7 @@ mod tests {
             hops: 3,
             expires: 1235172690.0,
             value: Some(6.078125),
-            used: 1234567999.5,
+            used: Some(1234567999.5),
             lr_cost: Some(3.25),
             interface: "TCPInterface[test]".to_string(),
             interface_hash: Some(rns_crypto::sha::sha256(b"TCPInterface[test]").to_vec()),
@@ -3731,7 +4289,7 @@ mod tests {
         {
             RpcResponse::PathTable(entries) => {
                 assert_eq!(entries[0].value, Some(6.078125));
-                assert_eq!(entries[0].used, 1234567999.5);
+                assert_eq!(entries[0].used, Some(1234567999.5));
                 assert_eq!(entries[0].lr_cost, Some(3.25));
                 assert_eq!(entries[0].state, Some(2));
                 assert_eq!(
@@ -4067,7 +4625,10 @@ mod tests {
             hex::encode(encode_medium_path_timeout(Some(22.0)).unwrap()),
             "cb4036000000000000"
         );
-        assert_eq!(hex::encode(encode_empty_dict().unwrap()), "80");
+        assert_eq!(
+            hex::encode(encode_response(&RpcResponse::LinkDistribution(Vec::new())).unwrap()),
+            "80"
+        );
         assert_eq!(hex::encode(encode_none().unwrap()), "c0");
         assert_eq!(hex::encode(encode_optional_bool(Some(true)).unwrap()), "c3");
         assert_eq!(
@@ -4104,7 +4665,7 @@ mod tests {
         ));
         assert!(matches!(
             decode("80", RpcRequest::GetLinkDistribution),
-            RpcResponse::Ok
+            RpcResponse::LinkDistribution(ref e) if e.is_empty()
         ));
         assert!(matches!(
             decode("c0", RpcRequest::GetProfilingResults),

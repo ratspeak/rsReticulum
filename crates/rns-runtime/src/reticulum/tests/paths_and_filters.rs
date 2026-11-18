@@ -204,7 +204,7 @@ fn shared_instance_path_tables_carry_interface_hash_and_state() {
         hops: 1,
         expires: 2.0,
         value: None,
-        used: 0.0,
+        used: Some(0.0),
         lr_cost: None,
         interface: "TCPInterface[test]".into(),
         interface_hash,

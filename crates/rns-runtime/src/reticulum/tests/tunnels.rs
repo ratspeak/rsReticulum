@@ -1326,3 +1326,72 @@ async fn a_client_answered_with_a_bad_signature_is_torn_down() {
     handle.shutdown_and_wait().await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Python 1.6.1 `_detach_interface`: text that names no interface but spells a
+/// tunnel id in hex, as `bytes.fromhex` reads it, detaches the interface whose
+/// `tunnel_id or local_tunnel_id` it is (Reticulum.py:976-1015).
+#[tokio::test]
+async fn detach_by_tunnel_id_finds_either_end_of_the_tunnel() {
+    let hub_port = unused_port().await;
+    let hub_dir = config_dir(
+        "detach-hub",
+        &format!(
+            "[reticulum]\n  share_instance = No\n  enable_transport = Yes\n\n[interfaces]\n  [[Hub]]\n    type = TCPServerInterface\n    enabled = yes\n    listen_ip = 127.0.0.1\n    listen_port = {hub_port}\n"
+        ),
+    );
+    let hub = start(&hub_dir).await;
+    let client_dir = config_dir("detach-client", &tcp_client_config(hub_port));
+    let client = start(&client_dir).await;
+    let accepted = wait_for_interface(&hub, |entry| {
+        entry.parent_id.is_some() && entry.tunnel_id.is_some()
+    })
+    .await
+    .expect("the hub takes the client's synthesis");
+    let uplink = wait_for_interface(&client, |entry| {
+        entry.name == "Uplink" && entry.tunnel_id.is_some()
+    })
+    .await
+    .expect("the client names its tunnel");
+    assert_eq!(accepted.tunnel_id, uplink.tunnel_id);
+    let tunnel = hex::encode(accepted.tunnel_id.unwrap());
+
+    assert_eq!(hub.detach_interface("not hex").await.unwrap(), None);
+    assert_eq!(hub.detach_interface(&"00".repeat(32)).await.unwrap(), None);
+    let spaced: Vec<String> = tunnel
+        .to_uppercase()
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| String::from_utf8(pair.to_vec()).unwrap())
+        .collect();
+    assert_eq!(
+        hub.detach_interface(&spaced.join(" ")).await.unwrap(),
+        Some(true)
+    );
+    assert!(
+        interfaces(&hub)
+            .await
+            .iter()
+            .all(|entry| entry.id != accepted.id),
+        "the accepted client is gone"
+    );
+    assert!(
+        interfaces(&hub)
+            .await
+            .iter()
+            .any(|entry| entry.name == "Hub"),
+        "its listener stays"
+    );
+    assert_eq!(client.detach_interface(&tunnel).await.unwrap(), Some(true));
+    assert!(
+        interfaces(&client)
+            .await
+            .iter()
+            .all(|entry| entry.name != "Uplink"),
+        "the client's own end goes by its local tunnel id"
+    );
+
+    client.shutdown_and_wait().await;
+    hub.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(client_dir);
+    let _ = std::fs::remove_dir_all(hub_dir);
+}
