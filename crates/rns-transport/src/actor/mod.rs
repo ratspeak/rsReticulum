@@ -2462,12 +2462,12 @@ impl TransportActor {
         Some(raw)
     }
 
-    /// Whether a non-expired path is cached. This does not probe reachability.
+    /// Whether an unexpired or 0-hop path is cached. This does not probe reachability.
     pub fn has_path(&self, dest_hash: &[u8; 16]) -> bool {
         self.path_table.has_path(dest_hash)
     }
 
-    /// Return hops for a non-expired cached path, or None if absent/expired.
+    /// Return hops for a cached path `has_path` would report, else None.
     pub fn hops_to(&self, dest_hash: &[u8; 16]) -> Option<u8> {
         self.path_table.hops_to(dest_hash)
     }
@@ -7918,7 +7918,7 @@ mod tests {
         let hash = [0xCC; 16];
         table.insert(
             hash,
-            crate::path_table::PathEntry::new(None, 0, 1, InterfaceMode::Gateway),
+            crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway),
         );
         assert!(table.has_path(&hash));
 

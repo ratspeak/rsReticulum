@@ -68,6 +68,12 @@ impl PathEntry {
         now_f64() > self.expires
     }
 
+    /// Live for lookups and culls: unexpired, or instance-local (0 hops),
+    /// which never times out (Transport.py).
+    pub fn is_retained(&self) -> bool {
+        self.hops == 0 || !self.is_expired()
+    }
+
     /// Record traffic over this path without renewing its lifetime.
     pub fn mark_used(&mut self) {
         self.used = now_f64();
@@ -82,8 +88,9 @@ impl PathEntry {
 }
 
 /// Destination-keyed routes and separately stored path-state labels. Ordinary
-/// lookup/iteration includes expired entries; `get_live`/`iter_live` checks
-/// expiry only, not interface health or reachability. State labels are supplied
+/// lookup/iteration includes expired entries; `get_live`/`iter_live` keep
+/// retained entries (`PathEntry::is_retained`) and check neither interface
+/// health nor reachability. State labels are supplied
 /// by callers and can exist without a route. This table does not probe peers.
 #[derive(Clone)]
 pub struct PathTable {
@@ -117,15 +124,15 @@ impl PathTable {
     }
 
     pub fn get_live(&self, dest_hash: &[u8; 16]) -> Option<&PathEntry> {
-        self.entries.get(dest_hash).filter(|e| !e.is_expired())
+        self.entries.get(dest_hash).filter(|e| e.is_retained())
     }
 
     pub fn get_live_mut(&mut self, dest_hash: &[u8; 16]) -> Option<&mut PathEntry> {
-        self.entries.get_mut(dest_hash).filter(|e| !e.is_expired())
+        self.entries.get_mut(dest_hash).filter(|e| e.is_retained())
     }
 
-    /// A path exists and has not yet expired. Callers should prefer this
-    /// over `get().is_some()` to exclude expired entries. This does not confirm
+    /// A retained path exists. Callers should prefer this over
+    /// `get().is_some()` to exclude expired entries. This does not confirm
     /// that the recorded interface or remote destination is currently reachable.
     pub fn has_path(&self, dest_hash: &[u8; 16]) -> bool {
         self.get_live(dest_hash).is_some()
@@ -158,7 +165,7 @@ impl PathTable {
     /// Set a present route's expiry to zero, then run a full expired-route cull
     /// across the table. Return whether the target entry existed before the
     /// operation. The cull uses the current wall clock and can remove other
-    /// expired entries too.
+    /// expired entries too. A 0-hop route survives, as upstream's does.
     pub fn expire(&mut self, dest_hash: &[u8; 16]) -> bool {
         if let Some(entry) = self.entries.get_mut(dest_hash) {
             entry.expires = 0.0;
@@ -180,24 +187,24 @@ impl PathTable {
             .unwrap_or(PathState::Unknown)
     }
 
-    /// Scan all routes, remove expired entries and remove every state label
+    /// Scan all routes, remove unretained entries and remove every state label
     /// without a remaining route. Return the number of routes removed.
     pub fn cull_expired(&mut self) -> usize {
         let before = self.entries.len();
-        self.entries.retain(|_, entry| !entry.is_expired());
+        self.entries.retain(|_, entry| entry.is_retained());
         self.states
             .retain(|hash, _| self.entries.contains_key(hash));
         before - self.entries.len()
     }
 
-    /// Remove at most `limit` expired routes and their state labels. The limit
+    /// Remove at most `limit` unretained routes and their state labels. The limit
     /// bounds removals, not scanning time: finding those entries can examine
     /// the entire table. Unrelated orphan state labels are not cleaned here.
     pub fn cull_expired_batch(&mut self, limit: usize) -> usize {
         let to_remove: Vec<DestHash> = self
             .entries
             .iter()
-            .filter(|(_, entry)| entry.is_expired())
+            .filter(|(_, entry)| !entry.is_retained())
             .take(limit)
             .map(|(hash, _)| *hash)
             .collect();
@@ -227,7 +234,8 @@ impl PathTable {
 
     /// Python's path-table cull (Transport.py): drop expired
     /// paths, paths on a missing interface and never-used paths older than
-    /// `linger` (x10 on slow interfaces). With `check_unused`, never-used
+    /// `linger` (x10 on slow interfaces). A 0-hop path neither expires nor
+    /// lingers out. With `check_unused`, never-used
     /// paths beyond `PATH_POOL_UNUSED_TARGET` are dropped too, fast-interface
     /// and earliest-expiring first. Returns the removed count and, with
     /// `check_unused`, the never-used count before removal.
@@ -247,9 +255,10 @@ impl PathTable {
                 unused.push((u8::from(slow), entry.expires, *hash));
             }
             let factor = if slow { PATH_SLOW_LINGER_FACTOR } else { 1.0 };
-            if now > entry.expires
+            let local = entry.hops == 0;
+            if (!local && now > entry.expires)
                 || bitrate.is_none()
-                || (entry.used == 0.0 && now > entry.timestamp + linger * factor)
+                || (!local && entry.used == 0.0 && now > entry.timestamp + linger * factor)
             {
                 stale.push(*hash);
             }
@@ -300,7 +309,7 @@ impl PathTable {
     }
 
     pub fn iter_live(&self) -> impl Iterator<Item = (&DestHash, &PathEntry)> {
-        self.entries.iter().filter(|(_, entry)| !entry.is_expired())
+        self.entries.iter().filter(|(_, entry)| entry.is_retained())
     }
 }
 
@@ -352,6 +361,40 @@ mod tests {
         assert_eq!(table.hops_to(&hash), None);
         assert_eq!(table.iter().count(), 1);
         assert_eq!(table.iter_live().count(), 0);
+    }
+
+    /// Transport.py 1.6.1 (833f6cf2, 5bd93ad9): a 0-hop path neither times
+    /// out nor lingers out, and goes only with its interface.
+    #[test]
+    fn instance_local_paths_are_kept_until_their_interface_goes() {
+        let mut table = PathTable::new();
+        let (local, remote) = ([0xA4; 16], [0xA5; 16]);
+        let now = now_f64();
+        for (hash, hops) in [(local, 0), (remote, 1)] {
+            let mut entry = PathEntry::new(None, hops, 1, InterfaceMode::Full);
+            entry.timestamp = now - 2.0 * crate::constants::UNUSED_PATH_LINGER;
+            entry.expires = now - 1.0;
+            table.insert(hash, entry);
+        }
+        assert!(table.has_path(&local));
+        assert_eq!(table.hops_to(&local), Some(0));
+        assert!(!table.has_path(&remote));
+        assert_eq!(table.iter_live().count(), 1);
+
+        let (removed, _) = table.cull(now, crate::constants::UNUSED_PATH_LINGER, false, |_| {
+            Some(1_000_000)
+        });
+        assert_eq!(removed, 1);
+        assert!(table.has_path(&local));
+
+        // rnpath -d reports success and the path stays, as upstream.
+        assert!(table.expire(&local));
+        assert!(table.has_path(&local));
+        assert_eq!(table.cull_expired_batch(16), 0);
+
+        let (removed, _) = table.cull(now, crate::constants::UNUSED_PATH_LINGER, false, |_| None);
+        assert_eq!(removed, 1);
+        assert!(table.get(&local).is_none());
     }
 
     #[test]
@@ -440,7 +483,7 @@ mod tests {
     fn test_expire_force_cull() {
         let mut table = PathTable::new();
         let hash = [0xBB; 16];
-        table.insert(hash, PathEntry::new(None, 0, 1, InterfaceMode::Gateway));
+        table.insert(hash, PathEntry::new(None, 1, 1, InterfaceMode::Gateway));
         assert!(table.has_path(&hash));
 
         let result = table.expire(&hash);
