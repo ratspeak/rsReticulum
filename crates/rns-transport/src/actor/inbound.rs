@@ -900,6 +900,9 @@ impl TransportActor {
             .unwrap_or_default();
         let suppressed =
             self.is_path_interface_suppressed(header.destination_hash, interface_id, now_f64());
+        // Transport.py: an unresponsive path takes the same emission with more
+        // hops, but the announce is not rebroadcast.
+        let mut table_insertion_only = false;
         let should_add = if suppressed {
             false
         } else if let Some(existing) = self.path_table.get(&header.destination_hash) {
@@ -922,8 +925,9 @@ impl TransportActor {
             } else if existing.is_expired() || announce_emitted > path_timebase {
                 !random_seen
             } else if announce_emitted == path_timebase {
-                self.path_table.get_state(&header.destination_hash)
-                    == crate::constants::PathState::Unresponsive
+                table_insertion_only = self.path_table.get_state(&header.destination_hash)
+                    == crate::constants::PathState::Unresponsive;
+                table_insertion_only
             } else {
                 false
             }
@@ -966,6 +970,7 @@ impl TransportActor {
             // check above compares against our own queued copy. Non-transport
             // nodes never queue (would amplify the announce per hub).
             if !rate_blocked
+                && !table_insertion_only
                 && (self.is_transport_enabled || is_from_local_client)
                 && header.context != rns_wire::context::PacketContext::PathResponse
                 && header.hops < PATHFINDER_M

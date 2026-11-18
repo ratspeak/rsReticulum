@@ -2590,6 +2590,7 @@ mod tests {
     mod announce_admission;
     mod announce_identity;
     mod announce_ingress;
+    mod announce_rebroadcast;
     mod bitrate_timing;
     mod discovery_api;
     mod discovery_public_api;
