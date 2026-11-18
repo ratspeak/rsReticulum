@@ -715,7 +715,7 @@ impl TransportActor {
         }
         // Python counts a path request once its tag and stamp pass these gates,
         // then classifies it against the updated burst state (Transport.py).
-        self.accept_inbound(super::inbound::InboundVerdict::Batched);
+        self.set_inbound_verdict(super::inbound::InboundVerdict::Batched);
         self.record_interface_event(interface_id, InterfaceEvent::ReceivedPathRequest, raw_len);
         self.count_transport_event(InterfaceEvent::ReceivedPathRequest);
         let ingress_limited = self
@@ -738,7 +738,7 @@ impl TransportActor {
             }
             return;
         }
-        self.accept_inbound(super::inbound::InboundVerdict::Accepted);
+        self.set_inbound_verdict(super::inbound::InboundVerdict::Accepted);
         self.inflight_path_requests.insert(requested_dest, now);
 
         let mut tag_bytes = [0u8; 16];

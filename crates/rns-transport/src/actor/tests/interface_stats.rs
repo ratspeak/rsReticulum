@@ -672,3 +672,197 @@ fn a_child_adds_accepted_and_filtered_bytes_to_its_parent() {
     );
     assert_eq!(parent.filtered_tx_bytes, 0);
 }
+
+fn transit_link(
+    actor: &mut TransportActor,
+    link_id: [u8; 16],
+    destination_hash: [u8; 16],
+    validated: bool,
+) {
+    actor.link_table.insert(
+        link_id,
+        crate::link_table::LinkEntry {
+            interface_owner: actor.interfaces.get(&2).map(|entry| entry.owner.clone()),
+            receiving_owner: actor.interfaces.get(&1).map(|entry| entry.owner.clone()),
+            requested_mode: 1,
+            accepted_mtu_ceiling: 500,
+            traffic: 0,
+            timestamp: now_f64(),
+            next_hop: Some([0xBB; 16]),
+            interface_id: 2,
+            remaining_hops: 1,
+            destination_hash,
+            validated,
+            proof_timeout: now_f64() + 120.0,
+            receiving_interface: 1,
+            taken_hops: 1,
+        },
+    );
+}
+
+fn link_packet(link_id: [u8; 16], tag: u8) -> Bytes {
+    packet(
+        DestinationType::Link,
+        PacketType::Data,
+        0,
+        None,
+        link_id,
+        &[tag; 24],
+    )
+}
+
+/// Python 1.6.1 counts relayed Link packets in `link_rxb` and `link_txb`
+/// unless they come from or go to a local client, and every forwarded byte
+/// in the Link's `IDX_LT_TRXB` (Transport.py:2509-2549).
+#[test]
+fn relayed_link_packets_count_as_link_traffic() {
+    let mut actor = hub();
+    let mut initiator_rx = attach(&mut actor, 1);
+    let mut destination_rx = attach(&mut actor, 2);
+    let link_id = [0x81; 16];
+    transit_link(&mut actor, link_id, [0x82; 16], true);
+
+    let outbound = link_packet(link_id, 1);
+    inbound(&mut actor, outbound.clone(), 1);
+    assert!(
+        destination_rx.try_recv().is_ok(),
+        "forwarded toward the destination"
+    );
+    let inbound_reply = link_packet(link_id, 2);
+    inbound(&mut actor, inbound_reply.clone(), 2);
+    assert!(
+        initiator_rx.try_recv().is_ok(),
+        "forwarded toward the initiator"
+    );
+
+    let both = (outbound.len() + inbound_reply.len()) as u64;
+    let measured = totals(&mut actor);
+    assert_eq!((measured.lrxb, measured.ltxb), (both, both));
+    assert_eq!(actor.link_table.get(&link_id).unwrap().traffic, both);
+
+    inbound(&mut actor, outbound.clone(), 1);
+    assert!(
+        destination_rx.try_recv().is_err(),
+        "a duplicate is not relayed"
+    );
+    assert_eq!(stats(&mut actor, 1).packet_filter_hits, 1);
+    assert_eq!(
+        stats(&mut actor, 1).filtered_rx_bytes,
+        outbound.len() as u64,
+        "the deferred duplicate check filters, as Python's packet filter"
+    );
+    assert_eq!(totals(&mut actor).lrxb, both);
+
+    actor.interfaces.get_mut(&1).unwrap().role = InterfaceRole::LocalClient;
+    // A local client's packets keep zero hops.
+    actor.link_table.get_mut(&link_id).unwrap().taken_hops = 0;
+    let from_client = link_packet(link_id, 3);
+    inbound(&mut actor, from_client.clone(), 1);
+    assert!(destination_rx.try_recv().is_ok());
+    let to_client = link_packet(link_id, 4);
+    inbound(&mut actor, to_client.clone(), 2);
+    assert!(initiator_rx.try_recv().is_ok());
+    let measured = totals(&mut actor);
+    assert_eq!(
+        (measured.lrxb, measured.ltxb),
+        (
+            both + to_client.len() as u64,
+            both + from_client.len() as u64
+        ),
+        "local client legs are not link traffic"
+    );
+    assert_eq!(
+        actor.link_table.get(&link_id).unwrap().traffic,
+        both + (from_client.len() + to_client.len()) as u64,
+        "the per-link counter keeps every forwarded byte"
+    );
+
+    std::thread::sleep(Duration::from_millis(5));
+    actor.count_traffic(1_000.0);
+    let measured = totals(&mut actor);
+    assert!(measured.lrxs > 0.0 && measured.ltxs > 0.0);
+}
+
+/// Python's `link_distribution()` groups relayed Links by destination with
+/// their traffic and the hashes of the interfaces they came in on.
+#[test]
+fn link_distribution_groups_relayed_links_by_destination() {
+    let mut actor = hub();
+    let _initiator_rx = attach(&mut actor, 1);
+    let mut destination_rx = attach(&mut actor, 2);
+    let destination = [0x83; 16];
+    transit_link(&mut actor, [0x84; 16], destination, true);
+    transit_link(&mut actor, [0x85; 16], destination, false);
+    transit_link(&mut actor, [0x86; 16], [0x87; 16], true);
+    let relayed = link_packet([0x84; 16], 5);
+    inbound(&mut actor, relayed.clone(), 1);
+    assert!(destination_rx.try_recv().is_ok());
+
+    let TransportQueryResponse::LinkDistribution(entries) =
+        actor.handle_query(TransportQuery::GetLinkDistribution)
+    else {
+        panic!("unexpected link distribution response");
+    };
+    let from = vec![rns_crypto::sha::sha256(b"stats_1")];
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].destination_hash, destination);
+    assert_eq!((entries[0].active, entries[0].pending), (1, 1));
+    assert_eq!(entries[0].traffic, relayed.len() as u64);
+    assert_eq!(entries[0].from_interfaces, from);
+    assert_eq!(entries[1].destination_hash, [0x87; 16]);
+    assert_eq!(
+        (entries[1].active, entries[1].pending, entries[1].traffic),
+        (1, 0, 0)
+    );
+}
+
+/// An own Link's packets count as link traffic: what it receives
+/// (`Link.receive`, Link.py:1034) and what it sends (Packet.py:312).
+#[test]
+fn an_own_links_packets_count_as_link_traffic() {
+    let mut actor = hub();
+    let mut rx = attach(&mut actor, 1);
+    let link_id = [0x88; 16];
+    let (delivery_tx, mut delivery_rx) = mpsc::channel(4);
+    actor.local_destinations.insert(link_id);
+    actor.destination_channels.insert(link_id, delivery_tx);
+    let received_packet = link_packet(link_id, 6);
+    inbound(&mut actor, received_packet.clone(), 1);
+    assert!(delivery_rx.try_recv().is_ok());
+
+    let binding = crate::messages::LinkEndpointBinding {
+        interface_owner: actor.interfaces.get(&1).map(|entry| entry.owner.id()),
+        link_id,
+        interface_id: 1,
+        role: crate::messages::LinkEndpointRole::Initiator,
+    };
+    let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (bind_tx, _bind_rx) = tokio::sync::oneshot::channel();
+    actor.handle_message(TransportMessage::BindLinkEndpoint {
+        binding,
+        lifecycle_tx,
+        result_tx: bind_tx,
+    });
+    let sent = link_packet(link_id, 7);
+    let (send_tx, mut send_rx) = tokio::sync::oneshot::channel();
+    actor.handle_message(TransportMessage::SendLinkEndpoint {
+        link_id,
+        role: crate::messages::LinkEndpointRole::Initiator,
+        request: OutboundRequest {
+            raw: sent.clone(),
+            destination_hash: link_id,
+        },
+        result_tx: send_tx,
+    });
+    assert_eq!(
+        send_rx.try_recv().unwrap(),
+        crate::messages::LinkEndpointSendResult::Sent
+    );
+    assert!(rx.try_recv().is_ok());
+
+    let measured = totals(&mut actor);
+    assert_eq!(
+        (measured.lrxb, measured.ltxb),
+        (received_packet.len() as u64, sent.len() as u64)
+    );
+}

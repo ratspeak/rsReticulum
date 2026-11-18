@@ -183,8 +183,8 @@ impl TransportActor {
         }
     }
 
-    /// Python's end of `preprocess_inbound` for the frame being processed.
-    pub(super) fn accept_inbound(&mut self, verdict: InboundVerdict) {
+    /// Python's `preprocess_inbound` verdict on the frame being processed.
+    pub(super) fn set_inbound_verdict(&mut self, verdict: InboundVerdict) {
         self.inbound_verdict = verdict;
     }
 
@@ -431,7 +431,7 @@ impl TransportActor {
         let path_request = parsed.flags.packet_type != rns_wire::flags::PacketType::Announce
             && parsed.destination_hash == Self::path_request_dest_hash();
         if parsed.flags.packet_type != rns_wire::flags::PacketType::Announce && !path_request {
-            self.accept_inbound(InboundVerdict::Accepted);
+            self.set_inbound_verdict(InboundVerdict::Accepted);
         }
 
         // Announce gates run after the packet filter and before the hash is
@@ -788,7 +788,7 @@ impl TransportActor {
         }
         self.record_interface_event(interface_id, InterfaceEvent::ReceivedAnnounce, raw.len());
         self.count_transport_event(InterfaceEvent::ReceivedAnnounce);
-        self.accept_inbound(InboundVerdict::Accepted);
+        self.set_inbound_verdict(InboundVerdict::Accepted);
 
         if let Some(validated_identity) = validated_identity.as_ref() {
             let known_public_key = self
@@ -1408,8 +1408,8 @@ impl TransportActor {
                     .remove(&rns_wire::hash::packet_hash(raw, header.flags.header_type));
                 return;
             }
-            if let Some(tx) = self.destination_channels.get(&header.destination_hash)
-                && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+            if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
+                match tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                     interface_owner: self
                         .interfaces
                         .get(&interface_id)
@@ -1417,11 +1417,21 @@ impl TransportActor {
                     raw: raw.clone(),
                     interface_id,
                     metrics,
-                })
-            {
-                self.channel_drops += 1;
-                warn!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
-                        "failed to deliver InboundPacket to local destination (channel full)");
+                }) {
+                    // Python's `Link.receive` (Link.py:1034).
+                    Ok(())
+                        if header.flags.destination_type
+                            == rns_wire::flags::DestinationType::Link =>
+                    {
+                        self.count_link_bytes(raw.len(), 0);
+                    }
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.channel_drops += 1;
+                        warn!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
+                            "failed to deliver InboundPacket to local destination (channel full)");
+                    }
+                }
             }
             return;
         }
@@ -1591,6 +1601,7 @@ impl TransportActor {
                 receiving_owner,
                 requested_mode,
                 accepted_mtu_ceiling,
+                traffic: 0,
             };
             self.link_table.insert(link_id, link_entry);
 
@@ -2072,8 +2083,8 @@ impl TransportActor {
             }
         }
 
-        if let Some(tx) = self.destination_channels.get(&header.destination_hash)
-            && let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
+        if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
+            match tx.try_send(crate::link_messages::DestinationEvent::InboundPacket {
                 interface_owner: self
                     .interfaces
                     .get(&_interface_id)
@@ -2081,11 +2092,18 @@ impl TransportActor {
                 raw: raw.clone(),
                 interface_id: _interface_id,
                 metrics,
-            })
-        {
-            self.channel_drops += 1;
-            error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
-                    "failed to deliver link proof to local link");
+            }) {
+                // Python hands only resource proofs to `Link.receive`.
+                Ok(()) if header.context == rns_wire::context::PacketContext::ResourcePrf => {
+                    self.count_link_bytes(raw.len(), 0);
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    self.channel_drops += 1;
+                    error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
+                        "failed to deliver link proof to local link");
+                }
+            }
         }
     }
 
@@ -2126,6 +2144,29 @@ impl TransportActor {
             );
             self.protocol_violation(interface_id);
             return true;
+        }
+        let skip_hashlist = matches!(
+            header.context,
+            rns_wire::context::PacketContext::Keepalive
+                | rns_wire::context::PacketContext::Resource
+                | rns_wire::context::PacketContext::ResourceReq
+                | rns_wire::context::PacketContext::ResourcePrf
+                | rns_wire::context::PacketContext::CacheRequest
+                | rns_wire::context::PacketContext::Channel
+        );
+        let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+        // The hashlist check deferred from ingress: Python's packet filter.
+        if !skip_hashlist && self.packet_hashlist.contains(&pkt_hash) {
+            trace!(
+                link_id = hex::encode(header.destination_hash),
+                packet_kind, "duplicate link-table packet dropped"
+            );
+            self.packet_filter_hit(interface_id);
+            self.set_inbound_verdict(InboundVerdict::Filtered);
+            return true;
+        }
+        if !from_local_client {
+            self.count_link_bytes(raw.len(), 0);
         }
         if !self.link_registration_is_current(&entry)
             || raw.len() > entry.accepted_mtu_ceiling as usize
@@ -2192,29 +2233,17 @@ impl TransportActor {
                     self.local_hops_delta
                 };
         }
-        let skip_hashlist = matches!(
-            header.context,
-            rns_wire::context::PacketContext::Keepalive
-                | rns_wire::context::PacketContext::Resource
-                | rns_wire::context::PacketContext::ResourceReq
-                | rns_wire::context::PacketContext::ResourcePrf
-                | rns_wire::context::PacketContext::CacheRequest
-                | rns_wire::context::PacketContext::Channel
-        );
         if !skip_hashlist {
-            let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
-            if !self.packet_hashlist.insert(pkt_hash) {
-                trace!(
-                    link_id = hex::encode(header.destination_hash),
-                    packet_kind, "duplicate link-table packet dropped after claim"
-                );
-                return true;
-            }
+            self.packet_hashlist.insert(pkt_hash);
         }
         if let Some(entry) = self.link_table.get_mut(&header.destination_hash) {
             entry.timestamp = now_f64();
+            entry.traffic = entry.traffic.saturating_add(forwarded.len() as u64);
         }
         self.send_to_interface(target_interface, &forwarded);
+        if !self.is_local_client_interface(target_interface) {
+            self.count_link_bytes(0, forwarded.len());
+        }
         // Transport.py
         if let Some(path) = self.path_table.get_mut(&entry.destination_hash) {
             path.mark_used();

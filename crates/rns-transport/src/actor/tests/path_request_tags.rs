@@ -218,6 +218,7 @@ async fn blocked_interface_rediscovery_shares_one_tag() {
                 receiving_owner: None,
                 requested_mode: 0,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
             },
         );
     });

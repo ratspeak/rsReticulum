@@ -4182,6 +4182,7 @@ mod tests {
             receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
             requested_mode: 1,
             accepted_mtu_ceiling: 500,
+            traffic: 0,
 
             timestamp: now_f64(),
             next_hop: Some([0xBB; 16]),
@@ -4254,6 +4255,7 @@ mod tests {
                 receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: None,
@@ -4307,6 +4309,7 @@ mod tests {
                 receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: None,
@@ -4362,6 +4365,7 @@ mod tests {
                 receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: None,
@@ -4413,6 +4417,7 @@ mod tests {
                     receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                     requested_mode: 1,
                     accepted_mtu_ceiling: 500,
+                    traffic: 0,
 
                     timestamp: now_f64(),
                     next_hop: None,
@@ -4460,6 +4465,7 @@ mod tests {
                 receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: None,
@@ -4516,6 +4522,7 @@ mod tests {
                 receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: None,
@@ -4581,6 +4588,7 @@ mod tests {
                 receiving_owner: relay.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: None,
@@ -4639,6 +4647,7 @@ mod tests {
                     .map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: Some([0xDD; 16]),
@@ -4675,6 +4684,7 @@ mod tests {
                     .map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: Some([0xCC; 16]),
@@ -8983,6 +8993,7 @@ mod tests {
                 receiving_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: None,
@@ -9024,6 +9035,7 @@ mod tests {
                 receiving_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: None,
@@ -9075,6 +9087,7 @@ mod tests {
                 receiving_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: None,
@@ -9119,6 +9132,7 @@ mod tests {
                 receiving_owner: actor.interfaces.get(&(1)).map(|entry| entry.owner.clone()),
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now_f64(),
                 next_hop: None,

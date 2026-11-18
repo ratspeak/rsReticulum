@@ -247,6 +247,7 @@ fn packet_capacity_authenticated_proof_obeys_request_ceiling_and_keeps_original_
             receiving_owner: Some(first_owner),
             requested_mode: 1,
             accepted_mtu_ceiling: 1000,
+            traffic: 0,
         },
     );
     for signal in [SignallingData::new(2, 500), SignallingData::new(1, 1001)] {

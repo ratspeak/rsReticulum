@@ -520,6 +520,7 @@ fn transit_table_capacity_and_driver_refusal_do_not_create_untracked_forwarding(
                             .map(|entry| entry.owner.clone()),
                         requested_mode: 1,
                         accepted_mtu_ceiling: 500,
+                        traffic: 0,
 
                         timestamp: now_f64(),
                         next_hop: None,

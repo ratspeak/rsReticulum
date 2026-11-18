@@ -455,7 +455,22 @@ impl TransportActor {
         Ok(())
     }
 
+    /// Python counts every packet an own Link sends in `link_txb` (Packet.py:312).
     fn try_send_link_endpoint_raw(
+        &mut self,
+        interface_id: InterfaceId,
+        link_id: [u8; 16],
+        role: crate::messages::LinkEndpointRole,
+        raw: &[u8],
+    ) -> InterfaceSendOutcome {
+        let outcome = self.try_send_link_endpoint_raw_uncounted(interface_id, link_id, role, raw);
+        if outcome == InterfaceSendOutcome::Sent {
+            self.count_link_bytes(0, raw.len());
+        }
+        outcome
+    }
+
+    fn try_send_link_endpoint_raw_uncounted(
         &mut self,
         interface_id: InterfaceId,
         link_id: [u8; 16],

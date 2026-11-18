@@ -27,6 +27,8 @@ pub struct LinkEntry {
     pub receiving_owner: Option<crate::InterfaceOwner>,
     pub requested_mode: u8,
     pub accepted_mtu_ceiling: u32,
+    /// Bytes forwarded over this Link (Python `IDX_LT_TRXB`).
+    pub traffic: u64,
 }
 
 /// Metadata retained when an unvalidated link expires before proof.
@@ -236,6 +238,7 @@ mod tests {
                 receiving_owner: None,
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: 1000.0,
                 next_hop: None,
@@ -264,6 +267,7 @@ mod tests {
                 receiving_owner: None,
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: 1000.0,
                 next_hop: Some([0xDD; 16]),
@@ -293,6 +297,7 @@ mod tests {
                 receiving_owner: None,
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: 1000.0,
                 next_hop: None,
@@ -329,6 +334,7 @@ mod tests {
                 receiving_owner: None,
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now,
                 next_hop: None,
@@ -349,6 +355,7 @@ mod tests {
                 receiving_owner: None,
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: 100.0,
                 next_hop: None,
@@ -369,6 +376,7 @@ mod tests {
                 receiving_owner: None,
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now,
                 next_hop: None,
@@ -389,6 +397,7 @@ mod tests {
                 receiving_owner: None,
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now,
                 next_hop: None,
@@ -426,6 +435,7 @@ mod tests {
                 receiving_owner: None,
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now,
                 next_hop: None,
@@ -446,6 +456,7 @@ mod tests {
                 receiving_owner: None,
                 requested_mode: 1,
                 accepted_mtu_ceiling: 500,
+                traffic: 0,
 
                 timestamp: now,
                 next_hop: None,

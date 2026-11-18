@@ -1048,6 +1048,9 @@ pub enum TransportQuery {
     /// The top-level traffic, packet, link and path counts of Python's
     /// `get_interface_stats()`, answered as `TrafficTotals`.
     GetTrafficTotals,
+    /// Python 1.6.1 `Transport.link_distribution()`: relayed Links grouped by
+    /// destination, answered as `LinkDistribution`.
+    GetLinkDistribution,
     GetRecentAnnounces,
     /// Return cached identity metadata without updating `last_used`. Locally
     /// restored cache metadata is trusted; this query performs no fresh signature
@@ -1270,6 +1273,7 @@ pub enum TransportQueryResponse {
     PathTable(Vec<PathTableRpcEntry>),
     InterfaceStats(Vec<InterfaceStatRpcEntry>),
     TrafficTotals(TrafficTotalsRpcEntry),
+    LinkDistribution(Vec<LinkDistributionRpcEntry>),
     RateTable(Vec<RateTableRpcEntry>),
     Announces(Vec<AnnounceRpcEntry>),
     RecalledDestination(Option<RecalledDestinationRpcEntry>),
@@ -1289,6 +1293,22 @@ pub enum TransportQueryResponse {
     Data(Vec<u8>),
     Ok,
     Error(String),
+}
+
+/// Relayed Links toward one destination (Python `link_distribution`), sorted
+/// by destination hash.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LinkDistributionRpcEntry {
+    pub destination_hash: [u8; 16],
+    /// Validated Links.
+    pub active: u64,
+    /// Links still awaiting their proof.
+    pub pending: u64,
+    /// Bytes the Links forwarded (`IDX_LT_TRXB`).
+    pub traffic: u64,
+    /// `Interface.get_hash()` of each interface a request arrived on, sorted.
+    pub from_interfaces: Vec<[u8; 32]>,
 }
 
 /// Snapshot of a cached route. Times are Unix seconds; returned interface
@@ -1456,6 +1476,13 @@ pub struct TrafficTotalsRpcEntry {
     pub ftxb: u64,
     pub frxs: f64,
     pub ftxs: f64,
+    /// Python `link_rxb` and `link_txb`: Link packets relayed in and out other
+    /// than to or from local clients, and those of this instance's own Links;
+    /// `link_speed_rx` and `link_speed_tx` in bits per second.
+    pub lrxb: u64,
+    pub ltxb: u64,
+    pub lrxs: f64,
+    pub ltxs: f64,
     pub rxpps: u64,
     pub txpps: u64,
     /// Python 1.6.1 `rx_packets`: packets that passed preprocessing.

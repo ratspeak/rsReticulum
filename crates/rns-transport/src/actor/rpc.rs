@@ -187,6 +187,9 @@ impl TransportActor {
             TransportQuery::GetTrafficTotals => {
                 TransportQueryResponse::TrafficTotals(self.traffic_totals())
             }
+            TransportQuery::GetLinkDistribution => {
+                TransportQueryResponse::LinkDistribution(self.link_distribution())
+            }
             TransportQuery::GetRateTable => {
                 let entries: Vec<RateTableRpcEntry> = self
                     .rate_table
@@ -828,6 +831,8 @@ pub(super) struct TrafficCount {
     /// Python `r_stat_rssi`, `r_stat_snr` and `r_stat_q` per interface.
     signal: HashMap<InterfaceId, PacketMetrics>,
     last_pps: Option<(std::time::Instant, u64, u64)>,
+    /// `link_rxb` and `link_txb` at `last_pps`.
+    last_link_bytes: (u64, u64),
     last_count: f64,
 }
 
@@ -840,6 +845,7 @@ impl Default for TrafficCount {
             speeds: HashMap::new(),
             signal: HashMap::new(),
             last_pps: None,
+            last_link_bytes: (0, 0),
             last_count: 0.0,
         }
     }
@@ -900,6 +906,46 @@ impl TransportActor {
     /// preprocessing (Transport.py:2266).
     pub(super) fn count_rx_packet(&mut self) {
         self.traffic_count.totals.rx_packets += 1;
+    }
+
+    /// Python 1.6.1 `link_rxb` and `link_txb` (Transport.py, Link.py, Packet.py).
+    pub(super) fn count_link_bytes(&mut self, rx: usize, tx: usize) {
+        let totals = &mut self.traffic_count.totals;
+        totals.lrxb = totals.lrxb.saturating_add(rx as u64);
+        totals.ltxb = totals.ltxb.saturating_add(tx as u64);
+    }
+
+    /// Python `Transport.link_distribution()`: every link table entry is a
+    /// relayed Link (Transport.py:3786-3814).
+    fn link_distribution(&self) -> Vec<crate::messages::LinkDistributionRpcEntry> {
+        let mut by_destination: HashMap<[u8; 16], crate::messages::LinkDistributionRpcEntry> =
+            HashMap::new();
+        for (_, link) in self.link_table.iter() {
+            let entry = by_destination
+                .entry(link.destination_hash)
+                .or_insert_with(|| crate::messages::LinkDistributionRpcEntry {
+                    destination_hash: link.destination_hash,
+                    ..Default::default()
+                });
+            entry.traffic = entry.traffic.saturating_add(link.traffic);
+            if link.validated {
+                entry.active += 1;
+            } else {
+                entry.pending += 1;
+            }
+            if let Some(interface) = self.interfaces.get(&link.receiving_interface) {
+                let hash = rns_crypto::sha::sha256(interface.upstream_name().as_bytes());
+                if !entry.from_interfaces.contains(&hash) {
+                    entry.from_interfaces.push(hash);
+                }
+            }
+        }
+        let mut entries: Vec<_> = by_destination.into_values().collect();
+        for entry in &mut entries {
+            entry.from_interfaces.sort_unstable();
+        }
+        entries.sort_unstable_by_key(|entry| entry.destination_hash);
+        entries
     }
 
     /// Python `Transport.tx_packets += 1` per `Transport.transmit` (Transport.py).
@@ -998,8 +1044,12 @@ impl TransportActor {
                 ((totals.rx_packets.saturating_sub(rxp)) as f64 / elapsed).round() as u64;
             totals.txpps =
                 ((totals.tx_packets.saturating_sub(txp)) as f64 / elapsed).round() as u64;
+            let (lrxb, ltxb) = count.last_link_bytes;
+            totals.lrxs = totals.lrxb.saturating_sub(lrxb) as f64 * 8.0 / elapsed;
+            totals.ltxs = totals.ltxb.saturating_sub(ltxb) as f64 * 8.0 / elapsed;
         }
         count.last_pps = Some((at, totals.rx_packets, totals.tx_packets));
+        count.last_link_bytes = (totals.lrxb, totals.ltxb);
         totals.measured = measured;
         totals.rxb += deltas[0];
         totals.txb += deltas[1];
@@ -1171,6 +1221,7 @@ mod tests {
             receiving_owner: None,
             requested_mode: 1,
             accepted_mtu_ceiling: 500,
+            traffic: 0,
         }
     }
 
