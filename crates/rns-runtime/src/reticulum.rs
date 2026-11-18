@@ -5952,6 +5952,7 @@ async fn prepare_interface_with_role_and_overrides(
     entry.inspection = handle.inspection;
     entry.ingress = ingress;
     entry.multipoint = multipoint;
+    entry.shared_medium = kind.shared_medium();
     if let Some(parent) = inherited.as_ref() {
         entry.announce_cap = parent.announce_cap;
         entry.announce_rate_target = parent.announce_rate_target;
@@ -6095,6 +6096,7 @@ fn clone_interface_post_init(
         default_ifac_size: post_init.default_ifac_size,
         ingress_control: post_init.ingress_control,
         announce_ingress_exempt: post_init.announce_ingress_exempt,
+        shared_medium: post_init.shared_medium,
         ingress_overrides: post_init.ingress_overrides.clone(),
         recursive_prs: post_init.recursive_prs,
         announces_from_internal: post_init.announces_from_internal,
@@ -6296,6 +6298,7 @@ async fn prepare_interface_with_post_init(
     entry.announces_from_internal = post_init.announces_from_internal;
     entry.announces_to_internal = post_init.announces_to_internal;
     entry.gravity = post_init.gravity.unwrap_or(0);
+    entry.shared_medium = post_init.shared_medium;
     entry.destination_cost = post_init.destination_cost;
     entry.pr_cost = post_init.pr_cost;
     Ok(PreparedInterfaceRegistration {

@@ -2009,6 +2009,9 @@ pub struct InterfacePostInit {
     /// Serial, KISS, AX.25 KISS, RNode and RNodeMulti interfaces never hold
     /// announces in Python; they override `should_ingress_limit`.
     pub announce_ingress_exempt: bool,
+    /// The interface classes Python marks `shared_medium`: Serial, KISS,
+    /// AX.25 KISS, RNode (every port), RNodeMulti, UDP and Pipe.
+    pub shared_medium: bool,
     /// Per-interface ingress/egress overrides parsed from `ic_*`, `ec_pr_freq`
     /// and `egress_control` settings.
     pub ingress_overrides: rns_transport::ingress::IngressOverrides,
@@ -2112,6 +2115,18 @@ impl InterfacePostInit {
                         | "RNodeMultiInterface"
                 )
             ),
+            shared_medium: matches!(
+                section.get("type"),
+                Some(
+                    "SerialInterface"
+                        | "KISSInterface"
+                        | "AX25KISSInterface"
+                        | "RNodeInterface"
+                        | "RNodeMultiInterface"
+                        | "UDPInterface"
+                        | "PipeInterface"
+                )
+            ),
             ingress_overrides,
             recursive_prs,
             announces_from_internal,
@@ -2169,6 +2184,33 @@ pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    /// The classes that set `shared_medium = True` in Python 1.6.1
+    /// (`RNS/Interfaces/*.py`); the base class leaves it false.
+    #[test]
+    fn shared_medium_follows_the_python_interface_class() {
+        for (kind, shared) in [
+            ("SerialInterface", true),
+            ("KISSInterface", true),
+            ("AX25KISSInterface", true),
+            ("RNodeInterface", true),
+            ("RNodeMultiInterface", true),
+            ("UDPInterface", true),
+            ("PipeInterface", true),
+            ("TCPClientInterface", false),
+            ("TCPServerInterface", false),
+            ("BackboneInterface", false),
+            ("BackboneClientInterface", false),
+            ("AutoInterface", false),
+            ("LocalInterface", false),
+            ("I2PInterface", false),
+        ] {
+            let mut section = ConfigSection::new();
+            section.set("type", kind);
+            let post_init = InterfacePostInit::try_from_section(&section).unwrap();
+            assert_eq!(post_init.shared_medium, shared, "{kind}");
+        }
+    }
 
     #[cfg(feature = "serial")]
     #[test]

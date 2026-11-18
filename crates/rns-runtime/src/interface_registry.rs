@@ -53,6 +53,13 @@ impl InterfaceKind {
         }
     }
 
+    /// Runtime-spawned radios and the BLE peer mesh share their medium; every
+    /// other directly registered interface (TCP, Backbone, I2P, Local and
+    /// Auto peers, listener children) does not (Python `shared_medium`).
+    pub(crate) fn shared_medium(self) -> bool {
+        self != Self::Standard
+    }
+
     fn requires_exact_driver(self) -> bool {
         match self {
             #[cfg(feature = "ble")]
@@ -1690,5 +1697,20 @@ mod tests {
             InterfaceKind::AndroidUsbRNode.shutdown_strategy(),
             InterfaceShutdownStrategy::ExactRNodeDriver
         );
+    }
+
+    /// The BLE peer mesh is one interface whose peers cannot hear each other,
+    /// so it must keep rebroadcasting what one of them sent.
+    #[test]
+    fn only_standard_registrations_are_off_a_shared_medium() {
+        assert!(!InterfaceKind::Standard.shared_medium());
+        #[cfg(feature = "ble")]
+        assert!(InterfaceKind::BlePeer.shared_medium() && InterfaceKind::BleRNode.shared_medium());
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        assert!(InterfaceKind::RNode.shared_medium());
+        #[cfg(feature = "serial")]
+        assert!(InterfaceKind::RNodeMulti.shared_medium());
+        #[cfg(target_os = "android")]
+        assert!(InterfaceKind::AndroidUsbRNode.shared_medium());
     }
 }
