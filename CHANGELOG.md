@@ -1,5 +1,7 @@
 # Changelog
 
+## Unreleased
+
 ## 1.5.1 - 2026-11-18
 
 - Bluetooth Peer runs in Gateway mode, so a node with transport on looks up the paths its Bluetooth peers ask for that it doesn't know yet. Nodes with transport off behave as before.
