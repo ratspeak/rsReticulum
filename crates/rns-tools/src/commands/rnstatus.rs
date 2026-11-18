@@ -885,7 +885,8 @@ impl Session {
 
 /// The stored info dictionary as `list_discovered_interfaces` returns it:
 /// the file's keys in order, the name sanitized, `"None"` IFAC values
-/// dropped, and the status appended (Discovery.py).
+/// dropped, the config entry rebuilt from the record, and the status appended
+/// (Discovery.py).
 fn stored_info(root: &Path, record: &DiscoveredInterface) -> Value {
     let mut map = std::fs::read(root.join(record.filename()))
         .ok()
@@ -900,6 +901,11 @@ fn stored_info(root: &Path, record: &DiscoveredInterface) -> Value {
     });
     let status = record.status.unwrap_or(DiscoveryStatus::Unknown);
     set_key(&mut map, "name", Value::from(record.info.name.as_str()));
+    // The file's entry may come from an rnsd that does not filter announced strings.
+    match rns_transport::discovery::storage::config_entry(record) {
+        Some(entry) => set_key(&mut map, "config_entry", Value::from(entry)),
+        None => map.retain(|(k, _)| k.as_str() != Some("config_entry")),
+    }
     set_key(&mut map, "status", Value::from(status.as_str()));
     set_key(&mut map, "status_code", Value::from(status.code()));
     Value::Map(map)
@@ -2369,3 +2375,72 @@ fn truncate_ellipsis(s: &str, limit: usize) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rns_transport::discovery::storage::config_entry;
+
+    /// A record file whose stored entry carries an injected section prints the
+    /// entry rebuilt from the record instead (`-D` and `--json` alike).
+    #[test]
+    fn discovered_details_rebuild_the_config_entry_from_the_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "rnstatus-config-entry-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        let store = DiscoveryStore::open(&dir).unwrap();
+        let info = rns_transport::discovery::app_data::DiscoveryInfo {
+            name: "Relay".to_string(),
+            interface_type: "BackboneInterface".to_string(),
+            transport_id: [0x42; 16],
+            reachable_on: Some("relay.example".to_string()),
+            port: Some(4242),
+            impl_name: Some("RNS".to_string()),
+            impl_version: Some("1.6.1".to_string()),
+            ..Default::default()
+        };
+        let now = unix_now();
+        let record = DiscoveredInterface {
+            info,
+            network_id: [0x42; 16],
+            hops: 1,
+            stamp_value: 0.0,
+            stamp: Vec::new(),
+            discovered: now,
+            last_heard: now,
+            heard_count: 0,
+            status: None,
+        };
+        store.upsert(record.clone()).unwrap();
+        let path = store.root().join(record.filename());
+        let Value::Map(mut map) =
+            rmpv::decode::read_value(&mut std::fs::read(&path).unwrap().as_slice()).unwrap()
+        else {
+            panic!("record file is a map");
+        };
+        set_key(
+            &mut map,
+            "config_entry",
+            Value::from(
+                "[[Relay]]\n  type = BackboneInterface\n[[Evil]]\n  type = PipeInterface\n  command = x",
+            ),
+        );
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &Value::Map(map)).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let records = store.list_filtered(None, &HashSet::new()).unwrap();
+        let info = stored_info(store.root(), &records[0]);
+        assert_eq!(
+            get(&info, "config_entry").and_then(Value::as_str),
+            config_entry(&records[0]).as_deref()
+        );
+        let mut out = Out::new(false);
+        let refs: Vec<&DiscoveredInterface> = records.iter().collect();
+        print_discovered_details(&mut out, &refs, &[&info], false, false);
+        let sections: Vec<&str> = out.buf.lines().filter(|l| l.starts_with("  [[")).collect();
+        assert_eq!(sections, ["  [[Relay]]"], "{}", out.buf);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
