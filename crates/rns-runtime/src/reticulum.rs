@@ -3201,6 +3201,8 @@ pub struct ReticulumConfig {
 
     /// Network stamp policy from the `[stamps]` section.
     pub stamps: rns_transport::stamps::StampPolicy,
+    /// `[stamps] max_workers` and `worker_niceness`, installed process-wide at init.
+    pub stamp_workers: rns_identity::stamps::StampWorkers,
     /// Destination-type filter and hop limiter from the `[filter]` section.
     pub filter: rns_transport::destination_filter::FilterPolicy,
 }
@@ -3249,6 +3251,7 @@ impl Default for ReticulumConfig {
             log_timestamps: true,
             bootstrap_configs: Vec::new(),
             stamps: rns_transport::stamps::StampPolicy::default(),
+            stamp_workers: rns_identity::stamps::StampWorkers::default(),
             filter: rns_transport::destination_filter::FilterPolicy::default(),
         }
     }
@@ -3369,6 +3372,21 @@ fn apply_stamps_section(
     }
     if let Some(v) = config_float(S, sec, "pr_stamp_timeout")? {
         policy.pr_stamp_timeout = StampPolicy::clamp_timeout(v);
+    }
+    Ok(())
+}
+
+/// Python `[stamps] max_workers` and `worker_niceness`: `as_int`, then clamped.
+fn apply_stamp_workers(
+    workers: &mut rns_identity::stamps::StampWorkers,
+    sec: &ConfigSection,
+) -> Result<(), ConfigError> {
+    use rns_identity::stamps::StampWorkers;
+    if let Some(v) = config_int("stamps", sec, "max_workers")? {
+        workers.max_workers = Some(StampWorkers::clamp_max_workers(v));
+    }
+    if let Some(v) = config_int("stamps", sec, "worker_niceness")? {
+        workers.niceness = StampWorkers::clamp_niceness(v);
     }
     Ok(())
 }
@@ -3552,6 +3570,7 @@ impl ReticulumConfig {
 
         if let Some(sec) = config.section("stamps") {
             apply_stamps_section(&mut rc.stamps, sec)?;
+            apply_stamp_workers(&mut rc.stamp_workers, sec)?;
         }
         rc.filter = config.filter_policy()?;
 
@@ -3970,6 +3989,7 @@ pub async fn init_with_policy(
     let _ = transport_tx.try_send(TransportMessage::SetBlackholeSources {
         sources: rc.blackhole_sources.clone(),
     });
+    rc.stamp_workers.install();
     let _ = transport_tx.try_send(TransportMessage::SetStampPolicy {
         policy: rc.stamps.clone(),
     });
@@ -17667,6 +17687,43 @@ egress_control = Yes
                 matches!(
                     ReticulumConfig::try_from_config(&config),
                     Err(ConfigError::InvalidValue { ref section, .. }) if section == "stamps"
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn stamps_section_worker_keys_clamp_as_python() {
+        let parse = |body: &str| {
+            let config = Config::parse(&format!("[stamps]\n{body}\n")).unwrap();
+            ReticulumConfig::try_from_config(&config).map(|rc| rc.stamp_workers)
+        };
+        let workers = parse("max_workers = 3\nworker_niceness = 7").unwrap();
+        assert_eq!(workers.max_workers.map(usize::from), Some(3));
+        assert_eq!(workers.niceness, 7);
+        let workers = parse("max_workers = 0\nworker_niceness = 25").unwrap();
+        assert_eq!(
+            (workers.max_workers.map(usize::from), workers.niceness),
+            (Some(1), 20)
+        );
+        let workers = parse("max_workers = -3\nworker_niceness = -3").unwrap();
+        assert_eq!(
+            (workers.max_workers.map(usize::from), workers.niceness),
+            (Some(1), 0)
+        );
+        let workers = parse("destination_cost = 20").unwrap();
+        assert_eq!(workers, rns_identity::stamps::StampWorkers::default());
+        for body in [
+            "max_workers = x",
+            "max_workers = 2.5",
+            "worker_niceness = high",
+        ] {
+            assert!(
+                matches!(
+                    parse(body),
+                    Err(ConfigError::InvalidValue { ref key, .. })
+                        if key == body.split(' ').next().unwrap()
                 ),
                 "{body}"
             );

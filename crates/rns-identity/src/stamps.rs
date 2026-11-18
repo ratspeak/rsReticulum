@@ -6,7 +6,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use rand::RngCore;
@@ -471,6 +471,85 @@ pub fn stamp_valid_fp(stamp: &[u8], target_fp: u16, workblock: &[u8]) -> Result<
     Ok(target_from_fp(target_fp)?.accepts(&hash_with(workblock, stamp)))
 }
 
+/// Python `Stamps.NICENESS`.
+pub const DEFAULT_WORKER_NICENESS: u8 = 16;
+/// Upper clamp of `[stamps] worker_niceness`.
+pub const MAX_WORKER_NICENESS: u8 = 20;
+
+static MAX_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static WORKER_NICENESS: AtomicU8 = AtomicU8::new(DEFAULT_WORKER_NICENESS);
+
+/// Process-wide limits on stamp search threads: Python `Stamps.MAX_WORKERS`
+/// and `Stamps.NICENESS`, set from `[stamps] max_workers` and `worker_niceness`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StampWorkers {
+    /// Cap on the threads of one search; `None` keeps the caller's count.
+    pub max_workers: Option<NonZeroUsize>,
+    /// Nice increment each thread of a multi-threaded search applies to
+    /// itself, `0..=20`. Linux only, where nice values are per thread; a no-op
+    /// elsewhere.
+    pub niceness: u8,
+}
+
+impl Default for StampWorkers {
+    fn default() -> Self {
+        Self {
+            max_workers: None,
+            niceness: DEFAULT_WORKER_NICENESS,
+        }
+    }
+}
+
+impl StampWorkers {
+    /// Python `max(1, v)`.
+    pub fn clamp_max_workers(value: i64) -> NonZeroUsize {
+        usize::try_from(value)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .unwrap_or(NonZeroUsize::MIN)
+    }
+
+    /// Python `min(20, max(0, v))`.
+    pub fn clamp_niceness(value: i64) -> u8 {
+        value.clamp(0, i64::from(MAX_WORKER_NICENESS)) as u8
+    }
+
+    /// The installed process settings.
+    pub fn current() -> Self {
+        Self {
+            max_workers: NonZeroUsize::new(MAX_WORKERS.load(Ordering::Relaxed)),
+            niceness: WORKER_NICENESS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Install for every later search in this process.
+    pub fn install(self) {
+        MAX_WORKERS.store(
+            self.max_workers.map_or(0, NonZeroUsize::get),
+            Ordering::Relaxed,
+        );
+        WORKER_NICENESS.store(self.niceness.min(MAX_WORKER_NICENESS), Ordering::Relaxed);
+    }
+
+    /// `threads` capped at `max_workers`.
+    pub fn cap(&self, threads: NonZeroUsize) -> NonZeroUsize {
+        self.max_workers.map_or(threads, |max| threads.min(max))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn renice_search_thread(increment: u8) {
+    if increment > 0 {
+        // SAFETY: nice(2) only adjusts the calling thread; errors are ignored, as upstream ignores them.
+        unsafe {
+            libc::nice(libc::c_int::from(increment));
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn renice_search_thread(_increment: u8) {}
+
 /// Stop conditions and parallelism for a stamp search.
 #[derive(Debug, Clone)]
 pub struct StampControl {
@@ -508,19 +587,30 @@ fn generation_target(cost: f64) -> Result<StampTarget, StampError> {
     target_from_cost(cost)
 }
 
-/// Run `worker` on `ctl.threads` threads until one returns a result or all stop.
+/// Run `worker` on `ctl.threads` threads, capped by the installed
+/// [`StampWorkers`], until one returns a result or all stop.
 fn search<T: Send>(
     ctl: &StampControl,
     worker: impl Fn(&AtomicBool) -> Option<T> + Sync,
 ) -> Option<T> {
+    search_with(ctl, StampWorkers::current(), worker)
+}
+
+fn search_with<T: Send>(
+    ctl: &StampControl,
+    workers: StampWorkers,
+    worker: impl Fn(&AtomicBool) -> Option<T> + Sync,
+) -> Option<T> {
     let found = AtomicBool::new(false);
-    if ctl.threads.get() == 1 {
+    let threads = workers.cap(ctl.threads).get();
+    if threads == 1 {
         return worker(&found);
     }
     let result = Mutex::new(None);
     std::thread::scope(|scope| {
-        for _ in 0..ctl.threads.get() {
+        for _ in 0..threads {
             scope.spawn(|| {
+                renice_search_thread(workers.niceness);
                 if let Some(hit) = worker(&found) {
                     found.store(true, Ordering::Relaxed);
                     result
@@ -728,6 +818,74 @@ mod tests {
             .unwrap();
         let workblock = stamp_workblock(b"material", 2);
         assert_eq!(stamp_valid(&stamp, 10.0, &workblock), Ok(true));
+    }
+
+    #[test]
+    fn worker_settings_clamp_as_python() {
+        assert_eq!(StampWorkers::default().max_workers, None);
+        assert_eq!(StampWorkers::default().niceness, 16);
+        assert_eq!(StampWorkers::clamp_max_workers(0).get(), 1);
+        assert_eq!(StampWorkers::clamp_max_workers(-3).get(), 1);
+        assert_eq!(StampWorkers::clamp_max_workers(6).get(), 6);
+        assert_eq!(StampWorkers::clamp_niceness(-3), 0);
+        assert_eq!(StampWorkers::clamp_niceness(25), 20);
+        assert_eq!(StampWorkers::clamp_niceness(7), 7);
+    }
+
+    #[test]
+    fn max_workers_caps_search_threads() {
+        let ctl = StampControl {
+            threads: NonZeroUsize::new(4).unwrap(),
+            ..StampControl::default()
+        };
+        let count = |workers: StampWorkers| {
+            let started = AtomicUsize::new(0);
+            search_with(&ctl, workers, |_| {
+                started.fetch_add(1, Ordering::Relaxed);
+                None::<()>
+            });
+            started.into_inner()
+        };
+        let capped = StampWorkers {
+            max_workers: NonZeroUsize::new(2),
+            niceness: 0,
+        };
+        assert_eq!(count(capped), 2);
+        assert_eq!(
+            count(StampWorkers {
+                niceness: 0,
+                ..StampWorkers::default()
+            }),
+            4
+        );
+        let above = StampWorkers {
+            max_workers: NonZeroUsize::new(9),
+            niceness: 0,
+        };
+        assert_eq!(count(above), 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pooled_search_threads_are_niced() {
+        // SAFETY: getpriority(2) reads the calling thread's nice value.
+        let nice = || unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let base = nice();
+        let ctl = StampControl {
+            threads: NonZeroUsize::new(2).unwrap(),
+            ..StampControl::default()
+        };
+        let workers = StampWorkers {
+            max_workers: None,
+            niceness: 16,
+        };
+        assert_eq!(
+            search_with(&ctl, workers, |_| Some(nice())),
+            Some((base + 16).min(19))
+        );
+        let single = StampControl::default();
+        assert_eq!(search_with(&single, workers, |_| Some(nice())), Some(base));
+        assert_eq!(nice(), base);
     }
 
     #[test]
