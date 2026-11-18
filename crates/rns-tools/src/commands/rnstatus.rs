@@ -593,7 +593,7 @@ impl Session {
     ) -> Result<Option<(Value, Option<Value>, Option<Value>)>, u8> {
         let no_output = args.json;
         let destination = Destination::hash_from_name_and_identity(MGMT_APP, Some(&identity_hash));
-        if !self.handle.has_path(destination).await.unwrap_or(false) {
+        if !rns_tools::has_local_path(&self.handle, destination).await {
             if !no_output {
                 outp!(out, "Path to {} requested ", pretty_hex(&destination));
                 out.flush_now();
@@ -603,7 +603,7 @@ impl Session {
                 .request_path(destination, PathRequestOptions::default())
                 .await;
             let started = std::time::Instant::now();
-            while !self.handle.has_path(destination).await.unwrap_or(false) {
+            while !rns_tools::has_local_path(&self.handle, destination).await {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 if started.elapsed().as_secs_f64() > args.timeout {
                     if !no_output {

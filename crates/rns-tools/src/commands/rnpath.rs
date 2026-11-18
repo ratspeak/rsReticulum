@@ -1253,7 +1253,7 @@ async fn await_remote_path(
             .unwrap_or(0.0),
         _ => 0.0,
     };
-    if handle.has_path(dest).await.unwrap_or(false) {
+    if rns_tools::has_local_path(handle, dest).await {
         return Ok(());
     }
     print!("Path to {} requested ", pretty_hex_rep(&dest));
@@ -1263,7 +1263,7 @@ async fn await_remote_path(
         .await;
     let deadline = deadline_after(timeout.max(medium));
     loop {
-        if handle.has_path(dest).await.unwrap_or(false) {
+        if rns_tools::has_local_path(handle, dest).await {
             return Ok(());
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {

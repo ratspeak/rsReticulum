@@ -508,7 +508,7 @@ async fn wait_for_path(
 ) -> Duration {
     let deadline = Instant::now() + path_timeout(handle, timeout).await;
     let h = pretty_hex_rep(&dest_hash);
-    let has_path = || async { handle.has_path(dest_hash).await.unwrap_or(false) };
+    let has_path = || async { rns_tools::has_local_path(handle, dest_hash).await };
     if !has_path().await {
         let _ = handle
             .transport_tx

@@ -173,7 +173,7 @@ async fn run(args: &Args, handle: &ReticulumHandle, dest_hash: [u8; 16], full_na
     let timeout = args.timeout.filter(|t| *t != 0.0);
 
     // rnprobe.py.
-    if !local_has_path(handle, dest_hash).await {
+    if !rns_tools::has_local_path(handle, dest_hash).await {
         let _ = handle
             .request_path(dest_hash, PathRequestOptions::default())
             .await;
@@ -184,7 +184,7 @@ async fn run(args: &Args, handle: &ReticulumHandle, dest_hash: [u8; 16], full_na
     }
     let path_deadline = deadline_after(probe_timeout(handle, dest_hash, timeout).await);
     let mut i = 0;
-    while !local_has_path(handle, dest_hash).await && !passed(path_deadline) {
+    while !rns_tools::has_local_path(handle, dest_hash).await && !passed(path_deadline) {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if !json {
             print!("\u{8}\u{8}{} ", SPINNER[i]);
@@ -566,16 +566,6 @@ async fn medium_path_timeout(handle: &ReticulumHandle) -> f64 {
                 + DEFAULT_PER_HOP_TIMEOUT
         })
         .unwrap_or(0.0)
-}
-
-/// `RNS.Transport.has_path`: this process's own path table.
-async fn local_has_path(handle: &ReticulumHandle, dest: [u8; 16]) -> bool {
-    matches!(
-        handle
-            .query_transport(TransportQuery::HasPath { dest })
-            .await,
-        Some(TransportQueryResponse::BoolResult(true))
-    )
 }
 
 /// `RNS.Transport.hops_to`: this process's own path table.

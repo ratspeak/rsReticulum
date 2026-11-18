@@ -335,6 +335,21 @@ impl RpcRegistration {
     }
 }
 
+/// Python `RNS.Transport.has_path`: this process's own path table. A
+/// shared-instance client fills it from the path responses it asks for and
+/// sends to a destination only once it holds a path; `ReticulumHandle::has_path`
+/// asks the shared instance instead.
+pub async fn has_local_path(handle: &ReticulumHandle, destination: [u8; 16]) -> bool {
+    matches!(
+        handle
+            .query_transport(rns_transport::messages::TransportQuery::HasPath { dest: destination })
+            .await,
+        Some(rns_transport::messages::TransportQueryResponse::BoolResult(
+            true
+        ))
+    )
+}
+
 /// Reticulum.get_medium_path_timeout (Reticulum.py): ask the shared
 /// instance, or compute Transport.medium_path_timeout (Transport.py)
 /// from the lowest online interface bitrate. 0 when unknown or on error.

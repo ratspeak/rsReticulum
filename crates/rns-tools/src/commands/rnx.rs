@@ -498,7 +498,7 @@ impl Client<'_> {
     async fn ensure_path(&self, timeout: Timeout) -> bool {
         let handle = self.handle;
         let hash = self.destination_hash;
-        if handle.has_path(hash).await.unwrap_or(false) {
+        if rns_tools::has_local_path(handle, hash).await {
             return true;
         }
         let _ = handle
@@ -510,7 +510,7 @@ impl Client<'_> {
         let msg = format!("Path to <{}> requested", hex::encode(hash));
         let found = spin(&msg, async {
             loop {
-                if handle.has_path(hash).await.unwrap_or(false) {
+                if rns_tools::has_local_path(handle, hash).await {
                     return true;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
