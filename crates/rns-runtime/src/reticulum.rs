@@ -3395,6 +3395,40 @@ fn parse_autoconnect_interface_mode(value: &str) -> Option<rns_interface::traits
     }
 }
 
+/// Python 1.6.1 `__autoconnect_cap` and `__autoconnect_warn` (Reticulum.py).
+const AUTOCONNECT_CAP: usize = 12;
+const AUTOCONNECT_WARN: usize = 6;
+
+/// Python caps the auto-connect target at 12 and warns above 6, unless
+/// `autoconnect_discovered_interfaces_disable_caps` is set (Reticulum.py:743-768).
+fn cap_autoconnect_limit(limit: usize, caps_disabled: bool) -> usize {
+    let mut limit = limit;
+    if !caps_disabled && limit > AUTOCONNECT_CAP {
+        limit = AUTOCONNECT_CAP;
+        tracing::warn!("Auto-connect interface target was capped to {limit}");
+        tracing::warn!(
+            "Using large numbers of auto-connected interfaces will not lead to better \
+             connectivity or redundancy. If you really know what you're doing, and are \
+             certain that you need this, you will also know how to get around this check."
+        );
+    }
+    if limit > AUTOCONNECT_WARN {
+        tracing::warn!(
+            "You have configured more than {AUTOCONNECT_WARN} auto-connect interfaces. In almost \
+             all situations, this is excessive, and should be avoided. For a normal home or \
+             office node, 2-3 autoconnects will be sufficient."
+        );
+        tracing::warn!(
+            "If you're running a fast, well-connected transport node that can actually provide \
+             additional capacity and transport to the network, you can consider raising this \
+             number to {AUTOCONNECT_WARN}-{}. Only in the rarest of cases will going beyond this \
+             actually provide any benefit.",
+            AUTOCONNECT_WARN + 3
+        );
+    }
+    limit
+}
+
 fn parse_autoconnect_limit(sec: &ConfigSection) -> Result<Option<usize>, ConfigError> {
     if let Some(v) = config_uint("reticulum", sec, "autoconnect_discovered_interfaces")? {
         return Ok(Some(v as usize));
@@ -3560,8 +3594,17 @@ impl ReticulumConfig {
             if let Some(value) = config_bool("reticulum", sec, "discover_interfaces")? {
                 rc.discover_interfaces = value;
             }
-            rc.autoconnect_discovered_interfaces =
-                parse_autoconnect_limit(sec)?.unwrap_or(rc.autoconnect_discovered_interfaces);
+            // Python honours the switch only above the count in the file; it
+            // applies here wherever it appears.
+            let caps_disabled = config_bool(
+                "reticulum",
+                sec,
+                "autoconnect_discovered_interfaces_disable_caps",
+            )?
+            .unwrap_or(false);
+            if let Some(limit) = parse_autoconnect_limit(sec)? {
+                rc.autoconnect_discovered_interfaces = cap_autoconnect_limit(limit, caps_disabled);
+            }
             if let Some(value) =
                 config_bool("reticulum", sec, "autoconnect_unverified_implementations")?
             {
@@ -15590,6 +15633,32 @@ loglevel = 7
         assert!(rc.blackhole_sources.is_empty());
         assert!(!rc.publish_blackhole);
         assert!(rc.bootstrap_configs.is_empty());
+    }
+
+    #[test]
+    fn autoconnect_targets_above_twelve_are_capped_unless_caps_are_disabled() {
+        for (keys, expected) in [
+            ("autoconnect_discovered_interfaces = 6\n", 6),
+            ("autoconnect_discovered_interfaces = 9\n", 9),
+            ("autoconnect_discovered_interfaces = 13\n", 12),
+            ("discover_interfaces_autoconnect = 40\n", 12),
+            (
+                "autoconnect_discovered_interfaces = 40\n\
+                 autoconnect_discovered_interfaces_disable_caps = Yes\n",
+                40,
+            ),
+            (
+                "autoconnect_discovered_interfaces_disable_caps = No\n\
+                 autoconnect_discovered_interfaces = 40\n",
+                12,
+            ),
+        ] {
+            let config = Config::parse(&format!("[reticulum]\n{keys}")).unwrap();
+            let rc = ReticulumConfig::from_config(&config);
+            assert_eq!(rc.autoconnect_discovered_interfaces, expected, "{keys}");
+        }
+        assert_eq!(cap_autoconnect_limit(0, false), 0);
+        assert_eq!(cap_autoconnect_limit(12, false), 12);
     }
 
     #[test]
