@@ -1,10 +1,12 @@
 //! Proof-of-work stamper for discovery announces.
 //!
 //! [`RnsDiscoveryStamper`] is the stamp construction upstream uses
-//! (`self.stamper = RNS.Stamps`, Discovery.py at 1.6.0): a 32-byte
-//! stamp over a 20-round workblock of the info hash, with fractional values.
-//! The trait remains so embedders can substitute an implementation; methods
-//! are synchronous and callers choose where expensive generation runs.
+//! (`self.stamper = RNS.Stamps`, Discovery.py at 1.6.1): a 32-byte stamp over
+//! a 20-round workblock of the info hash, with fractional values. Receivers
+//! also accept a stamp over the info hash itself, the non-expanded form
+//! upstream senders move to. The trait remains so embedders can substitute an
+//! implementation; methods are synchronous and callers choose where expensive
+//! generation runs.
 
 use std::num::NonZeroUsize;
 
@@ -37,6 +39,14 @@ pub trait DiscoveryStamper: Send + Sync {
 
     /// Whether the stamp meets `required_value` for this info hash.
     fn valid(&self, infohash: &[u8; 32], stamp: &[u8], required_value: f64) -> bool;
+
+    /// The stamp's value when it meets `required_value`, else `None`. The
+    /// value can depend on `required_value` when the stamper accepts more than
+    /// one workblock.
+    fn validate(&self, infohash: &[u8; 32], stamp: &[u8], required_value: f64) -> Option<f64> {
+        self.valid(infohash, stamp, required_value)
+            .then(|| self.value(infohash, stamp))
+    }
 }
 
 /// Upstream `RNS.Stamps` discovery construction, built on
@@ -93,12 +103,26 @@ impl DiscoveryStamper for RnsDiscoveryStamper {
         }
     }
 
+    /// Value over the 20-round workblock, the form this stamper generates.
     fn value(&self, infohash: &[u8; 32], stamp: &[u8]) -> f64 {
         stamps::stamp_value(&Self::workblock(infohash), stamp)
     }
 
     fn valid(&self, infohash: &[u8; 32], stamp: &[u8], required_value: f64) -> bool {
-        stamps::stamp_valid(stamp, required_value, &Self::workblock(infohash)).unwrap_or(false)
+        self.validate(infohash, stamp, required_value).is_some()
+    }
+
+    /// Upstream 1.6.1 order: the non-expanded workblock, then the 20-round
+    /// one; the value comes from the workblock that passed.
+    fn validate(&self, infohash: &[u8; 32], stamp: &[u8], required_value: f64) -> Option<f64> {
+        let passes = |workblock: &[u8]| {
+            stamps::stamp_valid(stamp, required_value, workblock).unwrap_or(false)
+        };
+        if passes(infohash) {
+            return Some(stamps::stamp_value(infohash, stamp));
+        }
+        let workblock = Self::workblock(infohash);
+        passes(&workblock).then(|| stamps::stamp_value(&workblock, stamp))
     }
 }
 
@@ -190,6 +214,30 @@ mod tests {
         let expected = if cores <= 12 { cores } else { cores / 2 };
         assert_eq!(generation_threads(14.0).get(), expected.max(1));
         assert_eq!(generation_threads(13.999).get(), expected.max(1));
+    }
+
+    // Upstream 1.6.1 `InterfaceAnnounceHandler.received_announce` verdicts and
+    // values; generator in the K1 hand-back (gen_discovery_ne.py).
+    const VECTOR_INFOHASH: &str =
+        "bbfdbadfc3ed56d93f63b737078eed1ec59bc77d3096864f19f0689a7cc36964";
+    const VECTOR_NE_STAMP: &str =
+        "2dbee58b18b27cbb784a32d2c6c72c09b9ba53f3a49894e093473980ea4bf25e";
+    const VECTOR_EXPANDED_STAMP: &str =
+        "009b03b8a5195ee423480e7194f83441e875bbc67d96e46635be9c7c9b1143fe";
+
+    #[test]
+    fn both_workblock_forms_validate_as_upstream_reports() {
+        let ih: [u8; 32] = hex::decode(VECTOR_INFOHASH).unwrap().try_into().unwrap();
+        let ne = hex::decode(VECTOR_NE_STAMP).unwrap();
+        let expanded = hex::decode(VECTOR_EXPANDED_STAMP).unwrap();
+        let s = RnsDiscoveryStamper;
+        assert_eq!(s.validate(&ih, &ne, 8.0), Some(8.265625));
+        assert_eq!(s.validate(&ih, &expanded, 8.0), Some(12.15625));
+        // At cost 0 the non-expanded check always passes first.
+        assert_eq!(s.validate(&ih, &expanded, 0.0), Some(2.29296875));
+        assert_eq!(s.validate(&ih, &ne, 8.26953125), None);
+        assert!(s.valid(&ih, &ne, 8.0));
+        assert!(!s.valid(&ih, &ne, 8.26953125));
     }
 
     #[test]

@@ -411,9 +411,9 @@ impl ReceiverConfig {
         stamp: &[u8],
     ) -> Result<ValidatedMaterial, Reason> {
         let infohash = rns_crypto::sha::full_hash(packed_info);
-        if !self.stamper.valid(&infohash, stamp, self.required_value) {
+        let Some(stamp_value) = self.stamper.validate(&infohash, stamp, self.required_value) else {
             return Err(Reason::StampInvalid);
-        }
+        };
 
         let info: DiscoveryInfo = match app_data::decode_info(packed_info) {
             Ok(i) => i,
@@ -426,7 +426,7 @@ impl ReceiverConfig {
         Ok(ValidatedMaterial {
             info,
             stamp: stamp.to_vec(),
-            stamp_value: self.stamper.value(&infohash, stamp),
+            stamp_value,
         })
     }
 
@@ -567,17 +567,17 @@ impl ReceiverState {
         }
 
         let infohash = rns_crypto::sha::full_hash(packed_info);
-        if !self
-            .config
-            .stamper
-            .valid(&infohash, stamp, self.config.required_value)
-        {
+        let Some(stamp_value) =
+            self.config
+                .stamper
+                .validate(&infohash, stamp, self.config.required_value)
+        else {
             let evicted = lock_unpoisoned(&self.caches).insert_invalid(key);
             if evicted {
                 ReceiverMetrics::increment(&self.metrics.invalid_cache_evictions);
             }
             return Err(Reason::StampInvalid);
-        }
+        };
 
         let info = match app_data::decode_info(packed_info) {
             Ok(info) => info,
@@ -589,7 +589,7 @@ impl ReceiverState {
         let material = ValidatedMaterial {
             info,
             stamp: stamp.to_vec(),
-            stamp_value: self.config.stamper.value(&infohash, stamp),
+            stamp_value,
         };
         let evicted = lock_unpoisoned(&self.caches).insert_valid(key, material.clone());
         if evicted {
@@ -872,6 +872,32 @@ mod tests {
         assert_eq!(listed[0].stamp_value, 20.0);
         assert_eq!(listed[0].hops, 3);
         assert_eq!(listed[0].network_id, [0x11; 16]);
+    }
+
+    #[test]
+    fn accepts_a_non_expanded_stamp_with_its_value() {
+        let dir = tmpdir("non_expanded");
+        let store = Arc::new(DiscoveryStore::open(&dir).unwrap());
+        let info = sample_info();
+        let infohash = encode_info(&info).unwrap().infohash;
+        let (stamp, value) = rns_identity::stamps::generate_stamp(
+            &infohash,
+            14.0,
+            0,
+            STAMP_SIZE,
+            &StampControl::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let (blob, _) = stamped_blob(&info, &stamp);
+        let cfg = make_cfg(
+            Arc::new(crate::discovery::stamper::RnsDiscoveryStamper),
+            store.clone(),
+            None,
+            None,
+        );
+        assert_eq!(cfg.process_event(&event_with(blob)), Outcome::Accepted);
+        assert_eq!(store.list(None).unwrap()[0].stamp_value, value);
     }
 
     #[test]
