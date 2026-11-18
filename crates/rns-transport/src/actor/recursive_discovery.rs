@@ -314,8 +314,7 @@ impl TransportActor {
                 && self.interfaces.get(&id).is_some_and(|entry| {
                     !interface_marked_offline(entry)
                         // A radio can serve hidden peers; an IPC edge is one peer.
-                        && (id != incoming || (entry.role == InterfaceRole::Normal
-                            && entry.mode != InterfaceMode::Roaming))
+                        && (id != incoming || entry.role == InterfaceRole::Normal)
                 });
             if eligible {
                 self.send_or_retain_announce(id, response, true);

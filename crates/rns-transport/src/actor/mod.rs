@@ -89,8 +89,6 @@ pub struct TransportActor {
     rx: mpsc::Receiver<TransportMessage>,
     inbound_queues: Arc<crate::inbound_queues::InboundQueues>,
     inbound_rx: crate::inbound_queues::InboundReceivers,
-    /// Set while an ingress-limited queue item is processed.
-    processing_ingress_limited: bool,
     mailbox: mpsc::WeakSender<TransportMessage>,
     announce_dispatch_tx: mpsc::Sender<crate::announce_dispatch::AnnounceDispatchRequest>,
     announce_dispatch_rx: mpsc::Receiver<crate::announce_dispatch::AnnounceDispatchRequest>,
@@ -501,7 +499,6 @@ impl TransportActor {
             rx,
             inbound_queues,
             inbound_rx,
-            processing_ingress_limited: false,
             mailbox: tx.downgrade(),
             announce_dispatch_tx,
             announce_dispatch_rx,
@@ -696,8 +693,8 @@ impl TransportActor {
                 _ = tokio::time::sleep(announce_wake.unwrap_or_default()), if announce_wake.is_some() => {
                     self.process_announce_queues(now_f64());
                 }
-                (class, msg) = std::future::poll_fn(|cx| self.inbound_rx.poll_recv(cx, &self.inbound_queues)) => {
-                    self.handle_inbound_event(class, msg);
+                (_, msg) = std::future::poll_fn(|cx| self.inbound_rx.poll_recv(cx, &self.inbound_queues)) => {
+                    self.handle_inbound_event(msg);
                 }
                 Some(request) = self.announce_dispatch_rx.recv() => {
                     self.handle_announce_dispatch(request);
@@ -743,33 +740,23 @@ impl TransportActor {
         }
     }
 
-    /// Path requests from an interface in a path-request burst wait in the
+    /// Path requests classified during a path-request burst wait in the
     /// ingress-limited queue, behind every other class (Transport.py).
-    fn handle_inbound_event(
-        &mut self,
-        class: crate::inbound_queues::TrafficClass,
-        item: crate::inbound_queues::Queued,
-    ) {
-        use crate::inbound_queues::{Queued, TrafficClass};
+    fn handle_inbound_event(&mut self, item: crate::inbound_queues::Queued) {
+        use crate::inbound_queues::Queued;
         match item {
             Queued::ReleasedAnnounce(announce) => self.on_released_announce(announce),
-            Queued::Message(msg)
-                if class == TrafficClass::PathRequest
-                    && matches!(&*msg, TransportMessage::InterfaceEvent { interface_id, .. }
-                        if self
-                            .interfaces
-                            .get_mut(interface_id)
-                            .is_some_and(|entry| entry.ingress.should_ingress_limit_pr())) =>
-            {
-                self.inbound_rx
-                    .push_ingress_limited(&self.inbound_queues, Queued::Message(msg));
+            Queued::PathRequest(request) => {
+                // Transport.py `_inbound` drops packets from an offline interface.
+                if self
+                    .interfaces
+                    .get(&request.interface_id)
+                    .is_some_and(|entry| !interface_marked_offline(entry))
+                {
+                    self.path_request(*request, true);
+                }
             }
-            Queued::Message(msg) => {
-                // Python carries the class on the packet into path_request (Transport.py).
-                self.processing_ingress_limited = class == TrafficClass::IngressLimited;
-                self.handle_message(*msg);
-                self.processing_ingress_limited = false;
-            }
+            Queued::Message(msg) => self.handle_message(*msg),
         }
     }
 
@@ -11171,6 +11158,16 @@ mod tests {
         }
     }
 
+    /// Answer the path requests a burst deferred, as the actor loop does.
+    fn drain_ingress_limited(actor: &mut TransportActor) {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        while let std::task::Poll::Ready((_, item)) =
+            actor.inbound_rx.poll_recv(&mut cx, &actor.inbound_queues)
+        {
+            actor.handle_inbound_event(item);
+        }
+    }
+
     fn enable_and_prime_egress_pr_limit(actor: &mut TransportActor, interface_id: InterfaceId) {
         let ingress = &mut actor
             .interfaces
@@ -11539,6 +11536,7 @@ mod tests {
 
         let requested = [0xE0; 16];
         actor.handle_inbound_path_request(&make_path_request_payload(requested, None), 1);
+        drain_ingress_limited(&mut actor);
 
         assert!(
             boundary_rx.try_recv().is_err(),
@@ -11567,6 +11565,7 @@ mod tests {
         actor.destination_channels.insert(dest, event_tx);
 
         actor.handle_inbound_path_request(&make_path_request_payload_with_tag(dest, None, tag), 1);
+        drain_ingress_limited(&mut actor);
 
         let event = event_rx
             .try_recv()
@@ -11627,6 +11626,7 @@ mod tests {
         );
 
         actor.handle_inbound_path_request(&make_path_request_payload(dest, None), 1);
+        drain_ingress_limited(&mut actor);
 
         let queued = actor
             .announce_table
@@ -11651,6 +11651,7 @@ mod tests {
 
         let requested = [0xE3; 16];
         actor.handle_inbound_path_request(&make_path_request_payload(requested, None), 1);
+        drain_ingress_limited(&mut actor);
 
         gateway_rx
             .try_recv()
@@ -12308,6 +12309,119 @@ mod tests {
         assert_eq!(header.transport_id, Some([0x44; 16]));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A known path whose announce cannot be read is answered by ignoring the
+    /// request (Transport.path_request): no search, nothing left in flight, so
+    /// the next request reads the cache again.
+    #[test]
+    fn uncached_known_path_is_ignored_without_holding_the_in_flight_gate() {
+        for mode in [InterfaceMode::Gateway, InterfaceMode::Full] {
+            let dir = std::env::temp_dir().join(format!("rns_path_request_cache_miss_{mode:?}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let (mut actor, _tx) = TransportActor::new();
+            actor.is_transport_enabled = true;
+            actor.transport_identity_hash = Some([0x44; 16]);
+            actor.storage_dir = Some(dir.clone());
+            actor.kd.attach_storage(&dir);
+
+            let (mut requestor, _requestor_rx) = make_test_interface("requestor");
+            requestor.mode = mode;
+            requestor.ingress = crate::ingress::IngressController::disabled();
+            actor.interfaces.insert(1, requestor);
+            let (mut boundary, mut boundary_rx) = make_test_interface("boundary");
+            boundary.mode = InterfaceMode::Boundary;
+            actor.interfaces.insert(2, boundary);
+
+            let (raw, dest) = make_valid_announce("test.path.request.cache_miss", 1);
+            let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+            let mut path_entry =
+                crate::path_table::PathEntry::new(Some([0xAB; 16]), 2, 2, InterfaceMode::Full);
+            path_entry.packet_hash = Some(ph);
+            actor.path_table.insert(dest, path_entry);
+            let request =
+                |tag: u8| make_path_request_payload_with_tag(dest, Some([0xCD; 16]), [tag; 16]);
+
+            for tag in [0xA1, 0xB2] {
+                actor.handle_inbound_path_request(&request(tag), 1);
+                assert!(boundary_rx.try_recv().is_err(), "{mode:?}");
+                assert!(actor.announce_table.get(&dest).is_none(), "{mode:?}");
+                assert!(
+                    !actor.discovery_path_requests.contains_key(&dest),
+                    "{mode:?}"
+                );
+                assert!(
+                    !actor.inflight_path_requests.contains_key(&dest),
+                    "{mode:?}"
+                );
+            }
+
+            crate::store::seed_cached_announce(&dir, &ph, &raw, None).unwrap();
+            actor.handle_inbound_path_request(&request(0xC3), 1);
+            let entry = actor
+                .announce_table
+                .get(&dest)
+                .expect("answered once readable");
+            assert_eq!(entry.retries, PATHFINDER_R, "{mode:?}");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Transport.py queues a path response with `PATHFINDER_R` retries, so
+    /// hearing other nodes answer first cancels it.
+    #[test]
+    fn overheard_answers_cancel_a_queued_path_response() {
+        for (copies, raw_hops) in [(2u8, 2u8), (1, 3)] {
+            let dir =
+                std::env::temp_dir().join(format!("rns_path_response_cancel_{copies}_{raw_hops}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let (mut actor, _tx) = TransportActor::new();
+            actor.is_transport_enabled = true;
+            actor.transport_identity_hash = Some([0x44; 16]);
+            actor.storage_dir = Some(dir.clone());
+            actor.kd.attach_storage(&dir);
+            let (requestor, _requestor_rx) = make_test_interface("requestor");
+            actor.interfaces.insert(1, requestor);
+            let (next_hop_iface, _rx2) = make_test_interface("next_hop_iface");
+            actor.interfaces.insert(2, next_hop_iface);
+
+            let (raw, dest) = make_valid_announce("test.path.response.cancel", 1);
+            let ph = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+            crate::store::seed_cached_announce(&dir, &ph, &raw, None).unwrap();
+            let mut path_entry =
+                crate::path_table::PathEntry::new(Some([0xAB; 16]), 2, 2, InterfaceMode::Gateway);
+            path_entry.packet_hash = Some(ph);
+            // The path came from this announce, so the copies heard below are replays.
+            let blob_at = rns_wire::constants::HEADER_MINSIZE + 64 + 10;
+            path_entry.add_random_blob(raw[blob_at..blob_at + 10].try_into().unwrap());
+            actor.path_table.insert(dest, path_entry);
+
+            actor.handle_inbound_path_request(&make_path_request_payload(dest, None), 1);
+            assert!(actor.announce_table.get(&dest).is_some());
+
+            for relay in 0..copies {
+                let mut heard = vec![raw[0] | 0x50, raw_hops];
+                heard.extend_from_slice(&[0x60 + relay; 16]);
+                heard.extend_from_slice(&raw[2..]);
+                actor.on_inbound(InboundPacket {
+                    raw: Bytes::from(heard),
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                });
+            }
+            assert!(
+                actor.announce_table.get(&dest).is_none(),
+                "copies={copies} raw_hops={raw_hops}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

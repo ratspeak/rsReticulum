@@ -41,7 +41,7 @@ fn release_held(actor: &mut TransportActor) {
         actor.inbound_rx.poll_recv(&mut cx, &actor.inbound_queues)
     {
         assert_eq!(class, crate::inbound_queues::TrafficClass::IngressLimited);
-        actor.handle_inbound_event(class, item);
+        actor.handle_inbound_event(item);
     }
 }
 

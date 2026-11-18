@@ -106,7 +106,8 @@ fn recursive_timeout_samples_only_known_online_useful_egress_and_stays_bounded()
 
 #[test]
 fn recursive_requesters_share_one_fanout_and_response_reaches_same_radio() {
-    for (mode, same_response) in [(InterfaceMode::Full, true), (InterfaceMode::Roaming, false)] {
+    // Transport.py answers every requester, roaming radios included.
+    for mode in [InterfaceMode::Full, InterfaceMode::Roaming] {
         let start = now_f64();
         let clock = crate::test_clock::Clock::at(start);
         let mut actor = relay();
@@ -140,11 +141,7 @@ fn recursive_requesters_share_one_fanout_and_response_reaches_same_radio() {
         assert!(second_rx.try_recv().is_err());
         inbound(&mut actor, announce.clone(), 2);
         assert_response(first_rx.try_recv().unwrap(), dest);
-        if same_response {
-            assert_response(second_rx.try_recv().unwrap(), dest);
-        } else {
-            assert!(second_rx.try_recv().is_err());
-        }
+        assert_response(second_rx.try_recv().unwrap(), dest);
         inbound(&mut actor, announce, 2);
         assert!(first_rx.try_recv().is_err() && second_rx.try_recv().is_err());
         assert!(actor.discovery_path_requests.is_empty());

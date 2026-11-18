@@ -32,6 +32,12 @@ fn inbound(raw: Bytes) -> TransportMessage {
 }
 
 fn path_request(tag: u8) -> Bytes {
+    path_request_for(&make_path_request_payload_with_tag(
+        [0x77; 16], None, [tag; 16],
+    ))
+}
+
+fn path_request_for(payload: &[u8]) -> Bytes {
     let header = rns_wire::header::PacketHeader {
         flags: rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,
@@ -49,9 +55,7 @@ fn path_request(tag: u8) -> Bytes {
         context: rns_wire::context::PacketContext::None,
     };
     let mut raw = header.pack();
-    raw.extend_from_slice(&make_path_request_payload_with_tag(
-        [0x77; 16], None, [tag; 16],
-    ));
+    raw.extend_from_slice(payload);
     Bytes::from(raw)
 }
 
@@ -130,14 +134,17 @@ fn queued_classes_drain_data_first_then_announce_then_path_request() {
 fn path_requests_during_a_path_request_burst_wait_behind_every_other_class() {
     let (mut actor, sender) = registered(lengths(8, 8, 8, 1));
     prime_ingress_pr_burst(&mut actor, 1);
-    for tag in 1..=3u8 {
-        sender.try_send(inbound(path_request(tag))).unwrap();
+    for dest in 1..=3u8 {
+        let payload = make_path_request_payload_with_tag([dest; 16], None, [dest; 16]);
+        sender
+            .try_send(inbound(path_request_for(&payload)))
+            .unwrap();
     }
-    // Each path request leaves the PR queue for the one-slot IL queue.
+    // Each path request passes its gates, then waits in the one-slot IL queue.
     for _ in 0..3 {
         let (class, msg) = next(&mut actor).unwrap();
         assert_eq!(class, TrafficClass::PathRequest);
-        actor.handle_inbound_event(class, msg);
+        actor.handle_inbound_event(msg);
     }
     let snapshot = actor.inbound_queues.snapshot();
     assert_eq!(snapshot.heights, [0, 0, 0, 1]);
@@ -151,15 +158,58 @@ fn path_requests_during_a_path_request_burst_wait_behind_every_other_class() {
     assert_eq!(actor.inbound_queues.snapshot().heights[3], 0);
 }
 
+/// Transport.py classifies after the size, tag, and stamp gates, so a
+/// rejected request never takes an ingress-limited slot.
+#[test]
+fn a_rejected_path_request_takes_no_ingress_limited_slot() {
+    let (mut actor, sender) = registered(lengths(8, 8, 8, 1));
+    prime_ingress_pr_burst(&mut actor, 1);
+    sender
+        .try_send(inbound(path_request_for(&[0x31; 16])))
+        .unwrap();
+    let payload = make_path_request_payload_with_tag([0x32; 16], None, [0x32; 16]);
+    sender
+        .try_send(inbound(path_request_for(&payload)))
+        .unwrap();
+    while let Some((_, msg)) = next(&mut actor) {
+        actor.handle_inbound_event(msg);
+        if actor.inbound_queues.snapshot().heights[3] == 1 {
+            break;
+        }
+    }
+    let snapshot = actor.inbound_queues.snapshot();
+    assert_eq!(snapshot.heights, [0, 0, 0, 1]);
+    assert_eq!(snapshot.dropped, [0; 4]);
+    assert!(actor.inflight_path_requests.contains_key(&[0x32; 16]));
+    assert!(!actor.inflight_path_requests.contains_key(&[0x31; 16]));
+}
+
+/// Transport.py registers a request as in flight on receipt, so a second
+/// request during the burst is dropped instead of queued behind the first.
+#[test]
+fn a_queued_ingress_limited_path_request_is_already_in_flight() {
+    let (mut actor, sender) = registered(lengths(8, 8, 8, 8));
+    actor.is_transport_enabled = true;
+    prime_ingress_pr_burst(&mut actor, 1);
+    for tag in [1u8, 2] {
+        sender.try_send(inbound(path_request(tag))).unwrap();
+        let (_, msg) = next(&mut actor).unwrap();
+        actor.handle_inbound_event(msg);
+    }
+    assert!(actor.inflight_path_requests.contains_key(&[0x77; 16]));
+    assert_eq!(actor.inbound_queues.snapshot().heights[3], 1);
+    assert!(
+        !actor.discovery_path_requests.contains_key(&[0x77; 16]),
+        "an ingress-limited duplicate is not batched"
+    );
+}
+
 /// Python decides at preprocess time and passes `ingress_limited` into
 /// `path_request`, so a queued ingress-limited request is never forwarded
 /// recursively even if the burst ended meanwhile (Transport.py).
 #[test]
 fn an_ingress_limited_path_request_is_not_forwarded_recursively() {
-    for (class, forwarded) in [
-        (TrafficClass::PathRequest, true),
-        (TrafficClass::IngressLimited, false),
-    ] {
+    for limited in [false, true] {
         let (mut actor, tx) = TransportActor::new_with_queues(64, 1024, lengths(8, 8, 8, 8));
         actor.is_transport_enabled = true;
         let (mut entry, _wire) = make_test_interface("requestor");
@@ -168,9 +218,24 @@ fn an_ingress_limited_path_request_is_not_forwarded_recursively() {
         actor.handle_message(TransportMessage::RegisterInterface { id: 1, entry });
         let (outbound, mut outbound_rx) = make_test_interface("outbound");
         actor.interfaces.insert(2, outbound);
+        if limited {
+            prime_ingress_pr_burst(&mut actor, 1);
+        }
         sender.try_send(inbound(path_request(1))).unwrap();
         let (_, item) = next(&mut actor).unwrap();
-        actor.handle_inbound_event(class, item);
-        assert_eq!(outbound_rx.try_recv().is_ok(), forwarded, "{class:?}");
+        actor.handle_inbound_event(item);
+        if limited {
+            assert!(outbound_rx.try_recv().is_err(), "deferred");
+            actor.interfaces.get_mut(&1).unwrap().ingress =
+                crate::ingress::IngressController::new();
+            let (class, item) = next(&mut actor).unwrap();
+            assert_eq!(class, TrafficClass::IngressLimited);
+            actor.handle_inbound_event(item);
+        }
+        assert_eq!(
+            outbound_rx.try_recv().is_ok(),
+            !limited,
+            "limited={limited}"
+        );
     }
 }

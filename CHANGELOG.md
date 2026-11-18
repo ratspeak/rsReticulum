@@ -8,6 +8,7 @@
 - Interface start-up code is compiled once instead of again in every crate that starts the runtime, which makes `rnsd-rs` about 1.5 MB smaller.
 - Bluetooth RNodes report battery, temperature, and channel load in the interface stats, as USB RNodes already do (`battery_state`, `battery_percent`, `cpu_temp`, `noise_floor`).
 - Bluetooth Peer: on Android, a link the app closes after a failed write reports `Disconnected`, so the peer no longer stays listed as connected. On Linux, disconnecting a peer reports it too, and the Central role keeps looking for a Bluetooth adapter that appears after start-up instead of giving up until restart.
+- Path requests are handled as in Python Reticulum 1.6.0. A node that knows a path but can't read its cached announce ignores the request instead of searching the network and blocking later requests for 45 seconds. A queued path response is dropped once other nodes are heard answering. Requests that arrive during a path-request burst are counted and checked before they wait, so duplicates no longer crowd out real ones. A search answer now also reaches a requester on the roaming interface it arrived on.
 - Announce handler events carry `emitted`, the time the announcer stamped into the announce, so an application can tell an older cached announce in a path response from a newer one. `AnnounceHandlerEvent` struct literals need the new field.
 
 ## 1.5.0 - 2026-11-13

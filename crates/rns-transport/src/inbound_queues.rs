@@ -85,6 +85,18 @@ pub(crate) enum Queued {
     Message(Box<TransportMessage>),
     /// A held announce the interface released (Interface.py).
     ReleasedAnnounce(crate::ingress::HeldAnnounce),
+    /// A path request classified during its interface's burst, gates passed.
+    PathRequest(Box<PendingPathRequest>),
+}
+
+/// A path request past the inbound gates, as `Transport.path_request` takes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingPathRequest {
+    pub(crate) interface_id: crate::messages::InterfaceId,
+    pub(crate) destination: [u8; 16],
+    pub(crate) requestor: Option<[u8; 16]>,
+    pub(crate) tag: [u8; 16],
+    pub(crate) ext: Option<[u8; 16]>,
 }
 
 pub(crate) struct InboundReceivers {

@@ -674,7 +674,6 @@ impl TransportActor {
                 data.get(PR_LENGTH..).and_then(|ext| ext.try_into().ok());
             (Some(id), &data[32..48], ext)
         };
-        let tag_bytes = Some(tag);
 
         let now = now_f64();
         let mut unique_tag = [0u8; 32];
@@ -714,19 +713,21 @@ impl TransportActor {
                 }
             }
         }
-        // Python counts a path request once its tag and stamp pass these gates
-        // (Transport.py).
+        // Python counts a path request once its tag and stamp pass these gates,
+        // then classifies it against the updated burst state (Transport.py).
         self.record_interface_event(interface_id, InterfaceEvent::ReceivedPathRequest, raw_len);
         self.count_transport_event(InterfaceEvent::ReceivedPathRequest);
+        let ingress_limited = self
+            .interfaces
+            .get_mut(&interface_id)
+            .is_some_and(|iface| iface.ingress.should_ingress_limit_pr());
 
         // Transport.py: a request for a destination already
         // in flight joins the waiting requesters instead of being processed.
         if self.inflight_path_requests.contains_key(&requested_dest) {
             // A leaf answers batched requesters only for its local clients;
             // upstream would also emit PATH_RESPONSEs naming the leaf as relay.
-            if (self.is_transport_enabled || is_from_local_client)
-                && !self.processing_ingress_limited
-            {
+            if (self.is_transport_enabled || is_from_local_client) && !ingress_limited {
                 pathing!(
                     dest = %hex::encode(requested_dest),
                     interface_id,
@@ -737,6 +738,50 @@ impl TransportActor {
             return;
         }
         self.inflight_path_requests.insert(requested_dest, now);
+
+        let mut tag_bytes = [0u8; 16];
+        tag_bytes.copy_from_slice(tag);
+        let request = crate::inbound_queues::PendingPathRequest {
+            interface_id,
+            destination: requested_dest,
+            requestor: requestor_transport_id,
+            tag: tag_bytes,
+            ext,
+        };
+        if ingress_limited {
+            // Transport.py: answered after every other class, still in flight.
+            self.inbound_rx.push_ingress_limited(
+                &self.inbound_queues,
+                crate::inbound_queues::Queued::PathRequest(Box::new(request)),
+            );
+            return;
+        }
+        self.path_request(request, false);
+    }
+
+    /// Python `Transport.path_request` for a request past the inbound gates.
+    pub(super) fn path_request(
+        &mut self,
+        request: crate::inbound_queues::PendingPathRequest,
+        ingress_limited: bool,
+    ) {
+        let crate::inbound_queues::PendingPathRequest {
+            interface_id,
+            destination: requested_dest,
+            requestor: requestor_transport_id,
+            tag,
+            ext,
+        } = request;
+        let tag = &tag[..];
+        let tag_bytes = Some(tag);
+        let now = now_f64();
+        let is_from_local_client = self.is_local_client_interface(interface_id);
+        // Transport.py consults the limiter for every request it processes.
+        let should_ingress_limit = ingress_limited
+            || self
+                .interfaces
+                .get_mut(&interface_id)
+                .is_some_and(|iface| iface.ingress.should_ingress_limit_pr());
 
         if self.local_destinations.contains(&requested_dest) {
             pathing!(
@@ -787,81 +832,86 @@ impl TransportActor {
                 .is_some_and(|iface| iface.mode == InterfaceMode::Roaming)
                 && path.interface_id == interface_id;
 
-            if requestor_is_next_hop || same_roaming_interface {
-                // Transport.py: answered, even when declined.
-                self.inflight_path_requests.remove(&requested_dest);
-            }
-            if requestor_is_next_hop {
+            // Transport.py: a known path answers the request even when the
+            // reply is declined or its announce cannot be read.
+            let Some(raw) = path
+                .packet_hash
+                .and_then(|hash| self.cached_announce_raw(&hash))
+            else {
                 pathing!(
                     dest = %hex::encode(requested_dest),
-                    "not answering path request — requester is our next hop"
+                    "ignoring path request — cached announce for the known path is unavailable"
                 );
+                self.inflight_path_requests.remove(&requested_dest);
                 return;
-            }
+            };
             if same_roaming_interface {
                 pathing!(
                     dest = %hex::encode(requested_dest),
                     "not answering path request on roaming interface learned from same interface"
                 );
-                return;
-            }
-
-            let cached_raw: Option<(u8, Vec<u8>)> = path
-                .packet_hash
-                .and_then(|hash| self.cached_announce_raw(&hash))
-                .map(|raw| (path.hops, raw));
-            if let Some((hops, raw)) = cached_raw {
-                // Python 1.3.8 Transport.py: unparseable cached announce
-                // aborts the answer entirely (no fall-through to discovery).
-                let Some(response) =
-                    self.path_response_from_cached_announce(&raw, requested_dest, hops)
-                else {
-                    return;
-                };
-                pathing!(
-                    dest = %hex::encode(requested_dest),
-                    hops,
-                    "answering path request — path is known, queueing path response"
-                );
-                let now = now_f64();
-                let path_on_local_client = self.is_local_client_interface(path.interface_id);
-                let response_delay = if is_from_local_client || path_on_local_client {
-                    0.0
-                } else {
-                    let roaming_extra = if self
-                        .interfaces
-                        .get(&interface_id)
-                        .is_some_and(|iface| iface.mode == InterfaceMode::Roaming)
-                    {
-                        PATH_REQUEST_RG
-                    } else {
-                        0.0
-                    };
-                    PATH_REQUEST_GRACE + roaming_extra
-                };
-                if let Some(held_entry) = self.announce_table.remove(&requested_dest) {
-                    self.held_announces.insert(requested_dest, held_entry);
-                }
-                self.announce_table.insert(
-                    requested_dest,
-                    crate::announce::AnnounceEntry {
-                        timestamp: now,
-                        retransmit_timeout: now + response_delay,
-                        retries: 0,
-                        hops,
-                        packet_raw: response,
-                        local_rebroadcasts: 0,
-                        block_rebroadcast: true,
-                        attached_interface: Some(interface_id),
-                        source_interface: None,
-                    },
-                );
-                if !self.shared_instance_client_mode {
-                    self.use_destination(&requested_dest);
-                }
                 self.inflight_path_requests.remove(&requested_dest);
                 return;
             }
+            // Transport.py: an unparseable cached announce aborts the answer,
+            // leaving the request in flight.
+            let Some(response) =
+                self.path_response_from_cached_announce(&raw, requested_dest, path.hops)
+            else {
+                return;
+            };
+            if requestor_is_next_hop {
+                pathing!(
+                    dest = %hex::encode(requested_dest),
+                    "not answering path request — requester is our next hop"
+                );
+                self.inflight_path_requests.remove(&requested_dest);
+                return;
+            }
+            let hops = path.hops;
+            pathing!(
+                dest = %hex::encode(requested_dest),
+                hops,
+                "answering path request — path is known, queueing path response"
+            );
+            let path_on_local_client = self.is_local_client_interface(path.interface_id);
+            let response_delay = if is_from_local_client || path_on_local_client {
+                0.0
+            } else {
+                let roaming_extra = if self
+                    .interfaces
+                    .get(&interface_id)
+                    .is_some_and(|iface| iface.mode == InterfaceMode::Roaming)
+                {
+                    PATH_REQUEST_RG
+                } else {
+                    0.0
+                };
+                PATH_REQUEST_GRACE + roaming_extra
+            };
+            if let Some(held_entry) = self.announce_table.remove(&requested_dest) {
+                self.held_announces.insert(requested_dest, held_entry);
+            }
+            self.announce_table.insert(
+                requested_dest,
+                crate::announce::AnnounceEntry {
+                    timestamp: now,
+                    retransmit_timeout: now + response_delay,
+                    // Transport.py: lets an overheard answer cancel this one.
+                    retries: PATHFINDER_R,
+                    hops,
+                    packet_raw: response,
+                    local_rebroadcasts: 0,
+                    block_rebroadcast: true,
+                    attached_interface: Some(interface_id),
+                    source_interface: None,
+                },
+            );
+            if !self.shared_instance_client_mode {
+                self.use_destination(&requested_dest);
+            }
+            self.inflight_path_requests.remove(&requested_dest);
+            return;
         }
 
         // Python 1.3.8 Transport.py: recursive_prs forces discovery
@@ -886,12 +936,7 @@ impl TransportActor {
                 None,
             );
         } else if self.is_transport_enabled && should_search_unknown {
-            let ingress_limited = self.processing_ingress_limited
-                || self
-                    .interfaces
-                    .get_mut(&interface_id)
-                    .is_some_and(|iface| iface.ingress.should_ingress_limit_pr());
-            if ingress_limited {
+            if should_ingress_limit {
                 pathing!(
                     dest = %hex::encode(requested_dest),
                     interface_id,
@@ -1336,14 +1381,14 @@ mod cache_miss_tests {
     use crate::messages::InterfaceEntry;
     use crate::path_table::PathEntry;
 
+    /// Transport.py answers a known path whose announce cannot be read by
+    /// ignoring the request: no discovery, and nothing left in flight.
     #[test]
-    fn live_path_without_cached_announce_uses_normal_discovery_gates() {
-        // A Boundary requester searches only Boundary and Gateway interfaces
-        // (Transport.py), so the Full route gets no request.
-        for (mode, discovers, sent) in [
-            (InterfaceMode::Gateway, true, true),
-            (InterfaceMode::Boundary, true, false),
-            (InterfaceMode::Full, false, false),
+    fn live_path_without_cached_announce_is_ignored() {
+        for mode in [
+            InterfaceMode::Gateway,
+            InterfaceMode::Boundary,
+            InterfaceMode::Full,
         ] {
             let (mut actor, _actor_tx) = TransportActor::new();
             actor.is_transport_enabled = true;
@@ -1383,11 +1428,9 @@ mod cache_miss_tests {
             let mut request = requested.to_vec();
             request.extend_from_slice(&[0x55; 16]);
             actor.handle_inbound_path_request(&request, 1);
-            assert_eq!(egress_rx.try_recv().is_ok(), sent);
-            assert_eq!(
-                actor.discovery_path_requests.contains_key(&requested),
-                discovers
-            );
+            assert!(egress_rx.try_recv().is_err(), "{mode:?}");
+            assert!(!actor.discovery_path_requests.contains_key(&requested));
+            assert!(!actor.inflight_path_requests.contains_key(&requested));
             assert!(actor.announce_table.is_empty());
         }
     }
