@@ -52,8 +52,8 @@ pub const PATH_SLOW_LINGER_FACTOR: f64 = 10.0;
 /// Interval between never-used pool checks (Transport.py).
 pub(crate) const PATH_POOL_CHECK_INTERVAL: f64 = 5.0 * 60.0;
 
-/// Reverse table entry timeout (8 minutes).
-pub const REVERSE_TIMEOUT: u64 = 480;
+/// Reverse table entry timeout (3 minutes, Transport.py).
+pub const REVERSE_TIMEOUT: u64 = 180;
 
 /// Receipt-count ceiling applied during periodic maintenance. Registration can
 /// temporarily exceed it; maintenance culls the oldest receipts.

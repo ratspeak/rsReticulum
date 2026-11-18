@@ -134,6 +134,19 @@ mod tests {
         assert_eq!(rt.len(), 0);
     }
 
+    /// Transport.py 1.6.1: three minutes, down from eight.
+    #[test]
+    fn entries_expire_after_three_minutes() {
+        let start = 1_000_000.0;
+        let clock = crate::test_clock::Clock::at(start);
+        let mut rt = ReverseTable::new();
+        rt.insert([0x01; 16], 1, None);
+        clock.set(start + 179.0);
+        assert_eq!(rt.cull_expired(), 0);
+        clock.set(start + 181.0);
+        assert_eq!(rt.cull_expired(), 1);
+    }
+
     #[test]
     fn test_cull_dead_interfaces() {
         let mut rt = ReverseTable::new();
