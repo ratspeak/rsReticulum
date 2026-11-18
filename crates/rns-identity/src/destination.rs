@@ -133,6 +133,13 @@ pub enum DestinationError {
     SigningUnavailable,
     #[error("announce link cost is not a finite number: {0}")]
     InvalidLinkCost(f64),
+    /// Packet.py: a HEADER_1 announce must leave room for the transport id a
+    /// relay inserts. Carries the size with that id.
+    #[error(
+        "transport-inserted announce size of {0} bytes exceeds the MTU of {mtu} bytes",
+        mtu = rns_wire::constants::MTU
+    )]
+    AnnounceTooLarge(usize),
 }
 
 /// Wire-shape controls for [`Destination::pack_packet`].
@@ -1157,7 +1164,7 @@ impl Destination {
         let (announce_data, has_ratchet) =
             self.create_announce_with_ext_at(identity, app_data, ratchet, tag, time, stamp_ext)?;
 
-        Ok(self.pack_announce_packet(&announce_data, has_ratchet, path_response))
+        self.pack_announce_packet(&announce_data, has_ratchet, path_response)
     }
 
     /// `Destination.stamp_material()`: hash, public key, name hash.
@@ -1230,9 +1237,12 @@ impl Destination {
 
         self.path_responses
             .retain(|_, cached| cache_now <= cached.timestamp + PR_TAG_WINDOW);
-        Ok(self.path_responses.get(tag).map(|cached| {
-            self.pack_announce_packet(&cached.announce_data, cached.has_ratchet, true)
-        }))
+        self.path_responses
+            .get(tag)
+            .map(|cached| {
+                self.pack_announce_packet(&cached.announce_data, cached.has_ratchet, true)
+            })
+            .transpose()
     }
 
     fn pack_announce_packet(
@@ -1240,7 +1250,7 @@ impl Destination {
         announce_data: &[u8],
         has_ratchet: bool,
         path_response: bool,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, DestinationError> {
         let context = if path_response {
             rns_wire::context::PacketContext::PathResponse
         } else {
@@ -1264,7 +1274,11 @@ impl Destination {
 
         let mut raw = header.pack();
         raw.extend_from_slice(announce_data);
-        raw
+        let inserted = raw.len() + rns_wire::constants::TRUNCATED_HASHLENGTH / 8;
+        if inserted > rns_wire::constants::MTU {
+            return Err(DestinationError::AnnounceTooLarge(inserted));
+        }
+        Ok(raw)
     }
 
     pub fn remove_link(&mut self, link_id: &[u8; 16]) {
@@ -1925,6 +1939,41 @@ mod tests {
         assert!(taken.is_some());
         assert!(taken.unwrap().has_private_key());
         assert!(dest.auto_identity().is_none());
+    }
+
+    /// Upstream 1.6.1 `Packet.pack` packs a 484-byte HEADER_1 announce and
+    /// refuses one byte more: 317 bytes of app data, 285 with a ratchet
+    /// (`RNS.Packet(dest, data, ANNOUNCE).pack()` over app-data sizes).
+    #[test]
+    fn an_announce_leaves_room_for_a_transport_id() {
+        let identity = Identity::new();
+        let mut dest =
+            Destination::new(Some(&identity), Direction::In, DestType::Single, "test.mtu").unwrap();
+        for (ratchet, largest) in [(None, 317), (Some(&[0x5A; 32]), 285)] {
+            let raw = dest
+                .announce_packet(
+                    &identity,
+                    Some(&vec![7; largest]),
+                    ratchet,
+                    false,
+                    None,
+                    1.0,
+                )
+                .unwrap();
+            assert_eq!(raw.len(), 484);
+            let too_large = dest.announce_packet(
+                &identity,
+                Some(&vec![7; largest + 1]),
+                ratchet,
+                false,
+                None,
+                1.0,
+            );
+            assert!(matches!(
+                too_large,
+                Err(DestinationError::AnnounceTooLarge(501))
+            ));
+        }
     }
 
     #[test]
