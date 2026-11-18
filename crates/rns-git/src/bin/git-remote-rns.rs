@@ -125,11 +125,11 @@ fn abort(
     })
 }
 
-/// Whether the path is known and its announce has reached this process.
-/// A shared-instance client's `has_path` reads the daemon's path table, so the
-/// identity can arrive just after the path shows up there.
+/// Whether this process's own path table has the path and its identity is
+/// known, as `RNS.Transport.has_path` in `client.py`. Known destinations loaded
+/// over RPC give the identity before any path of our own.
 async fn path_ready(handle: &ReticulumHandle, hash: [u8; 16]) -> bool {
-    handle.has_path(hash).await.unwrap_or(false)
+    rns_tools::has_local_path(handle, hash).await
         && matches!(handle.recall_without_use(hash).await, Ok(Some(_)))
 }
 
@@ -149,7 +149,7 @@ async fn await_path(handle: &ReticulumHandle, hash: [u8; 16]) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    handle.has_path(hash).await.unwrap_or(false)
+    rns_tools::has_local_path(handle, hash).await
 }
 
 fn init_logging(configdir: &Path, rnsconfig: Option<&str>, level: Option<i64>) {
