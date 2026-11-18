@@ -4,8 +4,8 @@ use std::collections::{HashMap, VecDeque};
 
 use rns_identity::stamps::{NETWORK_STAMP_SIZE, cost_to_fp};
 
-const VALID_CACHE_MAX: usize = 128;
-const INVALID_CACHE_MAX: usize = 128;
+const VALID_CACHE_MAX: usize = 384;
+const INVALID_CACHE_MAX: usize = 384;
 
 /// Why an announce was rejected, as upstream signals it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -238,17 +238,27 @@ mod tests {
     }
 
     #[test]
-    fn caches_hold_128_entries_first_in_first_out() {
+    fn caches_hold_384_entries_first_in_first_out() {
+        let key = |i: u16| {
+            let mut key = [0u8; 32];
+            key[..2].copy_from_slice(&i.to_be_bytes());
+            key
+        };
         let mut cache = AnnounceValidationCache::new();
-        for i in 0..=128u8 {
-            cache.insert_valid([i; 32], result(None));
-            cache.insert_invalid([i; 32], InvalidAnnounce::Invalid);
+        for i in 0..=384u16 {
+            cache.insert_valid(key(i), result(None));
+            cache.insert_invalid(key(i), InvalidAnnounce::Invalid);
         }
-        assert_eq!(cache.valid_len(), 128);
-        assert_eq!(cache.invalid_len(), 128);
+        // Identity.py 1.6.1.
+        assert_eq!(cache.valid_len(), 384);
+        assert_eq!(cache.invalid_len(), 384);
         assert!(matches!(
-            cache.lookup(&[0; 32], 0.0, false),
+            cache.lookup(&key(0), 0.0, false),
             CachedAnnounce::Miss
+        ));
+        assert!(matches!(
+            cache.lookup(&key(1), 0.0, false),
+            CachedAnnounce::Rejected(InvalidAnnounce::Invalid)
         ));
         cache.reset();
         assert_eq!((cache.valid_len(), cache.invalid_len()), (0, 0));
