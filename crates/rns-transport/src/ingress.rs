@@ -759,6 +759,9 @@ mod tests {
         assert_eq!(IC_HELD_RELEASE_INTERVAL, 5.0);
         assert_eq!(EC_PR_FREQ, 5.0);
         const { assert!(!EGRESS_CONTROL) };
+        // Interface.py 1.6.1, the `ic_max_held_announces` default.
+        assert_eq!(MAX_HELD_ANNOUNCES, 64);
+        assert_eq!(IngressController::new().max_held, 64);
     }
 
     #[test]

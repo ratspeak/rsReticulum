@@ -288,7 +288,7 @@ pub const AR_MINFREQ_HZ: f64 = 0.1;
 pub const PR_MINFREQ_HZ: f64 = 0.1;
 pub const AR_FREQ_DECAY: f64 = 1.0 / AR_MINFREQ_HZ;
 pub const PR_FREQ_DECAY: f64 = 1.0 / PR_MINFREQ_HZ;
-pub const MAX_HELD_ANNOUNCES: usize = 256;
+pub const MAX_HELD_ANNOUNCES: usize = rns_transport::constants::MAX_HELD_ANNOUNCES;
 /// Duration a new interface stays in "new" state (seconds).
 pub const IC_NEW_TIME: f64 = 7200.0;
 /// Burst threshold for new interfaces (announces/sec).

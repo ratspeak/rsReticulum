@@ -192,8 +192,8 @@ pub const BLACKHOLE_CHECK_INTERVAL: f64 = 60.0;
 /// (0.02 means 2%). Supply a fraction, not a percentage, to transport APIs.
 pub const ANNOUNCE_CAP: f64 = 0.02;
 
-/// Maximum ingress-limited announces to hold per interface.
-pub const MAX_HELD_ANNOUNCES: usize = 256;
+/// Maximum ingress-limited announces to hold per interface (Interface.py).
+pub const MAX_HELD_ANNOUNCES: usize = 64;
 
 /// Held announce release interval (seconds).
 pub const IC_HELD_RELEASE_INTERVAL: f64 = 5.0;
