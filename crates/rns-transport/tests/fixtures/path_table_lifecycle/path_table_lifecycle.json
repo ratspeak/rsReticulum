@@ -52,6 +52,7 @@
     {"transport_enabled": false, "shared_client": false, "last_request_age_s": 10, "hops": 1, "path_kept": false, "rediscovery_queued": false},
     {"transport_enabled": false, "shared_client": false, "last_request_age_s": 25, "hops": 1, "path_kept": false, "rediscovery_queued": true},
     {"transport_enabled": false, "shared_client": true, "last_request_age_s": null, "hops": 1, "path_kept": false, "rediscovery_queued": false},
-    {"transport_enabled": true, "shared_client": false, "last_request_age_s": null, "hops": 1, "path_kept": true, "rediscovery_queued": false}
+    {"transport_enabled": true, "shared_client": false, "last_request_age_s": null, "hops": 1, "path_kept": true, "rediscovery_queued": false},
+    {"transport_enabled": false, "shared_client": false, "last_request_age_s": null, "hops": 0, "path_kept": true, "rediscovery_queued": false}
   ]
 }

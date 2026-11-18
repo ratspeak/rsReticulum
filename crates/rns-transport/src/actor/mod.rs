@@ -1823,8 +1823,9 @@ impl TransportActor {
 
     /// Transport.py: a Link that was never established expires
     /// the path on a non-transport instance and, unless this is a
-    /// shared-instance client, queues a throttled rediscovery request.
-    /// Unlike upstream, a route newer than the one the request used is kept.
+    /// shared-instance client, queues a throttled rediscovery request. A
+    /// 0-hop path is left alone. Unlike upstream, a route newer than the one
+    /// the request used is kept.
     fn rediscover_after_failed_link(
         &mut self,
         destination: [u8; 16],
@@ -1834,7 +1835,7 @@ impl TransportActor {
             return;
         }
         if let Some(path) = self.path_table.get(&destination)
-            && Some(path_recovery::RouteVersion::from_path(path)) != route
+            && (path.hops == 0 || Some(path_recovery::RouteVersion::from_path(path)) != route)
         {
             return;
         }

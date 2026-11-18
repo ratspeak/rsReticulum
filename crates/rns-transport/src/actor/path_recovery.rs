@@ -124,6 +124,11 @@ impl TransportActor {
             return;
         }
         let now = now_f64();
+        // Transport.py: a failed Link never drops or rediscovers a 0-hop path.
+        let local = self
+            .path_table
+            .get_live(&request.destination_hash)
+            .is_some_and(|path| path.hops == 0);
         let mut path_dropped = false;
         let mut observed = false;
         if let Some(attempt) = request.failed_attempt.and_then(|link_id| {
@@ -140,6 +145,7 @@ impl TransportActor {
         }) {
             observed = now - attempt.observed_at < LOCAL_LINK_ROUTE_LIFETIME;
             if observed
+                && !local
                 && self
                     .path_table
                     .get_live(&request.destination_hash)
@@ -155,7 +161,7 @@ impl TransportActor {
         // A failed attempt's fresh replacement needs no new discovery flood.
         // Unknown attempts and explicit discovery can ask even if a cached
         // route exists, but all callers share the destination throttle/FIFO.
-        let should_request = path_dropped || !has_path || !observed;
+        let should_request = !local && (path_dropped || !has_path || !observed);
         let recent = self
             .path_requests
             .get(&request.destination_hash)
@@ -278,6 +284,20 @@ mod tests {
         actor.path_table.insert([0xDD; 16], path(1, 2));
         let again = recover(&mut actor, &handle, [0xDD; 16], Some(link));
         assert!(!again.path_dropped && again.has_path);
+    }
+
+    /// Transport.py 1.6.1 (5bd93ad9): a failed Link to a 0-hop destination
+    /// neither expires its path nor asks for one.
+    #[test]
+    fn failed_link_to_a_local_destination_keeps_its_path() {
+        let (mut actor, handle, _radio) = fixture();
+        actor.path_table.get_mut(&[0xDD; 16]).unwrap().hops = 0;
+        let link = dispatch(&mut actor);
+        let result = recover(&mut actor, &handle, [0xDD; 16], Some(link));
+        assert!(!result.path_dropped && result.has_path && !result.request_scheduled);
+        assert!(actor.pending_discovery_prs.is_empty());
+        let explicit = recover(&mut actor, &handle, [0xDD; 16], None);
+        assert!(!explicit.request_scheduled);
     }
 
     #[test]

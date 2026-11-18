@@ -363,7 +363,8 @@ impl TransportActor {
             should_request = true;
         } else if !path_request_throttle {
             if expired_link.taken_hops == 0 {
-                should_request = true;
+                // Transport.py: a local client's Link to a 0-hop destination asks nothing.
+                should_request = self.path_table.hops_to(&destination_hash) != Some(0);
             } else if self.path_table.hops_to(&destination_hash) == Some(1)
                 || expired_link.taken_hops == 1
             {
@@ -861,6 +862,34 @@ mod cleanup_tests {
         assert!(!actor.queue_discovery_path_request([0x31; 16], Some(2), 2.0));
         assert!(actor.queue_discovery_path_request([0x32; 16], None, 3.0));
         assert_eq!(actor.pending_discovery_prs.len(), 2);
+    }
+
+    /// Transport.py 1.6.1 (5bd93ad9): a local client's unproven Link to a
+    /// 0-hop destination neither asks for a path nor expires it.
+    #[test]
+    fn local_client_link_to_a_local_destination_asks_nothing() {
+        let now = now_f64();
+        for (hops, asks) in [(0, false), (2, true)] {
+            let (mut actor, _tx) = TransportActor::new();
+            let dest = [0x33; 16];
+            actor
+                .path_table
+                .insert(dest, PathEntry::new(None, hops, 1, InterfaceMode::Full));
+            actor.handle_expired_unvalidated_link(
+                crate::link_table::ExpiredLink {
+                    next_hop: None,
+                    interface_id: 1,
+                    remaining_hops: hops,
+                    destination_hash: dest,
+                    receiving_interface: 2,
+                    taken_hops: 0,
+                },
+                now,
+            );
+            assert_eq!(!actor.pending_discovery_prs.is_empty(), asks, "hops {hops}");
+            // A leaf drops the path it asks for.
+            assert_eq!(actor.path_table.has_path(&dest), !asks, "hops {hops}");
+        }
     }
 
     /// Transport.py: one cull pass removes every

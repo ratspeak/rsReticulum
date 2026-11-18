@@ -209,7 +209,7 @@ out = {
     "outbound": [outbound(1), outbound(3)],
     "pending_link_rediscovery": [pending_link(False, False, None), pending_link(False, False, 10),
                                  pending_link(False, False, 25), pending_link(False, True, None),
-                                 pending_link(True, False, None)],
+                                 pending_link(True, False, None), pending_link(False, False, None, 0)],
 }
 with open(OUT, "w") as f:
     f.write("{\n")
