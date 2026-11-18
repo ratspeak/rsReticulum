@@ -1,7 +1,7 @@
 //! Runtime wiring for tunnel synthesis, server interface ids and accepted
 //! clients' routing state, observed from the wire and the public handle.
 use super::*;
-use rns_transport::messages::InterfaceStatRpcEntry;
+use rns_transport::messages::{DetachReason, InterfaceStatRpcEntry};
 use rns_transport::path_table::{PathEntry, PathTable};
 use rns_transport::tunnel::TunnelSynthesisData;
 use rns_wire::context::PacketContext;
@@ -1269,8 +1269,25 @@ async fn a_tcp_client_records_the_hub_that_answers_its_synthesis() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A tunnel synthesis whose signature fails.
+fn bad_synthesis() -> Vec<u8> {
+    let mut synthesis = hub_answer(&Identity::new());
+    synthesis[rns_wire::constants::HEADER_MINSIZE + 120] ^= 0x01;
+    synthesis
+}
+
+async fn next_detach(
+    detaches: &mut tokio::sync::broadcast::Receiver<InterfaceDetach>,
+) -> InterfaceDetach {
+    tokio::time::timeout(Duration::from_secs(10), detaches.recv())
+        .await
+        .expect("the detach is published")
+        .unwrap()
+}
+
 /// An answer with a bad signature tears the client down for good, with
-/// interface management off (Transport.py:3245-3248, Reticulum.py:976-1015).
+/// interface management off and nobody subscribed to detaches
+/// (Transport.py:3245-3248, Reticulum.py:976-1015).
 #[tokio::test]
 async fn a_client_answered_with_a_bad_signature_is_torn_down() {
     let hub = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1292,12 +1309,10 @@ async fn a_client_answered_with_a_bad_signature_is_torn_down() {
             .await
             .is_some_and(|frame| synthesis_in(&frame).is_some())
     );
-    let mut answer = hub_answer(&Identity::new());
-    answer[rns_wire::constants::HEADER_MINSIZE + 120] ^= 0x01;
     connection
         .reader
         .get_mut()
-        .write_all(&rns_interface::hdlc::frame(&answer))
+        .write_all(&rns_interface::hdlc::frame(&bad_synthesis()))
         .await
         .unwrap();
 
@@ -1321,6 +1336,134 @@ async fn a_client_answered_with_a_bad_signature_is_torn_down() {
         .await
         .is_err(),
         "a detached client does not reconnect"
+    );
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The hub answers badly as the client connects, while the runtime starts:
+/// that detach, made before anyone subscribes, reaches the first subscriber,
+/// and a later one hears only what follows.
+#[tokio::test]
+async fn a_start_up_detach_reaches_the_first_subscriber() {
+    let hub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = hub.local_addr().unwrap().port();
+    let torn_down = tokio::spawn(async move {
+        let (mut stream, _) = hub.accept().await.unwrap();
+        stream
+            .write_all(&rns_interface::hdlc::frame(&bad_synthesis()))
+            .await
+            .unwrap();
+        let _ = stream.read_to_end(&mut Vec::new()).await;
+    });
+    let dir = config_dir("detach-start-up", &tcp_client_config(port));
+    let handle = start(&dir).await;
+    tokio::time::timeout(Duration::from_secs(10), torn_down)
+        .await
+        .expect("the runtime detaches the client before anyone subscribes")
+        .unwrap();
+
+    let detach = next_detach(&mut handle.subscribe_interface_detaches()).await;
+    assert_eq!(
+        (detach.name.as_str(), detach.parent_id, detach.reason),
+        ("Uplink", None, DetachReason::InvalidSynthesis)
+    );
+    assert!(
+        interfaces(&handle)
+            .await
+            .iter()
+            .all(|entry| entry.id != detach.interface_id)
+    );
+    assert!(matches!(
+        handle.subscribe_interface_detaches().try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_later_detach_reaches_every_subscriber() {
+    let hub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = hub.local_addr().unwrap().port();
+    let dir = config_dir("detach-later", &tcp_client_config(port));
+    let handle = start(&dir).await;
+    let mut subscribers = [
+        handle.subscribe_interface_detaches(),
+        handle.subscribe_interface_detaches(),
+    ];
+
+    let mut connection = Frames::accept(&hub, false).await;
+    assert!(
+        connection
+            .next(Duration::from_secs(5))
+            .await
+            .is_some_and(|frame| synthesis_in(&frame).is_some())
+    );
+    let uplink = wait_for_interface(&handle, |entry| entry.name == "Uplink")
+        .await
+        .unwrap();
+    connection
+        .reader
+        .get_mut()
+        .write_all(&rns_interface::hdlc::frame(&bad_synthesis()))
+        .await
+        .unwrap();
+    for subscriber in &mut subscribers {
+        assert_eq!(
+            next_detach(subscriber).await,
+            InterfaceDetach {
+                name: "Uplink".to_string(),
+                interface_id: uplink.id,
+                parent_id: None,
+                reason: DetachReason::InvalidSynthesis,
+            }
+        );
+    }
+
+    handle.shutdown_and_wait().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A server's accepted client that fails verification goes on its own, and
+/// the detach names the server it came from.
+#[tokio::test]
+async fn a_detached_accepted_client_names_its_server() {
+    let port = unused_port().await;
+    let dir = config_dir(
+        "detach-accepted",
+        &format!(
+            "[reticulum]\n  share_instance = No\n  enable_transport = Yes\n\n[interfaces]\n  [[Hub]]\n    type = TCPServerInterface\n    enabled = yes\n    listen_ip = 127.0.0.1\n    listen_port = {port}\n"
+        ),
+    );
+    let handle = start(&dir).await;
+    let mut detaches = handle.subscribe_interface_detaches();
+    let server = wait_for_interface(&handle, |entry| entry.name == "Hub")
+        .await
+        .unwrap();
+    let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let accepted = wait_for_interface(&handle, |entry| entry.parent_id == Some(server.id))
+        .await
+        .expect("the client registers");
+    client
+        .write_all(&rns_interface::hdlc::frame(&bad_synthesis()))
+        .await
+        .unwrap();
+
+    let detach = next_detach(&mut detaches).await;
+    assert_eq!(
+        (detach.interface_id, detach.parent_id, detach.reason),
+        (accepted.id, Some(server.id), DetachReason::InvalidSynthesis)
+    );
+    assert_eq!(detach.name, "Client on Hub");
+    assert!(
+        interfaces(&handle)
+            .await
+            .iter()
+            .any(|entry| entry.id == server.id),
+        "the server stays"
     );
 
     handle.shutdown_and_wait().await;

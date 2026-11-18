@@ -529,6 +529,7 @@ pub struct ReticulumHandle {
     pub handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
     interface_controls: InterfaceControlMap,
     interface_registry: InterfaceRegistry,
+    interface_detaches: InterfaceDetachEvents,
     pub socket_base: PathBuf,
     pub config: ReticulumConfig,
     /// Mobile builds throttle tick rates when the app is backgrounded.
@@ -651,6 +652,50 @@ pub enum AnnounceSubscriptionError {
     InvalidCapacity,
     #[error("transport channel is unavailable")]
     TransportUnavailable,
+}
+
+/// An interface the runtime detached because transport asked it to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InterfaceDetach {
+    /// Python `interface.name`: the config section's for a configured interface.
+    pub name: String,
+    pub interface_id: rns_transport::messages::InterfaceId,
+    /// The interface that spawned it, as a server spawns each client's.
+    pub parent_id: Option<rns_transport::messages::InterfaceId>,
+    pub reason: rns_transport::messages::DetachReason,
+}
+
+const INTERFACE_DETACH_CAPACITY: usize = 64;
+
+/// The receiver opened with the channel holds every detach until the first
+/// subscriber takes it, so one made before anyone subscribes is not lost.
+#[derive(Clone)]
+struct InterfaceDetachEvents {
+    tx: tokio::sync::broadcast::Sender<InterfaceDetach>,
+    first: Arc<std::sync::Mutex<Option<tokio::sync::broadcast::Receiver<InterfaceDetach>>>>,
+}
+
+impl InterfaceDetachEvents {
+    fn new() -> Self {
+        let (tx, first) = tokio::sync::broadcast::channel(INTERFACE_DETACH_CAPACITY);
+        Self {
+            tx,
+            first: Arc::new(std::sync::Mutex::new(Some(first))),
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<InterfaceDetach> {
+        self.first
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| self.tx.subscribe())
+    }
+
+    fn publish(&self, detach: InterfaceDetach) {
+        let _ = self.tx.send(detach);
+    }
 }
 
 /// Typed snapshot of Reticulum interface and aggregate traffic state.
@@ -1333,6 +1378,13 @@ impl ReticulumHandle {
     /// clients do not spawn configured interfaces and return an empty slice.
     pub fn startup_interface_failures(&self) -> &[(String, String)] {
         &self.startup_interface_failures
+    }
+
+    /// The detaches transport asks for; the first subscriber also gets those made before it.
+    pub fn subscribe_interface_detaches(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<InterfaceDetach> {
+        self.interface_detaches.subscribe()
     }
 
     /// Last authenticated shared-client state. Generic automatic clients do
@@ -2480,11 +2532,12 @@ impl ReticulumHandle {
     /// Python `_detach_interface(..., internal_forced=True)`, which transport
     /// calls for a bad or blackholed tunnel peer: it ignores
     /// `enable_interface_management`, and a client so detached stays down until
-    /// restart or attach (Reticulum.py:976-1015).
+    /// restart or attach (Reticulum.py:976-1015). Returns the interface it
+    /// detached.
     pub(crate) async fn detach_interface_by_id(
         &self,
         id: rns_transport::messages::InterfaceId,
-    ) -> Option<bool> {
+    ) -> Option<rns_transport::messages::InterfaceStatRpcEntry> {
         let Ok(TransportQueryResponse::InterfaceStats(entries)) = self
             .query_transport_result(TransportQuery::GetInterfaceStats)
             .await
@@ -2498,14 +2551,14 @@ impl ReticulumHandle {
             .map(|child| child.id)
             .collect();
         if !self.detach_entry(&entry, spawned).await {
-            return Some(false);
+            return None;
         }
         let name = entry
             .identity
             .as_ref()
             .map_or(entry.name.as_str(), |identity| identity.name.as_str());
         rns_transport::notice!("Interface {name} was detached");
-        Some(true)
+        Some(entry)
     }
 
     /// Tear down an interface and those it spawned; I2P listeners and local
@@ -4874,6 +4927,7 @@ pub async fn init_with_policy(
         handle_tx: handle_tx.clone(),
         interface_controls: interface_controls.clone(),
         interface_registry: interface_registry.clone(),
+        interface_detaches: InterfaceDetachEvents::new(),
         socket_base: socket_base.clone(),
         config: rc.clone(),
         is_foreground,
@@ -11215,7 +11269,7 @@ async fn spawn_configured_interface_driver(
 }
 
 /// Carry out the transport actor's interface requests until it stops or the
-/// runtime shuts down.
+/// runtime shuts down, telling subscribers of each detach.
 async fn run_interface_control(
     handle: ReticulumHandle,
     mut requests: mpsc::UnboundedReceiver<rns_transport::messages::InterfaceControl>,
@@ -11233,7 +11287,17 @@ async fn run_interface_control(
                 reason,
             }) => {
                 tracing::debug!(interface_id, ?reason, "transport asked for a detach");
-                let _ = handle.detach_interface_by_id(interface_id).await;
+                if let Some(entry) = handle.detach_interface_by_id(interface_id).await {
+                    let name = entry
+                        .identity
+                        .map_or(entry.name, |identity| identity.short_name);
+                    handle.interface_detaches.publish(InterfaceDetach {
+                        name,
+                        interface_id,
+                        parent_id: entry.parent_id,
+                        reason,
+                    });
+                }
             }
             Some(_) => {}
             None => return,
@@ -14025,6 +14089,7 @@ loglevel = 7
             handle_tx: htx,
             interface_controls,
             interface_registry,
+            interface_detaches: InterfaceDetachEvents::new(),
             socket_base: PathBuf::from("/tmp/dummy"),
             config: ReticulumConfig::default(),
             is_foreground: Arc::new(AtomicBool::new(true)),
