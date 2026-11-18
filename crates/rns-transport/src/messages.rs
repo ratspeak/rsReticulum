@@ -387,6 +387,8 @@ pub struct InterfaceEntry {
     /// polling. `None` when the driver doesn't expose one (e.g. in-memory test
     /// interfaces).
     pub online: Option<Arc<AtomicBool>>,
+    /// The driver's count of every deframed frame. Stats report the bytes
+    /// transport accepted and filtered instead, as Python 1.6.1 does.
     pub rxb: Option<Arc<std::sync::atomic::AtomicU64>>,
     pub txb: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Optional driver-owned aggregate inspection source.
@@ -432,6 +434,28 @@ pub struct InterfaceEntry {
     /// Configured path request stamp requirement; `None` follows
     /// `StampPolicy::pr_cost`. Resolve with `StampPolicy::interface_pr_cost`.
     pub pr_cost: Option<f64>,
+    /// Python 1.6.1 `rxb` and `frxb`: inbound frame bytes transport accepted
+    /// or filtered, a spawned child's included in its parent's.
+    pub(crate) received: ReceivedBytes,
+}
+
+/// Inbound frame bytes, counted once each as Python's `Transport.inbound`
+/// does: IFAC included, accepted or filtered by preprocessing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReceivedBytes {
+    pub(crate) accepted: u64,
+    pub(crate) filtered: u64,
+}
+
+impl ReceivedBytes {
+    pub(crate) fn count(&mut self, len: u64, accepted: bool) {
+        let counter = if accepted {
+            &mut self.accepted
+        } else {
+            &mut self.filtered
+        };
+        *counter = counter.saturating_add(len);
+    }
 }
 
 impl InterfaceEntry {
@@ -497,6 +521,7 @@ impl InterfaceEntry {
             shared_medium: false,
             destination_cost: None,
             pr_cost: None,
+            received: ReceivedBytes::default(),
         }
     }
 
@@ -1303,8 +1328,13 @@ pub struct PathTableRpcEntry {
 pub struct InterfaceStatRpcEntry {
     pub id: InterfaceId,
     pub name: String,
+    /// Python 1.6.1 `rxb`: received bytes transport accepted.
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Python `frxb`: received bytes transport filtered, duplicates included.
+    pub filtered_rx_bytes: u64,
+    /// Python `ftxb`, which upstream never increments.
+    pub filtered_tx_bytes: u64,
     pub rx_rate: u64,
     pub tx_rate: u64,
     pub online: bool,
@@ -1363,6 +1393,8 @@ pub struct InterfaceStatRpcEntry {
     /// Python `current_rx/tx/arx/atx/prx/ptx_speed` in bits per second, set by
     /// the traffic count on top-level interfaces after their first second.
     pub speeds: Option<[f64; 6]>,
+    /// Python `current_frx_speed` and `current_ftx_speed`, sampled with `speeds`.
+    pub filtered_speeds: Option<[f64; 2]>,
     /// Python `arxb`, `atxb`, `prxb` and `ptxb`.
     pub announce_rx_bytes: u64,
     pub announce_tx_bytes: u64,
@@ -1418,8 +1450,15 @@ pub struct TrafficTotalsRpcEntry {
     pub ptxs: f64,
     pub prxf: f64,
     pub ptxf: f64,
+    /// Python `filtered_rxb` and `filtered_txb`, summed like `rxb`, and
+    /// `filtered_speed_rx` and `filtered_speed_tx`.
+    pub frxb: u64,
+    pub ftxb: u64,
+    pub frxs: f64,
+    pub ftxs: f64,
     pub rxpps: u64,
     pub txpps: u64,
+    /// Python 1.6.1 `rx_packets`: packets that passed preprocessing.
     pub rx_packets: u64,
     pub tx_packets: u64,
     pub announce_rx_packets: u64,

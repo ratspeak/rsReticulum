@@ -1,6 +1,5 @@
 //! Held and cached announces re-enter inbound processing as Python
-//! re-injects them: past IFAC, without counting their bytes again
-//! (Interface.py, Transport.py).
+//! re-injects them: past IFAC (Interface.py, Transport.py).
 use super::*;
 use crate::ingress::HeldAnnounce;
 

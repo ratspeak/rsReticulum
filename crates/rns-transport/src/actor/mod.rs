@@ -124,6 +124,8 @@ pub struct TransportActor {
     pub(crate) blackhole_table: BlackholeTable,
     /// Python's interface traffic count and top-level stats counters.
     traffic_count: rpc::TrafficCount,
+    /// Python `preprocess_inbound`'s verdict on the frame being processed.
+    inbound_verdict: inbound::InboundVerdict,
     /// Python's `local_client_rssi_cache`, `_snr_cache` and `_q_cache`: one
     /// 512-entry list per metric, first match wins (Transport.py).
     pub(crate) packet_rssi_cache: VecDeque<([u8; 32], f32)>,
@@ -525,6 +527,7 @@ impl TransportActor {
             rate_table_retain: RATE_TABLE_RETAIN,
             blackhole_table: BlackholeTable::new(),
             traffic_count: rpc::TrafficCount::default(),
+            inbound_verdict: inbound::InboundVerdict::default(),
             packet_rssi_cache: VecDeque::new(),
             packet_snr_cache: VecDeque::new(),
             packet_q_cache: VecDeque::new(),
@@ -2900,48 +2903,14 @@ mod tests {
 
     fn make_test_interface(name: &str) -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
         let (tx, rx) = mpsc::channel(64);
-        let entry = InterfaceEntry {
-            owner: crate::InterfaceOwner::new(),
-            packet_capacity: crate::InterfacePacketCapacity::base(500),
-            name: name.to_string(),
-            mode: InterfaceMode::Gateway,
-            role: InterfaceRole::Normal,
-            parent_id: None,
-            accepted: false,
-            direction: InterfaceDirection::bidirectional(),
-            bitrate: 115200,
-            mtu: 500,
+        let entry = InterfaceEntry::new(
+            name.to_string(),
+            InterfaceMode::Gateway,
+            InterfaceDirection::bidirectional(),
+            115_200,
+            500,
             tx,
-            ifac_key: None,
-            ifac_size: 0,
-            ifac_netname: None,
-            ifac_signed: None,
-            autoconnect_source: None,
-            announce_cap: ANNOUNCE_CAP,
-            announce_allowed_at: 0.0,
-            announce_rate_target: None,
-            announce_rate_grace: None,
-            announce_rate_penalty: None,
-            online: None,
-            rxb: None,
-            txb: None,
-            inspection: None,
-            tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            tx_dropped_bytes: 0,
-            protocol_violations: 0,
-            ifac_violations: 0,
-            packet_filter_hits: 0,
-            multipoint: false,
-            recursive_prs: false,
-            announces_from_internal: true,
-            announces_to_internal: None,
-            gravity: 0,
-            shared_medium: false,
-            destination_cost: None,
-            pr_cost: None,
-            ingress: crate::ingress::IngressController::new(),
-            announce_queue: Vec::new(),
-        };
+        );
         (entry, rx)
     }
 

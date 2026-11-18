@@ -59,11 +59,7 @@ impl TransportActor {
                             .as_ref()
                             .map(|o| o.load(std::sync::atomic::Ordering::Relaxed))
                             .unwrap_or(true);
-                        let rx_bytes = entry
-                            .rxb
-                            .as_ref()
-                            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-                            .unwrap_or(0);
+                        let rx_bytes = entry.received.accepted;
                         let tx_bytes = entry
                             .txb
                             .as_ref()
@@ -93,6 +89,7 @@ impl TransportActor {
                             .get(&iface_id)
                             .copied()
                             .unwrap_or_default();
+                        let speeds = self.traffic_count.speeds.get(&iface_id).copied();
                         // Python publishes IFAC only for an interface that has it.
                         let ifac_signature = entry.ifac_signature();
                         let has_ifac = entry.ifac_key.is_some();
@@ -101,6 +98,8 @@ impl TransportActor {
                             name: entry.name.clone(),
                             rx_bytes,
                             tx_bytes,
+                            filtered_rx_bytes: entry.received.filtered,
+                            filtered_tx_bytes: 0,
                             rx_rate: 0,
                             tx_rate: 0,
                             online,
@@ -158,7 +157,8 @@ impl TransportActor {
                                 .inspection
                                 .as_ref()
                                 .and_then(|source| source.identity().cloned()),
-                            speeds: self.traffic_count.speeds.get(&iface_id).copied(),
+                            speeds: speeds.map(|s| [s[0], s[1], s[2], s[3], s[4], s[5]]),
+                            filtered_speeds: speeds.map(|s| [s[6], s[7]]),
                             announce_rx_bytes: arxb,
                             announce_tx_bytes: atxb,
                             path_request_rx_bytes: prxb,
@@ -513,11 +513,7 @@ impl TransportActor {
                             .as_ref()
                             .map(|o| o.load(std::sync::atomic::Ordering::Relaxed))
                             .unwrap_or(true);
-                        let rx = entry
-                            .rxb
-                            .as_ref()
-                            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-                            .unwrap_or(0);
+                        let rx = entry.received.accepted;
                         let tx = entry
                             .txb
                             .as_ref()
@@ -811,10 +807,14 @@ pub(super) enum InterfaceEvent {
     SentPathRequest,
 }
 
+/// Byte counters the traffic count samples: Python's `rxb`, `txb`, `arxb`,
+/// `atxb`, `prxb`, `ptxb`, `frxb` and `ftxb`.
+const SAMPLED: usize = 8;
+
 #[derive(Debug, Clone, Copy)]
 struct TrafficSample {
     at: std::time::Instant,
-    bytes: [u64; 6],
+    bytes: [u64; SAMPLED],
 }
 
 /// Python `Transport.count_traffic_loop` state and the packet counters it
@@ -824,7 +824,7 @@ pub(super) struct TrafficCount {
     started: std::time::Instant,
     totals: TrafficTotalsRpcEntry,
     samples: HashMap<InterfaceId, TrafficSample>,
-    speeds: HashMap<InterfaceId, [f64; 6]>,
+    speeds: HashMap<InterfaceId, [f64; SAMPLED]>,
     /// Python `r_stat_rssi`, `r_stat_snr` and `r_stat_q` per interface.
     signal: HashMap<InterfaceId, PacketMetrics>,
     last_pps: Option<(std::time::Instant, u64, u64)>,
@@ -896,8 +896,8 @@ impl TransportActor {
         }
     }
 
-    /// Python `Transport.rx_packets += 1` once a packet passes the packet
-    /// filter (Transport.py).
+    /// Python 1.6.1 `Transport.rx_packets += 1` once a packet passes
+    /// preprocessing (Transport.py:2266).
     pub(super) fn count_rx_packet(&mut self) {
         self.traffic_count.totals.rx_packets += 1;
     }
@@ -950,8 +950,8 @@ impl TransportActor {
         count
             .signal
             .retain(|id, _| self.interfaces.contains_key(id));
-        let mut deltas = [0u64; 6];
-        let mut speeds = [0f64; 6];
+        let mut deltas = [0u64; SAMPLED];
+        let mut speeds = [0f64; SAMPLED];
         let mut freqs = [0f64; 4];
         let mut measured = false;
         for (&id, entry) in &mut self.interfaces {
@@ -959,7 +959,16 @@ impl TransportActor {
                 continue;
             }
             let (arxb, atxb, prxb, ptxb) = entry.ingress.announce_and_path_request_bytes();
-            let bytes = [load(&entry.rxb), load(&entry.txb), arxb, atxb, prxb, ptxb];
+            let bytes = [
+                entry.received.accepted,
+                load(&entry.txb),
+                arxb,
+                atxb,
+                prxb,
+                ptxb,
+                entry.received.filtered,
+                0,
+            ];
             let Some(previous) = count.samples.insert(id, TrafficSample { at, bytes }) else {
                 continue;
             };
@@ -967,8 +976,8 @@ impl TransportActor {
             if elapsed <= 0.0 {
                 continue;
             }
-            let mut interface_speeds = [0f64; 6];
-            for i in 0..6 {
+            let mut interface_speeds = [0f64; SAMPLED];
+            for i in 0..SAMPLED {
                 let delta = bytes[i].saturating_sub(previous.bytes[i]);
                 deltas[i] += delta;
                 interface_speeds[i] = (delta as f64 * 8.0) / elapsed;
@@ -998,6 +1007,8 @@ impl TransportActor {
         totals.atxb += deltas[3];
         totals.prxb += deltas[4];
         totals.ptxb += deltas[5];
+        totals.frxb += deltas[6];
+        totals.ftxb += deltas[7];
         [
             totals.rxs,
             totals.txs,
@@ -1005,6 +1016,8 @@ impl TransportActor {
             totals.atxs,
             totals.prxs,
             totals.ptxs,
+            totals.frxs,
+            totals.ftxs,
         ] = speeds;
         [totals.arxf, totals.atxf, totals.prxf, totals.ptxf] = freqs;
     }

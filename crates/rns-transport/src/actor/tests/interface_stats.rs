@@ -494,14 +494,20 @@ fn traffic_totals_are_cumulative_over_top_level_interfaces() {
         actor.interfaces.insert(id, entry);
     }
     actor.count_traffic(1_000.0);
+    for id in 1..=3 {
+        actor.interfaces.get_mut(&id).unwrap().received.accepted += 100;
+    }
     for counter in &counters {
-        counter.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+        counter.fetch_add(1_000, std::sync::atomic::Ordering::Relaxed);
     }
     std::thread::sleep(Duration::from_millis(5));
     actor.count_traffic(1_001.0);
     let measured = totals(&mut actor);
     assert!(measured.measured);
-    assert_eq!(measured.rxb, 100, "only the top-level non-shared interface");
+    assert_eq!(
+        measured.rxb, 100,
+        "accepted bytes of the top-level non-shared interface, not the driver's wire count"
+    );
     assert!(measured.rxs > 0.0);
 
     actor.deregister_interface(1);
@@ -523,4 +529,146 @@ fn traffic_totals_count_never_used_paths() {
     let measured = totals(&mut actor);
     assert_eq!(measured.path_count, 3);
     assert_eq!(measured.unused_path_count, 2);
+}
+
+fn received(actor: &mut TransportActor, id: InterfaceId) -> (u64, u64) {
+    let entry = stats(actor, id);
+    (entry.rx_bytes, entry.filtered_rx_bytes)
+}
+
+/// Python 1.6.1 counts each frame once in `Transport.inbound`: accepted bytes
+/// in `rxb` and `rx_packets`, filtered ones in `frxb` (Transport.py:1973-1996).
+#[test]
+fn received_bytes_split_into_accepted_and_filtered() {
+    let mut actor = hub();
+    let _rx = attach(&mut actor, 1);
+    let data = make_data_packet([0x71; 16], 0);
+    let len = data.len() as u64;
+    inbound(&mut actor, data.clone(), 1);
+    assert_eq!(received(&mut actor, 1), (len, 0));
+    assert_eq!(totals(&mut actor).rx_packets, 1);
+
+    inbound(&mut actor, data, 1);
+    assert_eq!(
+        received(&mut actor, 1),
+        (len, len),
+        "a duplicate is filtered"
+    );
+    assert_eq!(
+        totals(&mut actor).rx_packets,
+        1,
+        "rx_packets counts accepted packets only"
+    );
+
+    let short_request = path_request([0x72; 16], &[0xA2; 15]);
+    inbound(&mut actor, short_request.clone(), 1);
+    assert_eq!(
+        received(&mut actor, 1),
+        (len, len + short_request.len() as u64),
+        "a path request of an invalid size is filtered"
+    );
+
+    let request = path_request([0x73; 16], &[0xA3; 16]);
+    inbound(&mut actor, request.clone(), 1);
+    let accepted = len + request.len() as u64;
+    assert_eq!(received(&mut actor, 1).0, accepted);
+    assert_eq!(totals(&mut actor).rx_packets, 2);
+
+    let (announce, _) = make_valid_announce("stats.accepted.announce", 1);
+    inbound(&mut actor, announce.clone(), 1);
+    assert_eq!(received(&mut actor, 1).0, accepted + announce.len() as u64);
+    assert_eq!(totals(&mut actor).rx_packets, 3);
+}
+
+/// A path request joining one in flight is accepted but never reaches
+/// `rx_packets` (Transport.py:2256).
+#[test]
+fn a_batched_path_request_is_accepted_without_counting_a_packet() {
+    let mut actor = hub();
+    let _rx = attach(&mut actor, 1);
+    let destination = [0x74; 16];
+    actor.inflight_path_requests.insert(destination, now_f64());
+    let request = path_request(destination, &[0xA4; 16]);
+    inbound(&mut actor, request.clone(), 1);
+    assert_eq!(received(&mut actor, 1), (request.len() as u64, 0));
+    assert_eq!(totals(&mut actor).rx_packets, 0);
+}
+
+/// IFAC failures are filtered with the IFAC bytes counted.
+#[test]
+fn an_ifac_failure_is_filtered() {
+    let mut actor = hub();
+    attach_ifac(&mut actor, 1, [0x5A; 64]);
+    let raw = make_data_packet([0x75; 16], 0);
+    let mut flagged = raw.to_vec();
+    flagged[0] |= 0x80;
+    flagged.splice(2..2, [0u8; 8]);
+    let len = flagged.len() as u64;
+    inbound(&mut actor, flagged, 1);
+    assert_eq!(stats(&mut actor, 1).ifac_violations, 1);
+    assert_eq!(received(&mut actor, 1), (0, len));
+    assert_eq!(totals(&mut actor).rx_packets, 0);
+}
+
+/// A held announce is filtered and its release counts again, now accepted
+/// (Transport.py:2165, Interface.py:339-341).
+#[test]
+fn a_held_announce_is_filtered_then_accepted_on_release() {
+    let mut actor = hub();
+    let _rx = attach(&mut actor, 1);
+    let ingress = &mut actor.interfaces.get_mut(&1).unwrap().ingress;
+    for _ in 0..50 {
+        ingress.received_announce();
+    }
+    assert!(ingress.should_ingress_limit(), "precondition: a burst");
+    let (announce, destination) = make_valid_announce("stats.held", 1);
+    let len = announce.len() as u64;
+    inbound(&mut actor, announce.clone(), 1);
+    assert_eq!(actor.interfaces[&1].ingress.held_count(), 1);
+    assert_eq!(received(&mut actor, 1), (0, len));
+    assert_eq!(totals(&mut actor).rx_packets, 0);
+
+    // The burst is over by the time Python releases it.
+    actor.interfaces.get_mut(&1).unwrap().ingress = crate::ingress::IngressController::new();
+    actor.on_released_announce(crate::ingress::HeldAnnounce {
+        raw: announce,
+        destination_hash: destination,
+        hops: 1,
+        receiving_interface_id: 1,
+    });
+    assert!(actor.path_table.has_path(&destination));
+    assert_eq!(received(&mut actor, 1), (len, len));
+    assert_eq!(totals(&mut actor).rx_packets, 1);
+}
+
+/// A spawned child adds both counters to its listener, and the traffic count
+/// samples filtered bytes into the totals.
+#[test]
+fn a_child_adds_accepted_and_filtered_bytes_to_its_parent() {
+    let mut actor = hub();
+    let _parent = attach(&mut actor, 1);
+    let (mut child, _rx) = make_test_interface("stats_1/client_2");
+    child.parent_id = Some(1);
+    actor.interfaces.insert(2, child);
+    actor.count_traffic(1_000.0);
+
+    let data = make_data_packet([0x76; 16], 0);
+    let len = data.len() as u64;
+    inbound(&mut actor, data.clone(), 2);
+    inbound(&mut actor, data, 2);
+    assert_eq!(received(&mut actor, 2), (len, len));
+    assert_eq!(received(&mut actor, 1), (len, len));
+
+    std::thread::sleep(Duration::from_millis(5));
+    actor.count_traffic(1_001.0);
+    let measured = totals(&mut actor);
+    assert_eq!((measured.rxb, measured.frxb, measured.ftxb), (len, len, 0));
+    assert!(measured.frxs > 0.0);
+    let parent = stats(&mut actor, 1);
+    assert!(
+        parent
+            .filtered_speeds
+            .is_some_and(|[frxs, ftxs]| frxs > 0.0 && ftxs == 0.0)
+    );
+    assert_eq!(parent.filtered_tx_bytes, 0);
 }

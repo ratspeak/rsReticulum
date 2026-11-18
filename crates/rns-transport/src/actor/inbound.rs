@@ -13,6 +13,19 @@ enum InboundOrigin {
     CachedPacket,
 }
 
+/// Python 1.6.1's verdict on one inbound frame (`Transport.inbound`): filtered
+/// unless preprocessing admits it.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub(super) enum InboundVerdict {
+    #[default]
+    Filtered,
+    /// Admitted, and counted in `rx_packets`.
+    Accepted,
+    /// Admitted without reaching `rx_packets`: a path request batched into one
+    /// already in flight (Transport.py:2256).
+    Batched,
+}
+
 /// A transit link proof's verdict; only a bad signature is a protocol
 /// violation (Transport.py).
 #[derive(PartialEq, Eq)]
@@ -43,13 +56,13 @@ impl TransportActor {
         fields(interface_id = packet.interface_id, raw_len = packet.raw.len()),
     )]
     pub(super) fn on_inbound(&mut self, packet: crate::messages::InboundPacket) {
-        self.on_inbound_inner(packet, InboundOrigin::Wire);
+        self.on_inbound_counted(packet, InboundOrigin::Wire);
     }
 
     /// An announce the ingress controller held, released for processing; it
-    /// can be held again (Interface.py).
+    /// can be held again, and counts again (Interface.py).
     pub(super) fn on_released_announce(&mut self, announce: crate::ingress::HeldAnnounce) {
-        self.on_inbound_inner(
+        self.on_inbound_counted(
             crate::messages::InboundPacket {
                 raw: announce.raw,
                 interface_id: announce.receiving_interface_id,
@@ -130,7 +143,7 @@ impl TransportActor {
         if raw.len() > 500 {
             return;
         }
-        self.on_inbound_inner(
+        self.on_inbound_counted(
             crate::messages::InboundPacket {
                 raw,
                 interface_id: 0,
@@ -140,6 +153,39 @@ impl TransportActor {
             },
             InboundOrigin::CachedPacket,
         );
+    }
+
+    /// Python `Transport.inbound`: each frame counts once, on its interface and
+    /// parent, as accepted or filtered bytes; cache replays are not counted.
+    fn on_inbound_counted(
+        &mut self,
+        packet: crate::messages::InboundPacket,
+        origin: InboundOrigin,
+    ) {
+        let (interface_id, len) = (packet.interface_id, packet.raw.len() as u64);
+        let outer = std::mem::take(&mut self.inbound_verdict);
+        self.on_inbound_inner(packet, origin);
+        let verdict = std::mem::replace(&mut self.inbound_verdict, outer);
+        if origin == InboundOrigin::CachedPacket {
+            return;
+        }
+        if verdict == InboundVerdict::Accepted {
+            self.count_rx_packet();
+        }
+        let accepted = verdict != InboundVerdict::Filtered;
+        let Some(entry) = self.interfaces.get_mut(&interface_id) else {
+            return;
+        };
+        let parent = entry.parent_id;
+        entry.received.count(len, accepted);
+        if let Some(parent) = parent.and_then(|id| self.interfaces.get_mut(&id)) {
+            parent.received.count(len, accepted);
+        }
+    }
+
+    /// Python's end of `preprocess_inbound` for the frame being processed.
+    pub(super) fn accept_inbound(&mut self, verdict: InboundVerdict) {
+        self.inbound_verdict = verdict;
     }
 
     fn on_inbound_inner(&mut self, packet: crate::messages::InboundPacket, origin: InboundOrigin) {
@@ -380,8 +426,12 @@ impl TransportActor {
             }
         }
 
-        if origin != InboundOrigin::CachedPacket {
-            self.count_rx_packet();
+        // Python 1.6.1 admits announces and path requests at the end of their
+        // own gates, everything else here (Transport.py:2266).
+        let path_request = parsed.flags.packet_type != rns_wire::flags::PacketType::Announce
+            && parsed.destination_hash == Self::path_request_dest_hash();
+        if parsed.flags.packet_type != rns_wire::flags::PacketType::Announce && !path_request {
+            self.accept_inbound(InboundVerdict::Accepted);
         }
 
         // Announce gates run after the packet filter and before the hash is
@@ -738,6 +788,7 @@ impl TransportActor {
         }
         self.record_interface_event(interface_id, InterfaceEvent::ReceivedAnnounce, raw.len());
         self.count_transport_event(InterfaceEvent::ReceivedAnnounce);
+        self.accept_inbound(InboundVerdict::Accepted);
 
         if let Some(validated_identity) = validated_identity.as_ref() {
             let known_public_key = self
