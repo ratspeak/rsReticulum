@@ -100,6 +100,7 @@ pub enum AllowPolicy {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DestinationError {
     #[error("SINGLE destination requires an identity")]
     MissingIdentity,
