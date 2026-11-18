@@ -1,39 +1,57 @@
 {
- "provenance": {"generator": "crates/rns-transport/tests/fixtures/path_table_lifecycle/generate.py", "upstream": "Reticulum", "version": "1.6.0", "commit": "cb1260891d1b6da8f6e9b21542c4f0cc0725cac4"},
+ "provenance": {"generator": "crates/rns-transport/tests/fixtures/path_table_lifecycle/generate.py", "upstream": "Reticulum", "version": "1.6.1", "commit": "cff4d03fdbd6bfb63b765280cd944756ac5cce8d"},
  "linger_leaf": {"transport_enabled": false, "linger_s": 720, "entries": [
-    {"label": "fast_young", "iface": "fast", "age_s": 660, "expires_rel_s": 604140.0, "used_age_s": null, "survives": true},
-    {"label": "fast_old", "iface": "fast", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "survives": false},
-    {"label": "fast_old_used", "iface": "fast", "age_s": 14400, "expires_rel_s": 590400.0, "used_age_s": 5.0, "survives": true},
-    {"label": "slow_past_x1", "iface": "slow", "age_s": 780, "expires_rel_s": 604020.0, "used_age_s": null, "survives": true},
-    {"label": "slow_past_x10", "iface": "slow", "age_s": 7201, "expires_rel_s": 597599.0, "used_age_s": null, "survives": false},
-    {"label": "slow_inside_x10", "iface": "slow", "age_s": 7140, "expires_rel_s": 597660.0, "used_age_s": null, "survives": true},
-    {"label": "zero_bitrate_old", "iface": "zero", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "survives": false},
-    {"label": "none_bitrate_old", "iface": "none", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "survives": false},
-    {"label": "edge_bitrate_old", "iface": "edge", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "survives": false},
-    {"label": "expired_used", "iface": "fast", "age_s": 60, "expires_rel_s": -10.0, "used_age_s": 5.0, "survives": false}
+    {"label": "fast_young", "iface": "fast", "age_s": 660, "expires_rel_s": 604140.0, "used_age_s": null, "hops": 1, "survives": true},
+    {"label": "fast_old", "iface": "fast", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "hops": 1, "survives": false},
+    {"label": "fast_old_used", "iface": "fast", "age_s": 14400, "expires_rel_s": 590400.0, "used_age_s": 5.0, "hops": 1, "survives": true},
+    {"label": "slow_past_x1", "iface": "slow", "age_s": 780, "expires_rel_s": 604020.0, "used_age_s": null, "hops": 1, "survives": true},
+    {"label": "slow_past_x10", "iface": "slow", "age_s": 7201, "expires_rel_s": 597599.0, "used_age_s": null, "hops": 1, "survives": false},
+    {"label": "slow_inside_x10", "iface": "slow", "age_s": 7140, "expires_rel_s": 597660.0, "used_age_s": null, "hops": 1, "survives": true},
+    {"label": "zero_bitrate_old", "iface": "zero", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "hops": 1, "survives": false},
+    {"label": "none_bitrate_old", "iface": "none", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "hops": 1, "survives": false},
+    {"label": "edge_bitrate_old", "iface": "edge", "age_s": 721, "expires_rel_s": 604079.0, "used_age_s": null, "hops": 1, "survives": false},
+    {"label": "expired_used", "iface": "fast", "age_s": 60, "expires_rel_s": -10.0, "used_age_s": 5.0, "hops": 1, "survives": false},
+    {"label": "local_old_unused", "iface": "fast", "age_s": 14400, "expires_rel_s": 590400.0, "used_age_s": null, "hops": 0, "survives": true},
+    {"label": "local_expired", "iface": "fast", "age_s": 60, "expires_rel_s": -10.0, "used_age_s": null, "hops": 0, "survives": true},
+    {"label": "local_on_gone_iface", "iface": "gone", "age_s": 60, "expires_rel_s": 604740.0, "used_age_s": 5.0, "hops": 0, "survives": false}
   ]},
  "linger_transport": {"transport_enabled": true, "linger_s": 6300.0, "entries": [
-    {"label": "fast_young", "iface": "fast", "age_s": 6240.0, "expires_rel_s": 598560.0, "used_age_s": null, "survives": true},
-    {"label": "fast_old", "iface": "fast", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "survives": false},
-    {"label": "fast_old_used", "iface": "fast", "age_s": 126000.0, "expires_rel_s": 478800.0, "used_age_s": 5.0, "survives": true},
-    {"label": "slow_past_x1", "iface": "slow", "age_s": 6360.0, "expires_rel_s": 598440.0, "used_age_s": null, "survives": true},
-    {"label": "slow_past_x10", "iface": "slow", "age_s": 63001.0, "expires_rel_s": 541799.0, "used_age_s": null, "survives": false},
-    {"label": "slow_inside_x10", "iface": "slow", "age_s": 62940.0, "expires_rel_s": 541860.0, "used_age_s": null, "survives": true},
-    {"label": "zero_bitrate_old", "iface": "zero", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "survives": false},
-    {"label": "none_bitrate_old", "iface": "none", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "survives": false},
-    {"label": "edge_bitrate_old", "iface": "edge", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "survives": false},
-    {"label": "expired_used", "iface": "fast", "age_s": 60, "expires_rel_s": -10.0, "used_age_s": 5.0, "survives": false}
+    {"label": "fast_young", "iface": "fast", "age_s": 6240.0, "expires_rel_s": 598560.0, "used_age_s": null, "hops": 1, "survives": true},
+    {"label": "fast_old", "iface": "fast", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "hops": 1, "survives": false},
+    {"label": "fast_old_used", "iface": "fast", "age_s": 126000.0, "expires_rel_s": 478800.0, "used_age_s": 5.0, "hops": 1, "survives": true},
+    {"label": "slow_past_x1", "iface": "slow", "age_s": 6360.0, "expires_rel_s": 598440.0, "used_age_s": null, "hops": 1, "survives": true},
+    {"label": "slow_past_x10", "iface": "slow", "age_s": 63001.0, "expires_rel_s": 541799.0, "used_age_s": null, "hops": 1, "survives": false},
+    {"label": "slow_inside_x10", "iface": "slow", "age_s": 62940.0, "expires_rel_s": 541860.0, "used_age_s": null, "hops": 1, "survives": true},
+    {"label": "zero_bitrate_old", "iface": "zero", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "hops": 1, "survives": false},
+    {"label": "none_bitrate_old", "iface": "none", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "hops": 1, "survives": false},
+    {"label": "edge_bitrate_old", "iface": "edge", "age_s": 6301.0, "expires_rel_s": 598499.0, "used_age_s": null, "hops": 1, "survives": false},
+    {"label": "expired_used", "iface": "fast", "age_s": 60, "expires_rel_s": -10.0, "used_age_s": 5.0, "hops": 1, "survives": false},
+    {"label": "local_old_unused", "iface": "fast", "age_s": 126000.0, "expires_rel_s": 478800.0, "used_age_s": null, "hops": 0, "survives": true},
+    {"label": "local_expired", "iface": "fast", "age_s": 60, "expires_rel_s": -10.0, "used_age_s": null, "hops": 0, "survives": true},
+    {"label": "local_on_gone_iface", "iface": "gone", "age_s": 60, "expires_rel_s": 604740.0, "used_age_s": 5.0, "hops": 0, "survives": false}
   ]},
- "pool_cap": {"count": 2100, "slow_every": 3, "expiry_base_s": 3600, "expiry_step_s": 240, "expiry_mod": 700, "used_count": 5, "removed": [16, 32, 64, 80, 179, 211, 227, 259, 275, 358, 374, 406, 422, 553, 569, 601, 617, 700, 716, 748, 764, 796, 895, 911, 943, 959, 1058, 1090, 1106, 1138, 1237, 1253, 1285, 1301, 1400, 1432, 1448, 1480, 1496, 1579, 1595, 1627, 1643, 1675, 1774, 1790, 1822, 1838, 1937, 1969, 1985, 2017], "used_survive": true},
+ "hop_limit": {"hop_limiter": 4, "entries": [
+    {"hops": 0, "survives": true},
+    {"hops": 3, "survives": true},
+    {"hops": 4, "survives": true},
+    {"hops": 5, "survives": false},
+    {"hops": 9, "survives": false}
+  ]},
+ "pool_cap": {"count": 2100, "slow_every": 3, "expiry_base_s": 3600, "expiry_step_s": 240, "expiry_mod": 700, "used_count": 5, "removed": [1, 4, 7, 10, 13, 14, 16, 17, 20, 23, 26, 29, 32, 46, 49, 52, 55, 58, 61, 62, 64, 65, 68, 71, 74, 77, 80, 97, 100, 103, 106, 109, 112, 113, 116, 119, 122, 125, 128, 145, 148, 151, 154, 157, 160, 161, 164, 167, 170, 173, 176, 179, 193, 196, 199, 202, 205, 208, 209, 211, 212, 215, 218, 221, 224, 227, 241, 244, 247, 250, 253, 256, 259, 260, 263, 266, 269, 272, 275, 292, 295, 298, 301, 304, 307, 308, 311, 314, 317, 320, 323, 340, 343, 346, 349, 352, 355, 356, 358, 359, 362, 365, 368, 371, 374, 388, 391, 394, 397, 400, 403, 404, 406, 407, 410, 413, 416, 419, 422, 439, 442, 445, 448, 451, 454, 455, 458, 461, 464, 467, 470, 487, 490, 493, 496, 499, 502, 503, 506, 509, 512, 515, 518, 535, 538, 541, 544, 547, 550, 551, 553, 554, 557, 560, 563, 566, 569, 583, 586, 589, 592, 595, 598, 599, 601, 602, 605, 608, 611, 614, 617, 634, 637, 640, 643, 646, 649, 650, 653, 656, 659, 662, 665, 682, 685, 688, 691, 694, 697, 698, 700, 701, 704, 707, 710, 713, 716, 730, 733, 736, 739, 742, 745, 746, 748, 749, 752, 755, 758, 761, 764, 781, 784, 787, 790, 793, 796, 797, 800, 803, 806, 809, 812, 829, 832, 835, 838, 841, 844, 845, 848, 851, 854, 857, 860, 877, 880, 883, 886, 889, 892, 893, 895, 896, 899, 902, 905, 908, 911, 925, 928, 931, 934, 937, 940, 941, 943, 944, 947, 950, 953, 956, 959, 976, 979, 982, 985, 988, 991, 992, 995, 998, 1001, 1004, 1007, 1024, 1027, 1030, 1033, 1036, 1039, 1040, 1043, 1046, 1049, 1052, 1055, 1058, 1072, 1075, 1078, 1081, 1084, 1087, 1088, 1090, 1091, 1094, 1097, 1100, 1103, 1106, 1120, 1123, 1126, 1129, 1132, 1135, 1138, 1139, 1142, 1145, 1148, 1151, 1154, 1171, 1174, 1177, 1180, 1183, 1186, 1187, 1190, 1193, 1196, 1199, 1202, 1219, 1222, 1225, 1228, 1231, 1234, 1235, 1237, 1238, 1241, 1244, 1247, 1250, 1253, 1267, 1270, 1273, 1276, 1279, 1282, 1283, 1285, 1286, 1289, 1292, 1295, 1298, 1301, 1318, 1321, 1324, 1327, 1330, 1333, 1334, 1337, 1340, 1343, 1346, 1349, 1366, 1369, 1372, 1375, 1378, 1381, 1382, 1385, 1388, 1391, 1394, 1397, 1400, 1414, 1417, 1420, 1423, 1426, 1429, 1430, 1432, 1433, 1436, 1439, 1442, 1445, 1448, 1462, 1465, 1468, 1471, 1474, 1477, 1480, 1481, 1484, 1487, 1490, 1493, 1496, 1513, 1516, 1519, 1522, 1525, 1528, 1529, 1532, 1535, 1538, 1541, 1544, 1561, 1564, 1567, 1570, 1573, 1576, 1577, 1579, 1580, 1583, 1586, 1589, 1592, 1595, 1609, 1612, 1615, 1618, 1621, 1624, 1625, 1627, 1628, 1631, 1634, 1637, 1640, 1643, 1660, 1663, 1666, 1669, 1672, 1675, 1676, 1679, 1682, 1685, 1688, 1691, 1708, 1711, 1714, 1717, 1720, 1723, 1724, 1727, 1730, 1733, 1736, 1739, 1756, 1759, 1762, 1765, 1768, 1771, 1772, 1774, 1775, 1778, 1781, 1784, 1787, 1790, 1804, 1807, 1810, 1813, 1816, 1819, 1820, 1822, 1823, 1826, 1829, 1832, 1835, 1838, 1855, 1858, 1861, 1864, 1867, 1870, 1871, 1874, 1877, 1880, 1883, 1886, 1903, 1906, 1909, 1912, 1915, 1918, 1919, 1922, 1925, 1928, 1931, 1934, 1937, 1951, 1954, 1957, 1960, 1963, 1966, 1967, 1969, 1970, 1973, 1976, 1979, 1982, 1985, 1999, 2002, 2005, 2008, 2011, 2014, 2017, 2018, 2021, 2024, 2027, 2030, 2033, 2050, 2053, 2056, 2059, 2062, 2065, 2066, 2069, 2072, 2075, 2078, 2081, 2098], "used_survive": true},
+ "pool_scaling": [
+    {"unused": 2100, "used": 2048, "removed": 564, "used_survive": true},
+    {"unused": 2100, "used": 2500, "removed": 1016, "used_survive": true},
+    {"unused": 2100, "used": 4000, "removed": 1588, "used_survive": true}
+  ],
  "outbound": [
     {"hops": 1, "age_s": 3600.0, "sent": true, "timestamp_unchanged": true, "expires_unchanged": true, "used_is_send_time": true},
     {"hops": 3, "age_s": 3600.0, "sent": true, "timestamp_unchanged": true, "expires_unchanged": true, "used_is_send_time": true}
   ],
  "pending_link_rediscovery": [
-    {"transport_enabled": false, "shared_client": false, "last_request_age_s": null, "path_kept": false, "rediscovery_queued": true},
-    {"transport_enabled": false, "shared_client": false, "last_request_age_s": 10, "path_kept": false, "rediscovery_queued": false},
-    {"transport_enabled": false, "shared_client": false, "last_request_age_s": 25, "path_kept": false, "rediscovery_queued": true},
-    {"transport_enabled": false, "shared_client": true, "last_request_age_s": null, "path_kept": false, "rediscovery_queued": false},
-    {"transport_enabled": true, "shared_client": false, "last_request_age_s": null, "path_kept": true, "rediscovery_queued": false}
+    {"transport_enabled": false, "shared_client": false, "last_request_age_s": null, "hops": 1, "path_kept": false, "rediscovery_queued": true},
+    {"transport_enabled": false, "shared_client": false, "last_request_age_s": 10, "hops": 1, "path_kept": false, "rediscovery_queued": false},
+    {"transport_enabled": false, "shared_client": false, "last_request_age_s": 25, "hops": 1, "path_kept": false, "rediscovery_queued": true},
+    {"transport_enabled": false, "shared_client": true, "last_request_age_s": null, "hops": 1, "path_kept": false, "rediscovery_queued": false},
+    {"transport_enabled": true, "shared_client": false, "last_request_age_s": null, "hops": 1, "path_kept": true, "rediscovery_queued": false}
   ]
 }

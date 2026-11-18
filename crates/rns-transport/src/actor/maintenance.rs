@@ -251,15 +251,17 @@ impl TransportActor {
         };
         let check_unused = now > self.path_pool_last_checked + PATH_POOL_CHECK_INTERVAL;
         let interfaces = &self.interfaces;
-        let (removed, unused) = self.path_table.cull(now, linger, check_unused, |id| {
-            interfaces.get(&id).map(|entry| entry.bitrate)
-        });
-        if let Some(unused) = unused {
+        let (removed, unused) =
+            self.path_table
+                .cull(now, linger, check_unused, self.hop_limiter, |id| {
+                    interfaces.get(&id).map(|entry| entry.bitrate)
+                });
+        if let Some((unused, target)) = unused {
             self.path_pool_last_checked = now;
-            if unused > PATH_POOL_UNUSED_TARGET {
+            if unused > target {
                 debug!(
-                    culled = unused - PATH_POOL_UNUSED_TARGET,
-                    "culled never-used paths to reach the pool size target"
+                    culled = unused - target,
+                    target, "culled never-used paths to reach the pool size target"
                 );
             }
         }

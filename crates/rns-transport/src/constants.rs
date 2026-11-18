@@ -42,8 +42,14 @@ pub const UNUSED_PATH_LINGER: f64 = 60.0 * 60.0 * 1.75;
 /// Never-used path linger on a leaf or shared-instance client (Transport.py).
 pub const UNUSED_PATH_LINGER_LEAF: f64 = 60.0 * 12.0;
 
-/// Never-used paths kept by the pool cull (Transport.py).
-pub const PATH_POOL_UNUSED_TARGET: usize = 2048;
+/// Never-used paths the pool cull keeps at most (Transport.py).
+pub const PATH_POOL_UNUSED_MAX: usize = 1536;
+
+/// Never-used paths the pool cull keeps however many paths are used.
+pub const PATH_POOL_UNUSED_MIN: usize = 512;
+
+/// Used paths beyond this shrink the never-used pool target one for one.
+pub const PATH_POOL_USED_TARGET: usize = 2048;
 
 /// Interfaces below this bitrate linger never-used paths longer (Transport.py).
 pub const PATH_SLOW_BITRATE: u64 = 25_000;

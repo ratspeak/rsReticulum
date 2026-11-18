@@ -2,8 +2,9 @@ use crate::now_f64;
 use std::collections::{HashMap, VecDeque};
 
 use crate::constants::{
-    AP_PATH_TIME, DESTINATION_TIMEOUT, InterfaceMode, MAX_RANDOM_BLOBS, PATH_POOL_UNUSED_TARGET,
-    PATH_SLOW_BITRATE, PATH_SLOW_LINGER_FACTOR, PERSIST_RANDOM_BLOBS, PathState, ROAMING_PATH_TIME,
+    AP_PATH_TIME, DESTINATION_TIMEOUT, InterfaceMode, MAX_RANDOM_BLOBS, PATH_POOL_UNUSED_MAX,
+    PATH_POOL_UNUSED_MIN, PATH_POOL_USED_TARGET, PATH_SLOW_BITRATE, PATH_SLOW_LINGER_FACTOR,
+    PERSIST_RANDOM_BLOBS, PathState, ROAMING_PATH_TIME,
 };
 use crate::messages::InterfaceId;
 use rns_wire::types::DestHash;
@@ -233,25 +234,32 @@ impl PathTable {
     }
 
     /// Python's path-table cull (Transport.py): drop expired
-    /// paths, paths on a missing interface and never-used paths older than
-    /// `linger` (x10 on slow interfaces). A 0-hop path neither expires nor
-    /// lingers out. With `check_unused`, never-used
-    /// paths beyond `PATH_POOL_UNUSED_TARGET` are dropped too, fast-interface
-    /// and earliest-expiring first. Returns the removed count and, with
-    /// `check_unused`, the never-used count before removal.
+    /// paths, paths on a missing interface, never-used paths older than
+    /// `linger` (x10 on slow interfaces) and paths of more than `hop_limiter`
+    /// hops. A 0-hop path neither expires nor lingers out. With
+    /// `check_unused`, never-used paths beyond the pool target are dropped
+    /// too, fast-interface and earliest-expiring first; the target shrinks
+    /// from `PATH_POOL_UNUSED_MAX` towards `PATH_POOL_UNUSED_MIN` once more
+    /// than `PATH_POOL_USED_TARGET` paths are used. Returns the removed count
+    /// and, with `check_unused`, the never-used count before removal and the
+    /// target.
     pub fn cull(
         &mut self,
         now: f64,
         linger: f64,
         check_unused: bool,
+        hop_limiter: u8,
         bitrate_of: impl Fn(InterfaceId) -> Option<u64>,
-    ) -> (usize, Option<usize>) {
+    ) -> (usize, Option<(usize, usize)>) {
         let mut stale: Vec<DestHash> = Vec::new();
         let mut unused: Vec<(u8, f64, DestHash)> = Vec::new();
+        let mut used_count = 0usize;
         for (hash, entry) in &self.entries {
             let bitrate = bitrate_of(entry.interface_id);
             let slow = bitrate.is_some_and(|b| b > 0 && b < PATH_SLOW_BITRATE);
-            if check_unused && entry.used == 0.0 {
+            if entry.used != 0.0 {
+                used_count += 1;
+            } else if check_unused {
                 unused.push((u8::from(slow), entry.expires, *hash));
             }
             let factor = if slow { PATH_SLOW_LINGER_FACTOR } else { 1.0 };
@@ -259,13 +267,17 @@ impl PathTable {
             if (!local && now > entry.expires)
                 || bitrate.is_none()
                 || (!local && entry.used == 0.0 && now > entry.timestamp + linger * factor)
+                || entry.hops > hop_limiter
             {
                 stale.push(*hash);
             }
         }
-        let unused_count = check_unused.then_some(unused.len());
-        if unused.len() > PATH_POOL_UNUSED_TARGET {
-            let cull_count = unused.len() - PATH_POOL_UNUSED_TARGET;
+        let unused_target = PATH_POOL_UNUSED_MIN.max(
+            PATH_POOL_UNUSED_MAX.saturating_sub(used_count.saturating_sub(PATH_POOL_USED_TARGET)),
+        );
+        let unused_count = check_unused.then_some((unused.len(), unused_target));
+        if unused.len() > unused_target {
+            let cull_count = unused.len() - unused_target;
             unused.sort_by(|a, b| {
                 a.0.cmp(&b.0)
                     .then(a.1.total_cmp(&b.1))
@@ -381,9 +393,13 @@ mod tests {
         assert!(!table.has_path(&remote));
         assert_eq!(table.iter_live().count(), 1);
 
-        let (removed, _) = table.cull(now, crate::constants::UNUSED_PATH_LINGER, false, |_| {
-            Some(1_000_000)
-        });
+        let (removed, _) = table.cull(
+            now,
+            crate::constants::UNUSED_PATH_LINGER,
+            false,
+            128,
+            |_| Some(1_000_000),
+        );
         assert_eq!(removed, 1);
         assert!(table.has_path(&local));
 
@@ -392,9 +408,35 @@ mod tests {
         assert!(table.has_path(&local));
         assert_eq!(table.cull_expired_batch(16), 0);
 
-        let (removed, _) = table.cull(now, crate::constants::UNUSED_PATH_LINGER, false, |_| None);
+        let (removed, _) = table.cull(
+            now,
+            crate::constants::UNUSED_PATH_LINGER,
+            false,
+            128,
+            |_| None,
+        );
         assert_eq!(removed, 1);
         assert!(table.get(&local).is_none());
+    }
+
+    /// Transport.py 1.6.1 (023849ed): 1536 never-used paths at most, fewer
+    /// once more than 2048 are used, never below 512.
+    #[test]
+    fn never_used_pool_target_follows_the_used_count() {
+        let now = now_f64();
+        let pool = |unused: usize, used: usize| {
+            let mut table = PathTable::new();
+            for i in 0..unused + used {
+                let mut entry = PathEntry::new(None, 1, 1, InterfaceMode::Full);
+                entry.used = if i < used { now } else { 0.0 };
+                table.insert((i as u128).to_be_bytes(), entry);
+            }
+            let (removed, report) = table.cull(now, f64::MAX, true, 128, |_| Some(1_000_000));
+            (removed, report)
+        };
+        assert_eq!(pool(1600, 0), (64, Some((1600, 1536))));
+        assert_eq!(pool(1600, 2148), (164, Some((1600, 1436))));
+        assert_eq!(pool(600, 3100), (88, Some((600, 512))));
     }
 
     #[test]

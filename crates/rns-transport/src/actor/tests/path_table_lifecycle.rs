@@ -1,5 +1,6 @@
-//! Path-table lifetime against upstream RNS 1.6.0: never-used linger on a
-//! leaf and a transport node, the never-used pool cap, traffic marking use
+//! Path-table lifetime against upstream RNS 1.6.1: never-used linger on a
+//! leaf and a transport node, instance-local (0-hop) paths, the hop limiter,
+//! the never-used pool cap and its used-count scaling, traffic marking use
 //! without renewing a path, and rediscovery after a local Link that never
 //! established.
 //!
@@ -17,7 +18,7 @@ fn golden() -> Value {
         "../../../tests/fixtures/path_table_lifecycle/path_table_lifecycle.json"
     ))
     .unwrap();
-    assert_eq!(v["provenance"]["version"], "1.6.0");
+    assert_eq!(v["provenance"]["version"], "1.6.1");
     v
 }
 
@@ -99,12 +100,14 @@ async fn linger_case(case: &Value) {
         ids.insert(kind, i as u64 + 1);
         keep.push(rx);
     }
+    // An interface Transport no longer has.
+    ids.insert("gone", 99);
     let t = now();
     let entries = case["entries"].as_array().unwrap();
     for (i, e) in entries.iter().enumerate() {
         let mut p = PathEntry::new(
             None,
-            1,
+            e["hops"].as_u64().unwrap() as u8,
             ids[e["iface"].as_str().unwrap()],
             InterfaceMode::Full,
         );
@@ -118,7 +121,7 @@ async fn linger_case(case: &Value) {
         assert_eq!(
             live.contains_key(&h16(i as u64 + 1)),
             e["survives"].as_bool().unwrap(),
-            "transport={transport} {}: upstream cull (Transport.py:1118-1160@1.6.0)",
+            "transport={transport} {}: upstream cull (Transport.py:1180-1220@1.6.1)",
             e["label"]
         );
     }
@@ -174,14 +177,84 @@ async fn never_used_pool_is_culled_to_the_upstream_target() {
         .iter()
         .map(|v| v.as_u64().unwrap())
         .collect();
-    assert_eq!(
-        removed, want,
-        "PATH_POOL_UNUSED_TARGET cull (Transport.py:1150-1156@1.6.0)"
-    );
+    assert_eq!(removed, want, "pool cull (Transport.py:1220-1228@1.6.1)");
     assert_eq!(
         (0..field("used_count")).all(|j| live.contains_key(&h16(count + j + 1))),
         c["used_survive"].as_bool().unwrap()
     );
+}
+
+#[tokio::test]
+async fn paths_beyond_the_hop_limiter_are_culled() {
+    let g = golden();
+    let c = &g["hop_limit"];
+    let (mut actor, tx) = TransportActor::new();
+    tx.try_send(TransportMessage::SetTransportEnabled { enabled: true })
+        .unwrap();
+    tx.try_send(TransportMessage::SetFilterPolicy {
+        policy: crate::destination_filter::FilterPolicy {
+            hop_limiter: c["hop_limiter"].as_u64().unwrap() as u8,
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    let (entry, _rx) = iface("a", 10_000_000, InterfaceMode::Full);
+    tx.try_send(TransportMessage::RegisterInterface { id: 1, entry })
+        .unwrap();
+    let t = now();
+    let entries = c["entries"].as_array().unwrap();
+    for (i, e) in entries.iter().enumerate() {
+        let hops = e["hops"].as_u64().unwrap() as u8;
+        let mut p = PathEntry::new(None, hops, 1, InterfaceMode::Full);
+        p.timestamp = t - 30.0;
+        p.used = t - 1.0;
+        actor.path_table.insert(h16(i as u64 + 1), p);
+    }
+    let live = run(actor, &tx).await;
+    for (i, e) in entries.iter().enumerate() {
+        assert_eq!(
+            live.contains_key(&h16(i as u64 + 1)),
+            e["survives"].as_bool().unwrap(),
+            "hops {} (Transport.py:1216-1219@1.6.1)",
+            e["hops"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn never_used_pool_target_shrinks_as_used_paths_grow() {
+    let g = golden();
+    for c in g["pool_scaling"].as_array().unwrap() {
+        let (mut actor, tx) = TransportActor::new();
+        tx.try_send(TransportMessage::SetTransportEnabled { enabled: true })
+            .unwrap();
+        actor.path_pool_last_checked = 0.0;
+        let (entry, _rx) = iface("a", 10_000_000, InterfaceMode::Full);
+        tx.try_send(TransportMessage::RegisterInterface { id: 1, entry })
+            .unwrap();
+        let t = now();
+        let (unused, used) = (c["unused"].as_u64().unwrap(), c["used"].as_u64().unwrap());
+        for i in 0..unused {
+            let mut p = PathEntry::new(None, 1, 1, InterfaceMode::Full);
+            p.timestamp = t - 30.0;
+            p.expires = t + 3600.0 + i as f64;
+            actor.path_table.insert(h16(i + 1), p);
+        }
+        for j in 0..used {
+            let mut p = PathEntry::new(None, 1, 1, InterfaceMode::Full);
+            p.timestamp = t - 30.0;
+            p.expires = t + 60.0;
+            p.used = t - 1.0;
+            actor.path_table.insert(h16(unused + j + 1), p);
+        }
+        let live = run(actor, &tx).await;
+        let got = serde_json::json!({
+            "unused": unused, "used": used,
+            "removed": (0..unused).filter(|i| !live.contains_key(&h16(i + 1))).count(),
+            "used_survive": (0..used).all(|j| live.contains_key(&h16(unused + j + 1))),
+        });
+        assert_eq!(&got, c, "pool target (Transport.py:1220-1222@1.6.1)");
+    }
 }
 
 #[tokio::test]
@@ -224,7 +297,7 @@ async fn outbound_traffic_marks_use_without_renewing_the_path() {
             "timestamp_unchanged": e.timestamp == ts0, "expires_unchanged": e.expires == exp0,
             "used_is_send_time": e.used >= before,
         });
-        assert_eq!(&got, case, "Transport.py:1618@1.6.0");
+        assert_eq!(&got, case, "Transport.py:1618@1.6.1");
     }
 }
 
@@ -245,7 +318,8 @@ async fn link_never_established_expires_the_path_and_rediscovers_as_upstream() {
             .unwrap();
         let dest = h16(7);
         let t = now();
-        let mut p = PathEntry::new(None, 1, 1, InterfaceMode::Full);
+        let hops = case["hops"].as_u64().unwrap() as u8;
+        let mut p = PathEntry::new(None, hops, 1, InterfaceMode::Full);
         p.timestamp = t - 10.0;
         p.used = t - 1.0;
         actor.path_table.insert(dest, p);
@@ -311,10 +385,10 @@ async fn link_never_established_expires_the_path_and_rediscovers_as_upstream() {
         }
         let got = serde_json::json!({
             "transport_enabled": case["transport_enabled"], "shared_client": case["shared_client"],
-            "last_request_age_s": case["last_request_age_s"],
+            "last_request_age_s": case["last_request_age_s"], "hops": hops,
             "path_kept": path_table(&tx).await.contains_key(&dest),
             "rediscovery_queued": requested,
         });
-        assert_eq!(&got, case, "Transport.py:839-866@1.6.0");
+        assert_eq!(&got, case, "Transport.py:896-918@1.6.1");
     }
 }
