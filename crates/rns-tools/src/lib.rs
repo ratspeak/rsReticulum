@@ -23,7 +23,7 @@ pub const RETICULUM_COMPAT_VERSION: &str = rns_runtime::constants::RETICULUM_COM
 
 /// A tool's `--version` line: its own name and crate version, then the
 /// releases it follows, `also` first and Reticulum last, as
-/// `lxmd-rs 1.4.0 (LXMF 1.3.0, Reticulum 1.6.0)`.
+/// `lxmd-rs 1.4.0 (LXMF 1.3.0, Reticulum 1.6.1)`.
 pub fn version_line(tool: &str, crate_version: &str, also: &[(&str, &str)]) -> String {
     let follows: Vec<String> = also
         .iter()
