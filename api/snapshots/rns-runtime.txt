@@ -2067,6 +2067,7 @@ pub rns_runtime::reticulum::StartupRNodeRuntime::interface_id: rns_interface::tr
 pub rns_runtime::reticulum::StartupRNodeRuntime::observer: rns_runtime::reticulum::RNodeRuntimeObserver
 pub const rns_runtime::reticulum::BLACKHOLE_LINK_COST: f64
 pub const rns_runtime::reticulum::DEFAULT_ANNOUNCE_SUBSCRIPTION_CAPACITY: usize
+pub fn rns_runtime::reticulum::configure_destination_stamper(core::option::Option<&str>, &rns_runtime::reticulum::InitOptions) -> core::result::Result<(), rns_runtime::reticulum::ReticulumError>
 pub fn rns_runtime::reticulum::get_instance() -> core::option::Option<&'static rns_runtime::reticulum::ReticulumHandle>
 pub async fn rns_runtime::reticulum::init(core::option::Option<&str>, core::option::Option<std::path::PathBuf>, rns_runtime::lifecycle::ShutdownSignal, alloc::sync::Arc<core::sync::atomic::AtomicBool>) -> core::result::Result<rns_runtime::reticulum::ReticulumHandle, rns_runtime::reticulum::ReticulumError>
 pub async fn rns_runtime::reticulum::init_with_options(core::option::Option<&str>, core::option::Option<std::path::PathBuf>, rns_runtime::lifecycle::ShutdownSignal, alloc::sync::Arc<core::sync::atomic::AtomicBool>, rns_runtime::reticulum::InitOptions) -> core::result::Result<rns_runtime::reticulum::ReticulumHandle, rns_runtime::reticulum::ReticulumError>

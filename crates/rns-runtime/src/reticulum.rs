@@ -11278,6 +11278,31 @@ fn parse_blocked_ips(lines: &[String]) -> Vec<std::net::IpAddr> {
     lines.iter().filter_map(|line| line.parse().ok()).collect()
 }
 
+/// Configure the destination stamper as `init` would for this config
+/// directory, without starting anything, so a stamp made before the network
+/// starts is saved where `init` loads it. A missing config reads as the default.
+pub fn configure_destination_stamper(
+    configdir: Option<&str>,
+    options: &InitOptions,
+) -> Result<(), ReticulumError> {
+    let config_dir = resolve_config_dir(configdir);
+    let config_path = config_dir.join("config");
+    let config = if config_path.exists() {
+        Config::from_file(&config_path)
+    } else {
+        Config::parse(Config::default_config())
+    }
+    .map_err(ReticulumError::Config)?;
+    let mut rc = ReticulumConfig::try_from_config(&config).map_err(ReticulumError::Config)?;
+    rc.apply_init_options(options);
+    rc.stamp_workers.install();
+    crate::destination_stamper::configure(
+        rc.stamps,
+        Some(StoragePaths::from_config_dir(&config_dir).storage_dir),
+    );
+    Ok(())
+}
+
 fn load_or_create_config(path: &Path) -> Result<(Config, bool), ReticulumError> {
     if path.exists() {
         Config::from_file(path)

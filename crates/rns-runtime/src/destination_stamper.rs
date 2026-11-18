@@ -640,6 +640,51 @@ mod tests {
     }
 
     #[test]
+    fn a_stamp_made_before_the_network_starts_is_saved_where_init_loads_it() {
+        let _settings = test_settings::blocking_unstamped();
+        let dir = scratch_dir("early");
+        std::fs::write(
+            dir.join("config"),
+            "[stamps]\n  destination_value = 8\n  destination_cost = 6\n",
+        )
+        .unwrap();
+        let configdir = dir.to_str().unwrap();
+        crate::reticulum::configure_destination_stamper(
+            Some(configdir),
+            &crate::reticulum::InitOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(policy().destination_value, 8.0);
+        let identity = Identity::new();
+        let app = "test.prepare.early";
+        let destination =
+            Destination::new(Some(&identity), Direction::In, DestType::Single, app).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(prepare(&destination, &identity).unwrap().ready())
+            .unwrap();
+        let material = destination.stamp_material(&identity.get_public_key());
+        assert!(
+            load_destination_stamp(&dir.join("storage"), &destination.hash, &material, 6.0)
+                .is_some()
+        );
+
+        // Without a config the defaults apply, and none is written.
+        let bare = scratch_dir("bare");
+        crate::reticulum::configure_destination_stamper(
+            bare.to_str(),
+            &crate::reticulum::InitOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(policy().destination_value, 25.0);
+        assert!(!bare.join("config").exists());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(bare);
+    }
+
+    #[test]
     fn prepare_does_nothing_when_destinations_are_not_stamped() {
         let _settings = test_settings::blocking_unstamped();
         let identity = Identity::new();
