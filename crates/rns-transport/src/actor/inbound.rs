@@ -1118,6 +1118,10 @@ impl TransportActor {
                     tunnel.expires = now_f64() + TUNNEL_TIMEOUT as f64;
                 }
             }
+            // Transport.py: a local client's announce or path response proves it live.
+            if is_from_local_client {
+                self.mark_path_responsive(&header.destination_hash);
+            }
             self.state_dirty = true;
             if self.path_requests.contains_key(&header.destination_hash) {
                 self.use_destination(&header.destination_hash);

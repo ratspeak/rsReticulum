@@ -116,3 +116,52 @@ async fn local_client_path_response_is_rebroadcast_once_everywhere() {
     tx.send(TransportMessage::Shutdown).await.unwrap();
     running.await.unwrap();
 }
+
+fn inbound(actor: &mut TransportActor, raw: Bytes, interface_id: InterfaceId) {
+    actor.on_inbound(InboundPacket {
+        raw,
+        interface_id,
+        rssi: None,
+        snr: None,
+        q: None,
+    });
+}
+
+/// Transport.py 1.6.1 (833f6cf2): a local client's announce leaves its path
+/// responsive and used, also when the rate limit holds it back; another
+/// announce leaves the path unknown and unused.
+#[test]
+fn local_client_announce_marks_its_path_responsive() {
+    let (mut actor, _tx) = TransportActor::new();
+    let (external, _external_rx) = make_test_interface("external");
+    let (mut client, _client_rx) = make_test_interface("local-client");
+    client.role = InterfaceRole::LocalClient;
+    client = client.with_announce_rate(3600.0, 0, 0.0);
+    actor.interfaces.insert(1, external);
+    actor.interfaces.insert(2, client);
+
+    let (remote, remote_dest) = make_valid_announce("t16.remote", 0);
+    inbound(&mut actor, remote, 1);
+    assert_eq!(actor.path_table.get_state(&remote_dest), PathState::Unknown);
+    assert_eq!(actor.path_table.get(&remote_dest).unwrap().used, 0.0);
+
+    let identity = rns_identity::identity::Identity::new();
+    let mut queued = None;
+    for emitted in [1_000, 2_000] {
+        let (raw, dest) =
+            make_announce_for_with_random_blob(&identity, "t16.local", 0, random_blob(1, emitted));
+        inbound(&mut actor, raw, 2);
+        // The second is rate-blocked: its rebroadcast is not queued.
+        let entry = actor.announce_table.get(&dest).unwrap().packet_raw.clone();
+        assert_eq!(*queued.get_or_insert_with(|| entry.clone()), entry);
+        let path = actor.path_table.get(&dest).unwrap();
+        assert!(path.has_random_blob(&random_blob(1, emitted)));
+        assert_eq!(path.hops, 0);
+        assert!(path.used > 0.0, "emitted {emitted}");
+        assert_eq!(
+            actor.path_table.get_state(&dest),
+            PathState::Responsive,
+            "emitted {emitted}"
+        );
+    }
+}
