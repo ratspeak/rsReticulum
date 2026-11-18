@@ -24,6 +24,13 @@ pub(super) struct PendingAdmission {
 mod tests {
     use super::*;
 
+    /// Admission is independent of path-request stamping.
+    fn unstamped_actor() -> TransportActor {
+        let (mut actor, _) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
+        actor
+    }
+
     fn interface(
         actor: &mut TransportActor,
         id: InterfaceId,
@@ -53,7 +60,7 @@ mod tests {
 
     #[test]
     fn full_driver_preserves_tag_without_spending_path_or_airtime_budget() {
-        let (mut actor, _) = TransportActor::new();
+        let mut actor = unstamped_actor();
         let mut radio = interface(&mut actor, 1, 1);
         fill(&actor, 1);
         let dest = [0xD1; 16];
@@ -81,7 +88,7 @@ mod tests {
 
     #[test]
     fn partial_admission_retries_only_failed_interface() {
-        let (mut actor, _) = TransportActor::new();
+        let mut actor = unstamped_actor();
         let mut blocked = interface(&mut actor, 1, 1);
         let mut ready = interface(&mut actor, 2, 8);
         fill(&actor, 1);
@@ -99,7 +106,7 @@ mod tests {
 
     #[test]
     fn refused_target_does_not_extend_healthy_recovery_discovery_cooldown() {
-        let (mut actor, _) = TransportActor::new();
+        let mut actor = unstamped_actor();
         let handle = actor.path_recovery_handle();
         let mut blocked = interface(&mut actor, 1, 1);
         let mut ready = interface(&mut actor, 2, 8);
@@ -150,7 +157,7 @@ mod tests {
     #[test]
     fn deadline_and_new_signed_route_retire_unadmitted_bytes() {
         for new_route in [false, true] {
-            let (mut actor, _) = TransportActor::new();
+            let mut actor = unstamped_actor();
             let mut radio = interface(&mut actor, 1, 1);
             fill(&actor, 1);
             let dest = [0xD3; 16];
@@ -174,7 +181,7 @@ mod tests {
     #[test]
     fn replacement_or_closed_interface_cannot_inherit_old_queued_request() {
         for replace in [false, true] {
-            let (mut actor, _) = TransportActor::new();
+            let mut actor = unstamped_actor();
             let radio = interface(&mut actor, 1, 1);
             fill(&actor, 1);
             actor.on_path_request([0xD4; 16]);
@@ -194,7 +201,7 @@ mod tests {
 
     #[test]
     fn recursive_operation_retirement_cancels_pending_egress() {
-        let (mut actor, _) = TransportActor::new();
+        let mut actor = unstamped_actor();
         let mut radio = interface(&mut actor, 1, 1);
         fill(&actor, 1);
         let dest = [0xD5; 16];
@@ -212,7 +219,7 @@ mod tests {
 
     #[test]
     fn admission_inventory_is_bounded_and_clear_shared_retires_it() {
-        let (mut actor, _) = TransportActor::new();
+        let mut actor = unstamped_actor();
         let _radio = interface(&mut actor, 1, 1);
         fill(&actor, 1);
         for i in 0..MAX_PENDING_ADMISSIONS + 32 {
@@ -231,7 +238,7 @@ mod tests {
 
     #[test]
     fn initial_policy_veto_and_missing_target_do_not_create_retry_or_sent_state() {
-        let (mut actor, _) = TransportActor::new();
+        let mut actor = unstamped_actor();
         let mut radio = interface(&mut actor, 1, 1);
         actor.interfaces.get_mut(&1).unwrap().announce_allowed_at = now_f64() + 120.0;
         actor.send_path_request([0xD7; 16], 1, None, true);
@@ -247,7 +254,7 @@ mod tests {
     fn admission_review_round_robin_reaches_recovered_interface_behind_full_slice() {
         let start = now_f64();
         let _clock = crate::test_clock::Clock::at(start);
-        let (mut actor, _) = TransportActor::new();
+        let mut actor = unstamped_actor();
         let _blocked = interface(&mut actor, 1, 1);
         let mut recovering = interface(&mut actor, 2, 1);
         fill(&actor, 1);
@@ -326,7 +333,7 @@ mod tests {
         for release_at_deadline in [false, true] {
             let start = now_f64();
             let clock = crate::test_clock::Clock::at(start);
-            let (mut actor, _) = TransportActor::new();
+            let mut actor = unstamped_actor();
             let mut radio = interface(&mut actor, 1, 1);
             fill(&actor, 1);
             let dest = [0xE3; 16];
@@ -395,7 +402,7 @@ mod tests {
         for change in 0..=5 {
             let start = now_f64();
             let clock = crate::test_clock::Clock::at(start);
-            let (mut actor, _) = TransportActor::new();
+            let mut actor = unstamped_actor();
             let mut radio = interface(&mut actor, 1, 1);
             fill(&actor, 1);
             let dest = [0xE4; 16];

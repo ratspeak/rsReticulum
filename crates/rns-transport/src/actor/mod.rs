@@ -11237,6 +11237,7 @@ mod tests {
     #[test]
     fn on_path_request_broadcasts_python_sized_leaf_payload() {
         let (mut actor, _tx) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
         let (gateway, mut gateway_rx) = make_test_interface("gateway");
         actor.interfaces.insert(1, gateway);
 
@@ -11271,6 +11272,7 @@ mod tests {
     #[test]
     fn path_request_options_attach_interface_tag_and_recursive_gate() {
         let (mut actor, _tx) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
         let (first, mut first_rx) = make_test_interface("first");
         let (second, mut second_rx) = make_test_interface("second");
         actor.interfaces.insert(1, first);
@@ -11298,6 +11300,7 @@ mod tests {
     #[test]
     fn explicit_path_request_sends_even_when_path_is_known() {
         let (mut actor, _tx) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
         let (gateway, mut gateway_rx) = make_test_interface("gateway");
         actor.interfaces.insert(1, gateway);
 
@@ -11319,6 +11322,7 @@ mod tests {
     #[test]
     fn await_path_requests_unknown_path_before_waiting() {
         let (mut actor, _tx) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
         let (gateway, mut gateway_rx) = make_test_interface("gateway");
         actor.interfaces.insert(1, gateway);
 
@@ -11340,6 +11344,7 @@ mod tests {
     #[test]
     fn transport_path_request_includes_identity_and_sixteen_byte_tag() {
         let (mut actor, _tx) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
         actor.is_transport_enabled = true;
         actor.transport_identity_hash = Some([0x44; 16]);
         let (gateway, mut gateway_rx) = make_test_interface("gateway");
@@ -11657,6 +11662,7 @@ mod tests {
     #[test]
     fn pr_ingress_burst_does_not_block_local_client_forwarding() {
         let (mut actor, _tx) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
 
         let (mut local_client, _local_rx) = make_test_interface("SharedInstanceServer/client_6");
         local_client.role = InterfaceRole::LocalClient;
@@ -11771,6 +11777,7 @@ mod tests {
     #[test]
     fn outgoing_path_request_frequency_counts_direct_forwarded_and_recursive_sends() {
         let (mut direct, _tx) = TransportActor::new();
+        direct.stamp_policy.stamp_prs = false;
         let (direct_iface, mut direct_rx) = make_test_interface("direct");
         direct.interfaces.insert(1, direct_iface);
         direct.on_path_request([0x10; 16]);
@@ -11788,6 +11795,7 @@ mod tests {
         );
 
         let (mut forwarded, _tx) = TransportActor::new();
+        forwarded.stamp_policy.stamp_prs = false;
         let (mut local_client, _local_rx) = make_test_interface("SharedInstanceServer/client_7");
         local_client.role = InterfaceRole::LocalClient;
         forwarded.interfaces.insert(1, local_client);
@@ -11808,6 +11816,7 @@ mod tests {
         );
 
         let (mut recursive, _tx) = TransportActor::new();
+        recursive.stamp_policy.stamp_prs = false;
         recursive.is_transport_enabled = true;
         let (mut requestor, _requestor_rx) = make_test_interface("requestor");
         requestor.mode = InterfaceMode::Gateway;
@@ -11837,6 +11846,7 @@ mod tests {
     #[test]
     fn recursive_path_request_rewrites_requestor_transport_id() {
         let (mut actor, _tx) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
         actor.is_transport_enabled = true;
         actor.transport_identity_hash = Some([0x44; 16]);
 
@@ -12035,6 +12045,7 @@ mod tests {
     #[test]
     fn queued_discovery_prs_emit_at_throttle_cadence() {
         let (mut actor, _tx) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
         let (iface, mut rx) = make_test_interface("gateway");
         actor.interfaces.insert(1, iface);
         let now = now_f64();
@@ -12064,6 +12075,7 @@ mod tests {
     #[test]
     fn queued_discovery_pr_skips_blocked_interface() {
         let (mut actor, _tx) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
         let (iface_a, mut rx_a) = make_test_interface("a");
         actor.interfaces.insert(1, iface_a);
         let (iface_b, mut rx_b) = make_test_interface("b");
@@ -12720,6 +12732,7 @@ mod tests {
     #[test]
     fn local_client_path_request_forwards_without_transport_mode() {
         let (mut actor, _tx) = TransportActor::new();
+        actor.stamp_policy.stamp_prs = false;
         let (mut local_client, _local_rx) = make_test_interface("SharedInstanceServer/client_4");
         local_client.role = InterfaceRole::LocalClient;
         actor.interfaces.insert(1, local_client);

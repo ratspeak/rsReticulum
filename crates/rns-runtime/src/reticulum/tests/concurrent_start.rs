@@ -74,10 +74,18 @@ async fn start_two_unreachable_clients(
             client("Reachable", "127.0.0.1", port),
         ),
     );
+    // Time the start alone, not the wait for the stamp settings.
+    let _starting = crate::destination_stamper::test_settings::starting().await;
     let started = std::time::Instant::now();
-    let handle = start(&dir, options)
-        .await
-        .expect("unreachable servers do not fail start-up");
+    let handle = super::super::init_with_options(
+        Some(dir.to_str().unwrap()),
+        None,
+        ShutdownSignal::new(),
+        Arc::new(AtomicBool::new(true)),
+        options,
+    )
+    .await
+    .expect("unreachable servers do not fail start-up");
     let elapsed = started.elapsed();
     assert!(
         handle.startup_interface_failures().is_empty(),

@@ -1181,6 +1181,7 @@ async fn a_rust_hub_restores_a_reconnecting_rust_clients_paths() {
             .is_some(),
         "the client connects"
     );
+    let _stamps = crate::destination_stamper::test_settings::unstamped().await;
     let destination = client
         .register_destination(
             Identity::new(),

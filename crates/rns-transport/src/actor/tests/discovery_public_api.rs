@@ -5,6 +5,7 @@ use crate::path_discovery::DiscoveryError;
 fn actor() -> (TransportActor, Vec<mpsc::Receiver<Bytes>>) {
     let (mut actor, _) = TransportActor::new();
     actor.is_transport_enabled = true;
+    actor.stamp_policy.stamp_prs = false;
     let mut receivers = Vec::new();
     for id in 1..=3 {
         let (tx, rx) = mpsc::channel(64);

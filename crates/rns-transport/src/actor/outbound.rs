@@ -1567,6 +1567,7 @@ mod path_request_stamp_tests {
     #[test]
     fn without_enforcement_unstamped_requests_are_counted_and_relayed_as_received() {
         let (mut actor, _a, mut b) = actor_with_two_interfaces(true);
+        actor.stamp_policy.stamp_prs = false;
         let data = hex::decode(STAMPED_TAG_1).unwrap()[..PR_LENGTH].to_vec();
         actor.handle_inbound_path_request(&data, 1);
         assert_eq!(received(&actor, 1), 1);
@@ -1574,9 +1575,8 @@ mod path_request_stamp_tests {
     }
 
     #[test]
-    fn a_stamping_transport_relays_unstamped_requests_with_the_lenient_marker() {
+    fn a_default_transport_relays_unstamped_requests_with_the_lenient_marker() {
         let (mut actor, _a, mut b) = actor_with_two_interfaces(true);
-        actor.stamp_policy.stamp_prs = true;
         let data = hex::decode(STAMPED_TAG_1).unwrap()[..PR_LENGTH].to_vec();
         actor.handle_inbound_path_request(&data, 1);
         let relayed = payload(&b.try_recv().expect("relayed without waiting for a stamp"));
@@ -1589,6 +1589,7 @@ mod path_request_stamp_tests {
     #[test]
     fn unstamped_emission_carries_the_transport_id_on_a_leaf() {
         let (mut actor, mut a, _b) = actor_with_two_interfaces(false);
+        actor.stamp_policy.stamp_prs = false;
         actor.on_path_request([0x77; 16]);
         let sent = payload(&a.try_recv().expect("sent"));
         assert_eq!(sent.len(), PR_LENGTH);
@@ -1596,9 +1597,8 @@ mod path_request_stamp_tests {
     }
 
     #[test]
-    fn stamped_emission_waits_for_the_stamper_then_uses_the_cached_stamp() {
+    fn default_emission_waits_for_the_stamper_then_uses_the_cached_stamp() {
         let (mut actor, mut a, _b) = actor_with_two_interfaces(false);
-        actor.stamp_policy.stamp_prs = true;
         actor.stamp_policy.pr_value = 4.0;
         let dest = [0x77; 16];
         let tag = [0x55; 16];

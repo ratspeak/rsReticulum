@@ -4220,14 +4220,15 @@ mod tests {
         crate::lifecycle::ShutdownSignal,
     ) {
         let shutdown = crate::lifecycle::ShutdownSignal::new();
-        let handle = crate::reticulum::init(
-            Some(dir.path().to_str().unwrap()),
-            Some(dir.path().join("sockets")),
-            shutdown.clone(),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        )
-        .await
-        .unwrap();
+        let handle =
+            crate::destination_stamper::test_settings::around_init(crate::reticulum::init(
+                Some(dir.path().to_str().unwrap()),
+                Some(dir.path().join("sockets")),
+                shutdown.clone(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ))
+            .await
+            .unwrap();
         (handle, shutdown)
     }
 

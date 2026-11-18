@@ -11343,6 +11343,62 @@ mod tests {
     mod paths_and_filters;
     mod tunnels;
 
+    // These shadow the entry points for every test here: each start writes the
+    // process destination-stamp settings (destination_stamper::test_settings).
+    async fn init(
+        configdir: Option<&str>,
+        socket_dir: Option<PathBuf>,
+        shutdown: ShutdownSignal,
+        is_foreground: Arc<AtomicBool>,
+    ) -> Result<ReticulumHandle, ReticulumError> {
+        crate::destination_stamper::test_settings::around_init(super::init(
+            configdir,
+            socket_dir,
+            shutdown,
+            is_foreground,
+        ))
+        .await
+    }
+
+    async fn init_with_options(
+        configdir: Option<&str>,
+        socket_dir: Option<PathBuf>,
+        shutdown: ShutdownSignal,
+        is_foreground: Arc<AtomicBool>,
+        options: InitOptions,
+    ) -> Result<ReticulumHandle, ReticulumError> {
+        crate::destination_stamper::test_settings::around_init(super::init_with_options(
+            configdir,
+            socket_dir,
+            shutdown,
+            is_foreground,
+            options,
+        ))
+        .await
+    }
+
+    #[cfg(feature = "rnode-tcp")]
+    async fn init_with_options_and_rnode_startup_options(
+        configdir: Option<&str>,
+        socket_dir: Option<PathBuf>,
+        shutdown: ShutdownSignal,
+        is_foreground: Arc<AtomicBool>,
+        options: InitOptions,
+        rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+    ) -> Result<ReticulumHandle, ReticulumError> {
+        crate::destination_stamper::test_settings::around_init(
+            super::init_with_options_and_rnode_startup_options(
+                configdir,
+                socket_dir,
+                shutdown,
+                is_foreground,
+                options,
+                rnode_startup_options,
+            ),
+        )
+        .await
+    }
+
     #[test]
     fn processes_starting_together_end_with_one_transport_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -14917,6 +14973,7 @@ loglevel = 7
 
     #[tokio::test(start_paused = true)]
     async fn discovery_publisher_registers_selected_signer_and_multiple_services() {
+        let _stamps = crate::destination_stamper::test_settings::unstamped().await;
         let _clock = drive_paused_clock();
         use rns_interface::traits::InterfaceMode;
         let mut runs = Vec::new();
@@ -14994,6 +15051,7 @@ loglevel = 7
     /// of announcing at once, so a flapping address cannot flood announces.
     #[tokio::test(start_paused = true)]
     async fn discovery_publisher_announces_a_learned_address_on_its_interval() {
+        let _stamps = crate::destination_stamper::test_settings::unstamped().await;
         let _clock = drive_paused_clock();
         use rns_interface::traits::InterfaceMode;
         let (handle, actor) = discovery_actor();
@@ -15039,6 +15097,7 @@ loglevel = 7
 
     #[tokio::test(start_paused = true)]
     async fn discovery_publisher_recovers_eligibility_fifo_and_services_attached_path_requests() {
+        let _stamps = crate::destination_stamper::test_settings::unstamped().await;
         let _clock = drive_paused_clock();
         use rns_interface::traits::InterfaceMode;
         let (mut handle, actor) = discovery_actor();
@@ -15157,6 +15216,7 @@ loglevel = 7
 
     #[tokio::test(start_paused = true)]
     async fn discovery_publisher_recalls_pending_service_when_it_goes_offline() {
+        let _stamps = crate::destination_stamper::test_settings::unstamped().await;
         let _clock = drive_paused_clock();
         struct CountedStamper(AtomicU64);
         impl DiscoveryStamper for CountedStamper {
@@ -15284,6 +15344,7 @@ loglevel = 7
 
     #[tokio::test(start_paused = true)]
     async fn discovery_publisher_sends_once_when_admitted_during_generation() {
+        let _stamps = crate::destination_stamper::test_settings::unstamped().await;
         let _clock = drive_paused_clock();
         let (handle, actor) = discovery_actor();
         let (tx, mut sink) =
@@ -15389,6 +15450,7 @@ loglevel = 7
 
     #[tokio::test(start_paused = true)]
     async fn discovery_enable_is_single_owner_and_clients_do_not_publish() {
+        let _stamps = crate::destination_stamper::test_settings::unstamped().await;
         let _clock = drive_paused_clock();
         use rns_interface::traits::InterfaceMode;
         let (mut handle, actor) = discovery_actor();

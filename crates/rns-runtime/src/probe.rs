@@ -714,6 +714,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn responder_sends_attached_path_response_announce() {
+        let _stamps = crate::destination_stamper::test_settings::unstamped().await;
         let (tx, mut rx) = mpsc::channel::<TransportMessage>(16);
 
         let identity = Identity::new();

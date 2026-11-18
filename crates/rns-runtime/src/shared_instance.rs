@@ -531,7 +531,7 @@ mod tests {
             policy: InstancePolicy,
             options: InitOptions,
         ) -> Result<ReticulumHandle, InstanceStartupError> {
-            reticulum::init_with_policy(
+            crate::destination_stamper::test_settings::around_init(reticulum::init_with_policy(
                 self.0.to_str(),
                 None,
                 ShutdownSignal::new(),
@@ -539,7 +539,7 @@ mod tests {
                 options,
                 Default::default(),
                 policy,
-            )
+            ))
             .await
         }
     }

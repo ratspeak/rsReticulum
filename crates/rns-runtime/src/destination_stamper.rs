@@ -52,7 +52,7 @@ fn settings() -> Settings {
         .unwrap_or_default()
 }
 
-/// The configured process stamp policy, or the 1.6.0 defaults.
+/// The configured process stamp policy, or the defaults.
 pub fn policy() -> StampPolicy {
     settings().policy
 }
@@ -438,4 +438,110 @@ pub async fn announce_packet(
             ext.as_ref(),
         )
         .map(Some)
+}
+
+/// Tests share the process stamp settings. Each `init` writes them, so starts
+/// run alongside each other but never alongside a test that holds a guard, and
+/// leave destination stamping off.
+#[cfg(test)]
+pub(crate) mod test_settings {
+    use std::future::Future;
+    use std::path::PathBuf;
+
+    use rns_transport::stamps::StampPolicy;
+    use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    static LOCK: RwLock<()> = RwLock::const_new(());
+
+    fn unstamped_policy() -> StampPolicy {
+        StampPolicy {
+            stamp_destinations: false,
+            ..StampPolicy::default()
+        }
+    }
+
+    /// Destination stamping off while held.
+    pub(crate) async fn unstamped() -> RwLockWriteGuard<'static, ()> {
+        let guard = LOCK.write().await;
+        super::configure(unstamped_policy(), None);
+        guard
+    }
+
+    pub(crate) fn blocking_unstamped() -> RwLockWriteGuard<'static, ()> {
+        blocking_exclusive(unstamped_policy(), None)
+    }
+
+    /// These settings while held.
+    pub(crate) fn blocking_exclusive(
+        policy: StampPolicy,
+        storage_dir: Option<PathBuf>,
+    ) -> RwLockWriteGuard<'static, ()> {
+        let guard = LOCK.blocking_write();
+        super::configure(policy, storage_dir);
+        guard
+    }
+
+    /// Held across a start; dropping it leaves destination stamping off.
+    pub(crate) struct Starting {
+        _guard: RwLockReadGuard<'static, ()>,
+    }
+
+    impl Drop for Starting {
+        fn drop(&mut self) {
+            super::configure(unstamped_policy(), None);
+        }
+    }
+
+    pub(crate) async fn starting() -> Starting {
+        Starting {
+            _guard: LOCK.read().await,
+        }
+    }
+
+    pub(crate) async fn around_init<F: Future>(init: F) -> F::Output {
+        let _starting = starting().await;
+        init.await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rns_identity::destination::DestType;
+
+    #[test]
+    fn default_policy_holds_announces_until_a_stamp_meets_the_target() {
+        let _settings = test_settings::blocking_exclusive(StampPolicy::default(), None);
+        let identity = Identity::new();
+        let mut destination = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "test.default.stamping",
+        )
+        .unwrap();
+        let mut stamps = DestinationStamps::new();
+        assert!(matches!(
+            stamps.admit(&destination, &identity, false, 1u8),
+            Admission::Queued
+        ));
+        drop(stamps);
+
+        destination.set_destination_stamp([7; NETWORK_STAMP_SIZE], 24.5);
+        let mut stamps = DestinationStamps::new();
+        assert!(matches!(
+            stamps.admit(&destination, &identity, false, 2u8),
+            Admission::Queued
+        ));
+        drop(stamps);
+
+        destination.set_destination_stamp([7; NETWORK_STAMP_SIZE], 25.0);
+        let mut stamps = DestinationStamps::new();
+        let Admission::Ready(3u8, Some(ext)) = stamps.admit(&destination, &identity, false, 3u8)
+        else {
+            panic!("a held stamp at the target announces at once");
+        };
+        assert_eq!(ext.stamp, [7; NETWORK_STAMP_SIZE]);
+        assert_eq!(ext.lr_cost, 12.5);
+    }
 }

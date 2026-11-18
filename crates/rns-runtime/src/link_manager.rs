@@ -9799,6 +9799,7 @@ mod tests {
 
     #[test]
     fn path_response_announce_request_sends_attached_path_response() {
+        let _stamps = crate::destination_stamper::test_settings::blocking_unstamped();
         let (tx, mut rx) = mpsc::channel(16);
         let (_event_tx, event_rx) = mpsc::channel(16);
 
@@ -9864,6 +9865,7 @@ mod tests {
 
     #[test]
     fn path_response_announce_retries_after_transport_ingress_saturation() {
+        let _stamps = crate::destination_stamper::test_settings::blocking_unstamped();
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(TransportMessage::DeregisterDestination { hash: [0x44; 16] })
             .unwrap();
@@ -9912,6 +9914,7 @@ mod tests {
 
     #[test]
     fn path_response_announces_carry_default_app_data() {
+        let _stamps = crate::destination_stamper::test_settings::blocking_unstamped();
         let (tx, mut rx) = mpsc::channel(16);
         let (_event_tx, event_rx) = mpsc::channel(16);
 
@@ -9969,6 +9972,7 @@ mod tests {
 
     #[test]
     fn destination_commands_announce_and_change_link_acceptance() {
+        let _stamps = crate::destination_stamper::test_settings::blocking_unstamped();
         let (transport_tx, mut transport_rx) = mpsc::channel(16);
         let (_event_tx, event_rx) = mpsc::channel(16);
         let identity = Identity::new();
@@ -10027,6 +10031,7 @@ mod tests {
 
     #[test]
     fn default_announce_command_uses_owned_destination() {
+        let _stamps = crate::destination_stamper::test_settings::blocking_unstamped();
         let (transport_tx, mut transport_rx) = mpsc::channel(16);
         let (_event_tx, event_rx) = mpsc::channel(16);
         let identity = Identity::new();

@@ -1,15 +1,15 @@
 //! Network stamp policy: the switches and costs Python keeps on `Transport`.
 //!
 //! Python reference: `RNS/Transport.py` and the `[stamps]` parser in
-//! `RNS/Reticulum.py` (1.6.0).
+//! `RNS/Reticulum.py` (1.6.1).
 
 pub use rns_identity::stamps::{LINK_COST_CAP, STAMP_COST_CAP};
 
 /// Lower bound for `lr_stamp_timeout` and `pr_stamp_timeout`, in seconds.
 pub const STAMP_TIMEOUT_FLOOR: f64 = 0.020;
-/// Not configurable in Python 1.6.0.
+/// Not configurable in Python 1.6.1.
 pub const STAMPER_PR_QUEUE_LENGTH: usize = 32;
-/// Not configurable in Python 1.6.0.
+/// Not configurable in Python 1.6.1.
 pub const STAMPER_AN_QUEUE_LENGTH: usize = 32;
 
 /// Effective stamp generation and enforcement policy for one instance.
@@ -21,9 +21,9 @@ pub struct StampPolicy {
     pub stamps_enforced: bool,
     /// Python `LR_STAMPS_ENFORCED`.
     pub lr_stamps_enforced: bool,
-    /// Python `STAMP_DESTINATIONS`.
+    /// Python `STAMP_DESTINATIONS`, on by default since 1.6.1.
     pub stamp_destinations: bool,
-    /// Python `STAMP_PRS`.
+    /// Python `STAMP_PRS`, on by default since 1.6.1.
     pub stamp_prs: bool,
     /// Python `STAMP_LRS`.
     pub stamp_lrs: bool,
@@ -51,8 +51,8 @@ impl Default for StampPolicy {
             stamps_enabled: true,
             stamps_enforced: false,
             lr_stamps_enforced: false,
-            stamp_destinations: false,
-            stamp_prs: false,
+            stamp_destinations: true,
+            stamp_prs: true,
             stamp_lrs: true,
             always_stamp_lrs: false,
             destination_cost: 23.5,
@@ -131,8 +131,8 @@ mod tests {
         assert!(p.stamps_enabled);
         assert!(!p.stamps_enforced);
         assert!(!p.lr_stamps_enforced);
-        assert!(!p.stamp_destinations);
-        assert!(!p.stamp_prs);
+        assert!(p.stamp_destinations);
+        assert!(p.stamp_prs);
         assert!(p.stamp_lrs);
         assert!(!p.always_stamp_lrs);
         assert_eq!(p.destination_cost, 23.5);
@@ -163,14 +163,18 @@ mod tests {
 
     #[test]
     fn switches_set_python_flags() {
-        let mut p = StampPolicy::default();
+        let mut p = StampPolicy {
+            stamp_destinations: false,
+            stamp_prs: false,
+            stamp_lrs: false,
+            ..StampPolicy::default()
+        };
         p.enable_stamping();
         assert!(p.stamp_destinations && p.stamp_prs && p.stamp_lrs);
         assert!(!p.stamps_enforced && !p.lr_stamps_enforced);
         let mut p = StampPolicy::default();
         p.enforce();
         assert!(p.stamps_enforced && p.lr_stamps_enforced);
-        assert!(!p.stamp_destinations && !p.stamp_prs);
     }
 
     #[test]

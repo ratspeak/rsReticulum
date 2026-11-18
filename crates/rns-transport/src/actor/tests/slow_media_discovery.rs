@@ -5,6 +5,7 @@ use super::*;
 fn relay() -> TransportActor {
     let (mut actor, _) = TransportActor::new();
     actor.is_transport_enabled = true;
+    actor.stamp_policy.stamp_prs = false;
     actor.transport_identity_hash = Some([0x44; 16]);
     actor
 }
