@@ -557,15 +557,29 @@ impl TransportActor {
     }
 
     /// Python's interface job (Transport.py): re-evaluate both burst
-    /// limiters, then release at most one held announce per interface.
+    /// limiters, then, when a release is due, cull the held announces that
+    /// can no longer update a path and release at most one per interface.
     fn process_held_announces(&mut self, _now: f64) {
         let iface_ids: Vec<InterfaceId> = self.interfaces.keys().copied().collect();
         for iface_id in iface_ids {
-            let released = self.interfaces.get_mut(&iface_id).and_then(|iface| {
+            let due = self.interfaces.get_mut(&iface_id).is_some_and(|iface| {
                 iface.ingress.should_ingress_limit();
                 iface.ingress.should_ingress_limit_pr();
-                iface.ingress.try_release_held()
+                iface.ingress.release_due()
             });
+            if !due {
+                continue;
+            }
+            let culled: Vec<[u8; 16]> = self.interfaces[&iface_id]
+                .ingress
+                .held_announces()
+                .filter(|held| !self.held_announce_is_useful(held))
+                .map(|held| held.destination_hash)
+                .collect();
+            let released = self
+                .interfaces
+                .get_mut(&iface_id)
+                .and_then(|iface| iface.ingress.cull_and_release(&culled));
 
             if let Some(announce) = released {
                 pathing!(

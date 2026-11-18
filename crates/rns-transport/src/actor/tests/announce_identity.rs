@@ -45,6 +45,21 @@ fn subscribe(actor: &mut TransportActor) -> mpsc::Receiver<crate::messages::Anno
     rx
 }
 
+/// An announce emitted after any made this second; Python 1.6.1 prefilters a
+/// same-emission copy of a known path (Transport.py).
+fn newer_announce(
+    identity: &rns_identity::identity::Identity,
+    app_name: &str,
+    hops: u8,
+) -> (Bytes, [u8; 16]) {
+    make_announce_for_with_random_blob(
+        identity,
+        app_name,
+        hops,
+        random_blob(0x5E, now_f64() as u64 + 1),
+    )
+}
+
 /// The same announce answered as a path response, as a transport hub replays
 /// it from its cache.
 fn as_path_response(announce: &Bytes) -> Bytes {
@@ -125,8 +140,7 @@ fn a_fresh_announce_completes_a_restored_entry() {
     let restored = actor.recent_announces.get_mut(&dest).unwrap();
     (restored.facts_known, restored.hops, restored.name_hash) = (false, 0, [0; 10]);
 
-    let (fresh, _) =
-        make_announce_for_context(&identity, "identity.restored", 3, PacketContext::None);
+    let (fresh, _) = newer_announce(&identity, "identity.restored", 3);
     inbound(&mut actor, &fresh);
 
     let entry = &actor.recent_announces[&dest];
@@ -145,8 +159,7 @@ fn a_fresh_announce_after_a_replay_is_not_a_path_response() {
     inbound(&mut actor, &as_path_response(&first));
     assert!(actor.recent_announces[&dest].is_path_response);
 
-    let (fresh, _) =
-        make_announce_for_context(&identity, "identity.first-replay", 2, PacketContext::None);
+    let (fresh, _) = newer_announce(&identity, "identity.first-replay", 2);
     inbound(&mut actor, &fresh);
 
     let entry = &actor.recent_announces[&dest];

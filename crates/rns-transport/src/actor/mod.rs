@@ -6521,6 +6521,8 @@ mod tests {
         assert!(path.has_random_blob(&higher_new_blob));
     }
 
+    /// Python 1.6.1 prefilters an older emission even for an expired path
+    /// (Transport.py `announce_prefilter`); only an awaited path takes it.
     #[test]
     fn test_older_higher_hop_announce_waits_for_expiry_or_unresponsive_path() {
         let (mut actor, _tx) = TransportActor::new();
@@ -6557,6 +6559,17 @@ mod tests {
         assert!(!path.has_random_blob(&older_blob));
 
         actor.path_table.get_mut(&dest_hash).unwrap().expires = 0.0;
+        actor.on_inbound(InboundPacket {
+            raw: raw_older.clone(),
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert_eq!(actor.path_table.get(&dest_hash).unwrap().hops, 2);
+        assert_eq!(actor.interfaces[&2].ingress.announces_filtered(), 2);
+
+        actor.path_requests.insert(dest_hash, now_f64());
         actor.on_inbound(InboundPacket {
             raw: raw_older,
             interface_id: 2,

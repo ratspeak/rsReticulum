@@ -427,7 +427,7 @@ impl TransportActor {
 
     /// Python's announce ingress in `preprocess_inbound`, in its order: the
     /// frame and payload sizes (protocol violations), a blocked type (silent),
-    /// then an unrequired type (filtered) (Transport.py).
+    /// an unrequired type (filtered), then the prefilter (Transport.py).
     fn admit_announce_ingress(
         &mut self,
         raw: &[u8],
@@ -484,7 +484,90 @@ impl TransportActor {
             self.filtered_announce(interface_id);
             return false;
         }
+        let blob_at = KEY_LEN + NAME_HASH_LEN;
+        let random_blob: [u8; RANDOM_BLOB_LEN] = payload[blob_at..blob_at + RANDOM_BLOB_LEN]
+            .try_into()
+            .expect("payload length checked");
+        if !self.prefilter_admits(header, &random_blob, interface_id) {
+            trace!(
+                interface_id,
+                dest = hex::encode(header.destination_hash),
+                "announce prefiltered"
+            );
+            self.record_interface_event(interface_id, InterfaceEvent::ReceivedAnnounce, 0);
+            self.filtered_announce(interface_id);
+            return false;
+        }
         true
+    }
+
+    /// Python's prefilter conditions: an announce for a known path that is no
+    /// path response, answers no path request and has no queued rebroadcast
+    /// must pass `announce_prefilter` (Transport.py). Reads the raw path table,
+    /// as upstream does, so an expired path not yet culled counts.
+    fn prefilter_admits(
+        &self,
+        header: &rns_wire::header::PacketHeader,
+        random_blob: &[u8; 10],
+        interface_id: InterfaceId,
+    ) -> bool {
+        let destination = &header.destination_hash;
+        let Some(path) = self.path_table.get(destination) else {
+            return true;
+        };
+        header.context == rns_wire::context::PacketContext::PathResponse
+            || self.path_requests.contains_key(destination)
+            || self.discovery_path_requests.contains_key(destination)
+            || self.announce_table.get(destination).is_some()
+            || self.announce_prefilter(destination, path, random_blob, interface_id)
+    }
+
+    /// Python `Transport.announce_prefilter`: whether an announce could still
+    /// update this path (Transport.py). A path whose interface is gone keeps
+    /// it, as upstream's `None` interface does.
+    fn announce_prefilter(
+        &self,
+        destination: &[u8; 16],
+        path: &crate::path_table::PathEntry,
+        random_blob: &[u8; 10],
+        receiving_interface: InterfaceId,
+    ) -> bool {
+        let Some(path_interface) = self.interfaces.get(&path.interface_id) else {
+            return true;
+        };
+        let emitted = announce_timebase(random_blob);
+        match emitted.cmp(&path_timebase_from_random_blobs(path.random_blobs.iter())) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => {
+                self.interfaces
+                    .get(&receiving_interface)
+                    .is_some_and(|entry| entry.gravity > path_interface.gravity)
+                    || self.path_table.get_state(destination)
+                        == crate::constants::PathState::Unresponsive
+            }
+        }
+    }
+
+    /// Interface.py culls a held announce for a destination now known when
+    /// `announce_prefilter` rejects it, with none of the ingress exemptions.
+    pub(super) fn held_announce_is_useful(&self, held: &crate::ingress::HeldAnnounce) -> bool {
+        let Some(path) = self.path_table.get(&held.destination_hash) else {
+            return true;
+        };
+        let Some(random_blob) = rns_wire::header::PacketHeader::unpack(&held.raw)
+            .ok()
+            .and_then(|(_, offset)| held.raw.get(offset + 74..offset + 84))
+            .and_then(|blob| <[u8; 10]>::try_from(blob).ok())
+        else {
+            return true;
+        };
+        self.announce_prefilter(
+            &held.destination_hash,
+            path,
+            &random_blob,
+            held.receiving_interface_id,
+        )
     }
 
     fn process_announce(

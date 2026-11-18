@@ -1,8 +1,15 @@
 //! Python 1.6.1 announce ingress (Transport.py `preprocess_inbound`): the size
-//! gates, the type filters, the filtered count `afrxc`, and the accounting
-//! of held announces (Interface.py).
+//! gates, the type filters, the prefilter that drops announces which cannot
+//! update a known path before their signature is checked, the filtered count
+//! `afrxc`, and the accounting of held announces (Interface.py).
+//!
+//! Expected prefilter verdicts were checked against upstream 1.6.1
+//! `Transport.announce_prefilter`, called directly on stand-in packets and
+//! path entries (older False, newer True, same emission False, higher
+//! gravity True, unresponsive True, path interface `None` True).
 use super::*;
-use crate::ingress::{IngressController, IngressOverrides};
+use crate::announce_validation::CachedAnnounce;
+use crate::ingress::{HeldAnnounce, IngressController, IngressOverrides};
 use rns_wire::context::PacketContext;
 
 const NOW: f64 = 1_800_000_000.0;
@@ -116,6 +123,11 @@ fn totals(actor: &mut TransportActor) -> crate::messages::TrafficTotalsRpcEntry 
     totals
 }
 
+fn hash(raw: &Bytes) -> [u8; 32] {
+    let (header, _) = rns_wire::header::PacketHeader::unpack(raw).unwrap();
+    rns_wire::hash::packet_hash(raw, header.flags.header_type)
+}
+
 /// `(arxc, arxb, afrxc)` on an interface.
 fn counts(actor: &mut TransportActor, id: InterfaceId) -> (u64, u64, u64) {
     let entry = stats(actor, id);
@@ -124,6 +136,140 @@ fn counts(actor: &mut TransportActor, id: InterfaceId) -> (u64, u64, u64) {
         entry.announce_rx_bytes,
         entry.announces_filtered,
     )
+}
+
+#[test]
+fn an_older_copy_of_a_known_path_is_dropped_before_validation() {
+    let clock = crate::test_clock::Clock::at(NOW);
+    let mut node = node(false);
+    let identity = rns_identity::identity::Identity::new();
+    let current = plain(&identity, 200);
+    inbound(&mut node.actor, &current.raw, 1);
+    assert!(node.actor.path_table.get(&current.destination).is_some());
+    let remembered_at = node.actor.recent_announces[&current.destination].timestamp;
+    let (arxc, arxb, afrxc) = counts(&mut node.actor, 1);
+    let before = totals(&mut node.actor);
+
+    clock.set(NOW + 5.0);
+    let older = plain(&identity, 199);
+    inbound(&mut node.actor, &older.raw, 1);
+
+    assert_eq!(
+        counts(&mut node.actor, 1),
+        (arxc + 1, arxb, afrxc + 1),
+        "received_announce(size=0) and filtered_announce()"
+    );
+    let after = totals(&mut node.actor);
+    assert_eq!(after.announce_rx_packets, before.announce_rx_packets);
+    assert_eq!(
+        after.announce_filtered_packets,
+        before.announce_filtered_packets + 1
+    );
+    assert!(matches!(
+        node.actor
+            .announce_validation
+            .lookup(&hash(&older.raw), 0.0, false),
+        CachedAnnounce::Miss
+    ));
+    assert!(!node.actor.packet_hashlist.contains(&hash(&older.raw)));
+    assert_eq!(
+        node.actor.recent_announces[&current.destination].timestamp, remembered_at,
+        "a prefiltered copy is never remembered"
+    );
+}
+
+#[test]
+fn a_same_emission_copy_needs_more_gravity_or_an_unresponsive_path() {
+    let _clock = crate::test_clock::Clock::at(NOW);
+    let mut node = node(false);
+    node.actor.interfaces.get_mut(&2).unwrap().gravity = 1;
+    let identity = rns_identity::identity::Identity::new();
+    let announce = plain(&identity, 300);
+    inbound(&mut node.actor, &announce.raw, 1);
+
+    inbound(&mut node.actor, &announce.raw, 2);
+    assert_eq!(counts(&mut node.actor, 2).2, 0, "higher gravity is kept");
+    assert_eq!(
+        node.actor
+            .path_table
+            .get(&announce.destination)
+            .unwrap()
+            .interface_id,
+        2
+    );
+
+    inbound(&mut node.actor, &announce.raw, 1);
+    let (arxc, arxb, afrxc) = counts(&mut node.actor, 1);
+    assert_eq!(afrxc, 1, "lower gravity is filtered");
+
+    node.actor.path_table.set_state(
+        announce.destination,
+        crate::constants::PathState::Unresponsive,
+    );
+    inbound(&mut node.actor, &announce.raw, 1);
+    assert_eq!(
+        counts(&mut node.actor, 1),
+        (arxc + 1, arxb + announce.raw.len() as u64, afrxc),
+        "an unresponsive path is kept"
+    );
+}
+
+#[test]
+fn path_responses_awaited_and_queued_destinations_skip_the_prefilter() {
+    let _clock = crate::test_clock::Clock::at(NOW);
+    let mut node = node(true);
+    let identity = rns_identity::identity::Identity::new();
+    let current = plain(&identity, 400);
+    let destination = current.destination;
+    inbound(&mut node.actor, &current.raw, 1);
+    let older = plain(&identity, 399);
+    let older_response = signed(&identity, 398, 1, PacketContext::PathResponse, &[], None);
+    let filtered = |node: &mut Node| counts(&mut node.actor, 2).2;
+
+    assert!(node.actor.announce_table.get(&destination).is_some());
+    inbound(&mut node.actor, &older.raw, 2);
+    assert_eq!(filtered(&mut node), 0, "a queued rebroadcast");
+
+    node.actor.announce_table.remove(&destination);
+    inbound(&mut node.actor, &older_response.raw, 2);
+    assert_eq!(filtered(&mut node), 0, "a path response");
+
+    node.actor.path_requests.insert(destination, NOW);
+    inbound(&mut node.actor, &older.raw, 2);
+    assert_eq!(filtered(&mut node), 0, "an awaited path");
+    node.actor.path_requests.remove(&destination);
+
+    node.actor.path_table.get_mut(&destination).unwrap().expires = 0.0;
+    inbound(&mut node.actor, &older.raw, 2);
+    assert_eq!(
+        filtered(&mut node),
+        1,
+        "an expired path not yet culled still counts"
+    );
+
+    node.actor
+        .request_recursive_discovery(destination, 1)
+        .expect("discovery for the expired path");
+    inbound(&mut node.actor, &older.raw, 2);
+    assert_eq!(filtered(&mut node), 1, "a discovery request");
+}
+
+#[test]
+fn a_path_on_a_detached_interface_takes_any_announce() {
+    let _clock = crate::test_clock::Clock::at(NOW);
+    let mut node = node(false);
+    let identity = rns_identity::identity::Identity::new();
+    let current = plain(&identity, 500);
+    inbound(&mut node.actor, &current.raw, 1);
+    node.actor
+        .path_table
+        .get_mut(&current.destination)
+        .unwrap()
+        .interface_id = 9;
+
+    inbound(&mut node.actor, &plain(&identity, 499).raw, 2);
+
+    assert_eq!(counts(&mut node.actor, 2).2, 0);
 }
 
 /// Python 1.6.1: a frame over the MTU, a HEADER_1 announce that leaves no
@@ -272,4 +418,90 @@ fn refused_and_replaced_holds_count_as_filtered() {
     inbound(&mut node.actor, &plain(&first, 901).raw, 1);
     assert_eq!(counts(&mut node.actor, 1).2, 2, "replaced");
     assert_eq!(node.actor.interfaces[&1].ingress.held_count(), 1);
+}
+
+fn learned_path(actor: &mut TransportActor, destination: [u8; 16], emitted: u64) {
+    let mut path = crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Gateway);
+    path.random_blobs.push_back(random_blob(0x99, emitted));
+    actor.path_table.insert(destination, path);
+}
+
+fn hold(actor: &mut TransportActor, announce: &Announce) {
+    actor
+        .interfaces
+        .get_mut(&1)
+        .unwrap()
+        .ingress
+        .hold_announce(HeldAnnounce {
+            raw: announce.raw.clone(),
+            destination_hash: announce.destination,
+            hops: 2,
+            receiving_interface_id: 1,
+        });
+}
+
+fn released(actor: &mut TransportActor) -> usize {
+    actor.last_held_announce_check = 0.0;
+    actor.on_tick();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut count = 0;
+    while actor
+        .inbound_rx
+        .poll_recv(&mut cx, &actor.inbound_queues)
+        .is_ready()
+    {
+        count += 1;
+    }
+    count
+}
+
+/// Interface.py culls held announces the prefilter rejects, but only on a
+/// pass where a release is due, and leaves them out of the release.
+#[test]
+fn a_held_announce_a_newer_path_outdates_is_culled_when_a_release_is_due() {
+    let _clock = crate::test_clock::Clock::at(NOW);
+    let mut node = node(false);
+    node.actor.interfaces.get_mut(&1).unwrap().ingress = IngressController::new();
+    let outdated = plain(&rns_identity::identity::Identity::new(), 1000);
+    let useful = plain(&rns_identity::identity::Identity::new(), 1000);
+    hold(&mut node.actor, &outdated);
+    hold(&mut node.actor, &useful);
+    learned_path(&mut node.actor, outdated.destination, 1001);
+    learned_path(&mut node.actor, useful.destination, 999);
+
+    assert_eq!(released(&mut node.actor), 1);
+    let ingress = &node.actor.interfaces[&1].ingress;
+    assert_eq!(ingress.held_count(), 0, "the outdated one is culled");
+}
+
+#[test]
+fn held_announces_are_not_culled_while_no_release_is_due() {
+    let _clock = crate::test_clock::Clock::at(NOW);
+    let mut node = node(false);
+    bursting(&mut node.actor, IngressOverrides::default());
+    let outdated = plain(&rns_identity::identity::Identity::new(), 1100);
+    hold(&mut node.actor, &outdated);
+    learned_path(&mut node.actor, outdated.destination, 1101);
+
+    assert_eq!(released(&mut node.actor), 0);
+    assert_eq!(node.actor.interfaces[&1].ingress.held_count(), 1);
+}
+
+/// A release re-enters `preprocess_inbound` (Interface.py), so the
+/// prefilter applies to it.
+#[test]
+fn a_released_announce_for_a_newer_path_is_prefiltered() {
+    let _clock = crate::test_clock::Clock::at(NOW);
+    let mut node = node(false);
+    let announce = plain(&rns_identity::identity::Identity::new(), 1200);
+    learned_path(&mut node.actor, announce.destination, 1201);
+
+    node.actor.on_released_announce(HeldAnnounce {
+        raw: announce.raw.clone(),
+        destination_hash: announce.destination,
+        hops: 2,
+        receiving_interface_id: 1,
+    });
+
+    assert_eq!(counts(&mut node.actor, 1), (1, 0, 1));
 }
