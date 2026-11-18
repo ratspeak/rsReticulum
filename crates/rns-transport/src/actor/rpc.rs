@@ -694,6 +694,22 @@ impl TransportActor {
                 self.cleanup_known_destinations(crate::actor::now_f64());
                 TransportQueryResponse::IntResult(self.recent_announces.len() as i64)
             }
+            TransportQuery::GetKnownDestinations => {
+                let mut rows: Vec<_> = self
+                    .recent_announces
+                    .values()
+                    .filter_map(super::store_worker::known_destination_row)
+                    .collect();
+                rows.sort_by_key(|row| row.destination_hash);
+                TransportQueryResponse::KnownDestinations(rows)
+            }
+            TransportQuery::KnownDestinationsLoaded => {
+                TransportQueryResponse::BoolResult(self.kd.loaded)
+            }
+            TransportQuery::LoadKnownDestinations { rows } => {
+                self.merge_known_destinations(rows);
+                TransportQueryResponse::Ok
+            }
             TransportQuery::ResolveIdentityHash { input } => {
                 // First treat input as a destination hash.
                 if let Some(entry) = self.recent_announces.get(&input)
@@ -889,13 +905,30 @@ impl TransportActor {
         else {
             return;
         };
-        match event {
-            InterfaceEvent::ReceivedAnnounce => parent.ingress.spawned_received_announce(size),
-            InterfaceEvent::SentAnnounce => parent.ingress.spawned_sent_announce(size),
-            InterfaceEvent::ReceivedPathRequest => {
+        // AutoInterface keeps the base Interface counters, so its peers' events
+        // count on it too (AutoInterface.py, Interface.py).
+        let counts_children = parent
+            .upstream_identity()
+            .is_some_and(|identity| identity.class_name == "AutoInterface");
+        match (event, counts_children) {
+            (InterfaceEvent::ReceivedAnnounce, true) => {
+                parent.ingress.received_announce_bytes(size)
+            }
+            (InterfaceEvent::SentAnnounce, true) => parent.ingress.sent_announce_bytes(size),
+            (InterfaceEvent::ReceivedPathRequest, true) => {
+                parent.ingress.received_path_request_bytes(size)
+            }
+            (InterfaceEvent::SentPathRequest, true) => parent.ingress.sent_path_request_bytes(size),
+            (InterfaceEvent::ReceivedAnnounce, false) => {
+                parent.ingress.spawned_received_announce(size)
+            }
+            (InterfaceEvent::SentAnnounce, false) => parent.ingress.spawned_sent_announce(size),
+            (InterfaceEvent::ReceivedPathRequest, false) => {
                 parent.ingress.spawned_received_path_request(size)
             }
-            InterfaceEvent::SentPathRequest => parent.ingress.spawned_sent_path_request(size),
+            (InterfaceEvent::SentPathRequest, false) => {
+                parent.ingress.spawned_sent_path_request(size)
+            }
         }
     }
 

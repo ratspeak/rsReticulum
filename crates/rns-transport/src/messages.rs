@@ -467,10 +467,15 @@ impl InterfaceEntry {
     /// registered name. Persisted tables name an interface by its hash
     /// (`Interface.get_hash`).
     pub(crate) fn upstream_name(&self) -> &str {
+        self.upstream_identity()
+            .map_or(self.name.as_str(), |identity| identity.name.as_str())
+    }
+
+    /// How upstream names the interface, where the driver supplies it.
+    pub(crate) fn upstream_identity(&self) -> Option<&InterfaceIdentity> {
         self.inspection
             .as_ref()
             .and_then(InterfaceInspectionSource::identity)
-            .map_or(self.name.as_str(), |identity| identity.name.as_str())
     }
 
     /// Minimal entry with defaults for everything optional. Use the
@@ -1277,6 +1282,17 @@ pub enum TransportQuery {
     /// Run announce-metadata cleanup now and return the remaining count. Periodic
     /// cleanup is additionally subject to its interval and startup-grace gates.
     CleanKnownDestinations,
+    /// Python `Reticulum.get_known_destinations`: every known destination with
+    /// an identity key, as `KnownDestinations` rows.
+    GetKnownDestinations,
+    /// Whether this shared-instance client read the owner's known destinations
+    /// database at start-up (`Identity.load_known_destinations`); `BoolResult`.
+    KnownDestinationsLoaded,
+    /// Python 1.6.1's split-mode fallback: known destinations a shared-instance
+    /// client fetched over RPC, merged as rows read from the database are.
+    LoadKnownDestinations {
+        rows: Vec<crate::store::KnownDestinationRow>,
+    },
     /// Resolve a raw 16-byte value as a destination first, then as an identity hash,
     /// using cached public keys. Returns `HashResult(None)` on a miss. This does
     /// not freshly authenticate the cache or contact a peer.
@@ -1325,6 +1341,7 @@ pub enum TransportQueryResponse {
     InterfaceStats(Vec<InterfaceStatRpcEntry>),
     TrafficTotals(TrafficTotalsRpcEntry),
     LinkDistribution(Vec<LinkDistributionRpcEntry>),
+    KnownDestinations(Vec<crate::store::KnownDestinationRow>),
     RateTable(Vec<RateTableRpcEntry>),
     Announces(Vec<AnnounceRpcEntry>),
     RecalledDestination(Option<RecalledDestinationRpcEntry>),

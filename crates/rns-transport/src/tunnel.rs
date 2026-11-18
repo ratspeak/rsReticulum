@@ -335,6 +335,23 @@ pub enum TunnelExtError {
 }
 
 impl RemoteTransportInfo {
+    /// The fields as a shared instance's interface stats carry them.
+    pub fn new(
+        implementation: String,
+        version: Vec<u64>,
+        transport: bool,
+        destination_cost: f64,
+        pr_cost: f64,
+    ) -> Self {
+        Self {
+            implementation,
+            version,
+            transport,
+            destination_cost,
+            pr_cost,
+        }
+    }
+
     /// Python 1.6.1's extension checks (Transport.py:3255-3288), except that
     /// integer costs are accepted: Python sends one for a clamped cost.
     pub fn decode(ext: &[u8]) -> Result<Self, TunnelExtError> {

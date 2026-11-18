@@ -474,6 +474,31 @@ fn a_parent_takes_its_childrens_announce_bytes_but_not_their_counts() {
     assert_eq!(stats(&mut actor, 2).announces_received, 1);
 }
 
+/// AutoInterface keeps the base counters, so its peers' announces count on it
+/// as well (AutoInterface.py, Interface.py).
+#[test]
+fn an_auto_interface_counts_its_peers_announces() {
+    let mut actor = hub();
+    let (mut parent, _parent_rx) = make_test_interface("auto");
+    parent.inspection = Some(
+        crate::messages::InterfaceInspectionSource::new(Default::default).with_identity(
+            crate::messages::InterfaceIdentity::bracketed("AutoInterface", "auto"),
+        ),
+    );
+    actor.interfaces.insert(1, parent);
+    let (mut peer, _peer_rx) = make_test_interface("auto/peer");
+    peer.parent_id = Some(1);
+    actor.interfaces.insert(2, peer);
+    let (announce, _) = make_valid_announce("stats.auto.peer", 0);
+    let size = announce.len() as u64;
+    inbound(&mut actor, announce, 2);
+    let parent = stats(&mut actor, 1);
+    assert_eq!(
+        (parent.announces_received, parent.announce_rx_bytes),
+        (1, size)
+    );
+}
+
 /// Totals sum top-level interfaces other than the shared-instance server and
 /// keep what they counted when an interface leaves (Transport.py).
 #[test]

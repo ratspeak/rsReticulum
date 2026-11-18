@@ -68,6 +68,8 @@ struct Started {
     rows: Vec<KnownDestinationRow>,
     /// The announce cache is in its database; false keeps it in the actor's memory.
     announces_stored: bool,
+    /// A client read the owner's known destinations database.
+    loaded: bool,
 }
 
 /// Outcome of one job, delivered to the actor.
@@ -225,8 +227,10 @@ fn run(
                 let started = if owner {
                     start_owner(&mut slot, &mut announces, &source, now)
                 } else {
+                    let rows = load_for_client(&source);
                     Started {
-                        rows: load_for_client(&source),
+                        loaded: rows.is_some(),
+                        rows: rows.unwrap_or_default(),
                         announces_stored: false,
                     }
                 };
@@ -261,30 +265,32 @@ fn start_owner(
     Started {
         rows,
         announces_stored,
+        loaded: true,
     }
 }
 
 /// A shared-instance client reads the owner's database once, read-only, and
-/// nothing else (`Identity.load_known_destinations`, shared-instance branch).
-fn load_for_client(source: &StoreSource) -> Vec<KnownDestinationRow> {
+/// nothing else (`Identity.load_known_destinations`, shared-instance branch);
+/// `None` when there is no database to read.
+fn load_for_client(source: &StoreSource) -> Option<Vec<KnownDestinationRow>> {
     match source {
-        StoreSource::Memory => Vec::new(),
+        StoreSource::Memory => None,
         #[cfg(feature = "sqlite-store")]
         StoreSource::Sqlite { known, .. } => {
-            // Upstream logs an error for a missing file too; a client whose
-            // directory is not the owner's has none, and that is not a fault.
+            // A client whose directory is not the owner's has none; the
+            // runtime then asks the shared instance (split mode).
             if !known.is_file() {
                 debug!("no known destinations database to load as a shared-instance client");
-                return Vec::new();
+                return None;
             }
-            let read = SqliteKnownDestinations::open_ro(known)
-                .and_then(|mut reader| read_rows(&mut reader));
-            read.unwrap_or_else(|e| {
-                error!(
-                    "could not load known destinations from the shared instance's database: {e}; continuing with an empty table"
-                );
-                Vec::new()
-            })
+            SqliteKnownDestinations::open_ro(known)
+                .and_then(|mut reader| read_rows(&mut reader))
+                .map_err(|e| {
+                    debug!(
+                        "could not load known destinations from the shared instance's database: {e}"
+                    )
+                })
+                .ok()
         }
     }
 }
@@ -709,6 +715,8 @@ pub(super) struct KdState {
     pub(super) results: tokio_mpsc::UnboundedReceiver<StoreResult>,
     /// Cached announces not yet known to be stored.
     announces: AnnouncePending,
+    /// Start-up read a known destinations database.
+    pub(super) loaded: bool,
     #[cfg(feature = "sqlite-store")]
     db_path: Option<PathBuf>,
     #[cfg(feature = "sqlite-store")]
@@ -733,6 +741,7 @@ impl KdState {
                 in_memory: true,
                 ..AnnouncePending::default()
             },
+            loaded: false,
             #[cfg(feature = "sqlite-store")]
             db_path: None,
             #[cfg(feature = "sqlite-store")]
@@ -801,11 +810,13 @@ impl KdState {
                 if owner && !started.announces_stored {
                     self.announces.in_memory = true;
                 }
+                self.loaded = started.loaded;
                 started.rows
             }
             None => {
                 error!("the store worker is not running; continuing without stored state");
                 self.announces.in_memory = true;
+                self.loaded = false;
                 Vec::new()
             }
         }
@@ -1237,7 +1248,7 @@ fn open_announce_store(source: &StoreSource) -> Option<Box<dyn AnnounceCacheStor
 
 /// The `known_destinations` row for a live entry, or `None` when the entry has no
 /// identity key (the table requires one).
-fn known_destination_row(entry: &RecentAnnounce) -> Option<KnownDestinationRow> {
+pub(super) fn known_destination_row(entry: &RecentAnnounce) -> Option<KnownDestinationRow> {
     let public_key = entry.public_key?;
     let mut row = KnownDestinationRow::new(entry.dest_hash, entry.timestamp, public_key);
     row.packet_hash = entry.packet_hash;
