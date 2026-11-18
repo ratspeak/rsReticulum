@@ -12815,10 +12815,13 @@ mod tests {
         actor.on_tick();
         let response = external_rx
             .try_recv()
-            .expect("the announce table rebroadcasts the local-client path response");
+            .expect("the announce table answers the requester");
         let (header, _) = rns_wire::header::PacketHeader::unpack(&response).unwrap();
         assert_eq!(header.destination_hash, dest);
-        assert_eq!(header.context, rns_wire::context::PacketContext::None);
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::PathResponse
+        );
         assert_eq!(
             header.flags.header_type,
             rns_wire::flags::HeaderType::Header2

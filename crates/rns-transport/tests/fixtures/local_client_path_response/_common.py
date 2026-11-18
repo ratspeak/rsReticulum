@@ -1,7 +1,8 @@
-"""Shared bootstrap for the scripts in this directory. Runs upstream RNS 1.6.0 only.
+"""Shared bootstrap for the scripts in this directory. Runs upstream RNS 1.6.1 only.
 
 The upstream tree is RATSPEAK_UPSTREAM_RETICULUM_DIR if set, else upstream/Reticulum
-in the workspace. Generators take an optional output directory (default: this directory).
+in the workspace (set it to upstream/candidate/Reticulum until the pin lift). Generators take an
+optional output directory (default: this directory).
 """
 import os, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -10,7 +11,7 @@ WORKSPACE = os.path.dirname(REPO)
 RNS_DIR = os.environ.get("RATSPEAK_UPSTREAM_RETICULUM_DIR") or os.path.join(WORKSPACE, "upstream", "Reticulum")
 sys.path.insert(0, RNS_DIR)
 import RNS
-assert RNS.__version__ == "1.6.0", RNS.__version__
+assert RNS.__version__ == "1.6.1", RNS.__version__
 assert os.path.realpath(RNS.__file__).startswith(os.path.realpath(RNS_DIR) + os.sep), RNS.__file__
 RNS_REF = "upstream Reticulum " + RNS.__version__
 

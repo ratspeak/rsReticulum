@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A local client's path response to a pending external path request, recorded by driving
-upstream RNS 1.6.0 Transport in-process (no daemon): the announce-table entry and what
-jobs() sends on two external interfaces (Transport.py:2626-2648, :906-950).
+upstream RNS 1.6.1 Transport in-process (no daemon): the announce-table entry and what
+jobs() sends on two external interfaces (Transport.py:2747-2775, :965-1010).
 Usage: generate.py [OUT_DIR]
 """
 import json, os, tempfile
@@ -37,7 +37,7 @@ class Iface(_Base):
     def process_outgoing(self, raw): self.sent.append(raw); self.txb += len(raw)
     def __str__(self): return self.name
 class SharedParent(Iface):
-    is_local_shared_instance = True
+    def __init__(self, name): super().__init__(name); self.is_local_shared_instance = True
 class LocalClientIface(Iface):
     def __init__(self, name): super().__init__(name); self.parent_interface = SharedParent("shared-parent")
 

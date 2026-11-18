@@ -1,6 +1,6 @@
 //! A local client's path response to a pending external request against
-//! upstream RNS 1.6.0. Expected values come from
-//! `tests/fixtures/local_client_path_response/generate.py`.
+//! upstream RNS 1.6.1, and the path state of a local client's announce.
+//! Expected values come from `tests/fixtures/local_client_path_response/generate.py`.
 
 use super::*;
 use crate::InterfaceTransportSender;
@@ -27,7 +27,7 @@ fn golden() -> Value {
         "../../../tests/fixtures/local_client_path_response/local_client_path_response.json"
     ))
     .unwrap();
-    assert_eq!(v["provenance"]["rns_version"], "1.6.0");
+    assert_eq!(v["provenance"]["rns_version"], "1.6.1");
     v
 }
 
@@ -47,14 +47,15 @@ fn iface(name: &str, tx: mpsc::Sender<Bytes>) -> InterfaceEntry {
 }
 
 /// A local client's path response to a pending external request enters the
-/// announce table and is rebroadcast once, context NONE, on every interface.
+/// announce table and goes once, as a path response, to the requester only
+/// (Transport.py 1.6.1, 70eb417d).
 #[tokio::test]
-async fn local_client_path_response_is_rebroadcast_once_everywhere() {
+async fn local_client_path_response_goes_only_to_the_requester() {
     let g = golden();
     let lp = &g["local_pr"];
     assert_eq!(lp["pending_cleared"], true);
+    assert_eq!(lp["announce_table_entry"]["block_rebroadcasts"], true);
     assert!(lp["ext_a_sent_before_jobs"].as_array().unwrap().is_empty());
-    let none_ctx = g["consts"]["NONE"].as_u64().unwrap() as u8;
     let raw = Bytes::from(hexv(&lp["announce_raw"]));
     let dest: [u8; 16] = hexv(&lp["destination_hash"]).try_into().unwrap();
 
@@ -105,13 +106,16 @@ async fn local_client_path_response_is_rebroadcast_once_everywhere() {
             }
         }
         assert_eq!(seen.len(), expected.len(), "{name}: {seen:?}");
-        assert_eq!(
-            seen[0],
-            (HeaderType::Header2, none_ctx, Some(transport_id)),
-            "{name}"
-        );
-        assert_eq!(expected[0]["context"].as_u64(), Some(u64::from(none_ctx)));
-        assert_ne!(seen[0].1, PacketContext::PathResponse.to_byte());
+        for (seen, expected) in seen.iter().zip(expected) {
+            assert_eq!(expected["header_type"], 1, "{name}");
+            let context = expected["context"].as_u64().unwrap() as u8;
+            assert_eq!(context, PacketContext::PathResponse.to_byte(), "{name}");
+            assert_eq!(
+                *seen,
+                (HeaderType::Header2, context, Some(transport_id)),
+                "{name}"
+            );
+        }
     }
     tx.send(TransportMessage::Shutdown).await.unwrap();
     running.await.unwrap();

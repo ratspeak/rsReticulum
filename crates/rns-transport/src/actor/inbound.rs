@@ -1194,21 +1194,20 @@ impl TransportActor {
         }
         let app_data_for_handlers = announce_app_data;
 
-        // The desiring interface is unused: the response rebroadcasts once
-        // everywhere through the announce table (Transport.py).
+        // Transport.py: a local client's answer to an external request goes
+        // once, as a path response, to the interface that asked.
         if is_from_local_client
             && header.context == rns_wire::context::PacketContext::PathResponse
-            && self
+            && let Some(desiring) = self
                 .pending_local_path_requests
                 .remove(&header.destination_hash)
-                .is_some()
         {
             let now = now_f64();
-            let rebroadcast_raw = self.transport_announce_from_raw(
+            let response_raw = self.transport_announce_from_raw(
                 raw,
                 header.destination_hash,
                 header.hops,
-                rns_wire::context::PacketContext::None,
+                rns_wire::context::PacketContext::PathResponse,
             );
             self.announce_table.insert(
                 header.destination_hash,
@@ -1217,10 +1216,10 @@ impl TransportActor {
                     retransmit_timeout: now,
                     retries: PATHFINDER_R,
                     hops: header.hops,
-                    packet_raw: rebroadcast_raw,
+                    packet_raw: response_raw,
                     local_rebroadcasts: 0,
-                    block_rebroadcast: false,
-                    attached_interface: None,
+                    block_rebroadcast: true,
+                    attached_interface: Some(desiring),
                     source_interface: Some(interface_id),
                     packet_hash: announce_packet_hash,
                     dedup_interfaces: Vec::new(),
