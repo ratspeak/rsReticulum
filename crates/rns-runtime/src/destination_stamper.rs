@@ -236,6 +236,58 @@ fn stamp_for(job: &Job) -> Option<DestinationStamp> {
     Some(generated)
 }
 
+/// A destination stamp being made ahead of the destination's first announce.
+/// Dropping it cancels a job that has not finished.
+pub struct PreparedStamp {
+    rx: mpsc::UnboundedReceiver<StampOutcome>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl PreparedStamp {
+    /// The stamp once made and saved; `None` when generation failed or was cancelled.
+    pub async fn ready(mut self) -> Option<DestinationStamp> {
+        self.rx.recv().await.and_then(|outcome| outcome.stamp)
+    }
+}
+
+impl Drop for PreparedStamp {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Make and save `destination`'s stamp on the stamper worker without
+/// announcing, so its first announce loads it instead of waiting. `None` when
+/// the policy does not stamp, the destination already holds a stamp at its
+/// target, or the queue is full.
+pub fn prepare(destination: &Destination, identity: &Identity) -> Option<PreparedStamp> {
+    let Settings {
+        policy,
+        storage_dir,
+    } = settings();
+    if !policy.stamp_destinations {
+        return None;
+    }
+    let target = destination.target_value(policy.destination_value);
+    if destination.destination_stamp_meets(target) {
+        return None;
+    }
+    let (reply, rx) = mpsc::unbounded_channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let job = Job {
+        owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
+        destination_hash: destination.hash,
+        material: destination
+            .stamp_material(&identity.get_public_key())
+            .to_vec(),
+        target,
+        storage_dir,
+        cancel: cancel.clone(),
+        reply,
+    };
+    submit(job, Priority::Announce).then_some(PreparedStamp { rx, cancel })
+}
+
 /// What to do with a requested announce.
 pub enum Admission<T> {
     /// Build and send now, with this extension when stamping is on.
@@ -543,5 +595,61 @@ mod tests {
         };
         assert_eq!(ext.stamp, [7; NETWORK_STAMP_SIZE]);
         assert_eq!(ext.lr_cost, 12.5);
+    }
+
+    fn quick_policy() -> StampPolicy {
+        StampPolicy {
+            destination_cost: 6.0,
+            destination_value: 8.0,
+            ..StampPolicy::default()
+        }
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rns-prepare-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn prepare_saves_a_stamp_the_first_announce_loads_without_waiting() {
+        let dir = scratch_dir("saves");
+        let _settings = test_settings::blocking_exclusive(quick_policy(), Some(dir.clone()));
+        let identity = Identity::new();
+        let app = "test.prepare.saves";
+        let destination =
+            Destination::new(Some(&identity), Direction::In, DestType::Single, app).unwrap();
+        let prepared = prepare(&destination, &identity).expect("a stamp to make");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (_, value) = runtime.block_on(prepared.ready()).expect("made");
+        assert!(value >= 8.0);
+
+        // A destination built after it loads the saved stamp and announces at once.
+        let mut later =
+            Destination::new(Some(&identity), Direction::In, DestType::Single, app).unwrap();
+        load_stored_stamp(&mut later, &identity);
+        assert!(matches!(
+            DestinationStamps::new().admit(&later, &identity, false, ()),
+            Admission::Ready((), Some(_))
+        ));
+        assert!(prepare(&later, &identity).is_none(), "nothing left to make");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prepare_does_nothing_when_destinations_are_not_stamped() {
+        let _settings = test_settings::blocking_unstamped();
+        let identity = Identity::new();
+        let destination = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "test.prepare.unstamped",
+        )
+        .unwrap();
+        assert!(prepare(&destination, &identity).is_none());
     }
 }

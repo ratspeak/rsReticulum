@@ -266,12 +266,18 @@ impl<T> core::default::Default for rns_runtime::destination_stamper::Destination
 pub fn rns_runtime::destination_stamper::DestinationStamps<T>::default() -> Self
 impl<T> core::ops::drop::Drop for rns_runtime::destination_stamper::DestinationStamps<T>
 pub fn rns_runtime::destination_stamper::DestinationStamps<T>::drop(&mut self)
+pub struct rns_runtime::destination_stamper::PreparedStamp
+impl rns_runtime::destination_stamper::PreparedStamp
+pub async fn rns_runtime::destination_stamper::PreparedStamp::ready(self) -> core::option::Option<rns_runtime::destination_stamper::DestinationStamp>
+impl core::ops::drop::Drop for rns_runtime::destination_stamper::PreparedStamp
+pub fn rns_runtime::destination_stamper::PreparedStamp::drop(&mut self)
 pub struct rns_runtime::destination_stamper::StampOutcome
 pub rns_runtime::destination_stamper::StampOutcome::stamp: core::option::Option<rns_runtime::destination_stamper::DestinationStamp>
 pub async fn rns_runtime::destination_stamper::announce_packet(&mut rns_identity::destination::Destination, &rns_identity::identity::Identity, core::option::Option<&[u8]>, core::option::Option<&[u8; 32]>, bool, core::option::Option<&[u8]>) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, rns_identity::destination::DestinationError>
 pub fn rns_runtime::destination_stamper::configure(rns_transport::stamps::StampPolicy, core::option::Option<std::path::PathBuf>)
 pub fn rns_runtime::destination_stamper::load_stored_stamp(&mut rns_identity::destination::Destination, &rns_identity::identity::Identity)
 pub fn rns_runtime::destination_stamper::policy() -> rns_transport::stamps::StampPolicy
+pub fn rns_runtime::destination_stamper::prepare(&rns_identity::destination::Destination, &rns_identity::identity::Identity) -> core::option::Option<rns_runtime::destination_stamper::PreparedStamp>
 pub type rns_runtime::destination_stamper::DestinationStamp = ([u8; 14], f64)
 pub mod rns_runtime::interface_factory
 pub enum rns_runtime::interface_factory::InterfaceConfig
