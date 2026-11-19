@@ -54,6 +54,7 @@ pub rns_tools::rnx::CommandResult::stderr_len: core::option::Option<u64>
 pub rns_tools::rnx::CommandResult::stdout: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_tools::rnx::CommandResult::stdout_len: core::option::Option<u64>
 impl rns_tools::rnx::CommandResult
+pub fn rns_tools::rnx::CommandResult::into_msgpack_within(self, usize) -> alloc::vec::Vec<u8>
 pub fn rns_tools::rnx::CommandResult::to_msgpack(&self) -> alloc::vec::Vec<u8>
 pub fn rns_tools::rnx::CommandResult::to_value(&self) -> rmpv::Value
 pub struct rns_tools::rnx::Rendered

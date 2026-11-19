@@ -96,8 +96,8 @@
       "tier": "tool-internal",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-tools.txt",
-      "itemCount": 136,
-      "sha256": "a0e45fd001fda929241db4292f8dc5ccd04d2afef90a9f355b0640b0efae5f5e"
+      "itemCount": 137,
+      "sha256": "064dd502544660e246ff7ffe49e11783bbc369213955c09b03af80819ffef88d"
     },
     {
       "name": "rns-git",
