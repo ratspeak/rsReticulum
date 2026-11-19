@@ -111,6 +111,11 @@ fn write_responder_config(tmp: &TempDir, shared_port: u16, control_port: u16, li
          enable_transport = Yes\n\
          respond_to_probes = Yes\n\
          \n\
+         [stamps]\n\
+         # A cheap probe-destination stamp: a debug build under load can take\n\
+         # longer than the path deadline to make the default value-25 one.\n\
+         destination_value = 8\n\
+         \n\
          [logging]\n\
          loglevel = 1\n\
          \n\
