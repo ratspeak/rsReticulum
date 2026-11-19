@@ -148,6 +148,7 @@ pub fn rns_interface::backbone::BackboneClientConfig::python_name(&self) -> allo
 pub struct rns_interface::backbone::BackboneServerConfig
 pub rns_interface::backbone::BackboneServerConfig::bitrate: u64
 pub rns_interface::backbone::BackboneServerConfig::block_fast_flapping: bool
+pub rns_interface::backbone::BackboneServerConfig::client_limit: u64
 pub rns_interface::backbone::BackboneServerConfig::device: core::option::Option<alloc::string::String>
 pub rns_interface::backbone::BackboneServerConfig::fast_flapping_block_time: core::time::Duration
 pub rns_interface::backbone::BackboneServerConfig::fast_flapping_grace: u64
@@ -162,6 +163,7 @@ impl rns_interface::backbone::BackboneServerConfig
 pub fn rns_interface::backbone::BackboneServerConfig::new(&str, &str, u16) -> Self
 pub const rns_interface::backbone::BITRATE_GUESS: u64
 pub const rns_interface::backbone::BLOCK_FAST_FLAPPING: bool
+pub const rns_interface::backbone::CLIENT_LIMIT: u64
 pub const rns_interface::backbone::DP_EC_DEAD_TIME: f64
 pub const rns_interface::backbone::DP_EC_HIGH_WM: u64
 pub const rns_interface::backbone::DP_EC_INTERVAL: core::time::Duration
@@ -181,6 +183,7 @@ pub const rns_interface::backbone::TCP_PROBE_AFTER: u32
 pub const rns_interface::backbone::TCP_PROBE_INTERVAL: u32
 pub const rns_interface::backbone::TCP_USER_TIMEOUT: u32
 pub const rns_interface::backbone::TX_HWM: u64
+pub fn rns_interface::backbone::set_blocked_ips(impl core::iter::traits::collect::IntoIterator<Item = core::net::ip_addr::IpAddr>) -> usize
 pub async fn rns_interface::backbone::spawn_backbone_client(rns_interface::backbone::BackboneClientConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
 pub async fn rns_interface::backbone::spawn_backbone_client_observed(rns_interface::backbone::BackboneClientConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> core::result::Result<rns_interface::tcp::SpawnedClientInterface, rns_interface::traits::InterfaceError>
 pub async fn rns_interface::backbone::spawn_backbone_server(rns_interface::backbone::BackboneServerConfig, rns_interface::traits::InterfaceId, alloc::sync::Arc<core::sync::atomic::AtomicU64>, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, tokio::sync::mpsc::bounded::Sender<rns_interface::traits::InterfaceHandle>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>
@@ -1399,8 +1402,6 @@ pub rns_interface::traits::InterfaceHandle::rxb: core::option::Option<alloc::syn
 pub rns_interface::traits::InterfaceHandle::tx: tokio::sync::mpsc::bounded::Sender<bytes::bytes::Bytes>
 pub rns_interface::traits::InterfaceHandle::txb: core::option::Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>>
 pub struct rns_interface::traits::TunnelIdentity(pub alloc::sync::Arc<rns_identity::identity::Identity>)
-impl rns_interface::traits::TunnelIdentity
-pub fn rns_interface::traits::TunnelIdentity::synthesis(&self, &str) -> core::option::Option<bytes::bytes::Bytes>
 impl core::fmt::Debug for rns_interface::traits::TunnelIdentity
 pub fn rns_interface::traits::TunnelIdentity::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub const rns_interface::traits::AR_FREQ_DECAY: f64

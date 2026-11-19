@@ -42,8 +42,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-identity.txt",
-      "itemCount": 523,
-      "sha256": "102a60eaeb149803b61e8d9c1edaac1a9e31be09f8ebeb69c54abad0a426ce67"
+      "itemCount": 537,
+      "sha256": "f525e1b3f59c1092454ad4e36bc8cd7a5294ed97a33707891780748fa21286c4"
     },
     {
       "name": "rns-transport",
@@ -51,8 +51,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-transport.txt",
-      "itemCount": 2165,
-      "sha256": "92f431ad69a4cc7e4d3df343a3a287682bac7ea97af6cd7b7958df5d1042b09a"
+      "itemCount": 2270,
+      "sha256": "bb1fb9639200f46f4af711d011e107fce2a3b13d544baeaf0f41aa9a1ef1b652"
     },
     {
       "name": "rns-link",
@@ -78,8 +78,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-interface.txt",
-      "itemCount": 1588,
-      "sha256": "7826b034a8acc97cb587507c23427a01017028323b21949b46371bb36a3d1409"
+      "itemCount": 1589,
+      "sha256": "d62d9d2d0825bbc56ea00c440fabe45d056447f316cd78761c1001118a3fc23c"
     },
     {
       "name": "rns-runtime",
@@ -87,8 +87,8 @@
       "tier": "provisional",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-runtime.txt",
-      "itemCount": 2462,
-      "sha256": "d704669b199ab5f476134deb1396d298939085e3bdd0f77195b1cf10652ef703"
+      "itemCount": 2501,
+      "sha256": "485e4b02fd9c45b681c6b7d928d4d068aa50a3419b3a49175c144491bf22b63d"
     },
     {
       "name": "rns-tools",
@@ -96,8 +96,8 @@
       "tier": "tool-internal",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-tools.txt",
-      "itemCount": 135,
-      "sha256": "b40d0f735ef75aafd36dbf51f0a11411cb0c01bffaf8cb3dda11fcf6d2f0d4e0"
+      "itemCount": 136,
+      "sha256": "a0e45fd001fda929241db4292f8dc5ccd04d2afef90a9f355b0640b0efae5f5e"
     },
     {
       "name": "rns-git",
@@ -105,8 +105,8 @@
       "tier": "tool-internal",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-git.txt",
-      "itemCount": 600,
-      "sha256": "3368d32f751194b716361dfa2b90b70c27f8a4d10a3b51892c7b40658b712eff"
+      "itemCount": 605,
+      "sha256": "b4bee5c983267ce1db8229af30fa2ceca00d0fccceb70fbdffc810524779b0e2"
     },
     {
       "name": "rns-ratkey",

@@ -84,7 +84,8 @@ pub rns_identity::destination::DestType::Group = 1
 pub rns_identity::destination::DestType::Link = 3
 pub rns_identity::destination::DestType::Plain = 2
 pub rns_identity::destination::DestType::Single = 0
-pub enum rns_identity::destination::DestinationError
+#[non_exhaustive] pub enum rns_identity::destination::DestinationError
+pub rns_identity::destination::DestinationError::AnnounceTooLarge(usize)
 pub rns_identity::destination::DestinationError::DecryptionFailed
 pub rns_identity::destination::DestinationError::EncryptionUnavailable
 pub rns_identity::destination::DestinationError::Identity(rns_identity::identity::IdentityError)
@@ -485,15 +486,28 @@ pub struct rns_identity::stamps::StampTarget(_)
 impl rns_identity::stamps::StampTarget
 pub fn rns_identity::stamps::StampTarget::accepts(&self, &[u8; 32]) -> bool
 pub fn rns_identity::stamps::StampTarget::to_be_bytes(&self) -> [u8; 33]
+pub struct rns_identity::stamps::StampWorkers
+pub rns_identity::stamps::StampWorkers::max_workers: core::option::Option<core::num::nonzero::NonZeroUsize>
+pub rns_identity::stamps::StampWorkers::niceness: u8
+impl rns_identity::stamps::StampWorkers
+pub fn rns_identity::stamps::StampWorkers::cap(&self, core::num::nonzero::NonZeroUsize) -> core::num::nonzero::NonZeroUsize
+pub fn rns_identity::stamps::StampWorkers::clamp_max_workers(i64) -> core::num::nonzero::NonZeroUsize
+pub fn rns_identity::stamps::StampWorkers::clamp_niceness(i64) -> u8
+pub fn rns_identity::stamps::StampWorkers::current() -> Self
+pub fn rns_identity::stamps::StampWorkers::install(self)
+impl core::default::Default for rns_identity::stamps::StampWorkers
+pub fn rns_identity::stamps::StampWorkers::default() -> Self
 pub struct rns_identity::stamps::StampedKey
 pub rns_identity::stamps::StampedKey::private: rns_crypto::x25519::X25519PrivateKey
 pub rns_identity::stamps::StampedKey::public: [u8; 32]
 pub rns_identity::stamps::StampedKey::value: f64
 pub const rns_identity::stamps::COST_FP: u32
 pub const rns_identity::stamps::COST_FP_BITS: u32
+pub const rns_identity::stamps::DEFAULT_WORKER_NICENESS: u8
 pub const rns_identity::stamps::LINK_COST_CAP: f64
 pub const rns_identity::stamps::MANTISSA_BITS: u32
 pub const rns_identity::stamps::MAX_VALUE_FP: u32
+pub const rns_identity::stamps::MAX_WORKER_NICENESS: u8
 pub const rns_identity::stamps::NETWORK_STAMP_SIZE: usize
 pub const rns_identity::stamps::PRM_DIGEST: &str
 pub const rns_identity::stamps::STAMP_COST_CAP: f64

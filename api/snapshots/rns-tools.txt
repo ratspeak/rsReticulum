@@ -127,6 +127,7 @@ pub const rns_tools::RETICULUM_COMPAT_VERSION: &str
 pub const rns_tools::RS_RETICULUM_VERSION: &str
 pub fn rns_tools::config_log_timestamps(&std::path::Path) -> bool
 pub async fn rns_tools::exit(&rns_runtime::reticulum::ReticulumHandle, i32) -> never
+pub async fn rns_tools::has_local_path(&rns_runtime::reticulum::ReticulumHandle, [u8; 16]) -> bool
 pub fn rns_tools::init_tracing<W>(rns_tools::LogLevel, bool, bool, W) where W: for<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> + core::marker::Send + core::marker::Sync + 'static
 pub fn rns_tools::link_closed_text(core::option::Option<rns_link::link::CloseReason>) -> core::option::Option<&'static str>
 pub async fn rns_tools::medium_path_timeout(&rns_runtime::reticulum::ReticulumHandle) -> f64

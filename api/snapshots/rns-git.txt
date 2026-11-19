@@ -283,7 +283,9 @@ impl rns_git::pages::PageNode
 pub fn rns_git::pages::PageNode::handle(&self, &rns_git::pages::PageRequest<'_>) -> rns_git::pages::PageReply
 pub fn rns_git::pages::PageNode::new(alloc::sync::Arc<std::sync::poison::rwlock::RwLock<rns_git::server::layout::Repositories>>, alloc::sync::Arc<rns_git::server::stats::Stats>, alloc::string::String, [u8; 16], &std::path::Path, rns_git::pages::PageOptions) -> Self
 pub struct rns_git::pages::PageOptions
+pub rns_git::pages::PageOptions::link_cost: f64
 pub rns_git::pages::PageOptions::media_conversion: bool
+pub rns_git::pages::PageOptions::stamp_value: core::option::Option<f64>
 pub rns_git::pages::PageOptions::use_nerdfonts: bool
 impl rns_git::pages::PageOptions
 pub fn rns_git::pages::PageOptions::from_config_text(&str) -> core::result::Result<Self, rns_runtime::config::ConfigError>
@@ -406,12 +408,14 @@ pub rns_git::server::config::NodeConfig::aliases: alloc::collections::btree::map
 pub rns_git::server::config::NodeConfig::announce_interval: i64
 pub rns_git::server::config::NodeConfig::blocked_identities: alloc::vec::Vec<alloc::vec::Vec<u8>>
 pub rns_git::server::config::NodeConfig::fetch_limits: rns_git::server::config::FetchLimits
+pub rns_git::server::config::NodeConfig::link_cost: f64
 pub rns_git::server::config::NodeConfig::loglevel: core::option::Option<i64>
 pub rns_git::server::config::NodeConfig::mirror_interval: i64
 pub rns_git::server::config::NodeConfig::node_name: alloc::string::String
 pub rns_git::server::config::NodeConfig::record_stats: bool
 pub rns_git::server::config::NodeConfig::repositories: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
 pub rns_git::server::config::NodeConfig::serve_nomadnet: bool
+pub rns_git::server::config::NodeConfig::stamp_value: core::option::Option<f64>
 pub rns_git::server::config::NodeConfig::stats_ignored: alloc::vec::Vec<alloc::vec::Vec<u8>>
 pub rns_git::server::config::NodeConfig::stats_push_ignored: alloc::vec::Vec<alloc::vec::Vec<u8>>
 impl rns_git::server::config::NodeConfig
@@ -419,6 +423,7 @@ pub fn rns_git::server::config::NodeConfig::parse(&str, i64) -> core::result::Re
 impl core::default::Default for rns_git::server::config::NodeConfig
 pub fn rns_git::server::config::NodeConfig::default() -> Self
 pub const rns_git::server::config::DEFAULT_CONFIG: &str
+pub const rns_git::server::config::DEFAULT_LINK_COST: f64
 pub const rns_git::server::config::DEFAULT_NODE_NAME: &str
 pub fn rns_git::server::config::expand_user(&str) -> std::path::PathBuf
 pub fn rns_git::server::config::load_or_create_identity(&std::path::Path) -> core::result::Result<rns_identity::identity::Identity, rns_identity::identity::IdentityError>
