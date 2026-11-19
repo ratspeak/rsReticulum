@@ -20,6 +20,8 @@
 - Backbone listeners take `client_limit` (default 500), and auto-connect stops at 12 discovered interfaces unless its caps are disabled.
 - A discovered interface's config entry drops line breaks and control characters from announced strings, so a pasted entry can't gain config sections.
 - `destination_stamper::prepare` makes and saves a destination's stamp before its first announce.
+- A shared-instance client's first announce is no longer lost: its registration path response now waits 250 ms, as upstream, so the shared instance passes the announce on. Integer config values take `_` digit groups (`1_0`), as Python's `int()` does.
+- rnsh-rs listeners no longer end a session when a client's identification and first message arrive together, rnx-rs sends results it used to drop silently (16 MB of output failed), and rnpath-rs prints `Sending request...` only once its link is up.
 
 ## 1.5.0 - 2026-11-13
 
