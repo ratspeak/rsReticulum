@@ -94,14 +94,13 @@ impl ConfigSection {
             .find(|key| self.has(key) && self.get_bool(key).is_none())
     }
 
+    /// Parses like Python `int()`, which ConfigObj `as_int` uses.
     pub fn get_int(&self, key: &str) -> Option<i64> {
-        let v = self.get(key)?;
-        v.parse().ok()
+        python_number_text(self.get(key)?)?.parse().ok()
     }
 
     pub fn get_uint(&self, key: &str) -> Option<u64> {
-        let v = self.get(key)?;
-        v.parse().ok()
+        python_number_text(self.get(key)?)?.parse().ok()
     }
 
     /// Parses like Python `float()`, which ConfigObj `as_float` uses.
@@ -595,9 +594,15 @@ fn strip_comment(line: &str) -> &str {
 
 /// Python `float()` also accepts single underscores between digits (PEP 515).
 fn parse_python_float(s: &str) -> Option<f64> {
+    python_number_text(s)?.parse().ok()
+}
+
+/// Number text as Python's `int()` and `float()` read it: surrounding
+/// whitespace dropped, and `_` allowed only between two digits.
+fn python_number_text(s: &str) -> Option<std::borrow::Cow<'_, str>> {
     let s = s.trim();
     if !s.contains('_') {
-        return s.parse().ok();
+        return Some(s.into());
     }
     let bytes = s.as_bytes();
     let grouped = bytes.iter().enumerate().all(|(i, &b)| {
@@ -606,10 +611,7 @@ fn parse_python_float(s: &str) -> Option<f64> {
                 && bytes[i - 1].is_ascii_digit()
                 && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
     });
-    if !grouped {
-        return None;
-    }
-    s.replace('_', "").parse().ok()
+    grouped.then(|| s.replace('_', "").into())
 }
 
 fn parse_bool(s: &str) -> Option<bool> {
@@ -849,6 +851,28 @@ mod tests {
         }
         sec.set("k", "-nan");
         assert!(sec.get_float("k").unwrap().is_nan());
+    }
+
+    #[test]
+    fn get_int_accepts_python_int_syntax() {
+        let mut sec = ConfigSection::new();
+        for (raw, expected) in [
+            ("1_0", Some(10)),
+            ("1_000_000", Some(1_000_000)),
+            ("+4", Some(4)),
+            ("-1_2", Some(-12)),
+            (" 7 ", Some(7)),
+            ("1__0", None),
+            ("_1", None),
+            ("1_", None),
+            ("1.0", None),
+            ("", None),
+        ] {
+            sec.set("k", raw);
+            assert_eq!(sec.get_int("k"), expected, "{raw:?}");
+        }
+        sec.set("k", "1_0");
+        assert_eq!(sec.get_uint("k"), Some(10));
     }
 
     #[test]
