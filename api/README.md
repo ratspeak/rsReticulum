@@ -76,7 +76,7 @@ The [capacity, IFAC, and receipt migration guide](migrations/capacity-and-receip
 
 ## Stability
 
-The 1.5 line follows Reticulum 1.6.0. It makes the transport actor's state
+The 1.5 line follows Reticulum 1.6.0, and 1.6.1 from 1.5.1. It makes the transport actor's state
 private, marks growing enums and structs `#[non_exhaustive]`, keeps known
 destinations, ratchets, and cached announces in upstream's SQLite stores, and
 moves stamp costs and values to `f64`. See the

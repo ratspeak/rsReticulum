@@ -7,7 +7,7 @@
 
 [![License: Reticulum License](https://img.shields.io/badge/license-Reticulum%20License-blue.svg)](LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
-[![Baseline: Reticulum 1.6.0](https://img.shields.io/badge/baseline-Reticulum%201.6.0-success.svg)](https://reticulum.network/)
+[![Baseline: Reticulum 1.6.1](https://img.shields.io/badge/baseline-Reticulum%201.6.1-success.svg)](https://reticulum.network/)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#compatibility-notes)
 
 [Reticulum Manual](https://reticulum.network/manual/) |
@@ -250,7 +250,7 @@ a password and give it only to programs you trust.
 
 Runtime state is kept under `<config-dir>/storage/`. Known destinations and
 received ratchets are stored in `known_destinations.db` and cached announces in
-`cache/announces.db`, SQLite files in the format Python Reticulum 1.6.0 uses.
+`cache/announces.db`, SQLite files in the format Python Reticulum 1.6.1 uses.
 A shared-instance client reads the owner's database and never
 writes it. A database that cannot be opened is replaced by in-memory state for
 that session, with one log line. These stores come from the default
@@ -295,7 +295,7 @@ identity.
 
 ## Compatibility Notes
 
-rsReticulum 1.5.1 follows Python Reticulum 1.6.0, and its tools name that
+rsReticulum 1.5.1 follows Python Reticulum 1.6.1, and its tools name that
 release in `--version`.
 
 Interface discovery announces this stack as `rsRNS`. `rnsd-rs` auto-connects to
