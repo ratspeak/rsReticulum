@@ -322,14 +322,16 @@ mod tests {
 
     #[test]
     fn default_config_carries_the_upstream_stamp_lines() {
+        // A Windows checkout embeds the template with CRLF line endings.
+        let config = DEFAULT_CONFIG.replace("\r\n", "\n");
         for (section, destination) in [("[rngit]", "repository node"), ("[pages]", "page node")] {
-            let start = DEFAULT_CONFIG.find(section).unwrap();
-            let text = &DEFAULT_CONFIG[start..];
+            let start = config.find(section).unwrap();
+            let text = &config[start..];
             assert!(text.contains(&format!(
                 "# You can configure the required link stamp cost for\n# connecting to the {destination}.\n\n# link_cost = 18.0\n"
             )));
         }
-        assert_eq!(DEFAULT_CONFIG.matches("# stamp_value = 25.0\n").count(), 2);
+        assert_eq!(config.matches("# stamp_value = 25.0\n").count(), 2);
         let node = NodeConfig::parse(DEFAULT_CONFIG, 0).unwrap();
         assert_eq!((node.stamp_value, node.link_cost), (None, 18.0));
     }
