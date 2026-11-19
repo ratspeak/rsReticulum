@@ -1293,10 +1293,8 @@ async fn remote_query(
 ) -> Result<Vec<u8>, ExitCode> {
     print!("{OUTPUT_RST}Establishing link with remote transport instance... ");
     flush();
-    print!("{OUTPUT_RST}Sending request... ");
-    flush();
     let client = LinkClient::new(handle.transport_tx.clone(), identity);
-    match client
+    let result = client
         .query(
             transport_hash,
             app,
@@ -1305,8 +1303,13 @@ async fn remote_query(
             REMOTE_HOPS,
             REMOTE_LINK_TIMEOUT,
         )
-        .await
-    {
+        .await;
+    // Upstream prints this once the link is up, so not after a link failure.
+    if matches!(result, Ok(_) | Err(LinkClientError::RequestFailed(_))) {
+        print!("{OUTPUT_RST}Sending request... ");
+        flush();
+    }
+    match result {
         // A timed-out receipt has no response; callers report it as a failed request.
         Err(LinkClientError::RequestFailed(RequestFailure::TimedOut)) => Ok(Vec::new()),
         // Upstream's link-closed callback prints, but its exit() runs off the
