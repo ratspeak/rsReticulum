@@ -295,7 +295,9 @@ async fn listen(args: &Args, interrupt: &ShutdownSignal) -> ! {
                 tracing::info!(target: rns_tools::NOTICE_TARGET, "Executing command [{}] for {requestor}", command.command);
                 let result = rns_tools::rnx::execute(&command).await;
                 tracing::info!(target: rns_tools::NOTICE_TARGET, "Delivering result of command [{}] to {requestor}", command.command);
-                if let Err(e) = responder.respond(RequestOutcome::ReplyValue(result.to_msgpack())) {
+                // Output over the admitted reply size is cut, not dropped.
+                let packed = result.into_msgpack_within(responder.response_byte_limit());
+                if let Err(e) = responder.respond(RequestOutcome::ReplyValue(packed)) {
                     tracing::warn!("could not deliver result of command [{}]: {e}", command.command);
                 }
             });

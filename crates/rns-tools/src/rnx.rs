@@ -152,12 +152,54 @@ impl CommandResult {
 
     /// Packed result, the response value the listener returns.
     pub fn to_msgpack(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        rmpv::encode::write_value(&mut out, &self.to_value()).expect("encoding to a Vec");
-        // Deferred replies are admitted by allocation capacity; growth after a large
-        // output doubles it, and a 16 MB result would be refused.
-        out.into_boxed_slice().into_vec()
+        pack(&self.to_value())
     }
+
+    /// Packed result of at most `limit` bytes. Output that does not fit is cut,
+    /// stdout first, while `stdout_len`/`stderr_len` keep the real lengths, so
+    /// the client reports it as truncated, as for its own `--stdout` and
+    /// `--stderr` limits (rnx.py).
+    pub fn into_msgpack_within(mut self, limit: usize) -> Vec<u8> {
+        let out_len = self.stdout.as_ref().map_or(0, Vec::len);
+        let err_len = self.stderr.as_ref().map_or(0, Vec::len);
+        let (stdout, stderr) = (self.stdout.take(), self.stderr.take());
+        self.stdout = stdout.as_ref().map(|_| Vec::new());
+        self.stderr = stderr.as_ref().map(|_| Vec::new());
+        // Empty bins take a 2-byte header; a bin32 header takes 5.
+        let frame = self.to_msgpack().len();
+        self.stdout = stdout;
+        self.stderr = stderr;
+        if frame + out_len + err_len + 6 > limit {
+            let mut room = limit.saturating_sub(frame + 6);
+            for (stream, len) in [(&mut self.stderr, err_len), (&mut self.stdout, out_len)] {
+                if let Some(bytes) = stream.as_mut() {
+                    let keep = len.min(room);
+                    bytes.truncate(keep);
+                    room -= keep;
+                }
+            }
+        }
+        let bin = |b: Option<Vec<u8>>| b.map_or(Value::Nil, Value::Binary);
+        let int = |i: Option<u64>| i.map_or(Value::Nil, |n| Value::from(n as i64));
+        pack(&Value::Array(vec![
+            Value::Boolean(self.executed),
+            self.retcode.map_or(Value::Nil, Value::from),
+            bin(self.stdout),
+            bin(self.stderr),
+            int(self.stdout_len),
+            int(self.stderr_len),
+            Value::F64(self.started),
+            self.concluded.map_or(Value::Nil, Value::F64),
+        ]))
+    }
+}
+
+fn pack(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    rmpv::encode::write_value(&mut out, value).expect("encoding to a Vec");
+    // Deferred replies are admitted by allocation capacity; growth after a large
+    // output doubles it, and a 16 MB result would be refused.
+    out.into_boxed_slice().into_vec()
 }
 
 fn now() -> f64 {
@@ -626,5 +668,57 @@ mod tests {
         let packed = result.to_msgpack();
         assert!(packed.len() > 16_000_000);
         assert_eq!(packed.capacity(), packed.len());
+    }
+
+    fn output_result(stdout: usize, stderr: usize) -> CommandResult {
+        CommandResult {
+            executed: true,
+            retcode: Some(0),
+            stdout: Some(vec![b'o'; stdout]),
+            stderr: Some(vec![b'e'; stderr]),
+            stdout_len: Some(stdout as u64),
+            stderr_len: Some(stderr as u64),
+            started: 1.0,
+            concluded: Some(2.0),
+        }
+    }
+
+    fn streams(packed: &[u8]) -> (usize, usize, i64, i64) {
+        let Value::Array(items) = rmpv::decode::read_value(&mut &packed[..]).unwrap() else {
+            panic!("result is an array");
+        };
+        let len = |v: &Value| v.as_slice().unwrap().len();
+        let int = |v: &Value| v.as_i64().unwrap();
+        (
+            len(&items[2]),
+            len(&items[3]),
+            int(&items[4]),
+            int(&items[5]),
+        )
+    }
+
+    #[test]
+    fn a_result_that_fits_packs_unchanged() {
+        let result = output_result(70_000, 300);
+        assert_eq!(
+            result.clone().into_msgpack_within(1 << 20),
+            result.to_msgpack()
+        );
+    }
+
+    #[test]
+    fn an_oversized_result_is_cut_stdout_first_and_keeps_the_real_lengths() {
+        let packed = output_result(70_000, 300).into_msgpack_within(50_000);
+        assert!(packed.len() <= 50_000);
+        assert_eq!(packed.capacity(), packed.len());
+        let (out, err, out_len, err_len) = streams(&packed);
+        assert!(out > 49_000 && out < 50_000);
+        assert_eq!((err, out_len, err_len), (300, 70_000, 300));
+
+        let packed = output_result(70_000, 300).into_msgpack_within(100);
+        assert!(packed.len() <= 100);
+        let (out, err, out_len, err_len) = streams(&packed);
+        assert_eq!((out, out_len, err_len), (0, 70_000, 300));
+        assert!(err < 300);
     }
 }
