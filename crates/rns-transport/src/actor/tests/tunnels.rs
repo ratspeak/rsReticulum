@@ -938,8 +938,8 @@ fn exempt_contexts_bypass_the_plain_hop_filter() {
     }
 }
 
-#[test]
-fn shared_owner_ingress_bypasses_the_plain_hop_filter() {
+#[tokio::test]
+async fn shared_owner_ingress_bypasses_the_plain_hop_filter() {
     let (mut actor, _) = TransportActor::new();
     actor.is_shared_instance = true;
     let (mut entry, _rx) = make_test_interface("SharedInstanceClient");

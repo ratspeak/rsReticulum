@@ -47,6 +47,9 @@ use rpc::InterfaceEvent;
 // duplex route. They never appear on the wire or in the interface registry.
 const LOCAL_LINK_INITIATOR_INTERFACE: InterfaceId = InterfaceId::MAX;
 const LOCAL_LINK_RESPONDER_INTERFACE: InterfaceId = InterfaceId::MAX - 1;
+/// `Transport.register_destination`'s wait before a shared-instance client's
+/// registration path-response announce.
+const REGISTRATION_ANNOUNCE_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 struct LocalLinkRoute {
@@ -1017,28 +1020,30 @@ impl TransportActor {
                     self.destination_channels.insert(hash, tx.clone());
                     self.registered_destination_names
                         .insert(hash, app_name.clone());
-                    // On a shared-instance connection, the destination is
-                    // brand new to the shared peer; fire an announce so it
-                    // learns the path immediately instead of waiting for the
-                    // next scheduled broadcast.
+                    // On a shared-instance connection, the shared peer learns the
+                    // new destination from a path-response announce sent after
+                    // REGISTRATION_ANNOUNCE_DELAY, so the application's own first
+                    // announce leaves first and is rebroadcast
+                    // (Transport.register_destination).
                     if self.is_shared_instance {
-                        if let Err(e) =
-                            tx.try_send(crate::link_messages::DestinationEvent::AnnounceRequested(
-                                crate::link_messages::AnnounceRequest {
-                                    app_name: app_name.clone(),
-                                    path_response: true,
-                                    tag: None,
-                                    attached_interface: None,
-                                },
-                            ))
-                        {
-                            self.channel_drops += 1;
-                            warn!(dest = hex::encode(hash), drops = self.channel_drops, err = %e,
-                                "failed to send AnnounceRequested (channel full)");
-                        }
+                        let request = crate::link_messages::DestinationEvent::AnnounceRequested(
+                            crate::link_messages::AnnounceRequest {
+                                app_name: app_name.clone(),
+                                path_response: true,
+                                tag: None,
+                                attached_interface: None,
+                            },
+                        );
+                        tokio::spawn(async move {
+                            tokio::time::sleep(REGISTRATION_ANNOUNCE_DELAY).await;
+                            if let Err(e) = tx.try_send(request) {
+                                warn!(dest = hex::encode(hash), err = %e,
+                                    "failed to send the registration path-response announce request");
+                            }
+                        });
                         debug!(
                             dest = hex::encode(hash),
-                            "auto-announce triggered for shared instance registration"
+                            "registration path-response announce scheduled for the shared instance"
                         );
                     }
                 }
@@ -2984,8 +2989,8 @@ mod tests {
         assert!(actor.local_destinations.contains(&hash));
     }
 
-    #[test]
-    fn shared_instance_registration_requests_path_response_announce() {
+    #[tokio::test(start_paused = true)]
+    async fn shared_instance_registration_requests_path_response_announce() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_shared_instance = true;
         let hash = [0xAB; 16];
@@ -2997,8 +3002,14 @@ mod tests {
             delivery_tx: Some(delivery_tx),
         });
 
+        // The application's own announce gets REGISTRATION_ANNOUNCE_DELAY to leave first.
+        tokio::time::sleep(REGISTRATION_ANNOUNCE_DELAY - Duration::from_millis(1)).await;
+        assert!(delivery_rx.try_recv().is_err());
         let crate::link_messages::DestinationEvent::AnnounceRequested(request) =
-            delivery_rx.try_recv().unwrap()
+            tokio::time::timeout(Duration::from_millis(2), delivery_rx.recv())
+                .await
+                .expect("announce request after the delay")
+                .unwrap()
         else {
             panic!("expected announce request");
         };
