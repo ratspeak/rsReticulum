@@ -154,7 +154,9 @@ impl CommandResult {
     pub fn to_msgpack(&self) -> Vec<u8> {
         let mut out = Vec::new();
         rmpv::encode::write_value(&mut out, &self.to_value()).expect("encoding to a Vec");
-        out
+        // Deferred replies are admitted by allocation capacity; growth after a large
+        // output doubles it, and a 16 MB result would be refused.
+        out.into_boxed_slice().into_vec()
     }
 }
 
@@ -603,4 +605,26 @@ pub fn client_result(
         0
     };
     (rendered, Some(response), code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_result_holds_no_spare_capacity() {
+        let result = CommandResult {
+            executed: true,
+            retcode: Some(0),
+            stdout: Some(vec![0x5a; 16_000_000]),
+            stderr: Some(Vec::new()),
+            stdout_len: Some(16_000_000),
+            stderr_len: Some(0),
+            started: 1.0,
+            concluded: Some(2.0),
+        };
+        let packed = result.to_msgpack();
+        assert!(packed.len() > 16_000_000);
+        assert_eq!(packed.capacity(), packed.len());
+    }
 }
