@@ -129,6 +129,7 @@
       "rns-identity": [
         "impl core::default::Default for rns_identity::ratchet::ReceivedRatchetStore",
         "impl rns_identity::ratchet::ReceivedRatchetStore",
+        "pub enum rns_identity::destination::DestinationError",
         "pub fn rns_identity::ratchet::ReceivedRatchetStore::clean_expired(&mut self)",
         "pub fn rns_identity::ratchet::ReceivedRatchetStore::current_ratchet_id(&mut self, &[u8; 16]) -> core::option::Option<alloc::vec::Vec<u8>>",
         "pub fn rns_identity::ratchet::ReceivedRatchetStore::default() -> Self",
@@ -248,6 +249,7 @@
         "pub fn rns_transport::discovery::stamper::NullStamper::valid(&self, &[u8; 32], &[u8], u8) -> bool",
         "pub fn rns_transport::discovery::stamper::NullStamper::value(&self, &[u8; 32], &[u8]) -> u8",
         "pub fn rns_transport::discovery::storage::classify(u64) -> rns_transport::discovery::storage::DiscoveryStatus",
+        "pub fn rns_transport::ingress::IngressController::hold_announce(&mut self, rns_transport::ingress::HeldAnnounce)",
         "pub fn rns_transport::ingress::IngressController::incoming_announce_frequency(&self) -> f64",
         "pub fn rns_transport::ingress::IngressController::incoming_pr_frequency(&self) -> f64",
         "pub fn rns_transport::ingress::IngressController::outgoing_announce_frequency(&self) -> f64",
@@ -405,6 +407,7 @@
         "pub rns_transport::link_table::LinkEntry::validated: bool",
         "pub rns_transport::messages::InterfaceStatRpcEntry::ifac_size: usize",
         "pub rns_transport::messages::TimerTick::timestamp: f64",
+        "pub rns_transport::messages::TransportMessage::SynthesizeTunnel::raw_packet: bytes::bytes::Bytes",
         "pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::app_data: core::option::Option<alloc::vec::Vec<u8>>",
         "pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::destination_hash: alloc::vec::Vec<u8>",
         "pub rns_transport::persistence::LegacyPersistedAnnounceEntryV5::hops: u8",
@@ -458,6 +461,7 @@
         "pub fn rns_protocol::resource::WindowState::grow(&mut self, usize)"
       ],
       "rns-interface": [
+        "impl rns_interface::traits::TunnelIdentity",
         "pub async fn rns_interface::auto::spawn_auto_interface(rns_interface::auto::AutoInterfaceConfig, rns_interface::traits::InterfaceId, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, alloc::sync::Arc<core::sync::atomic::AtomicBool>) -> core::result::Result<rns_interface::traits::InterfaceHandle, rns_interface::traits::InterfaceError>",
         "pub const rns_interface::backbone::CHILD_BITRATE_GUESS: u64",
         "pub const rns_interface::i2p::RECONNECT_WAIT_MAX: u64",
@@ -465,6 +469,7 @@
         "pub const rns_interface::tcp::RECONNECT_WAIT_MAX: u64",
         "pub const rns_interface::traits::IC_BURST_MIN_SAMPLES: usize",
         "pub fn rns_interface::rnode::process_rnode_response(u8, &[u8], rns_interface::traits::InterfaceId, &mut core::option::Option<f32>, &mut core::option::Option<f32>) -> rns_interface::rnode::RNodeResponse",
+        "pub fn rns_interface::traits::TunnelIdentity::synthesis(&self, &str) -> core::option::Option<bytes::bytes::Bytes>",
         "pub rns_interface::backbone::BackboneServerConfig::listen_ip: alloc::string::String",
         "pub rns_interface::ble_rnode::BleRNodeConfig::lt_alock: core::option::Option<f32>",
         "pub rns_interface::ble_rnode::BleRNodeConfig::st_alock: core::option::Option<f32>",
