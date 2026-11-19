@@ -300,34 +300,11 @@ async fn run_rnsh_listener_inner(
         tokio::select! {
             maybe_link = established_rx.recv() => {
                 let Some(link_id) = maybe_link else { break };
-                file_allowed = read_allowed_identity_files(&cfg.allowed_identity_files);
-                // or_insert (not insert) so a rare identification processed ahead
-                // of this establishment event is never clobbered.
-                sessions.entry(link_id).or_insert_with(|| ListenerSession::new(cfg.allow_all));
+                on_link_established(&cfg, &mut sessions, &mut file_allowed, link_id);
             }
             maybe_identified = identified_rx.recv() => {
                 let Some((link_id, identity_hash)) = maybe_identified else { break };
-                // Identification may race ahead of the establishment event.
-                let session = sessions
-                    .entry(link_id)
-                    .or_insert_with(|| ListenerSession::new(cfg.allow_all));
-                if session.state == ListenerState::Closed {
-                    continue;
-                }
-                if !matches!(session.state, ListenerState::WaitIdent | ListenerState::WaitVersion) {
-                    terminate_session(&command_tx, link_id, session, Some("Protocol error (LSSTATE_WAIT_IDENT)")).await;
-                } else if cfg.allow_all
-                    || cfg.allowed.contains(&identity_hash)
-                    || file_allowed.contains(&identity_hash)
-                {
-                    session.authorized = true;
-                    session.remote_identity_hash = Some(identity_hash);
-                    session.state = ListenerState::WaitVersion;
-                } else {
-                    session.authorized = false;
-                    terminate_session(&command_tx, link_id, session, Some("Identity not allowed")).await;
-                    tracing::info!(identity = %hex::encode(identity_hash), "rnsh identity not allowed");
-                }
+                on_link_identified(&command_tx, &cfg, &mut sessions, &file_allowed, link_id, identity_hash).await;
             }
             maybe_closed = closed_rx.recv() => {
                 let Some(link_id) = maybe_closed else { break };
@@ -335,6 +312,15 @@ async fn run_rnsh_listener_inner(
             }
             maybe_msg = channel_rx.recv() => {
                 let Some(msg) = maybe_msg else { break };
+                apply_queued_link_events(
+                    &command_tx,
+                    &cfg,
+                    &mut sessions,
+                    &mut file_allowed,
+                    &mut established_rx,
+                    &mut identified_rx,
+                )
+                .await;
                 let link_id = msg.link_id;
                 match handle_listener_channel_message(
                     &command_tx,
@@ -407,6 +393,88 @@ async fn run_rnsh_listener_inner(
     let _ = command_tx.send(LinkManagerCommand::Shutdown).await;
     let _ = manager_task.await;
     Ok(())
+}
+
+fn on_link_established(
+    cfg: &RnshListenerConfig,
+    sessions: &mut HashMap<[u8; 16], ListenerSession>,
+    file_allowed: &mut HashSet<[u8; 16]>,
+    link_id: [u8; 16],
+) {
+    *file_allowed = read_allowed_identity_files(&cfg.allowed_identity_files);
+    // or_insert (not insert) so a rare identification processed ahead
+    // of this establishment event is never clobbered.
+    sessions
+        .entry(link_id)
+        .or_insert_with(|| ListenerSession::new(cfg.allow_all));
+}
+
+async fn on_link_identified(
+    command_tx: &mpsc::Sender<LinkManagerCommand>,
+    cfg: &RnshListenerConfig,
+    sessions: &mut HashMap<[u8; 16], ListenerSession>,
+    file_allowed: &HashSet<[u8; 16]>,
+    link_id: [u8; 16],
+    identity_hash: [u8; 16],
+) {
+    // Identification may race ahead of the establishment event.
+    let session = sessions
+        .entry(link_id)
+        .or_insert_with(|| ListenerSession::new(cfg.allow_all));
+    if session.state == ListenerState::Closed {
+        return;
+    }
+    if !matches!(
+        session.state,
+        ListenerState::WaitIdent | ListenerState::WaitVersion
+    ) {
+        terminate_session(
+            command_tx,
+            link_id,
+            session,
+            Some("Protocol error (LSSTATE_WAIT_IDENT)"),
+        )
+        .await;
+    } else if cfg.allow_all
+        || cfg.allowed.contains(&identity_hash)
+        || file_allowed.contains(&identity_hash)
+    {
+        session.authorized = true;
+        session.remote_identity_hash = Some(identity_hash);
+        session.state = ListenerState::WaitVersion;
+    } else {
+        session.authorized = false;
+        terminate_session(command_tx, link_id, session, Some("Identity not allowed")).await;
+        tracing::info!(identity = %hex::encode(identity_hash), "rnsh identity not allowed");
+    }
+}
+
+/// The link manager queues a link's establishment and identification before its
+/// later channel messages; upstream handles all three in arrival order on one
+/// thread (`Link.py` LINKIDENTIFY, `Channel._run_callbacks`). Apply them before a
+/// channel message, or a VersionInfo sent right behind LINKIDENTIFY overtakes it.
+async fn apply_queued_link_events(
+    command_tx: &mpsc::Sender<LinkManagerCommand>,
+    cfg: &RnshListenerConfig,
+    sessions: &mut HashMap<[u8; 16], ListenerSession>,
+    file_allowed: &mut HashSet<[u8; 16]>,
+    established_rx: &mut mpsc::Receiver<[u8; 16]>,
+    identified_rx: &mut mpsc::Receiver<([u8; 16], [u8; 16])>,
+) {
+    while let Ok(link_id) = established_rx.try_recv() {
+        on_link_established(cfg, sessions, file_allowed, link_id);
+    }
+    while let Ok((link_id, identity_hash)) = identified_rx.try_recv() {
+        on_link_identified(
+            command_tx,
+            cfg,
+            sessions,
+            file_allowed,
+            link_id,
+            identity_hash,
+        )
+        .await;
+    }
 }
 
 /// End one listener session as `ListenerSession.terminate` does: report a fatal
@@ -2935,6 +3003,64 @@ mod tests {
         assert!(!session.authorized);
         assert_eq!(session.state, ListenerState::WaitIdent);
         let _ = std::fs::remove_file(&marker);
+    }
+
+    // An upstream initiator sends VersionInfo right behind LINKIDENTIFY, so both
+    // can be queued when the listener wakes. Identification goes first, with and
+    // without an allow list; otherwise the session ends with a protocol error or
+    // drops the VersionInfo while it still waits for identification.
+    #[tokio::test]
+    async fn identification_queued_ahead_of_version_info_is_applied_first() {
+        let identity_hash = [0xAB; 16];
+        for allow_all in [true, false] {
+            let mut cfg = marker_listener_config(&unique_marker("order"));
+            cfg.allow_all = allow_all;
+            cfg.allowed = vec![identity_hash];
+            let (command_tx, command_rx) = mpsc::channel(64);
+            let messages = Arc::new(Mutex::new(Vec::new()));
+            spawn_ack_manager(command_rx, messages.clone());
+            let (established_tx, mut established_rx) = mpsc::channel(4);
+            let (identified_tx, mut identified_rx) = mpsc::channel(4);
+            let link_id = [0x58; 16];
+            established_tx.try_send(link_id).unwrap();
+            identified_tx.try_send((link_id, identity_hash)).unwrap();
+
+            let mut sessions = HashMap::new();
+            let mut file_allowed = HashSet::new();
+            apply_queued_link_events(
+                &command_tx,
+                &cfg,
+                &mut sessions,
+                &mut file_allowed,
+                &mut established_rx,
+                &mut identified_rx,
+            )
+            .await;
+            handle_listener_channel_message(
+                &command_tx,
+                &cfg,
+                &mut sessions,
+                version_channel_msg(link_id),
+                &mpsc::unbounded_channel().0,
+            )
+            .await
+            .expect("handler ok");
+
+            let session = &sessions[&link_id];
+            assert_eq!(
+                session.state,
+                ListenerState::WaitCommand,
+                "allow_all={allow_all}"
+            );
+            assert_eq!(session.remote_identity_hash, Some(identity_hash));
+            let messages = messages.lock().unwrap();
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| matches!(m, RnshMessage::VersionInfo(_)))
+            );
+            assert!(!messages.iter().any(|m| matches!(m, RnshMessage::Error(_))));
+        }
     }
 
     // Positive control: an authorized session in WaitCommand DOES run the command,
