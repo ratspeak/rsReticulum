@@ -1471,6 +1471,8 @@ struct RNodeWriterContext {
     beacon_poll_interval: Duration,
     idle_probe_interval: Option<Duration>,
     idle_probes_enabled: Arc<AtomicBool>,
+    /// Wakes an idle writer for cancellation or a newly installed lane.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -1572,6 +1574,7 @@ struct RNodeGenerationWriter {
     ready: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     idle_probes_enabled: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
     task: RNodeTaskGuard<Result<RNodeWriterExit, RNodeWriteFailure>>,
 }
 
@@ -1579,6 +1582,12 @@ struct RNodeGenerationWriter {
 impl RNodeGenerationWriter {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    fn install_background(&self, lane: crate::background_announce::BackgroundAnnounceReceiver) {
+        *self.background.lock().unwrap() = Some(lane);
+        self.wake.notify_one();
     }
 }
 
@@ -1696,12 +1705,23 @@ enum RNodeWriterEvent {
     ProbePoll,
     FlowPoll,
     BeaconPoll,
+    Wake,
 }
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 async fn wait_for_rnode_probe_deadline(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+async fn wait_for_rnode_background_offer(
+    lane: Option<&crate::background_announce::BackgroundAnnounceReceiver>,
+) {
+    match lane {
+        Some(lane) => lane.offered().await,
         None => std::future::pending::<()>().await,
     }
 }
@@ -1781,8 +1801,8 @@ where
             && packet_rx.is_empty()
             && context.carrier_online.load(Ordering::SeqCst)
             && context.interface_online.load(Ordering::SeqCst)
-            && let Some(background) = background.filter(|lane| lane.ordinary_is_empty())
-            && let Some(packet) = background.try_start_when(rns_transport::now_f64(), || {
+            && let Some(lane) = background.as_ref().filter(|lane| lane.ordinary_is_empty())
+            && let Some(packet) = lane.try_start_when(rns_transport::now_f64(), || {
                 !context.flow_control
                     || context
                         .ready
@@ -1855,12 +1875,17 @@ where
         }
 
         let probe_deadline = idle_probe.as_ref().map(|probe| probe.deadline);
+        // READY and carrier state have no signal, so only waiting work polls.
+        let offer_waiting = background
+            .as_ref()
+            .is_some_and(crate::background_announce::BackgroundAnnounceReceiver::has_offer);
         let event = if pending_packet.is_some() {
             tokio::select! {
                 biased;
                 request = control_rx.recv(), if control_lane_open => {
                     RNodeWriterEvent::Control(request)
                 }
+                _ = context.wake.notified() => RNodeWriterEvent::Wake,
                 _ = wait_for_rnode_probe_deadline(probe_deadline) => {
                     RNodeWriterEvent::ProbePoll
                 }
@@ -1874,11 +1899,15 @@ where
                 request = control_rx.recv(), if control_lane_open => {
                     RNodeWriterEvent::Control(request)
                 }
+                _ = context.wake.notified() => RNodeWriterEvent::Wake,
                 _ = wait_for_rnode_probe_deadline(probe_deadline) => {
                     RNodeWriterEvent::ProbePoll
                 }
-                _ = tokio::time::sleep(RNODE_FLOW_POLL_INTERVAL) => {
+                _ = tokio::time::sleep(RNODE_FLOW_POLL_INTERVAL), if offer_waiting => {
                     RNodeWriterEvent::FlowPoll
+                }
+                _ = wait_for_rnode_background_offer(background.as_ref()), if !offer_waiting => {
+                    RNodeWriterEvent::Wake
                 }
                 packet = packet_rx.recv(), if packet_lane_open => {
                     RNodeWriterEvent::Packet(packet)
@@ -1931,6 +1960,7 @@ where
             }
             RNodeWriterEvent::ProbePoll => {}
             RNodeWriterEvent::FlowPoll => {}
+            RNodeWriterEvent::Wake => {}
             // Wake the top-of-loop due check even when both input lanes are
             // idle. Checking there also prevents a continuously ready packet
             // lane from starving an elapsed station-ID beacon.
@@ -1950,6 +1980,7 @@ where
     let ready = context.ready.clone();
     let cancelled = context.cancelled.clone();
     let idle_probes_enabled = context.idle_probes_enabled.clone();
+    let wake = context.wake.clone();
     let carrier_online = context.carrier_online.clone();
     let interface_online = context.interface_online.clone();
     let id = context.id;
@@ -1975,6 +2006,7 @@ where
         ready,
         cancelled,
         idle_probes_enabled,
+        wake,
         task: RNodeTaskGuard::new(task),
     }
 }
@@ -2015,6 +2047,7 @@ fn spawn_rnode_generation_writer(
             beacon_poll_interval: RNODE_BEACON_POLL_INTERVAL,
             idle_probe_interval: port.is_tcp().then_some(RNODE_TCP_IDLE_PROBE_INTERVAL),
             idle_probes_enabled: Arc::new(AtomicBool::new(options.idle_probes_enabled)),
+            wake: Arc::new(tokio::sync::Notify::new()),
         },
     );
     writer.interrupt = interrupt;
@@ -2031,6 +2064,7 @@ async fn finish_rnode_writer(writer: RNodeGenerationWriter) -> RNodeWriterFinish
         ready: _,
         cancelled: _,
         idle_probes_enabled: _,
+        wake: _,
         mut task,
         background: _,
     } = writer;
@@ -4225,7 +4259,7 @@ pub async fn spawn_rnode_interface_with_driver_and_options(
             let mut port_r = port_r;
 
             background.retire_generation();
-            *generation_writer.background.lock().unwrap() = Some(background.clone());
+            generation_writer.install_background(background.clone());
             let ready = generation_writer.ready.clone();
             let packet_tx = generation_writer.packet_tx.clone();
             let control_tx = generation_writer.control_tx.clone();
@@ -4759,6 +4793,7 @@ mod tests {
             beacon_poll_interval,
             idle_probe_interval: None,
             idle_probes_enabled: Arc::new(AtomicBool::new(true)),
+            wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -9322,5 +9357,56 @@ mod tests {
         writer.cancel();
         tokio::time::advance(RNODE_FLOW_POLL_INTERVAL).await;
         finish_rnode_writer(writer).await;
+    }
+
+    // The clock never moves here: an idle writer has no poll to fall back on,
+    // so each step proves its wake signal.
+    #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn idle_writer_wakes_for_lane_install_offer_and_cancel_without_polling() {
+        let (outer, _outer_rx) = mpsc::channel(2);
+        let background = crate::background_announce::register(&outer).unwrap();
+        let (actor, actor_control, raw) =
+            crate::background_announce::scheduled_actor(outer.clone());
+        let scripted = ScriptedWriter::default();
+        let context = scripted_writer_context(
+            false,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Duration::from_millis(5),
+        );
+        let mut writer = spawn_rnode_writer(scripted.clone(), context);
+        yield_to_rnode_tasks().await;
+
+        writer.install_background(background.clone());
+        yield_to_rnode_tasks().await;
+        actor_control
+            .send(TransportMessage::Tick(rns_transport::messages::TimerTick))
+            .await
+            .unwrap();
+        yield_until_rnode_test(
+            || scripted.flush_calls() == 1,
+            "an offer must wake an idle writer",
+        )
+        .await;
+        assert_eq!(scripted.writes(), vec![kiss::frame(&raw)]);
+
+        writer.cancel();
+        yield_until_rnode_test(
+            || writer.task.is_finished(),
+            "cancel must wake an idle writer",
+        )
+        .await;
+        assert_eq!(
+            writer.task.take().await.unwrap().unwrap(),
+            RNodeWriterExit::Cancelled
+        );
+        actor_control
+            .send(TransportMessage::Shutdown)
+            .await
+            .unwrap();
+        actor.await.unwrap();
     }
 }

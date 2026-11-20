@@ -9,7 +9,7 @@
 use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 const MAX_REGISTERED: usize = 4096;
 type Registry = Mutex<Vec<(mpsc::WeakSender<Bytes>, Weak<Shared>)>>;
@@ -34,6 +34,7 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     ordinary: mpsc::WeakSender<Bytes>,
+    offered: Notify,
 }
 struct Offer {
     owner: Option<crate::InterfaceOwner>,
@@ -109,6 +110,7 @@ impl BackgroundAnnounceReceiver {
                 active: false,
                 generation: 0,
             }),
+            offered: Notify::new(),
         });
         registry.push((ordinary.downgrade(), Arc::downgrade(&shared)));
         Ok(Self { shared })
@@ -182,6 +184,13 @@ impl BackgroundAnnounceReceiver {
     pub fn has_offer(&self) -> bool {
         self.shared.state.lock().unwrap().offer.is_some()
     }
+
+    /// Resolve after the next offer lands. An offer made while no one waits is
+    /// remembered for the next call, so a writer can check `has_offer` and then
+    /// wait without missing one. One waiter per lane.
+    pub async fn offered(&self) {
+        self.shared.offered.notified().await;
+    }
 }
 
 pub(crate) fn lookup(ordinary: &mpsc::Sender<Bytes>) -> Option<BackgroundAnnounceSender> {
@@ -242,6 +251,8 @@ impl BackgroundAnnounceSender {
             generation: state.generation,
         });
         state.active = true;
+        drop(state);
+        self.shared.offered.notify_one();
         Some(BackgroundOfferReceipt {
             started: rx,
             cancelled,
@@ -274,6 +285,34 @@ mod tests {
         drop(driver);
         assert!(lookup(&tx).is_none());
         assert!(BackgroundAnnounceReceiver::register(&tx).is_ok());
+    }
+    #[tokio::test]
+    async fn offer_wakes_a_waiting_or_later_writer() {
+        let (tx, _rx) = mpsc::channel(1);
+        let driver = BackgroundAnnounceReceiver::register(&tx).unwrap();
+        let sender = lookup(&tx).unwrap();
+        let _early = sender
+            .try_offer(Bytes::from_static(b"early"), 100.0, 0.0)
+            .unwrap();
+        let wait = std::time::Duration::from_secs(5);
+        tokio::time::timeout(wait, driver.offered())
+            .await
+            .expect("an offer made before the wait is remembered");
+        drop(driver.try_start(1.0).unwrap());
+
+        let waiter = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.offered().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        let _late = sender
+            .try_offer(Bytes::from_static(b"late"), 100.0, 2.0)
+            .unwrap();
+        tokio::time::timeout(wait, waiter)
+            .await
+            .expect("an offer wakes a waiting writer")
+            .unwrap();
     }
     #[test]
     fn lease_bounds_offer_through_complete_write_and_expiry() {
