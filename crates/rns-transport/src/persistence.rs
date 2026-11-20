@@ -10,11 +10,12 @@
 //! whole file and have no size limit; decoded metadata still needs validation
 //! before use. Loading a route does not establish that its peer is reachable.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Read};
 use std::path::Path;
 
 use rmpv::Value;
+use serde::ser::{SerializeSeq, SerializeTuple, Serializer};
 use serde::{Deserialize, Serialize};
 
 use crate::constants::PERSIST_RANDOM_BLOBS;
@@ -75,43 +76,127 @@ pub fn save_path_table(
     interface_names: &HashMap<u64, String>,
     path: &Path,
 ) -> Result<(), PersistenceError> {
-    let mut entries = Vec::new();
-    for (hash, entry) in table.iter() {
-        let interface_name = interface_names.get(&entry.interface_id).cloned();
-        // Skip entries whose interface has already been deregistered — we
-        // can't restore them safely (no name → no remap target on load).
-        if interface_name.is_none() {
-            continue;
-        }
-        let interface_hash = interface_name
-            .as_deref()
-            .map(interface_hash_from_name)
-            .map(|h| h.to_vec());
-        entries.push(PersistedPathEntry {
-            destination_hash: hash.to_vec(),
-            timestamp: entry.timestamp,
-            next_hop: entry.next_hop.map(|h| h.to_vec()),
-            hops: entry.hops,
-            expires: entry.expires,
-            random_blobs: entry
-                .blobs_for_persist()
-                .iter()
-                .map(|b| b.to_vec())
-                .collect(),
-            interface_id: entry.interface_id,
-            interface_name,
-            interface_hash,
-            packet_hash: entry.packet_hash.map(|h| h.to_vec()),
-            used: Some(entry.used),
-        });
+    atomic_write_bytes(
+        path,
+        &encode_path_table(table, &interface_keys(interface_names))?,
+    )
+}
+
+/// Interface name and name hash by interface id, hashed once per save.
+pub(crate) type InterfaceKeys<'a> = HashMap<u64, (&'a str, [u8; 32])>;
+
+pub(crate) fn interface_keys(names: &HashMap<u64, String>) -> InterfaceKeys<'_> {
+    names
+        .iter()
+        .map(|(&id, name)| (id, (name.as_str(), interface_hash_from_name(name))))
+        .collect()
+}
+
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, PersistenceError> {
+    rmp_serde::to_vec(value).map_err(|e| PersistenceError::Serialize(e.to_string()))
+}
+
+/// msgpack bin, as `Value::Binary` encodes.
+struct Bin<'a>(&'a [u8]);
+
+impl Serialize for Bin<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(self.0)
     }
+}
 
-    let persisted = PersistedPathTable {
-        entries,
+/// The newest `PERSIST_RANDOM_BLOBS` blobs, or all of them, as `Vec<Vec<u8>>`
+/// (byte arrays) or, with `bin`, as `Value::Binary` rows.
+struct Blobs<'a> {
+    blobs: &'a VecDeque<[u8; 10]>,
+    newest_only: bool,
+    bin: bool,
+}
+
+impl Serialize for Blobs<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let skip = if self.newest_only {
+            self.blobs.len().saturating_sub(PERSIST_RANDOM_BLOBS)
+        } else {
+            0
+        };
+        let blobs = self.blobs.iter().skip(skip);
+        if self.bin {
+            s.collect_seq(blobs.map(|b| Bin(b)))
+        } else {
+            s.collect_seq(blobs.map(|b| b.as_slice()))
+        }
+    }
+}
+
+/// Borrowed [`PersistedPathEntry`]; serializes to the same bytes.
+#[derive(Serialize)]
+struct PathEntryRef<'a> {
+    destination_hash: &'a [u8],
+    timestamp: f64,
+    next_hop: Option<&'a [u8]>,
+    hops: u8,
+    expires: f64,
+    random_blobs: Blobs<'a>,
+    interface_id: u64,
+    interface_name: Option<&'a str>,
+    interface_hash: Option<&'a [u8]>,
+    packet_hash: Option<&'a [u8]>,
+    used: Option<f64>,
+}
+
+struct PathRows<'a> {
+    table: &'a PathTable,
+    keys: &'a InterfaceKeys<'a>,
+}
+
+impl Serialize for PathRows<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let rows = || {
+            self.table.iter().filter_map(|(hash, entry)| {
+                let (name, name_hash) = self.keys.get(&entry.interface_id)?;
+                Some(PathEntryRef {
+                    destination_hash: hash.as_bytes(),
+                    timestamp: entry.timestamp,
+                    next_hop: entry.next_hop.as_ref().map(|h| h.as_slice()),
+                    hops: entry.hops,
+                    expires: entry.expires,
+                    random_blobs: Blobs {
+                        blobs: &entry.random_blobs,
+                        newest_only: true,
+                        bin: false,
+                    },
+                    interface_id: entry.interface_id,
+                    interface_name: Some(name),
+                    interface_hash: Some(name_hash),
+                    packet_hash: entry.packet_hash.as_ref().map(|h| h.as_slice()),
+                    used: Some(entry.used),
+                })
+            })
+        };
+        let mut seq = s.serialize_seq(Some(rows().count()))?;
+        for row in rows() {
+            seq.serialize_element(&row)?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(Serialize)]
+struct PathTableRef<'a> {
+    entries: PathRows<'a>,
+    version: u32,
+}
+
+/// [`save_path_table`]'s file bytes, without an owned copy of the table.
+pub(crate) fn encode_path_table(
+    table: &PathTable,
+    keys: &InterfaceKeys<'_>,
+) -> Result<Vec<u8>, PersistenceError> {
+    encode(&PathTableRef {
+        entries: PathRows { table, keys },
         version: PersistedPathTable::CURRENT_VERSION,
-    };
-
-    atomic_write(path, &persisted)
+    })
 }
 
 /// Decode a Rust path snapshot with a supported version (1 through 4).
@@ -191,37 +276,83 @@ pub fn save_python_destination_table(
     interface_names: &HashMap<u64, String>,
     path: &Path,
 ) -> Result<(), PersistenceError> {
-    let mut entries = Vec::new();
-    for (hash, entry) in table.iter() {
-        let Some(interface_name) = interface_names.get(&entry.interface_id) else {
-            continue;
-        };
-        let Some(packet_hash) = entry.packet_hash else {
-            continue;
-        };
-        let received_from = entry.next_hop.unwrap_or(*hash.as_bytes());
-        let random_blobs = entry
-            .random_blobs
-            .iter()
-            .map(|b| Value::Binary(b.to_vec()))
-            .collect();
-        entries.push(Value::Array(vec![
-            Value::Binary(hash.to_vec()),
-            Value::F64(entry.timestamp),
-            Value::Binary(received_from.to_vec()),
-            Value::Integer((entry.hops as u64).into()),
-            Value::F64(entry.expires),
-            Value::Array(random_blobs),
-            Value::Binary(interface_hash_from_name(interface_name).to_vec()),
-            Value::Binary(packet_hash.to_vec()),
-            Value::F64(entry.used),
-        ]));
-    }
+    atomic_write_bytes(
+        path,
+        &encode_python_destination_table(table, &interface_keys(interface_names))?,
+    )
+}
 
-    let mut serialized = Vec::new();
-    rmpv::encode::write_value(&mut serialized, &Value::Array(entries))
-        .map_err(|e| PersistenceError::Serialize(e.to_string()))?;
-    atomic_write_bytes(path, &serialized)
+/// One Python `destination_table` row (Transport.py).
+struct PythonPathRow<'a> {
+    destination_hash: &'a [u8],
+    timestamp: f64,
+    received_from: &'a [u8],
+    hops: u8,
+    expires: f64,
+    random_blobs: Blobs<'a>,
+    interface_hash: &'a [u8],
+    packet_hash: &'a [u8],
+    used: f64,
+}
+
+impl Serialize for PythonPathRow<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut row = s.serialize_tuple(9)?;
+        row.serialize_element(&Bin(self.destination_hash))?;
+        row.serialize_element(&self.timestamp)?;
+        row.serialize_element(&Bin(self.received_from))?;
+        row.serialize_element(&u64::from(self.hops))?;
+        row.serialize_element(&self.expires)?;
+        row.serialize_element(&self.random_blobs)?;
+        row.serialize_element(&Bin(self.interface_hash))?;
+        row.serialize_element(&Bin(self.packet_hash))?;
+        row.serialize_element(&self.used)?;
+        row.end()
+    }
+}
+
+struct Rows<F>(F);
+
+impl<'a, F, I> Serialize for Rows<F>
+where
+    F: Fn() -> I,
+    I: Iterator<Item = PythonPathRow<'a>>,
+{
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some((self.0)().count()))?;
+        for row in (self.0)() {
+            seq.serialize_element(&row)?;
+        }
+        seq.end()
+    }
+}
+
+/// [`save_python_destination_table`]'s file bytes, without a `Value` tree.
+pub(crate) fn encode_python_destination_table(
+    table: &PathTable,
+    keys: &InterfaceKeys<'_>,
+) -> Result<Vec<u8>, PersistenceError> {
+    encode(&Rows(|| {
+        table.iter().filter_map(|(hash, entry)| {
+            let (_, name_hash) = keys.get(&entry.interface_id)?;
+            let packet_hash = entry.packet_hash.as_ref()?;
+            Some(PythonPathRow {
+                destination_hash: hash.as_bytes(),
+                timestamp: entry.timestamp,
+                received_from: entry.next_hop.as_ref().unwrap_or(hash.as_bytes()),
+                hops: entry.hops,
+                expires: entry.expires,
+                random_blobs: Blobs {
+                    blobs: &entry.random_blobs,
+                    newest_only: false,
+                    bin: true,
+                },
+                interface_hash: name_hash,
+                packet_hash,
+                used: entry.used,
+            })
+        })
+    }))
 }
 
 /// Decode Python-compatible destination rows from a local file.
@@ -395,12 +526,22 @@ pub fn save_python_tunnel_table(
     interface_names: &HashMap<u64, String>,
     path: &Path,
 ) -> Result<(), PersistenceError> {
+    atomic_write_bytes(
+        path,
+        &encode_python_tunnel_table(table, &interface_keys(interface_names))?,
+    )
+}
+
+pub(crate) fn encode_python_tunnel_table(
+    table: &crate::tunnel::TunnelTable,
+    keys: &InterfaceKeys<'_>,
+) -> Result<Vec<u8>, PersistenceError> {
     let mut tunnel_values = Vec::new();
     for (_, tunnel) in table.iter() {
         let interface_hash = tunnel
             .interface_id
-            .and_then(|id| interface_names.get(&id))
-            .map(|name| Value::Binary(interface_hash_from_name(name).to_vec()))
+            .and_then(|id| keys.get(&id))
+            .map(|(_, hash)| Value::Binary(hash.to_vec()))
             .unwrap_or(Value::Nil);
 
         let mut path_values = Vec::new();
@@ -440,10 +581,7 @@ pub fn save_python_tunnel_table(
         ]));
     }
 
-    let mut serialized = Vec::new();
-    rmpv::encode::write_value(&mut serialized, &Value::Array(tunnel_values))
-        .map_err(|e| PersistenceError::Serialize(e.to_string()))?;
-    atomic_write_bytes(path, &serialized)
+    encode_value(&Value::Array(tunnel_values))
 }
 
 /// Decode a local Python-compatible tunnel table. Malformed tunnel or path
@@ -614,14 +752,10 @@ pub fn save_hashlist_legacy(
 }
 
 /// Replace `path` with the supplied hashes concatenated as raw 32-byte records.
-/// Input order and duplicates are preserved. The full output is allocated in
-/// memory before writing through the shared atomic-file helper.
+/// Input order and duplicates are preserved. The records are written in place
+/// through the shared atomic-file helper.
 pub fn save_raw_hashes(hashes: &[[u8; 32]], path: &Path) -> Result<(), PersistenceError> {
-    let mut serialized = Vec::with_capacity(hashes.len().saturating_mul(32));
-    for hash in hashes {
-        serialized.extend_from_slice(hash);
-    }
-    atomic_write_bytes(path, &serialized)
+    atomic_write_bytes(path, hashes.as_flattened())
 }
 
 /// Load raw 32-byte hash records through a 64 KiB reader buffer.
@@ -712,13 +846,14 @@ pub fn load_hashlist(path: &Path) -> Result<Vec<[u8; 32]>, PersistenceError> {
 
 /// Write to a sibling `.tmp` file and rename on top of the target so a crash
 /// mid-write cannot leave a half-written snapshot on disk.
+#[cfg(test)]
 fn atomic_write<T: Serialize>(path: &Path, data: &T) -> Result<(), PersistenceError> {
     let serialized =
         rmp_serde::to_vec(data).map_err(|e| PersistenceError::Serialize(e.to_string()))?;
     atomic_write_bytes(path, &serialized)
 }
 
-fn atomic_write_bytes(path: &Path, serialized: &[u8]) -> Result<(), PersistenceError> {
+pub(crate) fn atomic_write_bytes(path: &Path, serialized: &[u8]) -> Result<(), PersistenceError> {
     // Single canonical atomic-write implementation (fsync + rename + dir
     // sync) lives in rns-identity; transport tables share it (AF-2026-04.2).
     rns_identity::persistence::atomic_write(path, serialized).map_err(PersistenceError::Io)
@@ -753,6 +888,12 @@ pub fn save_blackhole_table(
     table: &crate::blackhole::BlackholeTable,
     path: &Path,
 ) -> Result<(), PersistenceError> {
+    atomic_write_bytes(path, &encode_blackhole_table(table)?)
+}
+
+pub(crate) fn encode_blackhole_table(
+    table: &crate::blackhole::BlackholeTable,
+) -> Result<Vec<u8>, PersistenceError> {
     let mut entries = Vec::new();
     for (hash, entry) in table.iter_entries() {
         if entry.source.is_some() {
@@ -767,12 +908,10 @@ pub fn save_blackhole_table(
         });
     }
 
-    let persisted = PersistedBlackholeTable {
+    encode(&PersistedBlackholeTable {
         entries,
         version: PersistedBlackholeTable::CURRENT_VERSION,
-    };
-
-    atomic_write(path, &persisted)
+    })
 }
 
 /// Decode a version-1 or version-2 Rust blackhole snapshot. Stored hash lengths,
@@ -849,7 +988,24 @@ pub fn save_local_blackhole_file(
     local_identity_hash: [u8; 16],
     blackhole_dir: &Path,
 ) -> Result<(), PersistenceError> {
+    write_local_blackhole_file(
+        &encode_local_blackhole_file(table, local_identity_hash)?,
+        blackhole_dir,
+    )
+}
+
+pub(crate) fn write_local_blackhole_file(
+    bytes: &[u8],
+    blackhole_dir: &Path,
+) -> Result<(), PersistenceError> {
     std::fs::create_dir_all(blackhole_dir).map_err(PersistenceError::Io)?;
+    atomic_write_bytes(&blackhole_dir.join("local"), bytes)
+}
+
+pub(crate) fn encode_local_blackhole_file(
+    table: &crate::blackhole::BlackholeTable,
+    local_identity_hash: [u8; 16],
+) -> Result<Vec<u8>, PersistenceError> {
     let local_entries = table
         .iter_entries()
         .filter(|(_, entry)| {
@@ -865,7 +1021,7 @@ pub fn save_local_blackhole_file(
             )
         })
         .collect();
-    write_value_file(&blackhole_dir.join("local"), &Value::Map(local_entries))
+    encode_value(&Value::Map(local_entries))
 }
 
 /// Store a publisher's fetched `/list` reply as `blackhole_dir/<publisher>`,
@@ -1005,11 +1161,15 @@ fn blackhole_entry_value(source: [u8; 16], until: Option<f64>, reason: Option<&s
     ])
 }
 
-fn write_value_file(path: &Path, value: &Value) -> Result<(), PersistenceError> {
+fn encode_value(value: &Value) -> Result<Vec<u8>, PersistenceError> {
     let mut serialized = Vec::new();
     rmpv::encode::write_value(&mut serialized, value)
         .map_err(|e| PersistenceError::Serialize(e.to_string()))?;
-    atomic_write_bytes(path, &serialized)
+    Ok(serialized)
+}
+
+fn write_value_file(path: &Path, value: &Value) -> Result<(), PersistenceError> {
+    atomic_write_bytes(path, &encode_value(value)?)
 }
 
 fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
@@ -1266,13 +1426,20 @@ pub fn save_tunnel_table(
     interface_names: &HashMap<u64, String>,
     path: &Path,
 ) -> Result<(), PersistenceError> {
+    atomic_write_bytes(
+        path,
+        &encode_tunnel_table(table, &interface_keys(interface_names))?,
+    )
+}
+
+pub(crate) fn encode_tunnel_table(
+    table: &crate::tunnel::TunnelTable,
+    keys: &InterfaceKeys<'_>,
+) -> Result<Vec<u8>, PersistenceError> {
     let entries: Vec<PersistedTunnelEntry> = table
         .iter()
         .map(|(_, entry)| {
-            let interface_name = entry
-                .interface_id
-                .and_then(|id| interface_names.get(&id))
-                .cloned();
+            let interface = entry.interface_id.and_then(|id| keys.get(&id));
             let paths: Vec<PersistedTunnelPath> = entry
                 .tunnel_paths
                 .iter()
@@ -1299,20 +1466,16 @@ pub fn save_tunnel_table(
                 interface_id: entry.interface_id.unwrap_or_default(),
                 expires: entry.expires,
                 paths,
-                interface_hash: interface_name
-                    .as_deref()
-                    .map(|name| interface_hash_from_name(name).to_vec()),
-                interface_name,
+                interface_hash: interface.map(|(_, hash)| hash.to_vec()),
+                interface_name: interface.map(|(name, _)| name.to_string()),
             }
         })
         .collect();
 
-    let persisted = PersistedTunnelTable {
+    encode(&PersistedTunnelTable {
         entries,
         version: PersistedTunnelTable::CURRENT_VERSION,
-    };
-
-    atomic_write(path, &persisted)
+    })
 }
 
 /// Decode a supported Rust tunnel snapshot (versions 1 through 3). This returns
@@ -1362,6 +1525,101 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn varied_path_table() -> (PathTable, HashMap<u64, String>) {
+        let mut table = PathTable::new();
+        for i in 0..40u8 {
+            let mut entry = PathEntry::new(
+                (i % 3 != 0).then_some([i; 16]),
+                i % 9,
+                u64::from(i % 4),
+                InterfaceMode::Full,
+            );
+            entry.timestamp = 1_700_000_000.25 + f64::from(i);
+            entry.expires = entry.timestamp + 604_800.5;
+            entry.used = if i % 2 == 0 {
+                0.0
+            } else {
+                entry.timestamp + 3.5
+            };
+            entry.packet_hash = (i % 5 != 0).then_some([i.wrapping_mul(7); 32]);
+            for b in 0..u16::from(i) {
+                entry.add_random_blob([(b % 251) as u8; 10]);
+            }
+            table.insert([i.wrapping_add(100); 16], entry);
+        }
+        let names = (0..3u64)
+            .map(|id| (id, format!("Interface[{id}]")))
+            .collect();
+        (table, names)
+    }
+
+    /// The borrowed encoders write the bytes the owned-copy encoders did.
+    #[test]
+    fn path_table_encoders_match_owned_reference() {
+        let (table, names) = varied_path_table();
+        let keys = interface_keys(&names);
+
+        let entries: Vec<PersistedPathEntry> = table
+            .iter()
+            .filter_map(|(hash, entry)| {
+                let name = names.get(&entry.interface_id)?;
+                Some(PersistedPathEntry {
+                    destination_hash: hash.to_vec(),
+                    timestamp: entry.timestamp,
+                    next_hop: entry.next_hop.map(|h| h.to_vec()),
+                    hops: entry.hops,
+                    expires: entry.expires,
+                    random_blobs: entry
+                        .blobs_for_persist()
+                        .iter()
+                        .map(|b| b.to_vec())
+                        .collect(),
+                    interface_id: entry.interface_id,
+                    interface_name: Some(name.clone()),
+                    interface_hash: Some(interface_hash_from_name(name).to_vec()),
+                    packet_hash: entry.packet_hash.map(|h| h.to_vec()),
+                    used: Some(entry.used),
+                })
+            })
+            .collect();
+        let reference = rmp_serde::to_vec(&PersistedPathTable {
+            entries,
+            version: PersistedPathTable::CURRENT_VERSION,
+        })
+        .unwrap();
+        assert_eq!(encode_path_table(&table, &keys).unwrap(), reference);
+
+        let rows: Vec<Value> = table
+            .iter()
+            .filter_map(|(hash, entry)| {
+                let name = names.get(&entry.interface_id)?;
+                let packet_hash = entry.packet_hash?;
+                Some(Value::Array(vec![
+                    Value::Binary(hash.to_vec()),
+                    Value::F64(entry.timestamp),
+                    Value::Binary(entry.next_hop.unwrap_or(*hash.as_bytes()).to_vec()),
+                    Value::Integer((entry.hops as u64).into()),
+                    Value::F64(entry.expires),
+                    Value::Array(
+                        entry
+                            .random_blobs
+                            .iter()
+                            .map(|b| Value::Binary(b.to_vec()))
+                            .collect(),
+                    ),
+                    Value::Binary(interface_hash_from_name(name).to_vec()),
+                    Value::Binary(packet_hash.to_vec()),
+                    Value::F64(entry.used),
+                ]))
+            })
+            .collect();
+        assert!(rows.len() > 10);
+        assert_eq!(
+            encode_python_destination_table(&table, &keys).unwrap(),
+            encode_value(&Value::Array(rows)).unwrap()
+        );
     }
 
     #[test]

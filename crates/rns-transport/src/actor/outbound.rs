@@ -266,6 +266,7 @@ impl TransportActor {
 
                     // Transport.py: traffic marks use, never liveness.
                     if let Some(path) = self.path_table.get_live_mut(&request.destination_hash) {
+                        self.state_dirty |= path.used == 0.0;
                         path.mark_used();
                     }
                     sent

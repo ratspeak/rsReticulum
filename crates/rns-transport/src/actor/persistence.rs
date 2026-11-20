@@ -86,35 +86,42 @@ pub(super) struct RoutingSnapshot {
     pub transport_identity_hash: Option<[u8; 16]>,
 }
 
+fn write_encoded(
+    dir: &std::path::Path,
+    name: &str,
+    encoded: Result<Vec<u8>, crate::persistence::PersistenceError>,
+) -> bool {
+    let written =
+        encoded.and_then(|bytes| crate::persistence::atomic_write_bytes(&dir.join(name), &bytes));
+    if let Err(e) = &written {
+        trace!("failed to save {name}: {e}");
+    }
+    written.is_ok()
+}
+
 /// Persist a routing snapshot. Runs on the blocking pool for periodic saves
 /// and inline for shutdown; must not touch the actor.
 pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSnapshot) {
-    let interface_names = &snapshot.interface_names;
+    use crate::persistence as p;
+    let keys = p::interface_keys(&snapshot.interface_names);
 
-    let path_table_path = dir.join("path_table.msgpack");
-    if let Err(e) =
-        crate::persistence::save_path_table(&snapshot.path_table, interface_names, &path_table_path)
-    {
-        trace!("failed to save path table: {}", e);
-    } else {
+    if write_encoded(
+        dir,
+        "path_table.msgpack",
+        p::encode_path_table(&snapshot.path_table, &keys),
+    ) {
         debug!("saved path table ({} entries)", snapshot.path_table.len());
     }
-
-    let destination_table_path = dir.join("destination_table");
-    if let Err(e) = crate::persistence::save_python_destination_table(
-        &snapshot.path_table,
-        interface_names,
-        &destination_table_path,
+    write_encoded(
+        dir,
+        "destination_table",
+        p::encode_python_destination_table(&snapshot.path_table, &keys),
+    );
+    if write_encoded(
+        dir,
+        "blackhole_table.msgpack",
+        p::encode_blackhole_table(&snapshot.blackhole_table),
     ) {
-        trace!("failed to save Python destination_table: {}", e);
-    }
-
-    let blackhole_path = dir.join("blackhole_table.msgpack");
-    if let Err(e) =
-        crate::persistence::save_blackhole_table(&snapshot.blackhole_table, &blackhole_path)
-    {
-        trace!("failed to save blackhole table: {}", e);
-    } else {
         debug!(
             "saved blackhole table ({} entries)",
             snapshot.blackhole_table.len()
@@ -123,39 +130,32 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
 
     // Publisher files are written only when fetched (Discovery.py).
     if let Some(local_identity_hash) = snapshot.transport_identity_hash {
-        let blackhole_dir = dir.join("blackhole");
-        if let Err(e) = crate::persistence::save_local_blackhole_file(
-            &snapshot.blackhole_table,
-            local_identity_hash,
-            &blackhole_dir,
-        ) {
-            trace!("failed to save Python blackhole files: {}", e);
+        let written =
+            p::encode_local_blackhole_file(&snapshot.blackhole_table, local_identity_hash)
+                .and_then(|bytes| p::write_local_blackhole_file(&bytes, &dir.join("blackhole")));
+        if let Err(e) = written {
+            trace!("failed to save Python blackhole files: {e}");
         }
     }
 
     // Per-announce Python cache files are written event-driven at receive
     // (`cache_announce_to_disk`), not re-serialized here every cycle.
 
-    let tunnel_path = dir.join("tunnel_table.msgpack");
-    if let Err(e) =
-        crate::persistence::save_tunnel_table(&snapshot.tunnel_table, interface_names, &tunnel_path)
-    {
-        trace!("failed to save tunnel table: {}", e);
-    } else {
+    if write_encoded(
+        dir,
+        "tunnel_table.msgpack",
+        p::encode_tunnel_table(&snapshot.tunnel_table, &keys),
+    ) {
         debug!(
             "saved tunnel table ({} entries)",
             snapshot.tunnel_table.len()
         );
     }
-
-    let python_tunnels_path = dir.join("tunnels");
-    if let Err(e) = crate::persistence::save_python_tunnel_table(
-        &snapshot.tunnel_table,
-        interface_names,
-        &python_tunnels_path,
-    ) {
-        trace!("failed to save Python tunnels table: {}", e);
-    }
+    write_encoded(
+        dir,
+        "tunnels",
+        p::encode_python_tunnel_table(&snapshot.tunnel_table, &keys),
+    );
 
     debug!(
         paths = snapshot.path_table.len(),
@@ -430,6 +430,7 @@ impl TransportActor {
                 trace!("failed to save hashlist: {}", e);
             } else {
                 info!(entries = hashes.len(), "flushed hashlist");
+                self.hashlist_saved_revision = self.packet_hashlist.revision();
             }
             save_announce_rate_table(dir, &self.rate_table.to_bytes());
         }
@@ -438,15 +439,22 @@ impl TransportActor {
     /// Falling-edge (foreground→background) flush. Same coverage as
     /// `save_state` but entirely off-actor: on desktop the edge fires on
     /// every window focus loss, and the inline fsync chain (F_FULLFSYNC per
-    /// file on macOS) stalls routing + control queries for seconds.
+    /// file on macOS) stalls routing + control queries for seconds. What
+    /// is already on disk is not written again.
     pub(super) fn save_state_async(&mut self) {
-        self.save_routing_state_async();
+        if self.state_dirty {
+            self.save_routing_state_async();
+        }
         if !self.owns_persistent_hashlist() {
             return;
         }
         let Some(dir) = self.storage_dir.clone() else {
             return;
         };
+        let revision = self.packet_hashlist.revision();
+        if revision == self.hashlist_saved_revision {
+            return;
+        }
         if self
             .hashlist_save_in_flight
             .load(std::sync::atomic::Ordering::Acquire)
@@ -456,6 +464,7 @@ impl TransportActor {
         }
         self.hashlist_save_in_flight
             .store(true, std::sync::atomic::Ordering::Release);
+        self.hashlist_saved_revision = revision;
         let hashes = self.packet_hashlist.current_hashes();
         let rate_table = self.rate_table.to_bytes();
         let in_flight = self.hashlist_save_in_flight.clone();
@@ -548,6 +557,7 @@ impl TransportActor {
                         );
                     }
                     self.packet_hashlist.load_from(loaded.hashes);
+                    self.hashlist_saved_revision = self.packet_hashlist.revision();
                     debug!(count, "loaded canonical packet hashlist from disk");
                 }
                 Err(e) => {
@@ -575,6 +585,7 @@ impl TransportActor {
                     self.packet_hashlist.load_from(hashes.clone());
                     match crate::persistence::save_raw_hashes(&hashes, &raw_path) {
                         Ok(()) => {
+                            self.hashlist_saved_revision = self.packet_hashlist.revision();
                             info!(
                                 source = %legacy_path.display(),
                                 destination = %raw_path.display(),
@@ -1449,6 +1460,46 @@ mod async_save_tests {
         );
         actor.state_dirty = true;
         actor
+    }
+
+    /// A cull pass that removes nothing leaves the routing state clean, so the
+    /// periodic save has nothing to write.
+    #[test]
+    fn empty_cull_pass_leaves_state_clean() {
+        let dir = temp_storage();
+        let mut actor = dirty_actor(&dir);
+        actor.state_dirty = false;
+        actor.last_tables_cull = 0.0;
+        actor.last_blackhole_check = 0.0;
+        actor.on_tick();
+        assert!(actor.path_table.has_path(&[0x11; 16]));
+        assert!(!actor.state_dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A background edge writes only what changed since the last save.
+    #[test]
+    fn background_save_skips_unchanged_state() {
+        let dir = temp_storage();
+        let mut actor = dirty_actor(&dir);
+        actor.is_transport_enabled = true;
+        actor.state_dirty = false;
+        actor.save_state_async();
+        assert!(!dir.join("path_table.msgpack").exists());
+        assert!(!dir.join("packet_hashlist.raw").exists());
+
+        actor.packet_hashlist.insert([0xAA; 32]);
+        actor.save_state_async();
+        assert!(!dir.join("path_table.msgpack").exists());
+        let saved = crate::persistence::load_hashlist_raw(&dir.join("packet_hashlist.raw"));
+        assert_eq!(saved.unwrap().hashes, vec![[0xAA; 32]]);
+
+        std::fs::remove_file(dir.join("packet_hashlist.raw")).unwrap();
+        actor.state_dirty = true;
+        actor.save_state_async();
+        assert!(dir.join("path_table.msgpack").exists());
+        assert!(!dir.join("packet_hashlist.raw").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Pending known-destination marks are handed to the store on the 10 s cadence,

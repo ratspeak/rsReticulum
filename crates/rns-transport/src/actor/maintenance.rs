@@ -45,7 +45,9 @@ impl TransportActor {
         if now - self.last_tables_cull >= TABLES_CULL_INTERVAL {
             self.cull_path_table(now);
             self.reverse_table.cull_expired();
-            self.tunnel_table.cull_expired();
+            if self.tunnel_table.cull_expired() > 0 {
+                self.state_dirty = true;
+            }
             self.cull_stale_tunnel_paths(now);
             self.cull_path_interface_suppressions(now);
             self.cull_local_link_route_attempts(now);
@@ -75,12 +77,6 @@ impl TransportActor {
                     );
                 }
             }
-
-            // Cull may have removed path/tunnel entries — flag for save so
-            // the on-disk file reflects the current routing state. False
-            // positives (cull found nothing) cost one no-op file rewrite at
-            // the next periodic flush.
-            self.state_dirty = true;
             self.last_tables_cull = now;
         }
 
@@ -131,8 +127,8 @@ impl TransportActor {
         if now - self.last_blackhole_check >= BLACKHOLE_CHECK_INTERVAL {
             if self.blackhole_table.cull_expired() > 0 {
                 self.publish_blackhole_snapshot();
+                self.state_dirty = true;
             }
-            self.state_dirty = true;
             self.last_blackhole_check = now;
         }
 
@@ -266,6 +262,7 @@ impl TransportActor {
             }
         }
         if removed > 0 {
+            self.state_dirty = true;
             pathing!(removed, "removed stale paths");
         }
     }

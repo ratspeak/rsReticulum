@@ -1439,6 +1439,8 @@ impl TransportActor {
                 .insert(pkt_hash, interface_id, Some(target_interface));
             self.send_to_interface(target_interface, &forwarded);
             if let Some(path) = self.path_table.get_live_mut(&header.destination_hash) {
+                // A first use is persisted: the path cull keeps used paths.
+                self.state_dirty |= path.used == 0.0;
                 path.mark_used();
             }
             trace!(
@@ -1568,6 +1570,8 @@ impl TransportActor {
                 return;
             }
             if let Some(path) = self.path_table.get_live_mut(&header.destination_hash) {
+                // A first use is persisted: the path cull keeps used paths.
+                self.state_dirty |= path.used == 0.0;
                 path.mark_used();
             }
 
@@ -2237,6 +2241,7 @@ impl TransportActor {
         }
         // Transport.py
         if let Some(path) = self.path_table.get_mut(&entry.destination_hash) {
+            self.state_dirty |= path.used == 0.0;
             path.mark_used();
         }
         trace!(

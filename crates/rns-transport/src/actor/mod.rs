@@ -318,6 +318,8 @@ pub struct TransportActor {
     /// decides whether a queued writer is still current.
     pub(crate) routing_save_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub(crate) hashlist_save_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `packet_hashlist.revision()` as last loaded or saved.
+    pub(crate) hashlist_saved_revision: u64,
 
     /// Persisted path entries waiting on their interface to re-register.
     /// Drained by `drain_pending_for_interface` on `RegisterInterface`.
@@ -608,6 +610,7 @@ impl TransportActor {
             routing_save_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             routing_save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             hashlist_save_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hashlist_saved_revision: 0,
             pending_path_entries: Vec::new(),
             recent_announces: HashMap::new(),
             startup_complete: false,

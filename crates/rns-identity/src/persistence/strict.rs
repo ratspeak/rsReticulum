@@ -265,16 +265,9 @@ fn barrier_unsupported(error: &io::Error) -> bool {
     }
 }
 
+/// On Apple targets `sync_all` is already `F_FULLFSYNC`.
 fn file_barrier(file: &File) -> io::Result<()> {
-    supported_barrier(file.sync_all())?;
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        use std::os::fd::AsRawFd;
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
-            supported_barrier(Err(io::Error::last_os_error()))?;
-        }
-    }
-    Ok(())
+    supported_barrier(file.sync_all())
 }
 
 fn parent_barrier(_path: &Path) -> io::Result<()> {

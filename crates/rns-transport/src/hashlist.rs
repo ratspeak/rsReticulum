@@ -13,6 +13,8 @@ pub struct PacketHashlist {
     current: HashSet<[u8; 32]>,
     previous: HashSet<[u8; 32]>,
     max_size: usize,
+    /// Bumped on every change to `current`, the persisted generation.
+    revision: u64,
 }
 
 impl PacketHashlist {
@@ -28,6 +30,7 @@ impl PacketHashlist {
             current: HashSet::new(),
             previous: HashSet::new(),
             max_size,
+            revision: 0,
         }
     }
 
@@ -42,6 +45,7 @@ impl PacketHashlist {
             return false;
         }
         self.current.insert(hash);
+        self.revision += 1;
         true
     }
 
@@ -57,7 +61,9 @@ impl PacketHashlist {
 
     /// Forget a hash from both generations.
     pub fn remove(&mut self, hash: &[u8; 32]) {
-        self.current.remove(hash);
+        if self.current.remove(hash) {
+            self.revision += 1;
+        }
         self.previous.remove(hash);
     }
 
@@ -65,6 +71,7 @@ impl PacketHashlist {
     /// begin an empty current generation.
     pub fn force_rotate(&mut self) {
         self.previous = std::mem::take(&mut self.current);
+        self.revision += 1;
     }
 
     pub fn len(&self) -> usize {
@@ -78,6 +85,12 @@ impl PacketHashlist {
     pub fn clear(&mut self) {
         self.current.clear();
         self.previous.clear();
+        self.revision += 1;
+    }
+
+    /// Changes when the current generation may have changed.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Snapshot the current generation in unspecified order for persistence.
@@ -109,6 +122,7 @@ impl PacketHashlist {
     pub fn load_from(&mut self, hashes: Vec<[u8; 32]>) {
         self.current = hashes.into_iter().collect();
         self.previous.clear();
+        self.revision += 1;
     }
 }
 
