@@ -83,6 +83,7 @@ pub rns_transport::background_egress::BackgroundRegistrationError::Duplicate
 pub struct rns_transport::background_egress::BackgroundAnnounceReceiver
 impl rns_transport::background_egress::BackgroundAnnounceReceiver
 pub fn rns_transport::background_egress::BackgroundAnnounceReceiver::has_offer(&self) -> bool
+pub async fn rns_transport::background_egress::BackgroundAnnounceReceiver::offered(&self)
 pub fn rns_transport::background_egress::BackgroundAnnounceReceiver::ordinary_is_empty(&self) -> bool
 pub fn rns_transport::background_egress::BackgroundAnnounceReceiver::register(&tokio::sync::mpsc::bounded::Sender<bytes::bytes::Bytes>) -> core::result::Result<Self, rns_transport::background_egress::BackgroundRegistrationError>
 pub fn rns_transport::background_egress::BackgroundAnnounceReceiver::retire_generation(&self)
