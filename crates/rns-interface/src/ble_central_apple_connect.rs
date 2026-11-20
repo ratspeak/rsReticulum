@@ -5,10 +5,11 @@
 
 #![cfg(any(target_os = "ios", target_os = "macos"))]
 
+use crate::apple_objc::{cbuuid, nsarray, nsdata};
 use crate::ble_tx_queue::PacketQueue;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
 use objc2::{msg_send, sel};
-use objc2_foundation::NSString;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -135,7 +136,7 @@ pub struct ConnectedPeer {
 
 impl Drop for ConnectedPeer {
     fn drop(&mut self) {
-        unsafe {
+        autoreleasepool(|_| unsafe {
             // Clear the (weakly-retained) delegate first so a late callback
             // can't fire into freed memory after the release below.
             if !self.peripheral.0.is_null() {
@@ -157,7 +158,7 @@ impl Drop for ConnectedPeer {
                     let _: () = msg_send![p.0, release];
                 }
             }
-        }
+        });
     }
 }
 
@@ -212,12 +213,12 @@ pub async fn connect_peer(
             reason = %reason,
             "Apple BLE central connect: tearing down partial connection"
         );
-        unsafe {
+        autoreleasepool(|_| unsafe {
             let _: () = msg_send![&*manager, cancelPeripheralConnection: peripheral];
             let _: () = msg_send![peripheral, setDelegate: std::ptr::null::<AnyObject>()];
             let _: () = msg_send![delegate, release];
             let _: () = msg_send![peripheral, release];
-        }
+        });
         if let Ok(mut g) = pending().lock() {
             for kind in [
                 CallbackKind::Connect,
@@ -239,11 +240,11 @@ pub async fn connect_peer(
         "Apple BLE central: connectPeripheral"
     );
     let rx = install_pending(&address, CallbackKind::Connect);
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let _: () = msg_send![&*manager.0,
             connectPeripheral: peripheral.0,
             options: std::ptr::null::<AnyObject>()];
-    }
+    });
     if let Err(e) = await_step(rx, "connect", CONNECT_TIMEOUT).await {
         teardown_partial(&address, manager.0, peripheral.0, delegate.0, &e);
         return Err(e);
@@ -263,17 +264,19 @@ pub async fn connect_peer(
     // install_pending must run BEFORE the CB call so a fast-path callback
     // (cached service data) can't race ahead of its own entry.
     let rx = install_pending(&address, CallbackKind::Services);
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let _: () = msg_send![peripheral.0, setDelegate: delegate.0];
         let svc_filter = build_cbuuid_array(&[target_service_uuid]);
-        let _: () = msg_send![peripheral.0, discoverServices: svc_filter];
-    }
+        let _: () = msg_send![peripheral.0, discoverServices: &*svc_filter];
+    });
     if let Err(e) = await_step(rx, "discoverServices", DISCOVERY_TIMEOUT).await {
         teardown_partial(&address, manager.0, peripheral.0, delegate.0, &e);
         return Err(e);
     }
 
-    let service = match unsafe { find_service(peripheral.0, target_service_uuid) } {
+    let service = match autoreleasepool(|_| unsafe {
+        find_service(peripheral.0, target_service_uuid)
+    }) {
         Some(p) => SendPtr(p),
         None => {
             let msg = format!("target service {target_service_uuid} not present after discovery");
@@ -295,39 +298,41 @@ pub async fn connect_peer(
         PeerProtocol::Columba => (COLUMBA_RX_UUID, COLUMBA_TX_UUID),
     };
     let rx = install_pending(&address, CallbackKind::Chars);
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let chars_filter = build_cbuuid_array(&[rx_uuid, tx_uuid]);
         let _: () = msg_send![peripheral.0,
-            discoverCharacteristics: chars_filter,
+            discoverCharacteristics: &*chars_filter,
             forService: service.0];
-    }
+    });
     if let Err(e) = await_step(rx, "discoverCharacteristics", DISCOVERY_TIMEOUT).await {
         teardown_partial(&address, manager.0, peripheral.0, delegate.0, &e);
         return Err(e);
     }
 
-    let rx_char = match unsafe { find_char(service.0, rx_uuid) } {
-        Some(p) => SendPtr(p),
-        None => {
+    // The peripheral owns these; retain so they outlive any single
+    // delegate callback frame.
+    let found = autoreleasepool(|_| unsafe {
+        let rx_char = find_char(service.0, rx_uuid);
+        let tx_char = find_char(service.0, tx_uuid);
+        if let (Some(rx), Some(tx)) = (rx_char, tx_char) {
+            let _: *mut AnyObject = msg_send![rx, retain];
+            let _: *mut AnyObject = msg_send![tx, retain];
+        }
+        (rx_char, tx_char)
+    });
+    let (rx_char, tx_char) = match found {
+        (Some(rx), Some(tx)) => (SendPtr(rx), SendPtr(tx)),
+        (None, _) => {
             let msg = format!("rx characteristic {rx_uuid} missing after discovery");
             teardown_partial(&address, manager.0, peripheral.0, delegate.0, &msg);
             return Err(msg);
         }
-    };
-    let tx_char = match unsafe { find_char(service.0, tx_uuid) } {
-        Some(p) => SendPtr(p),
-        None => {
+        (_, None) => {
             let msg = format!("tx characteristic {tx_uuid} missing after discovery");
             teardown_partial(&address, manager.0, peripheral.0, delegate.0, &msg);
             return Err(msg);
         }
     };
-    // The peripheral owns these; retain so they outlive any single
-    // delegate callback frame.
-    unsafe {
-        let _: *mut AnyObject = msg_send![rx_char.0, retain];
-        let _: *mut AnyObject = msg_send![tx_char.0, retain];
-    }
     tracing::info!(
         target: "ble_trace",
         step = "apple_connect.chars_discovered",
@@ -339,11 +344,11 @@ pub async fn connect_peer(
 
     // Step 4: setNotifyValue:YES on tx_char (CB handles CCCD internally).
     let rx = install_pending(&address, CallbackKind::Notify);
-    unsafe {
+    autoreleasepool(|_| unsafe {
         let _: () = msg_send![peripheral.0,
             setNotifyValue: true,
             forCharacteristic: tx_char.0];
-    }
+    });
     if let Err(e) = await_step(rx, "setNotifyValue", DISCOVERY_TIMEOUT).await {
         // Balance the rx/tx retains on failure.
         unsafe {
@@ -437,17 +442,19 @@ fn enqueue_packet(peer: &ConnectedPeer, frames: Vec<Vec<u8>>) -> Result<bool, St
 }
 
 fn drain_peer_queue(peer: &ConnectedPeer, q: &mut PacketQueue) {
-    while q.drain_one(|data| {
-        if !peer.online.load(Ordering::SeqCst) {
-            return false;
-        }
-        let ready: bool = unsafe { msg_send![peer.peripheral.0, canSendWriteWithoutResponse] };
-        if !ready {
-            return false;
-        }
-        unsafe { issue_write(peer, data) };
-        true
-    }) {}
+    autoreleasepool(|_| {
+        while q.drain_one(|data| {
+            if !peer.online.load(Ordering::SeqCst) {
+                return false;
+            }
+            let ready: bool = unsafe { msg_send![peer.peripheral.0, canSendWriteWithoutResponse] };
+            if !ready {
+                return false;
+            }
+            unsafe { issue_write(peer, data) };
+            true
+        }) {}
+    });
 }
 
 /// Caller must have either confirmed `canSendWriteWithoutResponse` or be
@@ -457,11 +464,11 @@ fn drain_peer_queue(peer: &ConnectedPeer, q: &mut PacketQueue) {
 /// `peer.peripheral.0` and `peer.rx_char.0` must be retained, valid CB
 /// pointers.
 unsafe fn issue_write(peer: &ConnectedPeer, data: &[u8]) {
+    let value = nsdata(data);
+    const WRITE_WITHOUT_RESPONSE: i64 = 1;
     unsafe {
-        let nsdata = nsdata_from_slice(data);
-        const WRITE_WITHOUT_RESPONSE: i64 = 1;
         let _: () = msg_send![peer.peripheral.0,
-            writeValue: nsdata,
+            writeValue: &*value,
             forCharacteristic: peer.rx_char.0,
             type: WRITE_WITHOUT_RESPONSE];
     }
@@ -481,10 +488,10 @@ pub fn disconnect_peer(address: &str) {
         *q = PacketQueue::default();
     }
     if let Some(manager_ptr) = crate::ble_central_apple::central_manager_ptr() {
-        unsafe {
+        autoreleasepool(|_| unsafe {
             let _: () = msg_send![&*manager_ptr,
                 cancelPeripheralConnection: peer.peripheral.0];
-        }
+        });
     }
     // online_flags entry stays — the disconnect callback flips it.
     tracing::info!(
@@ -575,8 +582,6 @@ pub unsafe fn adopt_restored_peer(
         Some(p) => SendPtr(p),
         None => {
             unsafe {
-                let _: () = msg_send![rx_char.0, retain];
-                let _: () = msg_send![rx_char.0, release];
                 let _: () = msg_send![peripheral, release];
             }
             return Err(format!(
@@ -824,8 +829,8 @@ async fn await_step(
 
 fn peripheral_delegate_class() -> &'static AnyClass {
     DELEGATE_CLASS.get_or_init(|| {
-        let superclass = AnyClass::get("NSObject").expect("NSObject must exist");
-        let mut builder = ClassBuilder::new("RatspeakBlePeripheralDelegate", superclass)
+        let superclass = AnyClass::get(c"NSObject").expect("NSObject must exist");
+        let mut builder = ClassBuilder::new(c"RatspeakBlePeripheralDelegate", superclass)
             .expect("ClassBuilder for peripheral delegate must succeed");
 
         extern "C" fn did_discover_services(
@@ -1015,41 +1020,11 @@ fn peripheral_delegate_class() -> &'static AnyClass {
     })
 }
 
-/// Autoreleased `NSArray<CBUUID>`; CB retains internally.
-fn build_cbuuid_array(uuids: &[Uuid]) -> *mut AnyObject {
-    if uuids.is_empty() {
-        return std::ptr::null_mut();
-    }
-    let cbuuid_cls = match AnyClass::get("CBUUID") {
-        Some(c) => c,
-        None => return std::ptr::null_mut(),
-    };
-    let nsarr_cls = match AnyClass::get("NSArray") {
-        Some(c) => c,
-        None => return std::ptr::null_mut(),
-    };
-    let mut raw_ptrs: Vec<*const AnyObject> = Vec::with_capacity(uuids.len());
-    for u in uuids {
-        let s = NSString::from_str(&u.to_string());
-        unsafe {
-            let cb: *mut AnyObject = msg_send![cbuuid_cls, UUIDWithString: &*s];
-            raw_ptrs.push(cb as *const AnyObject);
-        }
-    }
-    unsafe {
-        msg_send![nsarr_cls,
-            arrayWithObjects: raw_ptrs.as_ptr(),
-            count: raw_ptrs.len()]
-    }
-}
-
-/// Autoreleased `NSData` over a copy of `bytes`; valid for the synchronous
-/// CB call only.
-unsafe fn nsdata_from_slice(bytes: &[u8]) -> *mut AnyObject {
-    let cls = AnyClass::get("NSData").expect("NSData class must exist");
-    let ptr = bytes.as_ptr() as *const std::ffi::c_void;
-    let len = bytes.len();
-    unsafe { msg_send![cls, dataWithBytes: ptr, length: len] }
+/// Call inside `autoreleasepool`: the CBUUIDs autorelease.
+fn build_cbuuid_array(uuids: &[Uuid]) -> Retained<AnyObject> {
+    let owned: Vec<_> = uuids.iter().map(cbuuid).collect();
+    let refs: Vec<&AnyObject> = owned.iter().map(|u| &**u).collect();
+    nsarray(&refs)
 }
 
 unsafe fn find_service(peripheral: *mut AnyObject, uuid: Uuid) -> Option<*mut AnyObject> {
@@ -1203,6 +1178,13 @@ unsafe fn nsstring_to_string(s: *mut AnyObject) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cbuuid_filter_holds_no_extra_retains() {
+        assert!(crate::apple_objc::tests::freed_on_drop(|| {
+            autoreleasepool(|_| vec![build_cbuuid_array(&[RATSPEAK_RX_UUID, RATSPEAK_TX_UUID])])
+        }));
+    }
 
     #[test]
     fn expand_short_uuid_round_trip_16bit() {

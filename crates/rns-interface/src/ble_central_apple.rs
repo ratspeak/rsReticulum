@@ -8,6 +8,7 @@ use crate::ble_central_lifecycle::{
     CentralEvent, CentralLifecycle, CentralState, DiscoveryEvent, classify_protocol,
 };
 use crate::ble_peer::{COLUMBA_SERVICE_UUID, RATSPEAK_SERVICE_UUID};
+use objc2::rc::autoreleasepool;
 use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
 use objc2::{msg_send, sel};
 use objc2_core_bluetooth::{
@@ -144,7 +145,7 @@ pub async fn start_scan(
         let delegate_raw: *mut AnyObject = msg_send![delegate_cls, alloc];
         let delegate_raw: *mut AnyObject = msg_send![delegate_raw, init];
 
-        let Some(mgr_cls) = AnyClass::get("CBCentralManager") else {
+        let Some(mgr_cls) = AnyClass::get(c"CBCentralManager") else {
             tracing::error!("Apple BLE Central: CBCentralManager class not found");
             return;
         };
@@ -216,12 +217,12 @@ pub async fn stop_scan() -> Result<(), String> {
         }
     };
 
-    unsafe {
-        // We do NOT release the manager — the next start_scan reuses it.
-        // Per-cycle release on macOS triggers CBManagerStateUnsupported.
-        // `teardown_central` does the full release on interface shutdown.
+    // We do NOT release the manager — the next start_scan reuses it.
+    // Per-cycle release on macOS triggers CBManagerStateUnsupported.
+    // `teardown_central` does the full release on interface shutdown.
+    autoreleasepool(|_| unsafe {
         let _: () = msg_send![&*mgr_ptr, stopScan];
-    }
+    });
 
     finalize_stop();
     Ok(())
@@ -286,8 +287,8 @@ pub fn central_manager_ptr() -> Option<*mut AnyObject> {
 
 fn get_delegate_class() -> &'static AnyClass {
     DELEGATE_CLASS.get_or_init(|| {
-        let superclass = AnyClass::get("NSObject").expect("NSObject must exist");
-        let mut builder = ClassBuilder::new("RatspeakBleCentralDelegate", superclass)
+        let superclass = AnyClass::get(c"NSObject").expect("NSObject must exist");
+        let mut builder = ClassBuilder::new(c"RatspeakBleCentralDelegate", superclass)
             .expect("ClassBuilder for central delegate must succeed");
 
         extern "C" fn did_update_state(
@@ -720,23 +721,14 @@ unsafe fn scan_with_manager(mgr_raw: *mut AnyObject) -> Result<(), String> {
         .map_err(|e| format!("scan_services lock poisoned: {e}"))?
         .clone();
 
-    unsafe {
+    autoreleasepool(|_| unsafe {
+        let uuids: Vec<_> = services.iter().map(crate::apple_objc::cbuuid).collect();
+        let refs: Vec<&AnyObject> = uuids.iter().map(|u| &**u).collect();
         // nil filter = scan all.
-        let svc_arr: *mut AnyObject = if services.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            let arr_cls = AnyClass::get("NSArray").ok_or("NSArray not found")?;
-            let mut raw_ptrs: Vec<*const AnyObject> = Vec::with_capacity(services.len());
-            for u in &services {
-                raw_ptrs.push(cbuuid(u) as *const AnyObject);
-            }
-            msg_send![arr_cls,
-                arrayWithObjects: raw_ptrs.as_ptr(),
-                count: raw_ptrs.len()]
-        };
+        let svc_arr = (!refs.is_empty()).then(|| crate::apple_objc::nsarray(&refs));
 
-        let number_cls = AnyClass::get("NSNumber").ok_or("NSNumber not found")?;
-        let dict_cls = AnyClass::get("NSDictionary").ok_or("NSDictionary not found")?;
+        let number_cls = AnyClass::get(c"NSNumber").ok_or("NSNumber not found")?;
+        let dict_cls = AnyClass::get(c"NSDictionary").ok_or("NSDictionary not found")?;
         let yes: *mut AnyObject = msg_send![number_cls, numberWithBool: true];
         let opts: *mut AnyObject = msg_send![dict_cls,
             dictionaryWithObject: yes,
@@ -750,16 +742,16 @@ unsafe fn scan_with_manager(mgr_raw: *mut AnyObject) -> Result<(), String> {
             "Apple BLE Central: scanForPeripheralsWithServices"
         );
         let _: () = msg_send![&*mgr_raw,
-            scanForPeripheralsWithServices: svc_arr,
+            scanForPeripheralsWithServices: svc_arr.as_deref(),
             options: opts];
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// `{ RestoreIdentifierKey: CENTRAL_RESTORE_ID }`. Ignored on macOS.
 unsafe fn build_init_options() -> Result<*mut AnyObject, String> {
     unsafe {
-        let dict_cls = AnyClass::get("NSDictionary").ok_or("NSDictionary not found")?;
+        let dict_cls = AnyClass::get(c"NSDictionary").ok_or("NSDictionary not found")?;
         let restore_id = NSString::from_str(CENTRAL_RESTORE_ID);
         let opts: *mut AnyObject = msg_send![dict_cls,
             dictionaryWithObject: &*restore_id,
@@ -849,18 +841,6 @@ unsafe fn nsstring_to_string(s: *mut AnyObject) -> String {
         }
         let bytes = std::slice::from_raw_parts(utf8 as *const u8, len);
         String::from_utf8_lossy(bytes).into_owned()
-    }
-}
-
-fn cbuuid(uuid: &Uuid) -> *mut AnyObject {
-    let s = NSString::from_str(&uuid.to_string());
-    unsafe {
-        let cls = AnyClass::get("CBUUID").expect("CBUUID must exist at runtime");
-        let obj: *mut AnyObject = msg_send![cls, UUIDWithString: &*s];
-        // UUIDWithString: returns autoreleased; retain so the pointer
-        // survives the autorelease pool drain.
-        let _: *mut AnyObject = msg_send![obj, retain];
-        obj
     }
 }
 

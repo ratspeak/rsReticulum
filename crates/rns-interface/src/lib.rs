@@ -9,6 +9,8 @@ pub mod android_usb;
 mod android_usb_lifecycle;
 #[cfg(any(target_os = "android", test))]
 mod android_usb_setup;
+#[cfg(all(feature = "ble", any(target_os = "ios", target_os = "macos")))]
+mod apple_objc;
 pub mod auto;
 pub mod ax25kiss;
 pub mod backbone;

@@ -803,7 +803,7 @@
           "rename": null,
           "kind": null,
           "target": "cfg(any(target_os = \"ios\", target_os = \"macos\"))",
-          "requirement": "^0.5",
+          "requirement": "^0.6",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -814,12 +814,14 @@
           "rename": null,
           "kind": null,
           "target": "cfg(any(target_os = \"ios\", target_os = \"macos\"))",
-          "requirement": "^0.2",
+          "requirement": "^0.3",
           "optional": false,
-          "defaultFeatures": true,
+          "defaultFeatures": false,
           "features": [
             "CBAdvertisementData",
-            "CBCentralManagerConstants"
+            "CBCentralManagerConstants",
+            "CBPeripheralManagerConstants",
+            "std"
           ],
           "sourceKind": "registry"
         },
@@ -828,11 +830,12 @@
           "rename": null,
           "kind": null,
           "target": "cfg(any(target_os = \"ios\", target_os = \"macos\"))",
-          "requirement": "^0.2",
+          "requirement": "^0.3",
           "optional": false,
-          "defaultFeatures": true,
+          "defaultFeatures": false,
           "features": [
-            "NSString"
+            "NSString",
+            "std"
           ],
           "sourceKind": "registry"
         },

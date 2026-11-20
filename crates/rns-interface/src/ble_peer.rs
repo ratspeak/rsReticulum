@@ -1510,8 +1510,15 @@ pub(crate) fn try_push_apple_inbound(peer: String, data: Vec<u8>) -> bool {
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 mod apple_peripheral {
     use super::*;
+    use crate::apple_objc::{cbuuid, nsarray, nsdata};
+    use objc2::rc::{Allocated, Retained, autoreleasepool};
     use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
     use objc2::{msg_send, sel};
+    use objc2_core_bluetooth::{
+        CBPeripheralManagerOptionRestoreIdentifierKey,
+        CBPeripheralManagerRestoredStateAdvertisementDataKey,
+        CBPeripheralManagerRestoredStateServicesKey,
+    };
     use objc2_foundation::NSString;
     use std::sync::OnceLock;
 
@@ -1630,15 +1637,6 @@ mod apple_peripheral {
     /// Must stay stable across updates; changing forfeits
     /// previously-backgrounded GATT subscriptions.
     const PERIPHERAL_RESTORE_ID: &str = "org.ratspeak.ios.peripheral";
-
-    // objc2-core-bluetooth 0.2.2 only exports the central-role keys; link
-    // the peripheral-role NSString constants directly.
-    #[link(name = "CoreBluetooth", kind = "framework")]
-    unsafe extern "C" {
-        static CBPeripheralManagerOptionRestoreIdentifierKey: &'static NSString;
-        static CBPeripheralManagerRestoredStateServicesKey: &'static NSString;
-        static CBPeripheralManagerRestoredStateAdvertisementDataKey: &'static NSString;
-    }
 
     /// Ratspeak primary + Columba compat.
     const EXPECTED_SERVICE_COUNT: usize = 2;
@@ -1856,8 +1854,8 @@ mod apple_peripheral {
 
     fn get_delegate_class() -> &'static AnyClass {
         DELEGATE_CLASS.get_or_init(|| {
-            let superclass = AnyClass::get("NSObject").unwrap();
-            let mut builder = ClassBuilder::new("RatspeakBleDelegate", superclass).unwrap();
+            let superclass = AnyClass::get(c"NSObject").unwrap();
+            let mut builder = ClassBuilder::new(c"RatspeakBleDelegate", superclass).unwrap();
 
             extern "C" fn did_update_state(
                 _this: *mut AnyObject,
@@ -2488,40 +2486,27 @@ mod apple_peripheral {
                 return false;
             }
         };
-        unsafe {
-            let arr_cls = match AnyClass::get("NSArray") {
-                Some(c) => c,
-                None => return false,
-            };
-            let data_cls = match AnyClass::get("NSData") {
-                Some(c) => c,
-                None => return false,
-            };
-            let payload: *mut AnyObject = msg_send![data_cls,
-                dataWithBytes: data.as_ptr() as *const std::ffi::c_void,
-                length: data.len()];
-            let centrals: *mut AnyObject = if let Some(peer_id) = to_peer {
-                let map = subscribed_centrals_map().lock().unwrap();
-                let ptr = match map.get(peer_id) {
-                    Some(p) => p.0,
-                    None => {
+        autoreleasepool(|_| unsafe {
+            let payload = nsdata(data);
+            let centrals = match to_peer {
+                Some(peer_id) => {
+                    let map = subscribed_centrals_map().lock().unwrap();
+                    let Some(central) = map.get(peer_id) else {
                         tracing::warn!(peer = %peer_id, "Apple BLE notify_tx: peer not in subscribed map");
                         return false;
-                    }
-                };
-                let one = [ptr as *const AnyObject];
-                msg_send![arr_cls, arrayWithObjects: one.as_ptr(), count: 1usize]
-            } else {
-                std::ptr::null_mut()
+                    };
+                    Some(nsarray(&[&*central.0]))
+                }
+                None => None,
             };
             let ok: bool = msg_send![
                 mgr,
-                updateValue: payload,
+                updateValue: &*payload,
                 forCharacteristic: char_ptr,
-                onSubscribedCentrals: centrals,
+                onSubscribedCentrals: centrals.as_deref(),
             ];
             ok
-        }
+        })
     }
 
     // We only need the TX chars from notify_tx, but the registry is keyed
@@ -2554,17 +2539,6 @@ mod apple_peripheral {
         map.iter()
             .find(|(_, sp)| sp.0 == ptr)
             .map(|(uuid, _)| *uuid)
-    }
-
-    /// Returns a raw retained pointer.
-    fn cbuuid(uuid: &Uuid) -> *mut AnyObject {
-        let s = NSString::from_str(&uuid.to_string());
-        unsafe {
-            let cls = AnyClass::get("CBUUID").unwrap();
-            let obj: *mut AnyObject = msg_send![cls, UUIDWithString: &*s];
-            let _: *mut AnyObject = msg_send![obj, retain];
-            obj
-        }
     }
 
     pub async fn start_advertising(identity_hash: &[u8]) -> Result<(), String> {
@@ -2608,7 +2582,7 @@ mod apple_peripheral {
             let delegate_raw: *mut AnyObject = msg_send![delegate_cls, alloc];
             let delegate_raw: *mut AnyObject = msg_send![delegate_raw, init];
 
-            let Some(mgr_cls) = AnyClass::get("CBPeripheralManager") else {
+            let Some(mgr_cls) = AnyClass::get(c"CBPeripheralManager") else {
                 tracing::error!("iOS BLE Peripheral: CBPeripheralManager class not found");
                 return;
             };
@@ -2617,7 +2591,7 @@ mod apple_peripheral {
             // background BLE event after the process is killed.
             let opts: *mut AnyObject = {
                 let dict_cls =
-                    AnyClass::get("NSDictionary").expect("NSDictionary must exist at runtime");
+                    AnyClass::get(c"NSDictionary").expect("NSDictionary must exist at runtime");
                 let id = NSString::from_str(PERIPHERAL_RESTORE_ID);
                 msg_send![dict_cls,
                     dictionaryWithObject: &*id,
@@ -2682,68 +2656,21 @@ mod apple_peripheral {
         mgr_raw: *mut AnyObject,
         id_hash: &[u8],
     ) -> Result<(), String> {
-        unsafe {
-            let char_cls = AnyClass::get("CBMutableCharacteristic")
-                .ok_or("CBMutableCharacteristic not found")?;
-            let svc_cls = AnyClass::get("CBMutableService").ok_or("CBMutableService not found")?;
-            let arr_cls = AnyClass::get("NSArray").ok_or("NSArray not found")?;
-            let dict_cls = AnyClass::get("NSDictionary").ok_or("NSDictionary not found")?;
-
-            // RX (write + writeNoResponse)
-            let rx_raw: *mut AnyObject = msg_send![char_cls, alloc];
-            let rx_raw: *mut AnyObject = msg_send![rx_raw,
-                initWithType: cbuuid(&RATSPEAK_RX_UUID), properties: 0x0Cu64,
-                value: std::ptr::null::<AnyObject>(), permissions: 0x02u64];
-            // TX (read + notify)
-            let tx_raw: *mut AnyObject = msg_send![char_cls, alloc];
-            let tx_raw: *mut AnyObject = msg_send![tx_raw,
-                initWithType: cbuuid(&RATSPEAK_TX_UUID), properties: 0x12u64,
-                value: std::ptr::null::<AnyObject>(), permissions: 0x01u64];
-            // Keep the registry pointer valid for notify_tx.
-            let _: *mut AnyObject = msg_send![tx_raw, retain];
-            register_characteristic(RATSPEAK_TX_UUID, tx_raw);
-            // No static ID characteristic: it exposed a MAC-rotation-stable
-            // identity read to any connecting scanner (a tracking vector) and
-            // was never read by this stack — identity is learned from signed
-            // announces instead.
-
-            // Ratspeak service (primary)
-            let svc_raw: *mut AnyObject = msg_send![svc_cls, alloc];
-            let svc_raw: *mut AnyObject = msg_send![svc_raw,
-                initWithType: cbuuid(&RATSPEAK_SERVICE_UUID), primary: true];
-            let char_ptrs = [rx_raw as *const AnyObject, tx_raw as *const AnyObject];
-            let chars: *mut AnyObject = msg_send![arr_cls,
-                arrayWithObjects: char_ptrs.as_ptr(), count: 2usize];
-            let _: () = msg_send![svc_raw, setCharacteristics: chars];
-            let _: () = msg_send![mgr_raw, addService: svc_raw];
-
-            // Columba compat (secondary, omitted from advertising payload).
-            let c_rx_raw: *mut AnyObject = msg_send![char_cls, alloc];
-            let c_rx_raw: *mut AnyObject = msg_send![c_rx_raw,
-                initWithType: cbuuid(&COLUMBA_RX_UUID), properties: 0x0Cu64,
-                value: std::ptr::null::<AnyObject>(), permissions: 0x02u64];
-            let c_tx_raw: *mut AnyObject = msg_send![char_cls, alloc];
-            let c_tx_raw: *mut AnyObject = msg_send![c_tx_raw,
-                initWithType: cbuuid(&COLUMBA_TX_UUID), properties: 0x12u64,
-                value: std::ptr::null::<AnyObject>(), permissions: 0x01u64];
-            let _: *mut AnyObject = msg_send![c_tx_raw, retain];
-            register_characteristic(COLUMBA_TX_UUID, c_tx_raw);
-            let c_svc_raw: *mut AnyObject = msg_send![svc_cls, alloc];
-            let c_svc_raw: *mut AnyObject = msg_send![c_svc_raw,
-                initWithType: cbuuid(&COLUMBA_SERVICE_UUID), primary: false];
-            let c_char_ptrs = [c_rx_raw as *const AnyObject, c_tx_raw as *const AnyObject];
-            let c_chars: *mut AnyObject = msg_send![arr_cls,
-                arrayWithObjects: c_char_ptrs.as_ptr(), count: 2usize];
-            let _: () = msg_send![c_svc_raw, setCharacteristics: c_chars];
-            let _: () = msg_send![mgr_raw, addService: c_svc_raw];
+        autoreleasepool(|_| unsafe {
+            let gatt = build_gatt_services()?;
+            let dict_cls = AnyClass::get(c"NSDictionary").ok_or("NSDictionary not found")?;
+            // The registry owns these +1s until it is drained.
+            register_characteristic(RATSPEAK_TX_UUID, Retained::into_raw(gatt.ratspeak_tx));
+            register_characteristic(COLUMBA_TX_UUID, Retained::into_raw(gatt.columba_tx));
+            // The manager retains each service.
+            let _: () = msg_send![mgr_raw, addService: &*gatt.ratspeak];
+            let _: () = msg_send![mgr_raw, addService: &*gatt.columba];
 
             // One 128-bit UUID fits in the 31-byte BLE 4.x adv PDU; two do not.
             let ad_key = NSString::from_str("kCBAdvDataServiceUUIDs");
-            let uuid_ptrs = [cbuuid(&RATSPEAK_SERVICE_UUID) as *const AnyObject];
-            let uuid_arr: *mut AnyObject = msg_send![arr_cls,
-                arrayWithObjects: uuid_ptrs.as_ptr(), count: 1usize];
+            let uuid_arr = nsarray(&[&*cbuuid(&RATSPEAK_SERVICE_UUID)]);
             let ad_dict: *mut AnyObject = msg_send![dict_cls,
-                dictionaryWithObject: uuid_arr, forKey: &*ad_key];
+                dictionaryWithObject: &*uuid_arr, forKey: &*ad_key];
             let _: () = msg_send![mgr_raw, startAdvertising: ad_dict];
 
             tracing::info!(
@@ -2755,7 +2682,53 @@ mod apple_peripheral {
                 "Apple BLE Peripheral: advertising started"
             );
             Ok(())
-        }
+        })
+    }
+
+    struct GattServices {
+        ratspeak: Retained<AnyObject>,
+        columba: Retained<AnyObject>,
+        ratspeak_tx: Retained<AnyObject>,
+        columba_tx: Retained<AnyObject>,
+    }
+
+    /// Call inside `autoreleasepool`: the CBUUIDs autorelease. No static ID
+    /// characteristic: it exposed a MAC-rotation-stable identity read to any
+    /// connecting scanner (a tracking vector) and was never read by this
+    /// stack — identity is learned from signed announces instead.
+    unsafe fn build_gatt_services() -> Result<GattServices, String> {
+        let char_cls =
+            AnyClass::get(c"CBMutableCharacteristic").ok_or("CBMutableCharacteristic not found")?;
+        let svc_cls = AnyClass::get(c"CBMutableService").ok_or("CBMutableService not found")?;
+        // RX: write + writeNoResponse, writeable. TX: read + notify, readable.
+        let characteristic = |uuid: &Uuid, properties: u64, permissions: u64| unsafe {
+            let obj: Allocated<AnyObject> = msg_send![char_cls, alloc];
+            let obj: Retained<AnyObject> = msg_send![obj,
+                initWithType: &*cbuuid(uuid), properties: properties,
+                value: std::ptr::null::<AnyObject>(), permissions: permissions];
+            obj
+        };
+        let service = |uuid: &Uuid, primary: bool, rx: &AnyObject, tx: &AnyObject| unsafe {
+            let obj: Allocated<AnyObject> = msg_send![svc_cls, alloc];
+            let obj: Retained<AnyObject> =
+                msg_send![obj, initWithType: &*cbuuid(uuid), primary: primary];
+            let chars = nsarray(&[rx, tx]);
+            let _: () = msg_send![&*obj, setCharacteristics: &*chars];
+            obj
+        };
+        let rx = characteristic(&RATSPEAK_RX_UUID, 0x0C, 0x02);
+        let ratspeak_tx = characteristic(&RATSPEAK_TX_UUID, 0x12, 0x01);
+        let ratspeak = service(&RATSPEAK_SERVICE_UUID, true, &rx, &ratspeak_tx);
+        // Columba compat: secondary, omitted from the advertising payload.
+        let c_rx = characteristic(&COLUMBA_RX_UUID, 0x0C, 0x02);
+        let columba_tx = characteristic(&COLUMBA_TX_UUID, 0x12, 0x01);
+        let columba = service(&COLUMBA_SERVICE_UUID, false, &c_rx, &columba_tx);
+        Ok(GattServices {
+            ratspeak,
+            columba,
+            ratspeak_tx,
+            columba_tx,
+        })
     }
 
     /// Walks the lifecycle state machine in lockstep with the platform
@@ -2829,9 +2802,9 @@ mod apple_peripheral {
         let mgr_send = SendPtr(mgr_ptr);
 
         if needs_stop_ad {
-            unsafe {
+            autoreleasepool(|_| unsafe {
                 let _: () = msg_send![mgr_send.0, stopAdvertising];
-            }
+            });
             // CB has no peripheralManagerDidStopAdvertising delegate — poll
             // `isAdvertising`. Radio flips within ~20ms; 1s budget covers
             // contended radios and bounce loops.
@@ -2855,13 +2828,13 @@ mod apple_peripheral {
             apply_event(crate::ble_peer_lifecycle::LifecycleEvent::AdvertiseStopped);
         }
 
-        unsafe {
+        autoreleasepool(|_| unsafe {
             let _: () = msg_send![mgr_send.0, removeAllServices];
-        }
+        });
         apply_event(crate::ble_peer_lifecycle::LifecycleEvent::ServicesRemoved);
 
-        // Without this, every toggle cycle leaks two CBMutableCharacteristic
-        // pointers and notify_tx can race onto dead characteristics post-teardown.
+        // Releases the registry's TX characteristics, so notify_tx can't race
+        // onto dead characteristics post-teardown.
         {
             let mut map = characteristic_registry().lock().unwrap();
             for (_, ptr) in map.drain() {
@@ -2929,6 +2902,15 @@ mod apple_peripheral {
     #[cfg(test)]
     mod notify_tests {
         use super::*;
+        #[test]
+        fn gatt_services_hold_no_extra_retains() {
+            assert!(crate::apple_objc::tests::freed_on_drop(|| {
+                autoreleasepool(|_| {
+                    let g = unsafe { build_gatt_services() }.unwrap();
+                    vec![g.ratspeak, g.columba, g.ratspeak_tx, g.columba_tx]
+                })
+            }));
+        }
         #[test]
         fn readiness_keeps_partial_packet_first_across_characteristics() {
             let mut state = NotifyState {
