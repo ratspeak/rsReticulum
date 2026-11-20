@@ -4731,7 +4731,7 @@ impl LinkManager {
                                                 if coordinator.is_complete() {
                                                     let total_segments = coordinator.total_segments;
                                                     coordinator
-                                                        .reassemble()
+                                                        .take_reassembled()
                                                         .map(|blob| {
                                                             Some((
                                                                 blob,

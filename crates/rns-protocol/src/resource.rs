@@ -1149,13 +1149,18 @@ impl LazyMultiSegmentOutbound {
 
 /// Collect independently verified Resource segments in order. Use
 /// `set_segment` with `assemble_segment`, or pass already verified payloads to
-/// `set_segment_data`. `reassemble` concatenates those payloads; it does not
-/// recompute or verify `original_hash` or impose a total byte limit.
+/// `set_segment_data`. Payloads that arrive in order are appended to one
+/// buffer at once; `take_reassembled` returns it. Neither recomputes or
+/// verifies `original_hash`.
 pub struct MultiSegmentInbound {
     pub original_hash: [u8; 32],
     pub total_segments: usize,
     pub segments: Vec<Option<InboundResource>>,
+    /// Payloads that arrived ahead of a missing segment, by 0-based index.
     pub assembled_segments: Vec<Option<Vec<u8>>>,
+    /// Segments `1..=assembled_through`, concatenated.
+    pub assembled: Vec<u8>,
+    pub assembled_through: usize,
     pub data_size: usize,
     /// First metadata supplied through `set_metadata`. Outbound constructors
     /// can attach metadata to the first segment; the owner must carry it here
@@ -1174,6 +1179,8 @@ impl MultiSegmentInbound {
             total_segments,
             segments: Vec::new(),
             assembled_segments: Vec::new(),
+            assembled: Vec::new(),
+            assembled_through: 0,
             data_size: 0,
             metadata: None,
             size_bound: None,
@@ -1215,10 +1222,40 @@ impl MultiSegmentInbound {
         let idx = segment_index - 1;
         if let Some(Some(resource)) = self.segments.get_mut(idx) {
             let data = resource.assemble(decrypt_fn)?;
-            *Self::slot(&mut self.assembled_segments, idx) = Some(data);
+            self.store(idx, data);
             Ok(())
         } else {
             Err(ResourceError::Incomplete)
+        }
+    }
+
+    fn has_segment(&self, idx: usize) -> bool {
+        idx < self.assembled_through || matches!(self.assembled_segments.get(idx), Some(Some(_)))
+    }
+
+    /// Append the payload when it is next in order, then any parked payloads
+    /// it unblocks; otherwise park it.
+    fn store(&mut self, idx: usize, data: Vec<u8>) {
+        if idx < self.assembled_through {
+            return;
+        }
+        if idx > self.assembled_through {
+            *Self::slot(&mut self.assembled_segments, idx) = Some(data);
+            return;
+        }
+        let mut next = Some(data);
+        while let Some(data) = next.take() {
+            // Grown as data arrives, never from the peer's segment count.
+            if self.assembled_through == 0 {
+                self.assembled = data;
+            } else {
+                self.assembled.extend_from_slice(&data);
+            }
+            self.assembled_through += 1;
+            next = self
+                .assembled_segments
+                .get_mut(self.assembled_through)
+                .and_then(Option::take);
         }
     }
 
@@ -1238,12 +1275,11 @@ impl MultiSegmentInbound {
         if self.size_bound.is_some_and(|bound| data_size > bound) {
             return Err(ResourceError::TooLarge);
         }
-        let slot = Self::slot(&mut self.assembled_segments, segment_index - 1);
-        if slot.is_some() {
+        if self.has_segment(segment_index - 1) {
             return Err(ResourceError::DuplicateSegment);
         }
         self.data_size = data_size;
-        *slot = Some(data);
+        self.store(segment_index - 1, data);
         Ok(())
     }
 
@@ -1258,23 +1294,31 @@ impl MultiSegmentInbound {
         self.assembled_count() == self.total_segments
     }
 
-    /// Concatenate every assembled segment into the original payload.
+    /// A copy of the original payload. [`Self::take_reassembled`] moves it.
     pub fn reassemble(&self) -> Result<Vec<u8>, ResourceError> {
         if !self.is_complete() {
             return Err(ResourceError::Incomplete);
         }
-        let mut result = Vec::new();
-        for seg in &self.assembled_segments {
-            result.extend_from_slice(seg.as_ref().ok_or(ResourceError::Incomplete)?);
+        Ok(self.assembled.clone())
+    }
+
+    /// Move out the original payload, leaving this collector empty.
+    pub fn take_reassembled(&mut self) -> Result<Vec<u8>, ResourceError> {
+        if !self.is_complete() {
+            return Err(ResourceError::Incomplete);
         }
-        Ok(result)
+        let mut payload = std::mem::take(&mut self.assembled);
+        payload.shrink_to_fit();
+        Ok(payload)
     }
 
     pub fn assembled_count(&self) -> usize {
-        self.assembled_segments
-            .iter()
-            .filter(|s| s.is_some())
-            .count()
+        self.assembled_through
+            + self
+                .assembled_segments
+                .iter()
+                .filter(|s| s.is_some())
+                .count()
     }
 
     /// Fraction of segments assembled so far, in `0.0..=1.0`.
@@ -4438,6 +4482,32 @@ mod tests {
         let blob = inbound.reassemble().unwrap();
         assert_eq!(&blob[..4], &[0xAA; 4]);
         assert_eq!(&blob[4..], &[0xCC; 4]);
+    }
+
+    /// In-order payloads join one buffer as they arrive; a later one waits for
+    /// the gap, and a repeat of either is refused.
+    #[test]
+    fn multi_segment_payloads_join_in_order_as_they_arrive() {
+        let mut inbound = MultiSegmentInbound::new(3, [0x11; 32]);
+        inbound.set_segment_data(1, vec![1; 4]).unwrap();
+        assert_eq!(inbound.assembled, [1; 4]);
+        inbound.set_segment_data(3, vec![3; 2]).unwrap();
+        assert_eq!(inbound.assembled_count(), 2);
+        assert!(matches!(
+            inbound.set_segment_data(1, vec![9]),
+            Err(ResourceError::DuplicateSegment)
+        ));
+        assert!(matches!(
+            inbound.set_segment_data(3, vec![9]),
+            Err(ResourceError::DuplicateSegment)
+        ));
+        assert!(inbound.take_reassembled().is_err());
+        inbound.set_segment_data(2, vec![2; 4]).unwrap();
+        assert!(inbound.assembled_segments.iter().all(Option::is_none));
+        assert_eq!(
+            inbound.take_reassembled().unwrap(),
+            [vec![1; 4], vec![2; 4], vec![3; 2]].concat()
+        );
     }
 
     /// Out-of-range indices (`0` and `> total_segments`) must surface as

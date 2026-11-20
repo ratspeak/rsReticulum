@@ -69,8 +69,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-protocol.txt",
-      "itemCount": 670,
-      "sha256": "c597cd463ba4cc68357fee72f7a3926086473383cf52014a38235a8f462e7ddf"
+      "itemCount": 673,
+      "sha256": "cac91c8ac80f6706f0d2a4257da740f8188846ffc7da61a8ff2a8a293ad6dee3"
     },
     {
       "name": "rns-interface",

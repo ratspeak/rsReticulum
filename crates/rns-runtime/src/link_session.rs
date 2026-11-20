@@ -3552,7 +3552,7 @@ async fn complete_inbound_segment(
                     coordinator.set_metadata(metadata);
                 }
                 if coordinator.is_complete() {
-                    match coordinator.reassemble() {
+                    match coordinator.take_reassembled() {
                         Ok(data) => {
                             complete_data = Some(data);
                             complete_metadata = coordinator.metadata.take();

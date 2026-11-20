@@ -345,7 +345,9 @@ pub fn rns_protocol::resource::LinkResource::progress(&self) -> f64
 pub fn rns_protocol::resource::LinkResource::receive_part(&mut self, alloc::vec::Vec<u8>) -> bool
 pub fn rns_protocol::resource::LinkResource::validate_proof(&mut self, &[u8]) -> bool
 pub struct rns_protocol::resource::MultiSegmentInbound
+pub rns_protocol::resource::MultiSegmentInbound::assembled: alloc::vec::Vec<u8>
 pub rns_protocol::resource::MultiSegmentInbound::assembled_segments: alloc::vec::Vec<core::option::Option<alloc::vec::Vec<u8>>>
+pub rns_protocol::resource::MultiSegmentInbound::assembled_through: usize
 pub rns_protocol::resource::MultiSegmentInbound::data_size: usize
 pub rns_protocol::resource::MultiSegmentInbound::metadata: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_protocol::resource::MultiSegmentInbound::original_hash: [u8; 32]
@@ -362,6 +364,7 @@ pub fn rns_protocol::resource::MultiSegmentInbound::reassemble(&self) -> core::r
 pub fn rns_protocol::resource::MultiSegmentInbound::set_metadata(&mut self, alloc::vec::Vec<u8>)
 pub fn rns_protocol::resource::MultiSegmentInbound::set_segment(&mut self, usize, rns_protocol::resource::InboundResource)
 pub fn rns_protocol::resource::MultiSegmentInbound::set_segment_data(&mut self, usize, alloc::vec::Vec<u8>) -> core::result::Result<(), rns_protocol::resource::ResourceError>
+pub fn rns_protocol::resource::MultiSegmentInbound::take_reassembled(&mut self) -> core::result::Result<alloc::vec::Vec<u8>, rns_protocol::resource::ResourceError>
 pub fn rns_protocol::resource::MultiSegmentInbound::with_size_bound(self, usize) -> Self
 pub struct rns_protocol::resource::MultiSegmentOutbound
 pub rns_protocol::resource::MultiSegmentOutbound::data_size: usize
