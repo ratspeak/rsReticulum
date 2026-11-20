@@ -1381,7 +1381,7 @@ pub struct LinkDistributionRpcEntry {
 
 /// Snapshot of a cached route. Times are Unix seconds; returned interface
 /// metadata can use fallback values if the interface is no longer registered.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct PathTableRpcEntry {
     pub hash: [u8; 16],
