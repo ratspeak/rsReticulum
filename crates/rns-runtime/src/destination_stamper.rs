@@ -298,12 +298,15 @@ pub enum Admission<T> {
     Dropped(T),
 }
 
-/// Per-destination stamp state for an owner's event loop. Parked path
-/// responses are kept in order; ordinary announces coalesce to the latest.
+/// Per-destination stamp state for an owner's event loop, shaped like
+/// Python's stamp queue: the announce that started the job is in progress and
+/// leaves first; parked path responses follow in order, then the parked
+/// announce, which coalesces to the latest.
 pub struct DestinationStamps<T> {
     owner: u64,
     tx: mpsc::UnboundedSender<StampOutcome>,
     rx: mpsc::UnboundedReceiver<StampOutcome>,
+    in_progress: Option<(T, bool)>,
     parked_path_responses: VecDeque<T>,
     parked_announce: Option<T>,
     job: Option<Arc<AtomicBool>>,
@@ -316,6 +319,7 @@ impl<T> Default for DestinationStamps<T> {
             owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
             tx,
             rx,
+            in_progress: None,
             parked_path_responses: VecDeque::new(),
             parked_announce: None,
             job: None,
@@ -347,18 +351,16 @@ impl<T> DestinationStamps<T> {
         if destination.destination_stamp_meets(target) {
             return Admission::Ready(item, destination.announce_stamp_ext(policy.lr_cost));
         }
-        if path_response {
-            if self.parked_path_responses.len() >= STAMPER_PR_QUEUE_LENGTH {
-                tracing::debug!(dest = %destination, "stamp queue full, dropping announce");
-                return Admission::Dropped(item);
-            }
-            self.parked_path_responses.push_back(item);
-        } else {
-            self.parked_announce = Some(item);
-        }
         if self.job.is_some() {
             if path_response {
+                if self.parked_path_responses.len() >= STAMPER_PR_QUEUE_LENGTH {
+                    tracing::debug!(dest = %destination, "stamp queue full, dropping announce");
+                    return Admission::Dropped(item);
+                }
+                self.parked_path_responses.push_back(item);
                 promote(self.owner);
+            } else {
+                self.parked_announce = Some(item);
             }
             return Admission::Queued;
         }
@@ -374,22 +376,18 @@ impl<T> DestinationStamps<T> {
             cancel: cancel.clone(),
             reply: self.tx.clone(),
         };
-        let priority = if self.parked_path_responses.is_empty() {
-            Priority::Announce
-        } else {
+        let priority = if path_response {
             Priority::PathResponse
+        } else {
+            Priority::Announce
         };
         if submit(job, priority) {
             self.job = Some(cancel);
+            self.in_progress = Some((item, path_response));
             return Admission::Queued;
         }
         tracing::debug!(dest = %destination, "stamp queue full, dropping announce");
-        let dropped = if path_response {
-            self.parked_path_responses.pop_back()
-        } else {
-            self.parked_announce.take()
-        };
-        Admission::Dropped(dropped.expect("item was parked above"))
+        Admission::Dropped(item)
     }
 
     /// Wait for the in-flight job. Cancellation safe.
@@ -405,8 +403,9 @@ impl<T> DestinationStamps<T> {
         self.rx.try_recv().ok()
     }
 
-    /// Install a finished stamp and release the parked announces, path
-    /// responses first. A failed job cancels them, as `_announce` does.
+    /// Install a finished stamp and release the announce in progress, then the
+    /// parked path responses, then the parked announce. A failed job cancels
+    /// them, as `_announce` does.
     pub fn complete(
         &mut self,
         destination: &mut Destination,
@@ -414,9 +413,11 @@ impl<T> DestinationStamps<T> {
         outcome: StampOutcome,
     ) -> Vec<(T, Option<AnnounceStampExt>)> {
         self.job = None;
+        let in_progress = self.in_progress.take();
         let Some((stamp, value)) = outcome.stamp else {
-            let cancelled =
-                self.parked_path_responses.len() + usize::from(self.parked_announce.is_some());
+            let cancelled = usize::from(in_progress.is_some())
+                + self.parked_path_responses.len()
+                + usize::from(self.parked_announce.is_some());
             self.parked_path_responses.clear();
             self.parked_announce = None;
             if cancelled > 0 {
@@ -426,11 +427,12 @@ impl<T> DestinationStamps<T> {
             return Vec::new();
         };
         destination.set_destination_stamp(stamp, value);
-        let mut parked: Vec<(T, bool)> = self
-            .parked_path_responses
-            .drain(..)
-            .map(|item| (item, true))
-            .collect();
+        let mut parked: Vec<(T, bool)> = in_progress.into_iter().collect();
+        parked.extend(
+            self.parked_path_responses
+                .drain(..)
+                .map(|item| (item, true)),
+        );
         parked.extend(self.parked_announce.take().map(|item| (item, false)));
         let mut ready = Vec::new();
         for (item, path_response) in parked {
@@ -610,6 +612,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Python's stamper finishes the announce it is generating for before it
+    /// takes a queued path response, so a registration path response cannot
+    /// overtake the application's own first announce.
+    #[test]
+    fn the_announce_that_started_a_stamp_leaves_first() {
+        let _settings = test_settings::blocking_exclusive(quick_policy(), None);
+        let identity = Identity::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for (first, second) in [
+            ((false, "announce"), (true, "path response")),
+            ((true, "path response"), (false, "announce")),
+        ] {
+            let mut destination = Destination::new(
+                Some(&identity),
+                Direction::In,
+                DestType::Single,
+                "test.stamp.order",
+            )
+            .unwrap();
+            let mut stamps = DestinationStamps::new();
+            for (path_response, name) in [first, second] {
+                assert!(matches!(
+                    stamps.admit(&destination, &identity, path_response, name),
+                    Admission::Queued
+                ));
+            }
+            let outcome = runtime.block_on(stamps.recv());
+            let order: Vec<_> = stamps
+                .complete(&mut destination, &identity, outcome)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(order, [first.1, second.1]);
+        }
     }
 
     #[test]
