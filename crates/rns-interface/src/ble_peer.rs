@@ -398,39 +398,45 @@ fn has_wanted_reconnects(map: &RecentlyDisconnected) -> bool {
     }
 }
 
+/// Whether a scan saw a peer the connect loop would try: a free slot, and a
+/// peer linked neither way and not in reconnect backoff. Pass only addresses
+/// that clear the connect loop's RSSI gate, so the active scan rate is held
+/// only for peers it can act on.
+fn has_connect_candidate<'a>(
+    mut scanned: impl Iterator<Item = &'a str>,
+    connected: &HashMap<String, Arc<AtomicBool>>,
+    linked_to_us: &[String],
+    recently_disc: &RecentlyDisconnected,
+) -> bool {
+    connected.len() < MAX_PEERS
+        && scanned.any(|address| {
+            !connected.contains_key(address)
+                && !linked_to_us.iter().any(|peer| peer == address)
+                && !reconnect_in_backoff(recently_disc, address)
+        })
+}
+
 /// Interval used for background scans with `mobile-throttle`.
 pub const SCAN_BACKGROUND_INTERVAL: Duration = Duration::from_secs(60);
 
-const SCAN_SLEEP_SLICE: Duration = Duration::from_secs(2);
-
-/// Exits early on foreground-resume or `wake` notify.
+/// Exits early on a `wake` notify, which the owner sends after each change
+/// of `foreground`. The wait registers before the foreground check, so a
+/// resume between the scan and this sleep is not lost.
 async fn scan_sleep(
     total: Duration,
     foreground: &Arc<AtomicBool>,
     was_foreground: bool,
     wake: &Arc<tokio::sync::Notify>,
 ) {
-    if was_foreground {
-        tokio::select! {
-            _ = tokio::time::sleep(total) => {}
-            _ = wake.notified() => {}
-        }
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if !was_foreground && foreground.load(Ordering::Relaxed) {
         return;
     }
-    let deadline = std::time::Instant::now() + total;
-    loop {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return;
-        }
-        let remaining = (deadline - now).min(SCAN_SLEEP_SLICE);
-        tokio::select! {
-            _ = tokio::time::sleep(remaining) => {}
-            _ = wake.notified() => return,
-        }
-        if foreground.load(Ordering::Relaxed) {
-            return;
-        }
+    tokio::select! {
+        _ = tokio::time::sleep(total) => {}
+        _ = notified => {}
     }
 }
 
@@ -3008,10 +3014,10 @@ mod android_peripheral {
     }
 
     fn signal_peer_offline(address: &str) {
-        if let Ok(g) = peer_online_map().lock() {
-            if let Some(flag) = g.get(address) {
-                flag.store(false, Ordering::SeqCst);
-            }
+        if let Ok(g) = peer_online_map().lock()
+            && let Some(flag) = g.get(address)
+        {
+            flag.store(false, Ordering::SeqCst);
         }
     }
 
@@ -3256,10 +3262,9 @@ mod android_peripheral {
                 return Err("RatspeakBleAvailability returned null".into());
             }
             let jstr: jni::objects::JString = result.into();
-            Ok(env
-                .get_string(jstr)
+            env.get_string(jstr)
                 .map(|s| s.to_string_lossy().into_owned())
-                .map_err(|e| format!("availability string: {e}"))?)
+                .map_err(|e| format!("availability string: {e}"))
         })
     }
 
@@ -3388,7 +3393,7 @@ mod android_peripheral {
             // Close GATT server
             with_env(|env| {
                 let server_cls = find_app_class(env, "org.ratspeak.android.RatspeakBleServer")
-                    .map_err(|e| format!("{e}"))?;
+                    .map_err(|e| e.to_string())?;
                 env.call_static_method(server_cls, "closeGattServer", "()V", &[])
                     .map_err(|e| format!("closeGattServer: {e}"))?;
                 Ok(())
@@ -5980,11 +5985,12 @@ pub async fn spawn_ble_peer_interface(
                         // already-connected peers every scan, so gating on "new
                         // peers seen" alone pinned the radio at the active duty
                         // cycle forever.
-                        let have_candidate = connected_addrs.len() < MAX_PEERS
-                            && peers.iter().any(|p| {
-                                !connected_addrs.contains_key(&p.ble_address)
-                                    && !reconnect_in_backoff(&recently_disc, &p.ble_address)
-                            });
+                        let have_candidate = has_connect_candidate(
+                            peers.iter().map(|p| p.ble_address.as_str()),
+                            &connected_addrs,
+                            &[],
+                            &recently_disc,
+                        );
                         let next_interval =
                             if have_candidate || has_wanted_reconnects(&recently_disc) {
                                 SCAN_ACTIVE_INTERVAL
@@ -6264,13 +6270,16 @@ pub async fn spawn_ble_peer_interface(
                         // Connect strongest-RSSI first so a crowded room fills
                         // the MAX_PEERS slots with the nearest peers.
                         peers.sort_by_key(|p| std::cmp::Reverse(p.rssi));
+                        let peripheral_peer_addresses =
+                            apple_peripheral::subscribed_central_addresses();
                         // Idle down when there is no actionable peer — a stable
                         // mesh keeps seeing its connected peers every scan.
-                        let have_candidate = connected_addrs.len() < MAX_PEERS
-                            && peers.iter().any(|p| {
-                                !connected_addrs.contains_key(&p.ble_address)
-                                    && !reconnect_in_backoff(&recently_disc, &p.ble_address)
-                            });
+                        let have_candidate = has_connect_candidate(
+                            peers.iter().map(|p| p.ble_address.as_str()),
+                            &connected_addrs,
+                            &peripheral_peer_addresses,
+                            &recently_disc,
+                        );
                         let next_interval =
                             if have_candidate || has_wanted_reconnects(&recently_disc) {
                                 SCAN_ACTIVE_INTERVAL
@@ -6290,9 +6299,6 @@ pub async fn spawn_ble_peer_interface(
                             );
                         }
                         scan_interval = next_interval;
-
-                        let peripheral_peer_addresses =
-                            apple_peripheral::subscribed_central_addresses();
 
                         for peer in &peers {
                             dispatch_event(BlePeerEvent::Discovered {
@@ -6598,19 +6604,6 @@ pub async fn spawn_ble_peer_interface(
                 // MAX_PEERS slots with the nearest peers.
                 scan_results.sort_by_key(|r| std::cmp::Reverse(r.1));
 
-                // Idle down when there is no actionable peer — a stable mesh
-                // keeps seeing its connected peers every scan.
-                let have_candidate = connected_addrs.len() < MAX_PEERS
-                    && scan_results.iter().any(|(addr, _, _)| {
-                        !connected_addrs.contains_key(addr)
-                            && !reconnect_in_backoff(&recently_disc, addr)
-                    });
-                let scan_interval = if have_candidate || has_wanted_reconnects(&recently_disc) {
-                    SCAN_ACTIVE_INTERVAL
-                } else {
-                    SCAN_IDLE_INTERVAL
-                };
-
                 let peripheral_peer_addresses = if scan_results.is_empty() {
                     Vec::new()
                 } else {
@@ -6619,6 +6612,22 @@ pub async fn spawn_ble_peer_interface(
                     )
                     .await
                     .unwrap_or_default()
+                };
+                // Idle down when there is no actionable peer — a stable mesh
+                // keeps seeing its connected peers every scan.
+                let have_candidate = has_connect_candidate(
+                    scan_results
+                        .iter()
+                        .filter(|(_, rssi, _)| *rssi >= MIN_RSSI)
+                        .map(|(addr, _, _)| addr.as_str()),
+                    &connected_addrs,
+                    &peripheral_peer_addresses,
+                    &recently_disc,
+                );
+                let scan_interval = if have_candidate || has_wanted_reconnects(&recently_disc) {
+                    SCAN_ACTIVE_INTERVAL
+                } else {
+                    SCAN_IDLE_INTERVAL
                 };
 
                 for (addr, rssi, protocol) in &scan_results {
@@ -7559,6 +7568,59 @@ mod tests {
 
         record_reconnect_success(&map, "peer-address");
         assert!(!reconnect_in_backoff(&map, "peer-address"));
+    }
+
+    #[test]
+    fn connect_candidates_match_what_the_connect_loop_would_try() {
+        let recent = new_recently_disconnected();
+        let online = || Arc::new(AtomicBool::new(true));
+        let mut connected = HashMap::from([("central".to_owned(), online())]);
+        let linked_to_us = vec!["subscribed".to_owned()];
+        for _ in 0..RECONNECT_BACKOFF_FAILURES {
+            record_reconnect_failure(&recent, "backoff");
+        }
+        let candidate = |scanned: &[&'static str], connected: &HashMap<_, _>| {
+            has_connect_candidate(scanned.iter().copied(), connected, &linked_to_us, &recent)
+        };
+
+        assert!(!candidate(
+            &["central", "subscribed", "backoff"],
+            &connected
+        ));
+        assert!(candidate(&["central", "new"], &connected));
+        for index in connected.len()..MAX_PEERS {
+            connected.insert(format!("peer-{index}"), online());
+        }
+        assert!(!candidate(&["new"], &connected));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_sleep_wakes_on_a_resume_before_or_during_it() {
+        let foreground = Arc::new(AtomicBool::new(true));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let started = tokio::time::Instant::now();
+        scan_sleep(SCAN_BACKGROUND_INTERVAL, &foreground, false, &wake).await;
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "a resume before the sleep"
+        );
+
+        foreground.store(false, Ordering::Relaxed);
+        let sleep = tokio::spawn({
+            let (foreground, wake) = (foreground.clone(), wake.clone());
+            async move { scan_sleep(SCAN_BACKGROUND_INTERVAL, &foreground, false, &wake).await }
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        wake.notify_waiters();
+        sleep.await.unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO, "a wake during the sleep");
+
+        foreground.store(false, Ordering::Relaxed);
+        scan_sleep(SCAN_BACKGROUND_INTERVAL, &foreground, false, &wake).await;
+        assert_eq!(started.elapsed(), SCAN_BACKGROUND_INTERVAL);
     }
 
     #[test]
