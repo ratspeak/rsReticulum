@@ -391,6 +391,10 @@ pub struct RecentAnnounce {
     /// False for an entry restored from a row that carries no announce facts:
     /// `hops`, `name_hash`, and `is_path_response` are then unknown, not zero.
     pub facts_known: bool,
+    /// Emission time stamped into the random hash of the packet that last
+    /// refreshed this entry, which may be an older announce heard late; `None`
+    /// once restored from storage.
+    pub emitted: Option<u64>,
 }
 
 impl RecentAnnounce {
@@ -3328,6 +3332,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
 
@@ -3401,6 +3406,7 @@ mod tests {
                     stamp_value: 0.0,
                     lr_cost: None,
                     facts_known: true,
+                    emitted: None,
                 },
             );
         }
@@ -3500,6 +3506,7 @@ mod tests {
                     stamp_value: 0.0,
                     lr_cost: None,
                     facts_known: true,
+                    emitted: None,
                 },
             );
         }
@@ -3526,6 +3533,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
         let mut target_path =
@@ -6349,6 +6357,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
 
@@ -6404,6 +6413,7 @@ mod tests {
                     stamp_value: 0.0,
                     lr_cost: None,
                     facts_known: true,
+                    emitted: None,
                 },
             );
         }
@@ -8651,6 +8661,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
         actor.blackhole_table.add_with_reason(
@@ -9364,6 +9375,7 @@ mod tests {
             stamp_value: 0.0,
             lr_cost: None,
             facts_known: true,
+            emitted: None,
         }];
 
         let dir = std::env::temp_dir().join("reticulum_rs_test_announce_cache");
@@ -9667,6 +9679,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
 
@@ -9931,6 +9944,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
 
@@ -11660,6 +11674,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
 
@@ -12308,6 +12323,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
 
@@ -12570,6 +12586,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
 
@@ -12661,6 +12678,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
 
@@ -12809,6 +12827,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
 
@@ -13291,6 +13310,39 @@ mod tests {
         assert_eq!(hrx.try_recv().unwrap().emitted, emitted);
     }
 
+    /// Once the path is gone an older announce is accepted again (Transport.py)
+    /// and refreshes the cache, so the entry carries its own, older emission.
+    #[test]
+    fn cached_announce_reports_the_emission_of_the_packet_that_refreshed_it() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, _rx) = make_test_interface("test_iface");
+        actor.interfaces.insert(1, entry);
+        let identity = rns_identity::identity::Identity::new();
+        for (prefix, emitted) in [(0x41, 1_700_000_100), (0x42, 1_700_000_000)] {
+            let (raw, dest_hash) = make_announce_for_with_random_blob(
+                &identity,
+                "test.emitted",
+                1,
+                random_blob(prefix, emitted),
+            );
+            actor.on_inbound(crate::messages::InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+            let crate::messages::TransportQueryResponse::Announces(entries) =
+                actor.handle_query(crate::messages::TransportQuery::GetRecentAnnounces)
+            else {
+                panic!("expected Announces");
+            };
+            let cached = entries.iter().find(|e| e.dest_hash == dest_hash).unwrap();
+            assert_eq!(cached.emitted, Some(emitted));
+            actor.path_table.remove(&dest_hash);
+        }
+    }
+
     #[test]
     fn path_response_bypasses_announce_rate_limit() {
         let (mut actor, _tx) = TransportActor::new();
@@ -13586,6 +13638,7 @@ mod tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
     }

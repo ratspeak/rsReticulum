@@ -762,6 +762,7 @@ mod cleanup_tests {
             stamp_value: 0.0,
             lr_cost: None,
             facts_known: true,
+            emitted: None,
         };
         actor.recent_announces.insert(entry.dest_hash, entry);
     }

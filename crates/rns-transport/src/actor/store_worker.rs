@@ -1289,6 +1289,7 @@ pub(super) fn recent_from_row(row: KnownDestinationRow) -> RecentAnnounce {
         stamp_value: row.stamp_value,
         lr_cost: row.lr_cost,
         facts_known: facts.is_some(),
+        emitted: None,
     }
 }
 
@@ -1372,6 +1373,7 @@ mod tests {
             stamp_value: 0.0,
             lr_cost: Some(3.0),
             facts_known: true,
+            emitted: None,
         }
     }
 

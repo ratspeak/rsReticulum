@@ -17,6 +17,7 @@ pub async fn rns_transport::actor::PersistenceTrigger::request(&self) -> bool
 pub struct rns_transport::actor::RecentAnnounce
 pub rns_transport::actor::RecentAnnounce::app_data: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::actor::RecentAnnounce::dest_hash: [u8; 16]
+pub rns_transport::actor::RecentAnnounce::emitted: core::option::Option<u64>
 pub rns_transport::actor::RecentAnnounce::facts_known: bool
 pub rns_transport::actor::RecentAnnounce::hops: u8
 pub rns_transport::actor::RecentAnnounce::is_path_response: bool
@@ -1363,6 +1364,7 @@ pub struct rns_transport::messages::AnnounceHandlerId(_)
 #[non_exhaustive] pub struct rns_transport::messages::AnnounceRpcEntry
 pub rns_transport::messages::AnnounceRpcEntry::app_data: core::option::Option<alloc::vec::Vec<u8>>
 pub rns_transport::messages::AnnounceRpcEntry::dest_hash: [u8; 16]
+pub rns_transport::messages::AnnounceRpcEntry::emitted: core::option::Option<u64>
 pub rns_transport::messages::AnnounceRpcEntry::facts_known: bool
 pub rns_transport::messages::AnnounceRpcEntry::hops: u8
 pub rns_transport::messages::AnnounceRpcEntry::is_path_response: bool

@@ -243,6 +243,7 @@ impl TransportActor {
                             is_path_response,
                             retained: a.retained,
                             facts_known: a.facts_known,
+                            emitted: a.emitted,
                         }
                     })
                     .collect();

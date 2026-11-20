@@ -845,6 +845,7 @@ impl TransportActor {
         let announce_identity_hash = Some(validated.identity_hash);
         let announce_random_hash = announce_data.random_hash;
         let announce_stamp_value = validated.stamp_value.unwrap_or(0.0);
+        let announce_emitted = announce_timebase(&announce_random_hash);
 
         // Python remembers every freshly validated announce, replays included,
         // before it decides whether the path changes; a validation-cache hit
@@ -868,6 +869,7 @@ impl TransportActor {
                 e.is_path_response = is_path_response;
                 e.name_hash = announce_name_hash;
                 e.facts_known = true;
+                e.emitted = Some(announce_emitted);
                 self.kd.pending.mark_dirty(header.destination_hash);
                 self.remember_received_ratchet(header.destination_hash, announce_ratchet);
             }
@@ -891,6 +893,7 @@ impl TransportActor {
                     stamp_value: announce_stamp_value,
                     lr_cost: validated.lr_cost,
                     facts_known: true,
+                    emitted: Some(announce_emitted),
                 });
                 self.state_dirty = true;
                 self.kd.pending.mark_dirty(header.destination_hash);
@@ -914,8 +917,6 @@ impl TransportActor {
             .get(&interface_id)
             .map(|e| e.mode)
             .unwrap_or(InterfaceMode::Gateway);
-
-        let announce_emitted = announce_timebase(&announce_random_hash);
 
         // Cancel our queued rebroadcast when a neighbor already carried it.
         // Same-hop neighbor rebroadcast counts toward the local cap;

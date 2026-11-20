@@ -43,6 +43,7 @@ fn recent_announce_from_cached_packet(
         stamp_value: 0.0,
         lr_cost: None,
         facts_known: false,
+        emitted: None,
     };
 
     if let Ok((header, offset)) = rns_wire::header::PacketHeader::unpack(&raw_packet)
@@ -1282,6 +1283,7 @@ mod announce_clean_tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
         actor
@@ -1527,6 +1529,7 @@ mod async_save_tests {
                 stamp_value: 0.0,
                 lr_cost: None,
                 facts_known: true,
+                emitted: None,
             },
         );
         let now = crate::now_f64();

@@ -1618,6 +1618,10 @@ pub struct AnnounceRpcEntry {
     /// `hops`, `name_hash`, and `is_path_response` are then unknown, and hold
     /// zero and `false` only as placeholders.
     pub facts_known: bool,
+    /// Unix seconds the announcer stamped into the cached announce's random
+    /// hash. A copy of an older announce accepted late carries its own, older
+    /// time; `None` for an entry restored from storage.
+    pub emitted: Option<u64>,
 }
 
 /// Identity-bearing metadata returned by [`TransportQuery::RecallDestination`].

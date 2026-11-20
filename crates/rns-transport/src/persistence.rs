@@ -2296,6 +2296,7 @@ mod tests {
             stamp_value: 0.0,
             lr_cost: None,
             facts_known: true,
+            emitted: None,
         }];
 
         let dir = std::env::temp_dir().join("reticulum_rs_test_announce_persist");
@@ -2336,6 +2337,7 @@ mod tests {
             stamp_value: 25.5,
             lr_cost: Some(12.5),
             facts_known: true,
+            emitted: None,
         };
         let dir =
             std::env::temp_dir().join(format!("rns_announce_stamp_fields_{}", std::process::id()));
