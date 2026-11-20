@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use thiserror::Error;
 
 use crate::constants::MTU;
-use crate::hash::{packet_hash, truncated_packet_hash};
+use crate::hash::packet_hash_pair;
 use crate::header::{HeaderError, PacketHeader};
 
 /// Errors surfaced by [`Packet::new`] and [`Packet::from_raw`].
@@ -63,8 +63,7 @@ impl Packet {
             return Err(PacketError::ExceedsMtu(raw.len()));
         }
 
-        let hash = packet_hash(&raw, header.flags.header_type);
-        let trunc = truncated_packet_hash(&raw, header.flags.header_type);
+        let (hash, trunc) = packet_hash_pair(&raw, header.flags.header_type);
 
         Ok(Self {
             header,
@@ -95,8 +94,7 @@ impl Packet {
         }
 
         let (header, data_offset) = PacketHeader::unpack(&raw)?;
-        let hash = packet_hash(&raw, header.flags.header_type);
-        let trunc = truncated_packet_hash(&raw, header.flags.header_type);
+        let (hash, trunc) = packet_hash_pair(&raw, header.flags.header_type);
 
         Ok(Self {
             header,

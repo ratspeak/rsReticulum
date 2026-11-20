@@ -71,7 +71,7 @@ pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, TokenError> {
     let ciphertext =
         aes_cbc::encrypt(encryption_key, &iv, &padded).map_err(|_| TokenError::EncryptionFailed)?;
 
-    let mut signed_parts = Vec::with_capacity(16 + ciphertext.len());
+    let mut signed_parts = Vec::with_capacity(16 + ciphertext.len() + 32);
     signed_parts.extend_from_slice(&iv);
     signed_parts.extend_from_slice(&ciphertext);
 
