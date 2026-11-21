@@ -1443,6 +1443,7 @@ pub fn rns_runtime::destination_runtime::IdentityGatePolicy::fmt(&self, &mut cor
 #[non_exhaustive] pub struct rns_runtime::prelude::InitOptions
 pub rns_runtime::prelude::InitOptions::enable_stamping: bool
 pub rns_runtime::prelude::InitOptions::enforce_stamps: bool
+pub rns_runtime::prelude::InitOptions::hashlist_maxsize: core::option::Option<usize>
 pub rns_runtime::prelude::InitOptions::keep_starting_after_interface_failure: bool
 pub rns_runtime::prelude::InitOptions::require_shared_instance: bool
 pub rns_runtime::prelude::InitOptions::shared_instance_type: core::option::Option<rns_runtime::reticulum::SharedInstanceType>
@@ -1852,6 +1853,7 @@ pub fn rns_runtime::reticulum::DiscoveryRuntime::default() -> Self
 #[non_exhaustive] pub struct rns_runtime::reticulum::InitOptions
 pub rns_runtime::reticulum::InitOptions::enable_stamping: bool
 pub rns_runtime::reticulum::InitOptions::enforce_stamps: bool
+pub rns_runtime::reticulum::InitOptions::hashlist_maxsize: core::option::Option<usize>
 pub rns_runtime::reticulum::InitOptions::keep_starting_after_interface_failure: bool
 pub rns_runtime::reticulum::InitOptions::require_shared_instance: bool
 pub rns_runtime::reticulum::InitOptions::shared_instance_type: core::option::Option<rns_runtime::reticulum::SharedInstanceType>
@@ -1936,6 +1938,7 @@ pub rns_runtime::reticulum::ReticulumConfig::enable_remote_management: bool
 pub rns_runtime::reticulum::ReticulumConfig::enable_transport: bool
 pub rns_runtime::reticulum::ReticulumConfig::filter: rns_transport::destination_filter::FilterPolicy
 pub rns_runtime::reticulum::ReticulumConfig::force_shared_instance_bitrate: core::option::Option<u64>
+pub rns_runtime::reticulum::ReticulumConfig::hashlist_maxsize: usize
 pub rns_runtime::reticulum::ReticulumConfig::inbound_queue_lengths: rns_transport::inbound_queues::InboundQueueLengths
 pub rns_runtime::reticulum::ReticulumConfig::ingress_overrides: rns_transport::ingress::IngressOverrides
 pub rns_runtime::reticulum::ReticulumConfig::instance_name: alloc::string::String

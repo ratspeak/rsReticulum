@@ -83,7 +83,6 @@ impl ReverseTable {
         before - self.entries.len()
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

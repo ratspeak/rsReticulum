@@ -1107,6 +1107,9 @@ pub enum TransportQuery {
     /// Python 1.6.1 `Transport.link_distribution()`: relayed Links grouped by
     /// destination, answered as `LinkDistribution`.
     GetLinkDistribution,
+    /// How many entries the actor's in-memory tables hold, answered as
+    /// `TableSizes`, for a host that watches its memory. Rust-only.
+    GetTableSizes,
     GetRecentAnnounces,
     /// Return cached identity metadata without updating `last_used`. Locally
     /// restored cache metadata is trusted; this query performs no fresh signature
@@ -1340,6 +1343,7 @@ pub enum TransportQueryResponse {
     PathTable(Vec<PathTableRpcEntry>),
     InterfaceStats(Vec<InterfaceStatRpcEntry>),
     TrafficTotals(TrafficTotalsRpcEntry),
+    TableSizes(TableSizesRpcEntry),
     LinkDistribution(Vec<LinkDistributionRpcEntry>),
     KnownDestinations(Vec<crate::store::KnownDestinationRow>),
     RateTable(Vec<RateTableRpcEntry>),
@@ -1523,6 +1527,21 @@ pub struct InterfaceStatRpcEntry {
     pub last_connect_error: Option<String>,
     /// Consecutive failed attempts since the last connection that stayed up.
     pub connect_failures: u32,
+}
+
+/// Entries the transport actor's in-memory tables hold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TableSizesRpcEntry {
+    pub path_table: usize,
+    pub announce_table: usize,
+    pub held_announces: usize,
+    pub link_table: usize,
+    pub reverse_table: usize,
+    /// Both generations of the duplicate-packet hashlist.
+    pub packet_hashlist: usize,
+    /// The hashlist's cap; its generations rotate at half of it.
+    pub packet_hashlist_max: usize,
 }
 
 /// Python's top-level `get_interface_stats()` counters (Reticulum.py,

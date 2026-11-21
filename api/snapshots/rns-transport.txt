@@ -735,6 +735,7 @@ pub fn rns_transport::hashlist::PacketHashlist::insert(&mut self, [u8; 32]) -> b
 pub fn rns_transport::hashlist::PacketHashlist::is_empty(&self) -> bool
 pub fn rns_transport::hashlist::PacketHashlist::len(&self) -> usize
 pub fn rns_transport::hashlist::PacketHashlist::load_from(&mut self, alloc::vec::Vec<[u8; 32]>)
+pub fn rns_transport::hashlist::PacketHashlist::max_size(&self) -> usize
 pub fn rns_transport::hashlist::PacketHashlist::new() -> Self
 pub fn rns_transport::hashlist::PacketHashlist::new_with_capacity(usize) -> Self
 pub fn rns_transport::hashlist::PacketHashlist::remove(&mut self, &[u8; 32])
@@ -1267,6 +1268,7 @@ pub rns_transport::messages::TransportQuery::GetPathState::dest: [u8; 16]
 pub rns_transport::messages::TransportQuery::GetPathTable
 pub rns_transport::messages::TransportQuery::GetRateTable
 pub rns_transport::messages::TransportQuery::GetRecentAnnounces
+pub rns_transport::messages::TransportQuery::GetTableSizes
 pub rns_transport::messages::TransportQuery::GetTrafficTotals
 pub rns_transport::messages::TransportQuery::HaltInterface
 pub rns_transport::messages::TransportQuery::HaltInterface::id: rns_transport::messages::InterfaceId
@@ -1348,6 +1350,7 @@ pub rns_transport::messages::TransportQueryResponse::PathTable(alloc::vec::Vec<r
 pub rns_transport::messages::TransportQueryResponse::RateTable(alloc::vec::Vec<rns_transport::messages::RateTableRpcEntry>)
 pub rns_transport::messages::TransportQueryResponse::RecalledDestination(core::option::Option<rns_transport::messages::RecalledDestinationRpcEntry>)
 pub rns_transport::messages::TransportQueryResponse::StringResult(core::option::Option<alloc::string::String>)
+pub rns_transport::messages::TransportQueryResponse::TableSizes(rns_transport::messages::TableSizesRpcEntry)
 pub rns_transport::messages::TransportQueryResponse::TrafficTotals(rns_transport::messages::TrafficTotalsRpcEntry)
 pub struct rns_transport::messages::AnnounceHandlerEvent
 pub rns_transport::messages::AnnounceHandlerEvent::announce_packet_hash: [u8; 32]
@@ -1652,6 +1655,14 @@ pub rns_transport::messages::RecalledDestinationRpcEntry::ratchet: core::option:
 pub rns_transport::messages::RecalledDestinationRpcEntry::timestamp: f64
 impl core::default::Default for rns_transport::messages::RecalledDestinationRpcEntry
 pub fn rns_transport::messages::RecalledDestinationRpcEntry::default() -> Self
+#[non_exhaustive] pub struct rns_transport::messages::TableSizesRpcEntry
+pub rns_transport::messages::TableSizesRpcEntry::announce_table: usize
+pub rns_transport::messages::TableSizesRpcEntry::held_announces: usize
+pub rns_transport::messages::TableSizesRpcEntry::link_table: usize
+pub rns_transport::messages::TableSizesRpcEntry::packet_hashlist: usize
+pub rns_transport::messages::TableSizesRpcEntry::packet_hashlist_max: usize
+pub rns_transport::messages::TableSizesRpcEntry::path_table: usize
+pub rns_transport::messages::TableSizesRpcEntry::reverse_table: usize
 pub struct rns_transport::messages::TimerTick
 pub struct rns_transport::messages::TrackedReceiptRegistration
 pub rns_transport::messages::TrackedReceiptRegistration::destination_hash: [u8; 16]

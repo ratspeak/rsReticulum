@@ -62,7 +62,6 @@ impl AnnounceTable {
         self.entries.remove(dest_hash)
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

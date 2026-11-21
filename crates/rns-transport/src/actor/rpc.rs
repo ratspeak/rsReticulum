@@ -197,6 +197,17 @@ impl TransportActor {
             TransportQuery::GetTrafficTotals => {
                 TransportQueryResponse::TrafficTotals(self.traffic_totals())
             }
+            TransportQuery::GetTableSizes => {
+                TransportQueryResponse::TableSizes(crate::messages::TableSizesRpcEntry {
+                    path_table: self.path_table.len(),
+                    announce_table: self.announce_table.len(),
+                    held_announces: self.held_announces.len(),
+                    link_table: self.link_table.len(),
+                    reverse_table: self.reverse_table.len(),
+                    packet_hashlist: self.packet_hashlist.len(),
+                    packet_hashlist_max: self.packet_hashlist.max_size(),
+                })
+            }
             TransportQuery::GetLinkDistribution => {
                 TransportQueryResponse::LinkDistribution(self.link_distribution())
             }
@@ -1285,5 +1296,21 @@ mod tests {
             actor.handle_query(TransportQuery::GetLinkCount),
             TransportQueryResponse::IntResult(2)
         ));
+    }
+
+    #[test]
+    fn table_sizes_count_entries_and_report_the_hashlist_cap() {
+        let (mut actor, _tx) = TransportActor::new_with_capacity(16, 64);
+        actor.link_table.insert([0u8; 16], link_entry());
+        actor.packet_hashlist.insert([1u8; 32]);
+        actor.packet_hashlist.insert([2u8; 32]);
+        let TransportQueryResponse::TableSizes(sizes) =
+            actor.handle_query(TransportQuery::GetTableSizes)
+        else {
+            panic!("not table sizes");
+        };
+        assert_eq!(sizes.link_table, 1);
+        assert_eq!(sizes.path_table, 0);
+        assert_eq!((sizes.packet_hashlist, sizes.packet_hashlist_max), (2, 64));
     }
 }

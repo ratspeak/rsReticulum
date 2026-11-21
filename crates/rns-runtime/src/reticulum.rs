@@ -3129,6 +3129,10 @@ pub struct InitOptions {
     /// listing order, and failure handling are those of the one-at-a-time
     /// start upstream does (Reticulum.py), which stays the default.
     pub start_interfaces_concurrently: bool,
+    /// Embedder choice: the duplicate-packet hashlist cap for a host with a
+    /// memory budget. `None` keeps upstream's `hashlist_maxsize`
+    /// (Transport.py), [`rns_transport::constants::HASHLIST_MAXSIZE`].
+    pub hashlist_maxsize: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3357,6 +3361,10 @@ pub struct ReticulumConfig {
     pub loglevel: i32,
     /// `qlen_in_*` inbound queue lengths per traffic class.
     pub inbound_queue_lengths: InboundQueueLengths,
+    /// Duplicate-packet hashlist cap (Transport.py `hashlist_maxsize`); the
+    /// generations rotate at half of it. Upstream has no configuration key,
+    /// so only [`InitOptions::hashlist_maxsize`] changes it.
+    pub hashlist_maxsize: usize,
 
     /// Optional identity file, loaded or created at startup. It signs discovery
     /// announces and supplies the key for per-interface `discovery_encrypt`.
@@ -3443,6 +3451,7 @@ impl Default for ReticulumConfig {
             ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
             loglevel: 3,
             inbound_queue_lengths: InboundQueueLengths::default(),
+            hashlist_maxsize: rns_transport::constants::HASHLIST_MAXSIZE,
             network_identity_path: None,
             discover_interfaces: false,
             autoconnect_discovered_interfaces: 0,
@@ -3980,6 +3989,9 @@ impl ReticulumConfig {
         if let Some(shared_instance_type) = options.shared_instance_type {
             self.shared_instance_type = shared_instance_type.on_this_platform();
         }
+        if let Some(hashlist_maxsize) = options.hashlist_maxsize {
+            self.hashlist_maxsize = hashlist_maxsize;
+        }
     }
 
     /// Parse configuration, panicking on a value error. Use `try_from_config`
@@ -4132,7 +4144,7 @@ pub async fn init_with_policy(
     }
     let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new_with_options(
         4096,
-        rns_transport::constants::HASHLIST_MAXSIZE,
+        rc.hashlist_maxsize,
         rc.inbound_queue_lengths,
         actor_options,
     );
@@ -18949,6 +18961,51 @@ txpower = 17
         let handles = vec![test_interface_handle(41, None, "ordinary").into()];
         assert!(pending_configured_rnode_runtime(&standard, &handles).is_none());
         assert!(handle.startup_rnode_runtimes().is_empty());
+    }
+
+    // An embedder's hashlist cap reaches the transport actor; without one it
+    // keeps upstream's.
+    #[tokio::test]
+    async fn init_options_set_the_transport_hashlist_cap() {
+        for (cap, expected) in [
+            (None, rns_transport::constants::HASHLIST_MAXSIZE),
+            (Some(64), 64),
+        ] {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!("reticulum_rs_hashlist_cap_{nonce}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config"),
+                "[reticulum]\nshare_instance = No\nenable_transport = No\n\n[interfaces]\n",
+            )
+            .unwrap();
+            let shutdown = ShutdownSignal::new();
+            let handle = init_with_options(
+                Some(dir.to_str().unwrap()),
+                None,
+                shutdown,
+                Arc::new(AtomicBool::new(true)),
+                InitOptions {
+                    hashlist_maxsize: cap,
+                    ..InitOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            let sizes = handle
+                .query_control_result(TransportQuery::GetTableSizes)
+                .await
+                .unwrap();
+            let TransportQueryResponse::TableSizes(sizes) = sizes else {
+                panic!("not table sizes: {sizes:?}");
+            };
+            assert_eq!(sizes.packet_hashlist_max, expected);
+            handle.shutdown_and_wait().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[tokio::test]

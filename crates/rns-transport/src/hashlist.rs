@@ -78,6 +78,11 @@ impl PacketHashlist {
         self.current.len() + self.previous.len()
     }
 
+    /// The cap set at construction; generations rotate at half of it.
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
     pub fn is_empty(&self) -> bool {
         self.current.is_empty() && self.previous.is_empty()
     }
