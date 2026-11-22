@@ -27,6 +27,8 @@ pub mod ble_peer;
 #[cfg(feature = "ble")]
 pub mod ble_peer_lifecycle;
 #[cfg(feature = "ble")]
+mod ble_reticulum;
+#[cfg(feature = "ble")]
 pub mod ble_rnode;
 #[cfg(all(feature = "ble", any(target_os = "ios", target_os = "macos", test)))]
 mod ble_tx_queue;

@@ -18,6 +18,15 @@
 //! delivery announces. There is no ID characteristic: a statically readable
 //! identity hash was a tracking vector that defeated BLE MAC rotation.
 //!
+//! ### ble-reticulum peripherals (Columba, RTNode)
+//!
+//! A peripheral whose Columba service also has the Identity characteristic
+//! (`…28e6`) speaks the ble-reticulum protocol, and the Central role on
+//! Android, Linux and Windows speaks it back: the identity handshake, a
+//! header on every fragment and the keepalive, all in [`crate::ble_reticulum`].
+//! The identity read from such a peripheral is reported in
+//! [`BlePeerEvent::Connected`]; it is not authenticated.
+//!
 //! ## Fragmentation
 //!
 //! Packets larger than (MTU - 3), and small packets whose first byte would
@@ -212,6 +221,62 @@ impl BlePeerLinkRegistry {
 }
 
 type LinkRegistry = Arc<tokio::sync::RwLock<BlePeerLinkRegistry>>;
+
+/// Central links to ble-reticulum peripherals, by BLE address. The inbound
+/// consumer that Android and Apple share reassembles their notifications with
+/// [`crate::ble_reticulum::Reassembler`]; every other stream has this module's
+/// own framing. A link is entered before the identity handshake, which is what
+/// lets the peripheral send, and removed when the Central role drops the peer.
+type BleReticulumLinks = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+fn is_ble_reticulum_link(links: &BleReticulumLinks, address: &str) -> bool {
+    links.lock().is_ok_and(|links| links.contains(address))
+}
+
+/// What a central link turned out to be once the peer's GATT services were
+/// known.
+#[cfg(any(test, not(any(target_os = "ios", target_os = "macos"))))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CentralLink {
+    /// This module's framing. The peer is named by its signed announce.
+    Ratspeak,
+    /// The ble-reticulum protocol, after the identity handshake, with the
+    /// identity the peripheral published if it published a usable one.
+    BleReticulum {
+        peer_identity: Option<crate::ble_reticulum::Identity>,
+    },
+}
+
+#[cfg(any(test, not(any(target_os = "ios", target_os = "macos"))))]
+impl CentralLink {
+    fn is_ble_reticulum(self) -> bool {
+        matches!(self, Self::BleReticulum { .. })
+    }
+
+    /// `packet` as the characteristic values to write, each at most
+    /// `value_len` bytes.
+    fn fragments(self, packet: &[u8], value_len: usize) -> Vec<Vec<u8>> {
+        match self {
+            Self::Ratspeak => fragment_packet(packet, value_len),
+            Self::BleReticulum { .. } => crate::ble_reticulum::fragment_packet(packet, value_len),
+        }
+    }
+
+    /// The peer's identity as [`BlePeerEvent::Connected`] carries it.
+    fn identity_hex(self) -> String {
+        match self {
+            Self::BleReticulum {
+                peer_identity: Some(identity),
+            } => hex::encode(identity),
+            _ => String::new(),
+        }
+    }
+
+    /// Whether a link that last sent at `last_sent` owes its peer a keepalive.
+    fn keepalive_due(self, last_sent: Instant) -> bool {
+        self.is_ble_reticulum() && last_sent.elapsed() >= crate::ble_reticulum::KEEPALIVE_INTERVAL
+    }
+}
 
 /// Mobile peers can briefly hold both central and peripheral roles during a
 /// connection race or reconnect. Only the packet-source anti-loop may suppress
@@ -491,6 +556,11 @@ pub enum BlePeerEvent {
         rssi: i16,
         protocol: PeerProtocol,
     },
+    /// A GATT link is up. `identity_hash` is the hex identity a
+    /// ble-reticulum peripheral published in its Identity characteristic, and
+    /// empty for every other peer. It names the node on the other end of the
+    /// link and is not authenticated; a peer's messaging identity still
+    /// arrives only as [`BlePeerEvent::IdentityResolved`].
     Connected {
         address: String,
         identity_hash: String,
@@ -3727,6 +3797,95 @@ mod android_peripheral {
         })
     }
 
+    /// The Identity characteristic of the peer at `address`, read while
+    /// connecting: `None` for a peer that is not a ble-reticulum peripheral,
+    /// and empty when the characteristic could not be read.
+    pub fn peer_client_identity(address: &str) -> Option<Vec<u8>> {
+        with_env(|env| {
+            let cls = find_app_class(env, "org.ratspeak.android.RatspeakBlePeerClient")
+                .map_err(|e| format!("RatspeakBlePeerClient class: {e}"))?;
+            let addr_str = env
+                .new_string(address)
+                .map_err(|e| format!("addr string: {e}"))?;
+            let result = env
+                .call_static_method(
+                    cls,
+                    "peerIdentity",
+                    "(Ljava/lang/String;)[B",
+                    &[JValue::Object(addr_str.into())],
+                )
+                .map_err(|e| format!("peerIdentity: {e}"))?
+                .l()
+                .map_err(|e| format!("{e}"))?;
+            if result.is_null() {
+                return Ok(None);
+            }
+            env.convert_byte_array(result.into_inner())
+                .map(Some)
+                .map_err(|e| format!("identity bytes: {e}"))
+        })
+        .unwrap_or(None)
+    }
+
+    /// Write `data` to the peer's RX characteristic and wait for the peer to
+    /// acknowledge it. Blocking. Carries the ble-reticulum identity handshake,
+    /// which must arrive: the peripheral ignores the link until it has.
+    pub fn peer_client_write_with_response(address: &str, data: &[u8]) -> bool {
+        with_env(|env| {
+            let cls = find_app_class(env, "org.ratspeak.android.RatspeakBlePeerClient")
+                .map_err(|e| format!("RatspeakBlePeerClient class: {e}"))?;
+            let addr_str = env
+                .new_string(address)
+                .map_err(|e| format!("addr string: {e}"))?;
+            let payload = env
+                .byte_array_from_slice(data)
+                .map_err(|e| format!("byte array: {e}"))?;
+            let ok = env
+                .call_static_method(
+                    cls,
+                    "writeWithResponse",
+                    "(Ljava/lang/String;[B)Z",
+                    &[
+                        JValue::Object(addr_str.into()),
+                        JValue::Object(JObject::from(payload)),
+                    ],
+                )
+                .map_err(|e| format!("writeWithResponse: {e}"))?
+                .z()
+                .unwrap_or(false);
+            Ok(ok)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Connect to `address` as Central and, when the peer is a ble-reticulum
+    /// peripheral, complete its identity handshake. Blocking.
+    pub fn peer_client_open(
+        address: &str,
+        identity: crate::ble_reticulum::Identity,
+        ble_reticulum_links: &BleReticulumLinks,
+    ) -> Result<CentralLink, String> {
+        peer_client_connect(address)?;
+        let Some(published) = peer_client_identity(address) else {
+            return Ok(CentralLink::Ratspeak);
+        };
+        // The peripheral may notify as soon as it has our identity, so the
+        // inbound consumer has to know the link's framing first.
+        if let Ok(mut links) = ble_reticulum_links.lock() {
+            links.insert(address.to_string());
+        }
+        if !peer_client_write_with_response(address, &identity) {
+            if let Ok(mut links) = ble_reticulum_links.lock() {
+                links.remove(address);
+            }
+            peer_client_disconnect(address);
+            return Err("ble-reticulum identity handshake failed".into());
+        }
+        Ok(CentralLink::BleReticulum {
+            peer_identity: crate::ble_reticulum::parse_identity(&published),
+        })
+    }
+
     /// Push outbound bytes to a connected peer (Central side). The caller is
     /// responsible for fragmentation. Returns false if the address has no
     /// live client or the JNI call fails.
@@ -4823,6 +4982,7 @@ struct MeshPeerConnection {
     tx_char: btleplug::api::Characteristic,
     write_mtu: usize,
     protocol: PeerProtocol,
+    link: CentralLink,
     notifications:
         std::pin::Pin<Box<dyn futures::Stream<Item = btleplug::api::ValueNotification> + Send>>,
     /// Source key used by the anti-loop map. Matches the BLE address
@@ -4921,9 +5081,11 @@ async fn disconnect_central_peripherals() {
 
 /// Connect to a discovered mesh peer and subscribe to TX notifications.
 ///
-/// No BLE-level identity exchange. Identity is learned later from the first
-/// signed Reticulum announce over the link; sending unframed identity bytes
-/// here corrupts the fragment reassembler on first contact.
+/// A Ratspeak peer gets no BLE-level identity exchange: its identity is
+/// learned later from the first signed Reticulum announce over the link, and
+/// unframed identity bytes would corrupt its fragment reassembler on first
+/// contact. A ble-reticulum peripheral gets that protocol's handshake, with
+/// `session_identity` as this side's identity.
 ///
 /// Linux + Windows only — see [`MeshPeerConnection`] header for why Apple
 /// uses a parallel native path.
@@ -4935,6 +5097,7 @@ async fn connect_mesh_peer(
     adapter: &btleplug::platform::Adapter,
     peer: &BlePeer,
     generation: u64,
+    session_identity: crate::ble_reticulum::Identity,
 ) -> Result<MeshPeerConnection, String> {
     use crate::ble_connect::{operation, while_current};
     use btleplug::api::{Central, Peripheral as _};
@@ -5008,15 +5171,45 @@ async fn connect_mesh_peer(
                 return Err(format!("Connect failed after 3 attempts: {last_error}"));
             }
             operation("Service discovery", peripheral.discover_services()).await?;
+            let characteristics = peripheral.characteristics();
             let (protocol, rx_char, tx_char) =
-                mesh_gatt_characteristics(&peripheral.characteristics(), peer.protocol)
+                mesh_gatt_characteristics(&characteristics, peer.protocol)
                     .ok_or("Peer has no supported writable/notify mesh service")?;
+            let identity_char = (protocol == PeerProtocol::Columba)
+                .then(|| ble_reticulum_identity_characteristic(&characteristics))
+                .flatten();
 
             // Install the receiver first so a peer's immediate first-contact
             // notification cannot fall into a subscribe-to-read-loop gap.
             let notifications =
                 operation("Notification stream", peripheral.notifications()).await?;
             operation("Subscribe TX", peripheral.subscribe(&tx_char)).await?;
+            let link = match identity_char {
+                None => CentralLink::Ratspeak,
+                Some(identity_char) => {
+                    // A peer whose identity cannot be read stays unnamed;
+                    // Columba carries on the same way.
+                    let published = operation("Read identity", peripheral.read(&identity_char))
+                        .await
+                        .unwrap_or_default();
+                    let write_type = if rx_char
+                        .properties
+                        .contains(btleplug::api::CharPropFlags::WRITE)
+                    {
+                        btleplug::api::WriteType::WithResponse
+                    } else {
+                        btleplug::api::WriteType::WithoutResponse
+                    };
+                    operation(
+                        "Identity handshake",
+                        peripheral.write(&rx_char, &session_identity, write_type),
+                    )
+                    .await?;
+                    CentralLink::BleReticulum {
+                        peer_identity: crate::ble_reticulum::parse_identity(&published),
+                    }
+                }
+            };
             Ok(MeshPeerConnection {
                 generation,
                 connection_id,
@@ -5025,6 +5218,7 @@ async fn connect_mesh_peer(
                 rx_char,
                 tx_char,
                 protocol,
+                link,
                 notifications,
                 ble_address: peer.ble_address.clone(),
             })
@@ -5101,6 +5295,23 @@ fn mesh_gatt_characteristics(
         }
     }
     None
+}
+
+/// The readable Identity characteristic beside Columba's RX and TX: what
+/// marks a peripheral as speaking the ble-reticulum protocol. Ratspeak's own
+/// Columba-compatible service has none.
+#[cfg(any(test, target_os = "linux", target_os = "windows"))]
+fn ble_reticulum_identity_characteristic(
+    chars: &std::collections::BTreeSet<btleplug::api::Characteristic>,
+) -> Option<btleplug::api::Characteristic> {
+    chars
+        .iter()
+        .find(|c| {
+            c.service_uuid == COLUMBA_SERVICE_UUID
+                && c.uuid == COLUMBA_ID_UUID
+                && c.properties.contains(btleplug::api::CharPropFlags::READ)
+        })
+        .cloned()
 }
 
 /// Admit at most one unseen remembered target per scan cycle, after visible
@@ -5223,6 +5434,7 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
 
     // Fragment reassembly buffer: maps total_count to per-sequence payload slots.
     let mut reassembly: FragmentReassembly = HashMap::new();
+    let mut ble_reticulum_stream = crate::ble_reticulum::Reassembler::default();
     let mut missed_keepalives: u32 = 0;
 
     loop {
@@ -5293,7 +5505,24 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
                     continue;
                 }
 
-                let complete_packet = consume_ble_frame(data, &mut reassembly);
+                let complete_packet = match conn.link {
+                    CentralLink::Ratspeak => consume_ble_frame(data, &mut reassembly),
+                    CentralLink::BleReticulum { .. } => match ble_reticulum_stream.push(&data) {
+                        crate::ble_reticulum::Frame::Packet(packet) => Some(packet),
+                        crate::ble_reticulum::Frame::Invalid(reason) => {
+                            tracing::debug!(
+                                target: "ble_trace",
+                                step = "reassembly.invalid",
+                                peer = %conn.ble_address,
+                                len = data.len(),
+                                reason,
+                                "ble-reticulum frame dropped"
+                            );
+                            None
+                        }
+                        _ => None,
+                    },
+                };
 
                 // Forward complete packet to transport
                 if let Some(raw) = complete_packet {
@@ -5369,10 +5598,12 @@ async fn peer_read_loop(conn: MeshPeerConnection, ctx: PeerReadLoopCtx) {
     feature = "ble",
     not(any(target_os = "android", target_os = "ios", target_os = "macos"))
 ))]
+#[allow(clippy::too_many_arguments)]
 async fn peer_write_loop(
     peripheral: btleplug::platform::Peripheral,
     rx_char: btleplug::api::Characteristic,
     write_mtu: usize,
+    link: CentralLink,
     mut rx: mpsc::Receiver<Bytes>,
     peer_online: Arc<AtomicBool>,
     peer_address: String,
@@ -5387,7 +5618,32 @@ async fn peer_write_loop(
     // dropped the write_tx sender. 1s is short enough for teardown to feel
     // immediate and long enough to add no measurable battery cost.
     const SHUTDOWN_POLL: Duration = Duration::from_secs(1);
+    let mut last_sent = Instant::now();
     loop {
+        // Checked every pass, not only when the queue is idle: packets this
+        // peer sent us come through here and are skipped.
+        if link.keepalive_due(last_sent) {
+            let write = crate::ble_rnode::ble_write(
+                &peripheral,
+                &rx_char,
+                &crate::ble_reticulum::KEEPALIVE_FRAME,
+                write_mtu,
+            );
+            if !matches!(
+                tokio::time::timeout(PEER_WRITE_TIMEOUT, write).await,
+                Ok(Ok(()))
+            ) {
+                tracing::warn!(
+                    target: "ble_trace",
+                    step = "keepalive.tx_fail",
+                    peer = %peer_address,
+                    "ble-reticulum keepalive write failed"
+                );
+                peer_online.store(false, Ordering::SeqCst);
+                return;
+            }
+            last_sent = Instant::now();
+        }
         let data = tokio::select! {
             v = rx.recv() => match v {
                 Some(d) => d,
@@ -5413,7 +5669,7 @@ async fn peer_write_loop(
             continue;
         }
 
-        let fragments = fragment_packet(&data, write_mtu);
+        let fragments = link.fragments(&data, write_mtu);
         for (idx, frag) in fragments.iter().enumerate() {
             // Bound the write: a wedged BlueZ/WinRT stack can otherwise leave
             // this task (and every packet queued behind it) hung indefinitely.
@@ -5438,6 +5694,7 @@ async fn peer_write_loop(
             }
             pace_after_ble_fragment(idx, fragments.len()).await;
         }
+        last_sent = Instant::now();
         tx_count += 1;
         if tx_count.is_multiple_of(5) {
             tracing::info!(
@@ -5491,6 +5748,7 @@ pub async fn spawn_ble_peer_interface(
     let anti_loop = new_anti_loop_map();
     let link_registry: LinkRegistry =
         Arc::new(tokio::sync::RwLock::new(BlePeerLinkRegistry::default()));
+    let ble_reticulum_links: BleReticulumLinks = Arc::default();
 
     // TX/RX byte counters. Declared up here so the peripheral inbound
     // reassembly task spawned next can clone shared_rxb into its closure.
@@ -5504,6 +5762,7 @@ pub async fn spawn_ble_peer_interface(
         let transport_periph = transport_tx.clone();
         let anti_loop_p = anti_loop.clone();
         let link_registry_p = link_registry.clone();
+        let ble_reticulum_links_p = ble_reticulum_links.clone();
         // Apple (iOS+macOS) and Android peripheral modules expose a per-process
         // inbound channel populated by their delegate / GATT-server callback.
         // All platform peripheral modules surface a `(peer_id, data)`
@@ -5550,6 +5809,11 @@ pub async fn spawn_ble_peer_interface(
                     // string on Apple). Two peers writing fragments concurrently
                     // can no longer corrupt each other's reassembly buffers.
                     let mut reassembly: PeerReassembly = HashMap::new();
+                    // Notifications from ble-reticulum peripherals, by address.
+                    let mut ble_reticulum_streams: HashMap<
+                        String,
+                        crate::ble_reticulum::Reassembler,
+                    > = HashMap::new();
                     while let Some((peer, central, data)) = rx.recv().await {
                         if !generation_is_current(generation) {
                             break;
@@ -5566,7 +5830,30 @@ pub async fn spawn_ble_peer_interface(
                             continue; // Empty or keepalive
                         }
                         let complete =
-                            consume_peer_ble_frame(&peer, central, data, &mut reassembly);
+                            if central && is_ble_reticulum_link(&ble_reticulum_links_p, &peer) {
+                                use crate::ble_reticulum::Frame;
+                                match ble_reticulum_streams
+                                    .entry(peer.clone())
+                                    .or_default()
+                                    .push(&data)
+                                {
+                                    Frame::Packet(packet) => Some(packet),
+                                    Frame::Keepalive | Frame::Partial => None,
+                                    Frame::Invalid(reason) => {
+                                        tracing::debug!(
+                                            target: "ble_trace",
+                                            step = "reassembly.invalid",
+                                            peer = %peer,
+                                            len = data.len(),
+                                            reason,
+                                            "BLE Peer reassembly: ble-reticulum frame dropped"
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                consume_peer_ble_frame(&peer, central, data, &mut reassembly)
+                            };
 
                         if let Some(raw) = complete {
                             rxb.fetch_add(raw.len() as u64, Ordering::Relaxed);
@@ -5628,6 +5915,9 @@ pub async fn spawn_ble_peer_interface(
                             prune_reassembly(buf);
                         }
                         reassembly.retain(|_, m| !m.is_empty());
+                        // A link's next connection starts a new packet.
+                        ble_reticulum_streams
+                            .retain(|peer, _| is_ble_reticulum_link(&ble_reticulum_links_p, peer));
                     }
                 }),
             );
@@ -5903,6 +6193,7 @@ pub async fn spawn_ble_peer_interface(
         let writers = peer_writers.clone();
         let anti_loop = anti_loop.clone();
         let wake = foreground_wake.clone();
+        let session_identity = crate::ble_reticulum::session_identity();
 
         tokio::spawn(async move {
             // Connected peers keyed by BLE address. Identity-keyed dedupe
@@ -6060,11 +6351,14 @@ pub async fn spawn_ble_peer_interface(
                                 "BLE mesh candidate, connecting..."
                             );
 
-                            // Connect, subscribe, set up data flow.
-                            // No BLE-level identity exchange — identity is
-                            // learned later from the first signed Reticulum
-                            // announce that flows over the link.
-                            match connect_mesh_peer(&adapter, peer, generation).await {
+                            // Connect, subscribe, set up data flow. A
+                            // Ratspeak peer's identity is learned later from
+                            // the first signed Reticulum announce that flows
+                            // over the link; a ble-reticulum peripheral also
+                            // gets that protocol's handshake.
+                            match connect_mesh_peer(&adapter, peer, generation, session_identity)
+                                .await
+                            {
                                 Ok(conn) => {
                                     // Drop the wanted-reconnect entry now
                                     // that we've reconnected.
@@ -6090,6 +6384,7 @@ pub async fn spawn_ble_peer_interface(
                                     let p_write = conn.peripheral.clone();
                                     let rx_c = conn.rx_char.clone();
                                     let mtu = conn.write_mtu;
+                                    let link = conn.link;
                                     let online_w = peer_online.clone();
                                     let addr_w = peer.ble_address.clone();
                                     let anti_loop_w = anti_loop.clone();
@@ -6100,6 +6395,7 @@ pub async fn spawn_ble_peer_interface(
                                                 p_write,
                                                 rx_c,
                                                 mtu,
+                                                link,
                                                 peer_write_rx,
                                                 online_w,
                                                 addr_w,
@@ -6142,7 +6438,7 @@ pub async fn spawn_ble_peer_interface(
                                     );
                                     dispatch_event(BlePeerEvent::Connected {
                                         address: addr_evt.clone(),
-                                        identity_hash: String::new(),
+                                        identity_hash: link.identity_hex(),
                                         protocol: proto_evt,
                                     });
                                     dispatch_status_changed(
@@ -6539,6 +6835,8 @@ pub async fn spawn_ble_peer_interface(
         let recently_disc = recently_disconnected.clone();
         let anti_loop = anti_loop.clone();
         let wake = foreground_wake.clone();
+        let ble_reticulum_links = ble_reticulum_links.clone();
+        let session_identity = crate::ble_reticulum::session_identity();
 
         tokio::spawn(async move {
             // Scan timeout per cycle — short enough to feel responsive when a
@@ -6576,6 +6874,11 @@ pub async fn spawn_ble_peer_interface(
                     alive
                 });
                 if !dropped_addrs.is_empty() {
+                    if let Ok(mut links) = ble_reticulum_links.lock() {
+                        for addr in &dropped_addrs {
+                            links.remove(addr);
+                        }
+                    }
                     // peer_client_disconnect crosses into the JVM and can block;
                     // run it off the async runtime rather than stalling the loop.
                     let _ = tokio::task::spawn_blocking(move || {
@@ -6685,14 +6988,19 @@ pub async fn spawn_ble_peer_interface(
                     // Blocking connect call — Kotlin uses CountDownLatches that
                     // would deadlock on the GATT callback thread.
                     let addr_clone = addr.clone();
+                    let links_clone = ble_reticulum_links.clone();
                     let connect_result = tokio::task::spawn_blocking(move || {
-                        android_peripheral::peer_client_connect(&addr_clone)
+                        android_peripheral::peer_client_open(
+                            &addr_clone,
+                            session_identity,
+                            &links_clone,
+                        )
                     })
                     .await
                     .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
                     match connect_result {
-                        Ok(()) => {
+                        Ok(link) => {
                             let peer_online = Arc::new(AtomicBool::new(true));
                             android_peripheral::register_peer_online(
                                 addr.clone(),
@@ -6726,7 +7034,32 @@ pub async fn spawn_ble_peer_interface(
                                     // task would live until the scan loop's
                                     // cleanup-on-next-tick dropped the write_tx.
                                     const SHUTDOWN_POLL: Duration = Duration::from_secs(1);
+                                    let mut last_sent = Instant::now();
                                     loop {
+                                        // Checked every pass, not only when the
+                                        // queue is idle: packets this peer sent
+                                        // us come through here and are skipped.
+                                        if link.keepalive_due(last_sent) {
+                                            let addr_k = addr_w.clone();
+                                            let sent = tokio::task::spawn_blocking(move || {
+                                                android_peripheral::peer_client_write(
+                                                    &addr_k,
+                                                    &crate::ble_reticulum::KEEPALIVE_FRAME,
+                                                )
+                                            })
+                                            .await
+                                            .unwrap_or(false);
+                                            if !sent {
+                                                // A dead link ends through its
+                                                // disconnect callback; a busy one
+                                                // gets the next keepalive.
+                                                tracing::debug!(
+                                                    peer = %addr_w,
+                                                    "Android peer client keepalive not sent"
+                                                );
+                                            }
+                                            last_sent = Instant::now();
+                                        }
                                         let data = tokio::select! {
                                             v = peer_write_rx.recv() => match v {
                                                 Some(d) => d,
@@ -6761,7 +7094,7 @@ pub async fn spawn_ble_peer_interface(
                                         })
                                         .await
                                         .unwrap_or(20);
-                                        let frags = fragment_packet(&data, mtu);
+                                        let frags = link.fragments(&data, mtu);
                                         let addr_w2 = addr_w.clone();
                                         let send_ok = tokio::task::spawn_blocking(move || {
                                             let total = frags.len();
@@ -6785,6 +7118,7 @@ pub async fn spawn_ble_peer_interface(
                                             online_w.store(false, Ordering::SeqCst);
                                             break;
                                         }
+                                        last_sent = Instant::now();
                                     }
                                     let mut writers = writers_cleanup.write().await;
                                     remove_peer_writer_if_current(
@@ -6800,11 +7134,12 @@ pub async fn spawn_ble_peer_interface(
                             tracing::info!(
                                 address = %addr,
                                 protocol = ?protocol,
+                                ble_reticulum = link.is_ble_reticulum(),
                                 "BLE mesh (Android) peer connected"
                             );
                             dispatch_event(BlePeerEvent::Connected {
                                 address: addr.clone(),
-                                identity_hash: String::new(),
+                                identity_hash: link.identity_hex(),
                                 protocol: *protocol,
                             });
                             dispatch_status_changed(
@@ -6995,6 +7330,107 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn only_a_readable_columba_identity_marks_a_ble_reticulum_peripheral() {
+        use btleplug::api::{CharPropFlags, Characteristic};
+        let make = |service, uuid, properties| Characteristic {
+            uuid,
+            service_uuid: service,
+            properties,
+            descriptors: Default::default(),
+        };
+        let rx = make(
+            COLUMBA_SERVICE_UUID,
+            COLUMBA_RX_UUID,
+            CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE,
+        );
+        let tx = make(
+            COLUMBA_SERVICE_UUID,
+            COLUMBA_TX_UUID,
+            CharPropFlags::READ | CharPropFlags::NOTIFY,
+        );
+        let identity = make(COLUMBA_SERVICE_UUID, COLUMBA_ID_UUID, CharPropFlags::READ);
+
+        // RTNode's table: the peer is found as Columba and has the identity.
+        let rtnode = [rx.clone(), tx.clone(), identity.clone()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            mesh_gatt_characteristics(&rtnode, PeerProtocol::Columba)
+                .unwrap()
+                .0,
+            PeerProtocol::Columba
+        );
+        assert_eq!(
+            ble_reticulum_identity_characteristic(&rtnode),
+            Some(identity)
+        );
+
+        // Ratspeak's Columba-compatible service has no identity.
+        let ratspeak = [rx.clone(), tx.clone()].into_iter().collect();
+        assert_eq!(ble_reticulum_identity_characteristic(&ratspeak), None);
+        // Neither an identity that cannot be read nor one on another service counts.
+        for other in [
+            make(COLUMBA_SERVICE_UUID, COLUMBA_ID_UUID, CharPropFlags::WRITE),
+            make(RATSPEAK_SERVICE_UUID, COLUMBA_ID_UUID, CharPropFlags::READ),
+            make(RATSPEAK_SERVICE_UUID, RATSPEAK_ID_UUID, CharPropFlags::READ),
+        ] {
+            let chars = [rx.clone(), tx.clone(), other].into_iter().collect();
+            assert_eq!(ble_reticulum_identity_characteristic(&chars), None);
+        }
+    }
+
+    #[test]
+    fn a_central_link_frames_packets_as_its_peer_expects() {
+        let ratspeak = CentralLink::Ratspeak;
+        let node = CentralLink::BleReticulum {
+            peer_identity: Some([0xab; 16]),
+        };
+        let unnamed = CentralLink::BleReticulum {
+            peer_identity: None,
+        };
+
+        // A Reticulum data packet that fits one value: bare for a Ratspeak
+        // peer, under a header for a ble-reticulum one.
+        let packet = [0x00u8; 40];
+        assert_eq!(ratspeak.fragments(&packet, 182), [packet.to_vec()]);
+        let framed = node.fragments(&packet, 182);
+        assert_eq!(framed.len(), 1);
+        assert_eq!(framed[0][..5], [0x01, 0, 0, 0, 1]);
+        assert_eq!(framed[0][5..], packet);
+        assert_eq!(unnamed.fragments(&packet, 182), framed);
+
+        // Only a ble-reticulum peripheral named itself.
+        assert_eq!(ratspeak.identity_hex(), "");
+        assert_eq!(node.identity_hex(), "ab".repeat(16));
+        assert_eq!(unnamed.identity_hex(), "");
+    }
+
+    #[test]
+    fn only_a_ble_reticulum_link_owes_a_keepalive_and_only_when_idle() {
+        let node = CentralLink::BleReticulum {
+            peer_identity: None,
+        };
+        let now = Instant::now();
+        let idle = now
+            .checked_sub(crate::ble_reticulum::KEEPALIVE_INTERVAL)
+            .expect("the clock has run for a keepalive interval");
+        assert!(node.keepalive_due(idle));
+        assert!(!node.keepalive_due(now));
+        assert!(!CentralLink::Ratspeak.keepalive_due(idle));
+    }
+
+    #[test]
+    fn ble_reticulum_links_are_known_by_address_while_registered() {
+        let links: BleReticulumLinks = Arc::default();
+        assert!(!is_ble_reticulum_link(&links, "C0:00:00:00:00:01"));
+        links.lock().unwrap().insert("C0:00:00:00:00:01".into());
+        assert!(is_ble_reticulum_link(&links, "C0:00:00:00:00:01"));
+        assert!(!is_ble_reticulum_link(&links, "C0:00:00:00:00:02"));
+        links.lock().unwrap().remove("C0:00:00:00:00:01");
+        assert!(!is_ble_reticulum_link(&links, "C0:00:00:00:00:01"));
     }
 
     #[test]

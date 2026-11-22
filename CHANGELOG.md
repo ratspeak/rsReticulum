@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Bluetooth Peer's Central role speaks the ble-reticulum protocol to peripherals that have it (RTNode firmware, Columba, the ble-reticulum Linux interface) on Android, Linux, and Windows. A Columba service with the Identity characteristic marks such a peripheral: the Central reads that characteristic, sends the identity handshake, puts the protocol's header on every fragment, and sends its keepalive after 15 seconds without sending. Before, it connected to these peripherals with Ratspeak's own framing and they dropped everything. The peripheral's identity arrives in `BlePeerEvent::Connected.identity_hash`, which was always empty; it is the peripheral's own claim, not an authenticated one. The identity the Central sends is random for each interface start, not a Reticulum identity. On Android the embedding app's `RatspeakBlePeerClient` needs two more static methods, `peerIdentity(String): ByteArray?` and `writeWithResponse(String, ByteArray): Boolean`; without them every peer gets Ratspeak's framing as before. Apple's Central role and the Peripheral role on every platform are unchanged.
+
 ## 1.5.1 - 2026-11-18
 
 - Bluetooth Peer runs in Gateway mode, so a node with transport on looks up the paths its Bluetooth peers ask for that it doesn't know yet. Nodes with transport off behave as before.
