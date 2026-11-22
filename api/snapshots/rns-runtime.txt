@@ -589,6 +589,9 @@ pub rns_runtime::link_manager::LinkManagerCommand::CloseLink::send_teardown: boo
 pub rns_runtime::link_manager::LinkManagerCommand::DeregisterRequestHandler
 pub rns_runtime::link_manager::LinkManagerCommand::DeregisterRequestHandler::path: alloc::string::String
 pub rns_runtime::link_manager::LinkManagerCommand::DeregisterRequestHandler::result_tx: core::option::Option<tokio::sync::oneshot::Sender<bool>>
+pub rns_runtime::link_manager::LinkManagerCommand::LinkInterface
+pub rns_runtime::link_manager::LinkManagerCommand::LinkInterface::link_id: [u8; 16]
+pub rns_runtime::link_manager::LinkManagerCommand::LinkInterface::result_tx: tokio::sync::oneshot::Sender<core::option::Option<rns_transport::messages::InterfaceId>>
 pub rns_runtime::link_manager::LinkManagerCommand::LinkRtt
 pub rns_runtime::link_manager::LinkManagerCommand::LinkRtt::link_id: [u8; 16]
 pub rns_runtime::link_manager::LinkManagerCommand::LinkRtt::result_tx: tokio::sync::oneshot::Sender<core::option::Option<f64>>

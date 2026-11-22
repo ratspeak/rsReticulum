@@ -602,6 +602,12 @@ pub enum LinkManagerCommand {
         link_id: [u8; 16],
         result_tx: oneshot::Sender<Option<f64>>,
     },
+    /// The interface an established Link is attached to ([`LinkManager::link_interface`]),
+    /// `None` for an unknown Link.
+    LinkInterface {
+        link_id: [u8; 16],
+        result_tx: oneshot::Sender<Option<InterfaceId>>,
+    },
     /// Channel readiness and the Python Buffer close wait, `link.rtt * len(tx_ring)`.
     ChannelCloseWait {
         link_id: [u8; 16],
@@ -2494,6 +2500,10 @@ impl LinkManager {
                     .get(&link_id)
                     .map(|active| active.link.rtt_secs());
                 let _ = result_tx.send(rtt);
+                true
+            }
+            LinkManagerCommand::LinkInterface { link_id, result_tx } => {
+                let _ = result_tx.send(self.link_interface(&link_id));
                 true
             }
             LinkManagerCommand::ChannelCloseWait { link_id, result_tx } => {
@@ -10688,6 +10698,45 @@ mod tests {
             })
         ));
         assert_eq!(manager.link_interface(&initiator.link_id), Some(73));
+    }
+
+    #[test]
+    fn link_interface_command_answers_an_inbound_links_interface() {
+        let identity = Identity::new();
+        let destination_hash =
+            Destination::hash_from_name_and_identity("endpoint.binding", Some(&identity.hash));
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut manager = LinkManager::with_destination(
+            transport_tx,
+            event_rx,
+            &identity,
+            "endpoint.binding",
+            identity.get_signing_key(),
+        );
+        let (initiator, request_data) = Link::new_initiator(destination_hash, 1);
+        manager.handle_link_request(&link_request_raw(destination_hash, &request_data), 41);
+        let Ok(TransportMessage::BindLinkEndpoint {
+            lifecycle_tx,
+            result_tx,
+            ..
+        }) = transport_rx.try_recv()
+        else {
+            panic!("responder must bind its endpoint first");
+        };
+        let _ = result_tx.send(LinkEndpointBindResult::Bound);
+        std::mem::forget(lifecycle_tx);
+        assert!(manager.poll_link_endpoints());
+
+        let ask = |manager: &mut LinkManager, link_id: [u8; 16]| {
+            let (result_tx, mut result_rx) = oneshot::channel();
+            assert!(
+                manager.handle_command(LinkManagerCommand::LinkInterface { link_id, result_tx })
+            );
+            result_rx.try_recv().expect("answered at once")
+        };
+        assert_eq!(ask(&mut manager, initiator.link_id), Some(41));
+        assert_eq!(ask(&mut manager, [0x5a; 16]), None);
     }
 
     #[test]
