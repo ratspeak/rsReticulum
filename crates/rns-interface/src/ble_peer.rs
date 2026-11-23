@@ -2007,7 +2007,11 @@ mod apple_peripheral {
                         let mgr_addr = mgr_ptr as usize;
                         std::thread::spawn(move || unsafe {
                             let mgr = mgr_addr as *mut AnyObject;
-                            match register_services_and_advertise(mgr, &id_hash) {
+                            match crate::apple_objc::catch_objc("re-register services", || {
+                                register_services_and_advertise(mgr, &id_hash)
+                            })
+                            .and_then(|done| done)
+                            {
                                 Ok(()) => tracing::info!(
                                     "iOS BLE Peripheral: recovery — re-registered services"
                                 ),
@@ -2592,22 +2596,42 @@ mod apple_peripheral {
                 tracing::error!("iOS BLE Peripheral: CBPeripheralManager class not found");
                 return;
             };
-            let mgr_raw: *mut AnyObject = msg_send![mgr_cls, alloc];
             // RestoreIdentifierKey lets iOS resurrect this peripheral for a
-            // background BLE event after the process is killed.
-            let opts: *mut AnyObject = {
+            // background BLE event after the process is killed, where the
+            // bundle allows it.
+            let opts: *mut AnyObject = if crate::apple_objc::may_restore("bluetooth-peripheral") {
                 let dict_cls =
                     AnyClass::get(c"NSDictionary").expect("NSDictionary must exist at runtime");
                 let id = NSString::from_str(PERIPHERAL_RESTORE_ID);
                 msg_send![dict_cls,
                     dictionaryWithObject: &*id,
                     forKey: CBPeripheralManagerOptionRestoreIdentifierKey]
+            } else {
+                std::ptr::null_mut()
             };
-            let mgr_raw: *mut AnyObject = msg_send![mgr_raw,
-                initWithDelegate: delegate_raw,
-                queue: std::ptr::null::<AnyObject>(),
-                options: opts,
-            ];
+            let created = crate::apple_objc::catch_objc("CBPeripheralManager init", || {
+                let mgr_raw: *mut AnyObject = msg_send![mgr_cls, alloc];
+                let mgr_raw: *mut AnyObject = msg_send![mgr_raw,
+                    initWithDelegate: delegate_raw,
+                    queue: std::ptr::null::<AnyObject>(),
+                    options: opts,
+                ];
+                mgr_raw
+            });
+            let mgr_raw = match created {
+                Ok(mgr) if !mgr.is_null() => mgr,
+                failed => {
+                    let reason = failed
+                        .err()
+                        .unwrap_or_else(|| "CBPeripheralManager init returned nil".into());
+                    tracing::error!("iOS BLE Peripheral: {reason}");
+                    if let Ok(mut g) = pending_advertise().lock() {
+                        *g = None;
+                    }
+                    apply_event(crate::ble_peer_lifecycle::LifecycleEvent::FatalError { reason });
+                    return;
+                }
+            };
             // `retain` returns `id`; binding as `*mut AnyObject` avoids
             // objc2's debug class-verify tripping on KVO-swizzled subclasses
             // like `NSKVONotifying_CBPeripheralManager`.
@@ -2642,7 +2666,11 @@ mod apple_peripheral {
                 return;
             };
 
-            match register_services_and_advertise(mgr_raw, &pending.identity_hash) {
+            match crate::apple_objc::catch_objc("register services and advertise", || {
+                register_services_and_advertise(mgr_raw, &pending.identity_hash)
+            })
+            .and_then(|done| done)
+            {
                 Ok(()) => tracing::info!(
                     "iOS BLE Peripheral: powered on, registering services + advertising"
                 ),

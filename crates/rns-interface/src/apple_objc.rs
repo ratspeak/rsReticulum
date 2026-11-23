@@ -3,10 +3,50 @@
 //! object lives until the thread exits.
 
 use objc2::msg_send;
-use objc2::rc::{Allocated, Retained};
+use objc2::rc::{Allocated, Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2_foundation::NSString;
 use uuid::Uuid;
+
+/// Runs `f`, returning an Objective-C exception it raises as `Err`. One that
+/// reaches Rust aborts the process.
+pub(crate) fn catch_objc<R>(what: &str, f: impl FnOnce() -> R) -> Result<R, String> {
+    objc2::exception::catch(std::panic::AssertUnwindSafe(f)).map_err(|e| match e {
+        Some(e) => format!("{what}: {e}"),
+        None => format!("{what}: Objective-C exception"),
+    })
+}
+
+/// Whether a CoreBluetooth manager may ask for state restoration in `mode`
+/// (`bluetooth-central` or `bluetooth-peripheral`). iOS raises for a restore
+/// identifier unless the bundle declares the mode, which an app extension
+/// cannot.
+pub(crate) fn may_restore(mode: &str) -> bool {
+    !cfg!(target_os = "ios") || declares_background_mode(mode)
+}
+
+/// Whether the main bundle's `UIBackgroundModes` lists `mode`.
+pub(crate) fn declares_background_mode(mode: &str) -> bool {
+    autoreleasepool(|_| unsafe {
+        let (Some(bundle_cls), Some(array_cls)) =
+            (AnyClass::get(c"NSBundle"), AnyClass::get(c"NSArray"))
+        else {
+            return false;
+        };
+        let bundle: *mut AnyObject = msg_send![bundle_cls, mainBundle];
+        if bundle.is_null() {
+            return false;
+        }
+        let key = NSString::from_str("UIBackgroundModes");
+        let modes: *mut AnyObject = msg_send![bundle, objectForInfoDictionaryKey: &*key];
+        if modes.is_null() {
+            return false;
+        }
+        let is_array: bool = msg_send![modes, isKindOfClass: array_cls];
+        let mode = NSString::from_str(mode);
+        is_array && msg_send![modes, containsObject: &*mode]
+    })
+}
 
 /// `UUIDWithString:` autoreleases, so call this inside `autoreleasepool`.
 pub(crate) fn cbuuid(uuid: &Uuid) -> Retained<AnyObject> {
@@ -39,7 +79,29 @@ pub(crate) fn nsarray(objects: &[&AnyObject]) -> Retained<AnyObject> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use objc2::rc::{Weak, autoreleasepool};
+    use objc2::rc::Weak;
+
+    #[test]
+    fn an_objective_c_exception_comes_back_as_an_error() {
+        let raised = catch_objc("manager", || unsafe {
+            let cls = AnyClass::get(c"NSArray").unwrap();
+            let empty: *mut AnyObject = msg_send![cls, array];
+            let _: *mut AnyObject = msg_send![empty, objectAtIndex: 3usize];
+        });
+        let error = raised.unwrap_err();
+        assert!(error.starts_with("manager: "), "{error}");
+        assert!(error.contains("index 3"), "{error}");
+        assert_eq!(catch_objc("manager", || 7), Ok(7));
+    }
+
+    /// A test binary declares no background modes, so an iOS one would ask
+    /// for no restoration; elsewhere restoration is never refused.
+    #[test]
+    fn restoration_follows_the_declared_background_modes() {
+        assert!(!declares_background_mode("bluetooth-central"));
+        assert!(!declares_background_mode("bluetooth-peripheral"));
+        assert_eq!(may_restore("bluetooth-central"), !cfg!(target_os = "ios"));
+    }
 
     /// Runs `make` on a thread with no autorelease pool, drops what it returns,
     /// and reports whether every returned object was freed. A stray retain or

@@ -806,7 +806,9 @@
           "requirement": "^0.6",
           "optional": false,
           "defaultFeatures": true,
-          "features": [],
+          "features": [
+            "exception"
+          ],
           "sourceKind": "registry"
         },
         {

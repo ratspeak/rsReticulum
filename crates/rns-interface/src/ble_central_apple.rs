@@ -149,21 +149,42 @@ pub async fn start_scan(
             tracing::error!("Apple BLE Central: CBCentralManager class not found");
             return;
         };
-        let mgr_raw: *mut AnyObject = msg_send![mgr_cls, alloc];
         // RestoreIdentifierKey lets iOS resurrect us for a background BLE
-        // event after the process is killed.
-        let opts = match build_init_options() {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!("Apple BLE Central: init-options build failed: {e}");
-                std::ptr::null_mut::<AnyObject>()
+        // event after the process is killed, where the bundle allows it.
+        let opts = if crate::apple_objc::may_restore("bluetooth-central") {
+            match build_init_options() {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("Apple BLE Central: init-options build failed: {e}");
+                    std::ptr::null_mut::<AnyObject>()
+                }
+            }
+        } else {
+            std::ptr::null_mut::<AnyObject>()
+        };
+        let created = crate::apple_objc::catch_objc("CBCentralManager init", || {
+            let mgr_raw: *mut AnyObject = msg_send![mgr_cls, alloc];
+            let mgr_raw: *mut AnyObject = msg_send![mgr_raw,
+                initWithDelegate: delegate_raw,
+                queue: std::ptr::null::<AnyObject>(),
+                options: opts,
+            ];
+            mgr_raw
+        });
+        let mgr_raw = match created {
+            Ok(mgr) if !mgr.is_null() => mgr,
+            Ok(_) => {
+                apply_event(CentralEvent::FatalError {
+                    reason: "CBCentralManager init returned nil".into(),
+                });
+                return;
+            }
+            Err(reason) => {
+                tracing::error!("Apple BLE Central: {reason}");
+                apply_event(CentralEvent::FatalError { reason });
+                return;
             }
         };
-        let mgr_raw: *mut AnyObject = msg_send![mgr_raw,
-            initWithDelegate: delegate_raw,
-            queue: std::ptr::null::<AnyObject>(),
-            options: opts,
-        ];
         // `retain` returns `id`; binding as `*mut AnyObject` avoids objc2's
         // debug class-verify tripping on KVO-swizzled subclasses.
         let _: *mut AnyObject = msg_send![mgr_raw, retain];
@@ -721,6 +742,14 @@ unsafe fn scan_with_manager(mgr_raw: *mut AnyObject) -> Result<(), String> {
         .map_err(|e| format!("scan_services lock poisoned: {e}"))?
         .clone();
 
+    crate::apple_objc::catch_objc("scanForPeripheralsWithServices", || unsafe {
+        scan_with_services(mgr_raw, &services)
+    })?
+}
+
+/// # Safety
+/// As [`scan_with_manager`].
+unsafe fn scan_with_services(mgr_raw: *mut AnyObject, services: &[Uuid]) -> Result<(), String> {
     autoreleasepool(|_| unsafe {
         let uuids: Vec<_> = services.iter().map(crate::apple_objc::cbuuid).collect();
         let refs: Vec<&AnyObject> = uuids.iter().map(|u| &**u).collect();

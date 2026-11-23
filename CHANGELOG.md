@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Apple Bluetooth: a CoreBluetooth manager asks for state restoration only where the app declares the `bluetooth-central` or `bluetooth-peripheral` background mode. iOS raises an exception otherwise, which aborted any process without them, such as a Network Extension, as soon as Bluetooth Peer or a Bluetooth radio started. An Objective-C exception from creating a manager, scanning, or advertising now comes back as an error instead of ending the process.
+
 ## 1.5.1 - 2026-11-18
 
 - Bluetooth Peer runs in Gateway mode, so a node with transport on looks up the paths its Bluetooth peers ask for that it doesn't know yet. Nodes with transport off behave as before.
