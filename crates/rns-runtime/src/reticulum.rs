@@ -4097,13 +4097,41 @@ pub async fn init_with_policy(
     rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
     policy: InstancePolicy,
 ) -> Result<ReticulumHandle, InstanceStartupError> {
+    init_with_policy_holding(
+        configdir,
+        socket_dir,
+        shutdown,
+        is_foreground,
+        options,
+        rnode_startup_options,
+        policy,
+        &[],
+    )
+    .await
+}
+
+/// [`init_with_policy`], with the configured interfaces named in `held` left
+/// out of this run as if disabled. Embedder choice: the config file is read,
+/// never rewritten, so they start again in a run that does not hold them.
+#[allow(clippy::too_many_arguments)]
+pub async fn init_with_policy_holding(
+    configdir: Option<&str>,
+    socket_dir: Option<PathBuf>,
+    shutdown: ShutdownSignal,
+    is_foreground: Arc<AtomicBool>,
+    options: InitOptions,
+    rnode_startup_options: rns_interface::rnode::RNodeStartupOptions,
+    policy: InstancePolicy,
+    held: &[String],
+) -> Result<ReticulumHandle, InstanceStartupError> {
     let started_at = std::time::Instant::now();
     let config_dir = resolve_config_dir(configdir);
     let paths = StoragePaths::from_config_dir(&config_dir);
     paths.ensure_dirs().map_err(ReticulumError::Io)?;
 
     let config_path = config_dir.join("config");
-    let (config, config_created) = load_or_create_config(&config_path)?;
+    let (mut config, config_created) = load_or_create_config(&config_path)?;
+    hold_interfaces(&mut config, held);
     if config_created {
         rns_transport::notice!(
             path = %config_path.display(),
@@ -11379,6 +11407,22 @@ pub fn configure_destination_stamper(
     Ok(())
 }
 
+/// Disables the `[interfaces]` sections named in `held`, in memory only.
+fn hold_interfaces(config: &mut Config, held: &[String]) {
+    let Some(interfaces) = config.section_mut("interfaces") else {
+        return;
+    };
+    for name in held {
+        if let Some(section) = interfaces.subsections.get_mut(name) {
+            for key in ["interface_enabled", "enabled"] {
+                if key == "interface_enabled" || section.has(key) {
+                    section.set(key, "no");
+                }
+            }
+        }
+    }
+}
+
 fn load_or_create_config(path: &Path) -> Result<(Config, bool), ReticulumError> {
     if path.exists() {
         Config::from_file(path)
@@ -11599,6 +11643,7 @@ mod tests {
 
     mod autoconnect;
     mod concurrent_start;
+    mod held_interfaces;
     mod interface_stats;
     mod manage_interfaces;
     mod paths_and_filters;
