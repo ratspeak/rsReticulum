@@ -3909,6 +3909,9 @@ impl ReticulumConfig {
                     "required_discovery_value",
                 );
             }
+            if let Some(warning) = misplaced_hop_limiter_warning(sec) {
+                tracing::warn!("{warning}");
+            }
             // Reticulum.py keeps only a positive value; Discovery.py defaults the rest.
             if let Some(v) = config_float("reticulum", sec, "required_discovery_value")?.or(
                 config_float("reticulum", sec, "discover_interfaces_required_value")?,
@@ -3987,6 +3990,16 @@ impl ReticulumConfig {
     pub fn from_config(config: &Config) -> Self {
         Self::try_from_config(config).expect("valid Reticulum configuration")
     }
+}
+
+/// The warning for a global `hop_limiter` set in `[reticulum]`. Upstream's
+/// `rnsd --exampleconfig` shows it there, but Python reads it only from
+/// `[filter]` (Reticulum.py), as `Config::filter_policy` does; Python ignores
+/// it silently, the runtime ignores it with this warning.
+fn misplaced_hop_limiter_warning(reticulum: &ConfigSection) -> Option<&'static str> {
+    reticulum.has("hop_limiter").then_some(
+        "The configuration option hop_limiter in [reticulum] has no effect, set it in [filter] instead",
+    )
 }
 
 /// Python 1.3.8 Transport.py: the wire-facing transport identity is

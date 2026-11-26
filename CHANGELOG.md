@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `rnsd-rs --exampleconfig` shows `hop_limiter` in a `[filter]` section, where it takes effect. A `hop_limiter` under `[reticulum]` still has no effect, as in Python Reticulum, and now logs a warning.
+
 ## 1.5.1 - 2026-11-18
 
 - Bluetooth Peer runs in Gateway mode, so a node with transport on looks up the paths its Bluetooth peers ask for that it doesn't know yet. Nodes with transport off behave as before.

@@ -22,6 +22,72 @@ fn config_dir_type_lists_fill_the_filter_policy() {
     assert!(rc.filter.known_types.is_empty() && rc.filter.flagged_types.is_empty());
 }
 
+/// Runs `f` with a subscriber on this thread that keeps the message of every
+/// WARN event, and returns `f`'s value with those messages.
+fn with_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+
+    struct Message(String);
+    impl Visit for Message {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().unwrap().push(message.0);
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let value = tracing::subscriber::with_default(Warnings(Arc::clone(&seen)), f);
+    let warnings = seen.lock().unwrap().clone();
+    (value, warnings)
+}
+
+#[test]
+fn a_reticulum_hop_limiter_is_ignored_with_a_warning_naming_filter() {
+    // Upstream's example config shows the global hop_limiter under
+    // [reticulum]; Python and the runtime read it only from [filter].
+    let misplaced = Config::parse("[reticulum]\n  hop_limiter = 16\n").unwrap();
+    let (rc, warnings) = with_warnings(|| ReticulumConfig::try_from_config(&misplaced).unwrap());
+    assert_eq!(
+        warnings,
+        [
+            "The configuration option hop_limiter in [reticulum] has no effect, \
+          set it in [filter] instead"
+        ]
+    );
+    assert_eq!(
+        rc.filter.hop_limiter,
+        rns_transport::constants::PATHFINDER_M
+    );
+
+    let placed =
+        Config::parse("[reticulum]\n  enable_transport = No\n[filter]\n  hop_limiter = 16\n")
+            .unwrap();
+    let (rc, warnings) = with_warnings(|| ReticulumConfig::try_from_config(&placed).unwrap());
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(rc.filter.hop_limiter, 16);
+}
+
 fn post_init(kind: &str, hop_limiter: &str) -> interface_factory::InterfacePostInit {
     let mut section = ConfigSection::new();
     section.set("type", kind);
