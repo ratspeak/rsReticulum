@@ -11,7 +11,9 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use rns_tools::{RETICULUM_COMPAT_VERSION, RS_RETICULUM_VERSION};
 const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
-// Upstream `rnsd --exampleconfig` output, including print()'s trailing newline.
+// Upstream `rnsd --exampleconfig` output, including print()'s trailing newline,
+// with one deliberate change: upstream shows `hop_limiter` under `[reticulum]`,
+// where neither Python nor rsReticulum reads it, so it sits in `[filter]` here.
 const RNSD_EXAMPLE_CONFIG: &str = r#"# This is an example Reticulum config file.
 # You should probably edit it to include any additional,
 # interfaces and settings you might need.
@@ -215,18 +217,20 @@ instance_name = default
 # blackhole_update_interval = 60
 
 
-# You can enable a hop limiter, that will drop all packets
-# exceeding the specified maximum hop count.
-
-# hop_limiter = 16
-
-
 # When not running as a transport node, it is possible to
 # force the use of the same, static transport identity
 # for every instance start. Defaults to using a new identity
 # at every instance start, if transport is disabled.
 
 # static_transport_identity = no
+
+[filter]
+
+# You can enable a hop limiter, that will drop all packets
+# exceeding the specified maximum hop count.
+
+# hop_limiter = 16
+
 
 [stamps]
 # This section configures stamping behaviour and defaults.
@@ -1134,5 +1138,17 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn example_hop_limiter_takes_effect_once_uncommented() {
+        // Upstream's example shows hop_limiter under [reticulum], which neither
+        // Python nor the runtime reads; uncommented here, it must limit hops.
+        let commented = "\n# hop_limiter = 16\n";
+        assert_eq!(RNSD_EXAMPLE_CONFIG.matches(commented).count(), 1);
+        let uncommented = RNSD_EXAMPLE_CONFIG.replace(commented, "\nhop_limiter = 16\n");
+        let config = rns_runtime::config::Config::parse(&uncommented).unwrap();
+        let rc = rns_runtime::reticulum::ReticulumConfig::try_from_config(&config).unwrap();
+        assert_eq!(rc.filter.hop_limiter, 16);
     }
 }
