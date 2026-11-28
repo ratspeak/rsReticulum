@@ -42,8 +42,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-identity.txt",
-      "itemCount": 537,
-      "sha256": "f525e1b3f59c1092454ad4e36bc8cd7a5294ed97a33707891780748fa21286c4"
+      "itemCount": 540,
+      "sha256": "4141288b63aa5b267d4c8fb994cf3a6be1092a88220e102899daf7e5c03565c9"
     },
     {
       "name": "rns-transport",
@@ -60,8 +60,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-link.txt",
-      "itemCount": 440,
-      "sha256": "d1c84fa2090ecb50afc746344017a8d82b50e2733b572fdcec79f212a20c5944"
+      "itemCount": 441,
+      "sha256": "3c45e3d2d4a6dbe2da5f38483af139558a603fd2eeb03c98deeb301035078466"
     },
     {
       "name": "rns-protocol",
@@ -78,8 +78,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-interface.txt",
-      "itemCount": 1589,
-      "sha256": "d62d9d2d0825bbc56ea00c440fabe45d056447f316cd78761c1001118a3fc23c"
+      "itemCount": 1590,
+      "sha256": "e8410a0c94aac8799082edb59a70a8ed26a85aab2175c916d2bdcb3509959b69"
     },
     {
       "name": "rns-runtime",

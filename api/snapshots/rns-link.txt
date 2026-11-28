@@ -1,4 +1,5 @@
 pub mod rns_link
+pub use rns_link::msgpack
 pub mod rns_link::clock
 pub struct rns_link::clock::ContinuousInstant(_)
 impl rns_link::clock::ContinuousInstant

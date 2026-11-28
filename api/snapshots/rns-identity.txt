@@ -347,6 +347,9 @@ pub fn rns_identity::known_destinations::KnownDestinations::save(&self, &std::pa
 pub fn rns_identity::known_destinations::KnownDestinations::unretain(&mut self, &[u8; 16])
 impl core::default::Default for rns_identity::known_destinations::KnownDestinations
 pub fn rns_identity::known_destinations::KnownDestinations::default() -> Self
+pub mod rns_identity::msgpack
+pub const rns_identity::msgpack::MAX_DECODE_DEPTH: usize
+pub fn rns_identity::msgpack::read_value<R: alloc::io::read::Read>(&mut R) -> core::result::Result<rmpv::Value, rmpv::decode::Error>
 pub mod rns_identity::name_hash
 pub fn rns_identity::name_hash::name_hash(&str) -> [u8; 10]
 pub mod rns_identity::persistence

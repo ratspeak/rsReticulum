@@ -1339,6 +1339,7 @@ impl core::default::Default for rns_interface::tcp::TcpInterfaceState
 pub fn rns_interface::tcp::TcpInterfaceState::default() -> Self
 pub struct rns_interface::tcp::TcpServerConfig
 pub rns_interface::tcp::TcpServerConfig::bitrate: u64
+pub rns_interface::tcp::TcpServerConfig::client_limit: core::option::Option<u64>
 pub rns_interface::tcp::TcpServerConfig::device: core::option::Option<alloc::string::String>
 pub rns_interface::tcp::TcpServerConfig::i2p_tunneled: bool
 pub rns_interface::tcp::TcpServerConfig::ifac_size: usize
