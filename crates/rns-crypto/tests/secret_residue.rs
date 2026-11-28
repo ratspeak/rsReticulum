@@ -42,6 +42,19 @@ fn the_harness_ignores_bytes_freed_before_the_check() {
 }
 
 #[test]
+fn the_harness_ignores_stale_bytes_in_a_block_allocated_before_the_check() {
+    let _serial = serial();
+    let secret: [u8; 64] = pseudo_random(14);
+    // Large enough that the allocator hands the same block straight back.
+    drop(black_box(secret.repeat(1024)));
+    let unwritten = black_box(Vec::<u8>::with_capacity(64 * 1024));
+
+    let ((), freed) = freed_by(|| drop(unwritten));
+
+    assert_no_residue(&freed, &[("secret", &secret)]);
+}
+
+#[test]
 fn token_encrypt_frees_no_plaintext() {
     let _serial = serial();
     let key: [u8; 64] = pseudo_random(1);

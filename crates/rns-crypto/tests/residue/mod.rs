@@ -33,13 +33,13 @@ fn armed() -> bool {
 }
 
 unsafe impl GlobalAlloc for RecordingAllocator {
-    // Blocks handed out while armed start zeroed, so a recorded block holds
-    // only what was written during the check, never a reused block's old bytes.
+    // Every block starts zeroed, so a recorded block holds only what was
+    // written into it, never a reused block's old bytes. That covers blocks
+    // allocated before the check and freed in it.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if !armed() {
-            return unsafe { System.alloc(layout) };
+        if armed() {
+            PEAK.fetch_max(layout.size(), Ordering::Relaxed);
         }
-        PEAK.fetch_max(layout.size(), Ordering::Relaxed);
         unsafe { System.alloc_zeroed(layout) }
     }
 
