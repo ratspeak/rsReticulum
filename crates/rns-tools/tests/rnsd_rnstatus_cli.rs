@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -149,6 +149,7 @@ fn rnstatus_json(tmp: &TempDir) -> Output {
 fn poll_rnstatus_until<F>(
     daemon: &mut ChildGuard,
     tmp: &TempDir,
+    shared_port: u16,
     deadline_after: Duration,
     predicate: F,
 ) -> Result<(), String>
@@ -156,6 +157,26 @@ where
     F: Fn(&[serde_json::Value]) -> bool,
 {
     let deadline = Instant::now() + deadline_after;
+    // rnstatus probes the shared port by binding it, as upstream's does; one racing
+    // the daemon's bind leaves the daemon standalone on Windows. A connect binds nothing.
+    let shared_addr = std::net::SocketAddr::from(([127, 0, 0, 1], shared_port));
+    loop {
+        if let Some(status) = daemon.try_wait() {
+            return Err(format!(
+                "rnsd-rs exited before its shared server was listening: {status}"
+            ));
+        }
+        if TcpStream::connect_timeout(&shared_addr, Duration::from_millis(500)).is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "rnsd-rs did not listen on shared port {shared_port} before the deadline"
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
     let mut last_status = None;
     let mut last_stdout = String::new();
     let mut last_stderr = String::new();
@@ -232,13 +253,17 @@ fn rnsd_rnstatus_cli_survives_stale_python_destination_table() {
         ["--config".as_ref(), tmp.path().as_os_str()],
     );
 
-    if let Err(message) =
-        poll_rnstatus_until(&mut daemon, &tmp, Duration::from_secs(5), |interfaces| {
+    if let Err(message) = poll_rnstatus_until(
+        &mut daemon,
+        &tmp,
+        shared_port,
+        Duration::from_secs(5),
+        |interfaces| {
             interfaces.iter().any(|entry| {
                 entry.get("type").and_then(|v| v.as_str()) == Some("LocalServerInterface")
             })
-        })
-    {
+        },
+    ) {
         panic_with_daemon_output(message, daemon);
     }
 }
@@ -282,14 +307,18 @@ fn rnsd_rnstatus_cli_public_tcp_testnet_smoke() {
         ["--config".as_ref(), tmp.path().as_os_str()],
     );
 
-    if let Err(message) =
-        poll_rnstatus_until(&mut daemon, &tmp, Duration::from_secs(10), |interfaces| {
+    if let Err(message) = poll_rnstatus_until(
+        &mut daemon,
+        &tmp,
+        shared_port,
+        Duration::from_secs(10),
+        |interfaces| {
             interfaces.iter().any(|entry| {
                 entry.get("name").and_then(|v| v.as_str()) == Some("Public TCP")
                     && entry.get("status").and_then(|v| v.as_bool()) == Some(true)
             })
-        })
-    {
+        },
+    ) {
         panic_with_daemon_output(
             format!("{message}\nexpected Public TCP to come online for {host}:{port}"),
             daemon,

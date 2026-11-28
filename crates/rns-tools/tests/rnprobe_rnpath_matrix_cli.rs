@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -174,9 +174,32 @@ fn rnstatus_json(tmp: &TempDir) -> Output {
 fn poll_shared_server(
     daemon: &mut ChildGuard,
     tmp: &TempDir,
+    shared_port: u16,
     deadline_after: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + deadline_after;
+    // rnstatus probes the shared port by binding it, as upstream's does; one racing
+    // the daemon's bind leaves the daemon standalone on Windows. A connect binds nothing.
+    let shared_addr = std::net::SocketAddr::from(([127, 0, 0, 1], shared_port));
+    loop {
+        if let Some(status) = daemon.try_wait() {
+            return Err(format!(
+                "{} exited before shared server was listening: {status}",
+                daemon.label
+            ));
+        }
+        if TcpStream::connect_timeout(&shared_addr, Duration::from_millis(500)).is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{} did not listen on shared port {shared_port} before the deadline",
+                daemon.label
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
     let mut last_status = None;
     let mut last_stdout = String::new();
     let mut last_stderr = String::new();
@@ -355,9 +378,12 @@ fn rust_probe_destination_supports_active_path_and_probe_matrix() {
         env!("CARGO_BIN_EXE_rnsd-rs"),
         ["--config".as_ref(), responder_tmp.path().as_os_str()],
     );
-    if let Err(message) =
-        poll_shared_server(&mut responder, &responder_tmp, Duration::from_secs(30))
-    {
+    if let Err(message) = poll_shared_server(
+        &mut responder,
+        &responder_tmp,
+        ports[1],
+        Duration::from_secs(30),
+    ) {
         let mut placeholder = ChildGuard {
             label: "path origin rnsd-rs",
             child: None,
@@ -400,9 +426,12 @@ fn rust_probe_destination_supports_active_path_and_probe_matrix() {
         env!("CARGO_BIN_EXE_rnsd-rs"),
         ["--config".as_ref(), path_origin_tmp.path().as_os_str()],
     );
-    if let Err(message) =
-        poll_shared_server(&mut path_origin, &path_origin_tmp, Duration::from_secs(30))
-    {
+    if let Err(message) = poll_shared_server(
+        &mut path_origin,
+        &path_origin_tmp,
+        ports[3],
+        Duration::from_secs(30),
+    ) {
         let mut cold_placeholder = ChildGuard {
             label: "cold origin rnsd-rs",
             child: None,
@@ -420,9 +449,12 @@ fn rust_probe_destination_supports_active_path_and_probe_matrix() {
         env!("CARGO_BIN_EXE_rnsd-rs"),
         ["--config".as_ref(), cold_origin_tmp.path().as_os_str()],
     );
-    if let Err(message) =
-        poll_shared_server(&mut cold_origin, &cold_origin_tmp, Duration::from_secs(30))
-    {
+    if let Err(message) = poll_shared_server(
+        &mut cold_origin,
+        &cold_origin_tmp,
+        ports[5],
+        Duration::from_secs(30),
+    ) {
         panic_with_daemon_outputs(message, &mut responder, &mut path_origin, &mut cold_origin);
     }
 
