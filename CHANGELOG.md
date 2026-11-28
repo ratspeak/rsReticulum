@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- An incoming Resource refuses parts beyond its advertised transfer size, so a peer can no longer send MTU-sized parts for a small advertisement and fill memory.
+- MessagePack from peers (Link requests and responses, Resource advertisements and hashmap updates, discovery announces, tunnel synthesis, rnsh, rncp, rngit) is decoded at most 63 containers deep, through `rns_identity::msgpack::read_value`, instead of rmpv's 512, which overflowed the stack of a debug build.
+- TCP server interfaces take `client_limit`, as Backbone listeners do. Python's TCPServerInterface has no limit, so there is none by default.
 - `init_with_policy_holding` starts the runtime with named configured interfaces left out of the run, as if disabled, without rewriting the config file, so they start again in a run that does not hold them.
 - Apple Bluetooth: a CoreBluetooth manager asks for state restoration only where the app declares the `bluetooth-central` or `bluetooth-peripheral` background mode. iOS raises an exception otherwise, which aborted any process without them, such as a Network Extension, as soon as Bluetooth Peer or a Bluetooth radio started. An Objective-C exception from creating a manager, scanning, or advertising now comes back as an error instead of ending the process.
 
