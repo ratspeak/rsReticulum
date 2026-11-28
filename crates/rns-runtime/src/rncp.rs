@@ -689,7 +689,8 @@ fn serve_fetch(
 fn extract_filename(metadata: Option<&[u8]>) -> Option<String> {
     let meta = metadata?;
     // Envelope: msgpack({"name": b"filename"}).
-    let map: rmpv::Value = rmpv::decode::read_value(&mut std::io::Cursor::new(meta)).ok()?;
+    let map: rmpv::Value =
+        rns_identity::msgpack::read_value(&mut std::io::Cursor::new(meta)).ok()?;
     let entries = match map {
         rmpv::Value::Map(m) => m,
         _ => return None,

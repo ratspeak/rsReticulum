@@ -167,7 +167,8 @@ pub fn parse_hashmap_update(data: &[u8]) -> Result<([u8; 32], usize, Vec<u8>), R
     let mut resource_hash = [0u8; 32];
     resource_hash.copy_from_slice(&data[..32]);
 
-    let value = rmpv::decode::read_value(&mut &data[32..]).map_err(|_| ResourceError::Corrupt)?;
+    let value =
+        rns_link::msgpack::read_value(&mut &data[32..]).map_err(|_| ResourceError::Corrupt)?;
     let rmpv::Value::Array(items) = value else {
         return Err(ResourceError::Corrupt);
     };

@@ -125,7 +125,7 @@ pub enum RequestSendMode {
 /// Decode exactly one complete MessagePack value, rejecting trailing bytes.
 pub fn decode_single_value(packed: &[u8]) -> Option<rmpv::Value> {
     let mut cursor = std::io::Cursor::new(packed);
-    match rmpv::decode::read_value(&mut cursor) {
+    match rns_identity::msgpack::read_value(&mut cursor) {
         Ok(value) if cursor.position() as usize == packed.len() => Some(value),
         _ => None,
     }
@@ -693,7 +693,7 @@ impl Link {
             .decrypt(encrypted_data)
             .map_err(|_| HandshakeError::InvalidSignature)?;
 
-        let peer_rtt = rmpv::decode::read_value(&mut &plaintext[..])
+        let peer_rtt = rns_identity::msgpack::read_value(&mut &plaintext[..])
             .ok()
             .and_then(|value| match value {
                 rmpv::Value::Boolean(flag) => Some(f64::from(u8::from(flag))),
@@ -1100,7 +1100,7 @@ impl Link {
         let request_id = truncated_hash(plaintext);
 
         // Unpack msgpack array: [timestamp, path_hash, data]
-        let value = rmpv::decode::read_value(&mut &plaintext[..])
+        let value = rns_identity::msgpack::read_value(&mut &plaintext[..])
             .map_err(|_| LinkCryptoError::DecryptionFailed)?;
 
         let array = value.as_array().ok_or(LinkCryptoError::DecryptionFailed)?;
@@ -1231,7 +1231,7 @@ impl Link {
     pub fn parse_response_value(
         plaintext: &[u8],
     ) -> Result<([u8; 16], rmpv::Value), LinkCryptoError> {
-        let value = rmpv::decode::read_value(&mut &plaintext[..])
+        let value = rns_identity::msgpack::read_value(&mut &plaintext[..])
             .map_err(|_| LinkCryptoError::DecryptionFailed)?;
 
         let rmpv::Value::Array(mut array) = value else {
@@ -1282,7 +1282,7 @@ impl Link {
     ) -> Result<Duration, LinkCryptoError> {
         let plaintext = self.decrypt(encrypted_data)?;
 
-        let value = rmpv::decode::read_value(&mut &plaintext[..])
+        let value = rns_identity::msgpack::read_value(&mut &plaintext[..])
             .map_err(|_| LinkCryptoError::DecryptionFailed)?;
         let peer_rtt = value.as_f64().ok_or(LinkCryptoError::DecryptionFailed)?;
 

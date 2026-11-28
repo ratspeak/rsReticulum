@@ -800,7 +800,7 @@ impl ReleaseRemote for LinkRemote {
         Some(match (response.metadata, response.file) {
             (Some(metadata), Some(file)) => ReleaseResponse::File {
                 path: file,
-                metadata: rmpv::decode::read_value(&mut metadata.as_slice())
+                metadata: rns_identity::msgpack::read_value(&mut metadata.as_slice())
                     .unwrap_or(rmpv::Value::Nil),
             },
             _ => match response.value {

@@ -213,8 +213,8 @@ pub fn decode_published_manifest(
     publisher: IdentityHash,
 ) -> Result<Vec<([u8; 16], BlackholeManifestEntry)>, ManifestError> {
     let mut cursor = std::io::Cursor::new(bytes);
-    let root =
-        rmpv::decode::read_value(&mut cursor).map_err(|e| ManifestError::Decode(e.to_string()))?;
+    let root = rns_identity::msgpack::read_value(&mut cursor)
+        .map_err(|e| ManifestError::Decode(e.to_string()))?;
     let Value::Map(map) = root else {
         return Err(ManifestError::NotAMap);
     };

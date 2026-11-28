@@ -142,8 +142,8 @@ impl ResourceAdvertisement {
             rns_wire::constants::MTU,
         )
         .map_err(|error| error.to_string())?;
-        let value =
-            rmpv::decode::read_value(&mut &data[..]).map_err(|e| format!("msgpack decode: {e}"))?;
+        let value = rns_link::msgpack::read_value(&mut &data[..])
+            .map_err(|e| format!("msgpack decode: {e}"))?;
 
         let map = match &value {
             Value::Map(m) => m,

@@ -14,3 +14,5 @@ pub mod link;
 pub mod mtu_discovery;
 pub mod request;
 pub mod stamp;
+
+pub use rns_identity::msgpack;

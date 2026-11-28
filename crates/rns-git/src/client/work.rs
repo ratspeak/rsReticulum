@@ -108,7 +108,8 @@ pub(crate) fn exchange(
 }
 
 pub(crate) fn unpack(body: &[u8], context: &str) -> Result<Value, Fail> {
-    rmpv::decode::read_value(&mut &body[..]).map_err(|e| Fail::Abort(format!("{context}: {e}")))
+    rns_identity::msgpack::read_value(&mut &body[..])
+        .map_err(|e| Fail::Abort(format!("{context}: {e}")))
 }
 
 /// Python `str.capitalize()`.
