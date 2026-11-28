@@ -567,6 +567,7 @@ pub struct InboundResource {
     pub sdu: usize,
     /// Metadata extracted at `assemble()` time when `flags.has_metadata` was set.
     pub metadata: Option<Vec<u8>>,
+    received_bytes: usize,
 }
 
 impl InboundResource {
@@ -646,12 +647,22 @@ impl InboundResource {
             map_hashes: initial_map_hashes,
             sdu: link_sdu.unwrap_or(SDU),
             metadata: None,
+            received_bytes: 0,
         })
     }
 
     /// Try to slot `data` into the current window by map-hash match. Returns
     /// true when the part was accepted into a previously-empty slot.
     pub fn receive_part(&mut self, data: Vec<u8>) -> bool {
+        // A sender slices exactly `total_size` bytes into parts; anything past
+        // that is a peer inflating its parts to the interface MTU.
+        let Some(received) = self
+            .received_bytes
+            .checked_add(data.len())
+            .filter(|received| *received <= self.total_size)
+        else {
+            return false;
+        };
         let mh = get_map_hash(&data, &self.random_hash);
 
         tracing::trace!(
@@ -681,6 +692,7 @@ impl InboundResource {
         for i in search_start..search_end {
             if i < self.map_hashes.len() && self.map_hashes[i] == mh && self.parts[i].is_none() {
                 self.parts[i] = Some(data);
+                self.received_bytes = received;
                 self.update_consecutive();
                 return true;
             }
@@ -3002,6 +3014,50 @@ mod tests {
             assert!(inbound.receive_part(part.clone()));
         }
         assert!(inbound.is_complete());
+        assert_eq!(inbound.assemble(None).unwrap(), data);
+    }
+
+    #[test]
+    fn test_inbound_refuses_parts_past_advertised_transfer_size() {
+        // A peer advertises a tiny transfer, then sends MTU-sized parts whose
+        // map hashes it computed itself.
+        let random_hash = [7u8; RANDOM_HASH_SIZE];
+        let parts: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 64 * 1024]).collect();
+        let map_hashes = parts
+            .iter()
+            .map(|part| get_map_hash(part, &random_hash))
+            .collect();
+        let mut inbound = InboundResource::new(
+            parts.len(),
+            128,
+            1,
+            random_hash,
+            [0u8; 32],
+            ResourceFlags::default(),
+            map_hashes,
+        )
+        .unwrap();
+        for part in parts {
+            assert!(!inbound.receive_part(part));
+        }
+        assert!(inbound.parts.iter().all(Option::is_none));
+
+        // Parts summing to exactly the transfer size still complete.
+        let data: Vec<u8> = (0..1200).map(|i| (i % 251) as u8).collect();
+        let outbound = OutboundResource::new(data.clone(), false, None).unwrap();
+        let mut inbound = InboundResource::new(
+            outbound.num_parts(),
+            outbound.total_size,
+            data.len(),
+            outbound.random_hash,
+            outbound.resource_hash,
+            ResourceFlags::default(),
+            outbound.map_hashes.clone(),
+        )
+        .unwrap();
+        for part in &outbound.parts {
+            assert!(inbound.receive_part(part.clone()));
+        }
         assert_eq!(inbound.assemble(None).unwrap(), data);
     }
 
