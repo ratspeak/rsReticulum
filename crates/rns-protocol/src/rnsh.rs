@@ -492,8 +492,8 @@ fn encode_value(value: &Value) -> Result<Vec<u8>, RnshCodecError> {
 
 fn decode_value(raw: &[u8]) -> Result<Value, RnshCodecError> {
     let mut cursor = Cursor::new(raw);
-    let value =
-        rmpv::decode::read_value(&mut cursor).map_err(|e| RnshCodecError::Decode(e.to_string()))?;
+    let value = rns_link::msgpack::read_value(&mut cursor)
+        .map_err(|e| RnshCodecError::Decode(e.to_string()))?;
     if cursor.position() as usize != raw.len() {
         return Err(RnshCodecError::InvalidShape("trailing msgpack bytes"));
     }

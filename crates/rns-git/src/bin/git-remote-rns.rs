@@ -87,14 +87,14 @@ impl Transport for LinkTransport {
         match (response.metadata, response.file) {
             (Some(metadata), Some(file)) => Some(Response::File {
                 path: file,
-                metadata: rmpv::decode::read_value(&mut metadata.as_slice())
+                metadata: rns_identity::msgpack::read_value(&mut metadata.as_slice())
                     .unwrap_or(rmpv::Value::Nil),
             }),
             // A spooled Resource response without metadata: the value itself.
             (None, Some(file)) => {
                 let data = std::fs::read(&file).ok();
                 let _ = std::fs::remove_file(&file);
-                let value = rmpv::decode::read_value(&mut data?.as_slice()).ok()?;
+                let value = rns_identity::msgpack::read_value(&mut data?.as_slice()).ok()?;
                 Some(response_value(value))
             }
             _ => Some(response_value(response.value)),

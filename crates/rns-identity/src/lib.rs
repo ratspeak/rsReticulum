@@ -8,6 +8,7 @@ pub mod destination;
 pub mod identity;
 pub mod ifac;
 pub mod known_destinations;
+pub mod msgpack;
 pub mod name_hash;
 pub mod persistence;
 pub mod ratchet;

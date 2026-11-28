@@ -908,6 +908,11 @@ fn synthesize_tcp_server(
     config.listen_ip = section.get("listen_ip").map(str::to_string);
     config.mode = mode;
     config.i2p_tunneled = parse_bool_strict(name, "i2p_tunneled", section, false)?;
+    // BackboneInterface's `client_limit`; Python's TCPServerInterface ignores it.
+    config.client_limit = match parse_int_strict(name, "client_limit", section, 0)? {
+        0 => None,
+        limit => Some(u64::try_from(limit).unwrap_or(0)),
+    };
 
     if let Some(kiss) = section.get_bool("kiss_framing") {
         config.kiss_framing = kiss;
@@ -2367,9 +2372,16 @@ mod tests {
             InterfaceConfig::TcpServer(c) => {
                 assert_eq!(c.listen_ip.as_deref(), Some("0.0.0.0"));
                 assert_eq!(c.listen_port, 4242);
+                assert_eq!(c.client_limit, None);
             }
             _ => panic!("expected TcpServer"),
         }
+        section.set("client_limit", "64");
+        let InterfaceConfig::TcpServer(c) = synthesize_interface("test_srv", &section).unwrap()
+        else {
+            panic!("expected TcpServer");
+        };
+        assert_eq!(c.client_limit, Some(64));
     }
 
     #[test]

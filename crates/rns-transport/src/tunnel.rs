@@ -356,8 +356,8 @@ impl RemoteTransportInfo {
     /// integer costs are accepted: Python sends one for a clamped cost.
     pub fn decode(ext: &[u8]) -> Result<Self, TunnelExtError> {
         use rmpv::Value;
-        let value =
-            rmpv::decode::read_value(&mut &ext[..]).map_err(|_| TunnelExtError::Undecodable)?;
+        let value = rns_identity::msgpack::read_value(&mut &ext[..])
+            .map_err(|_| TunnelExtError::Undecodable)?;
         if !python_decodable(&value) {
             return Err(TunnelExtError::Undecodable);
         }

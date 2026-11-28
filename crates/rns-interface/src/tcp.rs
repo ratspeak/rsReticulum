@@ -247,6 +247,9 @@ pub struct TcpServerConfig {
     pub bitrate: u64,
     /// IFAC size in bytes; accepted clients inherit it.
     pub ifac_size: usize,
+    /// A new connection is closed while this many clients are connected.
+    /// Python's TCPServerInterface has no limit, so `None` is the default.
+    pub client_limit: Option<u64>,
 }
 
 impl TcpServerConfig {
@@ -262,6 +265,7 @@ impl TcpServerConfig {
             i2p_tunneled: false,
             bitrate: BITRATE_GUESS,
             ifac_size: DEFAULT_IFAC_SIZE,
+            client_limit: None,
         }
     }
 }
@@ -960,6 +964,18 @@ pub async fn spawn_tcp_server(
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    if config
+                        .client_limit
+                        .is_some_and(|limit| task_clients.load(Ordering::Relaxed) >= limit)
+                    {
+                        tracing::debug!(
+                            name = %config.name,
+                            peer = %peer,
+                            "TCP server client limit reached, closing connection"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
                     let client_name = format!("{}/client_{}", config.name, client_id);
                     tracing::info!(name = %client_name, peer = %peer, "accepted TCP connection");
@@ -1339,6 +1355,42 @@ mod tests {
             .expect("child after parent registration")
             .unwrap();
         assert_eq!(child.parent_id, Some(700));
+    }
+
+    #[tokio::test]
+    async fn server_closes_connections_past_its_client_limit() {
+        use tokio::io::AsyncReadExt;
+        let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
+        let (handle_tx, mut handle_rx) = mpsc::channel::<InterfaceHandle>(8);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = TcpServerConfig::new("limited-server", "127.0.0.1", port);
+        config.client_limit = Some(1);
+        let server = spawn_tcp_server(
+            config,
+            710,
+            Arc::new(AtomicU64::new(711)),
+            transport_tx,
+            handle_tx,
+        )
+        .await
+        .unwrap();
+        server.owner.mark_registered();
+        let _first = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let _child = tokio::time::timeout(std::time::Duration::from_secs(3), handle_rx.recv())
+            .await
+            .expect("first client is accepted")
+            .unwrap();
+
+        let mut second = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(3), second.read(&mut byte))
+            .await
+            .expect("a client past the limit is closed");
+        assert!(matches!(read, Ok(0) | Err(_)));
+        assert!(handle_rx.try_recv().is_err());
+        server.read_task.abort();
     }
 
     /// TCP loopback: spawn server + client on localhost:0, roundtrip a packet.

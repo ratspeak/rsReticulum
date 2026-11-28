@@ -679,7 +679,7 @@ impl Session {
             outp!(out, "{CLR}");
             outp!(out, "Sending request... ");
         }
-        let result = match rmpv::decode::read_value(&mut bytes.as_slice()) {
+        let result = match rns_identity::msgpack::read_value(&mut bytes.as_slice()) {
             Ok(Value::Array(items)) if !items.is_empty() => {
                 let mut items = items.into_iter();
                 let status = items.next().unwrap_or(Value::Nil);

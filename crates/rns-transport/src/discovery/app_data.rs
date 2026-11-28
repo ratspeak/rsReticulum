@@ -361,7 +361,7 @@ pub fn split_stamp(body: &[u8]) -> Result<(&[u8], &[u8]), AppDataError> {
 /// This does not resolve the endpoint, authenticate the transport ID or verify
 /// a stamp. Oversized port/channel and SF/CR integers are clamped.
 pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
-    let value = rmpv::decode::read_value(&mut Cursor::new(packed))
+    let value = rns_identity::msgpack::read_value(&mut Cursor::new(packed))
         .map_err(|e| AppDataError::Msgpack(e.to_string()))?;
     if !python_unpackable(&value) {
         return Err(AppDataError::Msgpack("map upstream cannot unpack".into()));
