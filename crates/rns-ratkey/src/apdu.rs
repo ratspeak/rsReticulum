@@ -28,6 +28,7 @@ pub const INS_ATTEST: u8 = 0xF9;
 pub const INS_IMPORT_KEY: u8 = 0xFE;
 pub const INS_GET_VERSION: u8 = 0xFD;
 pub const INS_GET_SERIAL: u8 = 0xF8;
+pub const INS_SET_MANAGEMENT_KEY: u8 = 0xFF;
 
 // Algorithm IDs; ALG_ED25519/ALG_X25519 are YubiKey 5.7+ Yubico extensions.
 pub const ALG_ED25519: u8 = 0xE0;
@@ -358,6 +359,19 @@ pub fn get_serial() -> Vec<u8> {
 
 pub fn attest_key(slot: u8) -> Vec<u8> {
     build_apdu(INS_ATTEST, slot, 0x00, &[])
+}
+
+/// Yubico SET MANAGEMENT KEY: replace the 9B key with `key` of algorithm `alg`,
+/// no touch required. Needs management-key auth in the same session. The
+/// command carries the new key; wipe it after use.
+pub fn set_management_key(alg: u8, key: &[u8]) -> Vec<u8> {
+    use zeroize::Zeroize;
+    let mut data = Vec::with_capacity(3 + key.len());
+    data.extend_from_slice(&[alg, SLOT_CARD_MANAGEMENT, key.len() as u8]);
+    data.extend_from_slice(key);
+    let cmd = build_apdu(INS_SET_MANAGEMENT_KEY, 0xFF, 0xFF, &data);
+    data.zeroize();
+    cmd
 }
 
 // --- Management-key authentication (slot 9B, witness/challenge mutual auth) ---
@@ -868,6 +882,14 @@ mod tests {
     #[test]
     fn test_reset_piv() {
         assert_eq!(reset_piv(), vec![0x00, 0xFB, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_set_management_key() {
+        let key = [0x11u8; 24];
+        let mut expected = vec![0x00, 0xFF, 0xFF, 0xFF, 27, MGMT_ALG_AES192, 0x9B, 24];
+        expected.extend_from_slice(&key);
+        assert_eq!(set_management_key(MGMT_ALG_AES192, &key), expected);
     }
 
     #[test]

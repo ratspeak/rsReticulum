@@ -16,6 +16,7 @@ pub const rns_ratkey::apdu::INS_IMPORT_KEY: u8
 pub const rns_ratkey::apdu::INS_RESET_PIV: u8
 pub const rns_ratkey::apdu::INS_RESET_RETRY: u8
 pub const rns_ratkey::apdu::INS_SELECT: u8
+pub const rns_ratkey::apdu::INS_SET_MANAGEMENT_KEY: u8
 pub const rns_ratkey::apdu::INS_VERIFY: u8
 pub const rns_ratkey::apdu::MGMT_ALG_AES128: u8
 pub const rns_ratkey::apdu::MGMT_ALG_AES192: u8
@@ -63,6 +64,7 @@ pub fn rns_ratkey::apdu::parse_version_response(&[u8]) -> core::result::Result<(
 pub fn rns_ratkey::apdu::reset_piv() -> alloc::vec::Vec<u8>
 pub fn rns_ratkey::apdu::reset_retry(&str, &str) -> alloc::vec::Vec<u8>
 pub fn rns_ratkey::apdu::select_piv() -> alloc::vec::Vec<u8>
+pub fn rns_ratkey::apdu::set_management_key(u8, &[u8]) -> alloc::vec::Vec<u8>
 pub fn rns_ratkey::apdu::sign_ed25519(u8, &[u8]) -> alloc::vec::Vec<u8>
 pub fn rns_ratkey::apdu::slot_to_object_id(u8) -> core::option::Option<&'static [u8]>
 pub fn rns_ratkey::apdu::verify_pin(&str) -> alloc::vec::Vec<u8>
@@ -379,6 +381,7 @@ pub fn rns_ratkey::session::PivSession<T>::read_certificate(&mut self, u8) -> co
 pub fn rns_ratkey::session::PivSession<T>::read_metadata(&mut self, u8) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
 pub fn rns_ratkey::session::PivSession<T>::read_public_key(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
 pub fn rns_ratkey::session::PivSession<T>::reset_piv(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::rotate_management_key(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
 pub fn rns_ratkey::session::PivSession<T>::serial(&self) -> core::option::Option<u32>
 pub fn rns_ratkey::session::PivSession<T>::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
 pub fn rns_ratkey::session::PivSession<T>::unblock_pin(&mut self, &str, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
@@ -561,6 +564,7 @@ pub fn rns_ratkey::session::PivSession<T>::read_certificate(&mut self, u8) -> co
 pub fn rns_ratkey::session::PivSession<T>::read_metadata(&mut self, u8) -> core::result::Result<alloc::vec::Vec<u8>, rns_ratkey::error::RatkeyError>
 pub fn rns_ratkey::session::PivSession<T>::read_public_key(&mut self, u8) -> core::result::Result<[u8; 32], rns_ratkey::error::RatkeyError>
 pub fn rns_ratkey::session::PivSession<T>::reset_piv(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
+pub fn rns_ratkey::session::PivSession<T>::rotate_management_key(&mut self) -> core::result::Result<(), rns_ratkey::error::RatkeyError>
 pub fn rns_ratkey::session::PivSession<T>::serial(&self) -> core::option::Option<u32>
 pub fn rns_ratkey::session::PivSession<T>::sign_ed25519(&mut self, u8, &[u8]) -> core::result::Result<[u8; 64], rns_ratkey::error::RatkeyError>
 pub fn rns_ratkey::session::PivSession<T>::unblock_pin(&mut self, &str, &str) -> core::result::Result<(), rns_ratkey::error::RatkeyError>

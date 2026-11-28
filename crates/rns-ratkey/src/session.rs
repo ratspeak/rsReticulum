@@ -320,6 +320,25 @@ impl<T: PivTransport> PivSession<T> {
         }
         Ok(())
     }
+
+    /// Replace the management key (9B) with a fresh random key of its current
+    /// algorithm and keep no copy, so the slots cannot be written again without
+    /// a PIV reset (which needs the PIN and PUK blocked, not this key).
+    /// Requires management-key auth in this session.
+    pub fn rotate_management_key(&mut self) -> Result<(), RatkeyError> {
+        let meta = self.read_metadata(apdu::SLOT_CARD_MANAGEMENT)?;
+        let alg = apdu::parse_metadata_algorithm(&meta)?;
+        let len = crate::mgmt::key_len(alg).ok_or_else(|| {
+            RatkeyError::UnsupportedDevice(format!(
+                "unsupported management-key algorithm 0x{alg:02X}"
+            ))
+        })?;
+        let key = Zeroizing::new(rns_crypto::random::random_bytes(len));
+        let cmd = Zeroizing::new(apdu::set_management_key(alg, &key));
+        let resp = self.transport.transmit(&cmd)?;
+        apdu::check_response(&resp)?;
+        Ok(())
+    }
 }
 
 /// PC/SC convenience alias; `connect()` lives on this monomorphization.

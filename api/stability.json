@@ -114,8 +114,8 @@
       "tier": "experimental",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/rns-ratkey.txt",
-      "itemCount": 618,
-      "sha256": "f2ab796d37f18d7d5d7a515e4b6c28900f6f1c214aec4142fed069275793fdfd"
+      "itemCount": 622,
+      "sha256": "f8b8d902f57119b65133e456d3cd7e5ebb71732c7d14cc3aa87131a157b126c5"
     }
   ],
   "approvedBreakingChanges": {

@@ -6,8 +6,11 @@
 //! are sequential, with no empty-slot guard or rollback: an error can leave
 //! one slot changed, and a later file-write failure does not undo card changes.
 //! The caller owns consent, credential handling and recovery of partial work.
-//! Provisioning does not change the card PIN, PUK or management key, or verify
-//! attestation. `config.pin` is used only by `provision_mock`.
+//! Once both slots are written, provisioning replaces the management key with a
+//! random one it discards, so nothing can overwrite the slots again short of a
+//! PIV reset (PIN and PUK blocked; no management key needed). It does not change
+//! the card PIN or PUK, or verify attestation. `config.pin` is used only by
+//! `provision_mock`.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -165,9 +168,10 @@ fn touch_str(tp: TouchPolicy) -> &'static str {
 
 /// Derive private keys from `mnemonic` on the host and import them into
 /// 9A/9D with PIN-once and the requested touch policies. Requires a connected
-/// session and valid management key. Writes `.hwid` only when a directory is
-/// configured. Existing keys can be replaced, and partial failure is not
-/// rolled back; see the module's provisioning boundary.
+/// session and valid management key, which is then rotated away. Writes
+/// `.hwid` only when a directory is configured. Existing keys can be replaced,
+/// and partial failure is not rolled back; see the module's provisioning
+/// boundary.
 pub fn import_recoverable_identity<T: PivTransport>(
     session: &mut PivSession<T>,
     mgmt_key: &[u8],
@@ -188,13 +192,15 @@ pub fn import_recoverable_identity<T: PivTransport>(
         Some(apdu::PIN_POLICY_ONCE),
         Some(touch_byte(config.touch_encryption)),
     )?;
+    session.rotate_management_key()?;
 
     finalize_provision(session, config, derived.ed25519_pub, derived.x25519_pub)
 }
 
-/// Authenticate with the management key and generate new 9A/9D keys on the
-/// token, without a seed backup. Write `.hwid` only when configured. This can
-/// replace existing keys and has no rollback after partial failure.
+/// Authenticate with the management key, generate new 9A/9D keys on the
+/// token without a seed backup, then rotate the management key away. Write
+/// `.hwid` only when configured. This can replace existing keys and has no
+/// rollback after partial failure.
 pub fn provision_hardware_only<T: PivTransport>(
     session: &mut PivSession<T>,
     mgmt_key: &[u8],
@@ -211,6 +217,7 @@ pub fn provision_hardware_only<T: PivTransport>(
         Some(apdu::PIN_POLICY_ONCE),
         Some(touch_byte(config.touch_encryption)),
     )?;
+    session.rotate_management_key()?;
     finalize_provision(session, config, ed_pub, x_pub)
 }
 
@@ -421,6 +428,153 @@ mod tests {
 
         let err = provision_mock(&mut session, &config).unwrap_err();
         assert!(matches!(err, RatkeyError::PinFailed { .. }));
+    }
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::detect::DeviceType;
+    use crate::session::DeviceMeta;
+
+    const FACTORY_MGMT_KEY: [u8; 24] = [
+        1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8,
+    ];
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    struct Card {
+        alg: u8,
+        key: Vec<u8>,
+        authenticated: bool,
+        writes: Vec<u8>,
+    }
+
+    /// The card side of management auth, slot writes and SET MANAGEMENT KEY.
+    struct CardTransport(Rc<RefCell<Card>>);
+
+    fn ok(mut data: Vec<u8>) -> Result<Vec<u8>, RatkeyError> {
+        data.extend_from_slice(&[0x90, 0x00]);
+        Ok(data)
+    }
+
+    fn wrap_7c(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x7C, (payload.len() + 2) as u8, tag, payload.len() as u8];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    impl PivTransport for CardTransport {
+        fn transmit(&mut self, cmd: &[u8]) -> Result<Vec<u8>, RatkeyError> {
+            const WITNESS: [u8; 16] = [0x77; 16];
+            let mut card = self.0.borrow_mut();
+            let (ins, p2, data) = (cmd[1], cmd[3], cmd.get(5..).unwrap_or(&[]));
+            let denied = Ok(vec![0x69, 0x82]);
+            match ins {
+                apdu::INS_GET_METADATA if p2 == apdu::SLOT_CARD_MANAGEMENT => {
+                    ok(vec![0x01, 0x01, card.alg])
+                }
+                apdu::INS_GENERAL_AUTHENTICATE => {
+                    let witness = apdu::parse_auth_witness(data).unwrap();
+                    if witness.is_empty() {
+                        let enc = crate::mgmt::ecb_encrypt(card.alg, &card.key, &WITNESS).unwrap();
+                        ok(wrap_7c(0x80, &enc))
+                    } else if witness == WITNESS {
+                        card.authenticated = true;
+                        let challenge = &data[data.len() - 16..];
+                        let enc = crate::mgmt::ecb_encrypt(card.alg, &card.key, challenge).unwrap();
+                        ok(wrap_7c(0x82, &enc))
+                    } else {
+                        denied
+                    }
+                }
+                apdu::INS_GENERATE_ASYMMETRIC
+                | apdu::INS_IMPORT_KEY
+                | apdu::INS_SET_MANAGEMENT_KEY
+                    if !card.authenticated =>
+                {
+                    denied
+                }
+                apdu::INS_GENERATE_ASYMMETRIC => {
+                    card.writes.push(ins);
+                    let mut resp = vec![0x7F, 0x49, 0x22, 0x86, 0x20];
+                    resp.extend_from_slice(&[p2; 32]);
+                    ok(resp)
+                }
+                apdu::INS_IMPORT_KEY => {
+                    card.writes.push(ins);
+                    ok(Vec::new())
+                }
+                apdu::INS_SET_MANAGEMENT_KEY => {
+                    card.writes.push(ins);
+                    assert_eq!(&data[..2], &[card.alg, apdu::SLOT_CARD_MANAGEMENT]);
+                    card.key = data[3..3 + data[2] as usize].to_vec();
+                    ok(Vec::new())
+                }
+                _ => panic!("unexpected apdu ins=0x{ins:02X}"),
+            }
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    fn factory_card() -> (Rc<RefCell<Card>>, PivSession<CardTransport>) {
+        let card = Rc::new(RefCell::new(Card {
+            alg: apdu::MGMT_ALG_AES192,
+            key: FACTORY_MGMT_KEY.to_vec(),
+            authenticated: false,
+            writes: Vec::new(),
+        }));
+        let meta = DeviceMeta {
+            device_type: DeviceType::YubiKey5,
+            serial: Some(1),
+            firmware: Some("5.7.4".to_string()),
+        };
+        (Rc::clone(&card), PivSession::new(CardTransport(card), meta))
+    }
+
+    #[test]
+    fn provisioning_leaves_no_known_management_key() {
+        type Flow = fn(&mut PivSession<CardTransport>, &ProvisionConfig) -> Result<(), RatkeyError>;
+        let flows: [(&str, Flow); 3] = [
+            ("hardware only", |s, c| {
+                provision_hardware_only(s, &FACTORY_MGMT_KEY, c).map(drop)
+            }),
+            ("recoverable", |s, c| {
+                provision_recoverable(s, &FACTORY_MGMT_KEY, c).map(drop)
+            }),
+            ("restore", |s, c| {
+                restore(s, &FACTORY_MGMT_KEY, c, TEST_MNEMONIC).map(drop)
+            }),
+        ];
+        for (name, flow) in flows {
+            let (card, mut session) = factory_card();
+            flow(&mut session, &ProvisionConfig::default()).unwrap();
+
+            let card_state = card.borrow();
+            assert_eq!(card_state.key.len(), 24, "{name}");
+            assert_ne!(card_state.key, FACTORY_MGMT_KEY, "{name}");
+            // Rotated once, after both slots were written.
+            assert_eq!(card_state.writes.len(), 3, "{name}");
+            assert_eq!(card_state.writes[2], apdu::INS_SET_MANAGEMENT_KEY, "{name}");
+            drop(card_state);
+
+            card.borrow_mut().authenticated = false;
+            assert!(
+                matches!(
+                    session.authenticate_management_key(&FACTORY_MGMT_KEY),
+                    Err(RatkeyError::ManagementAuthFailed)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rotating_needs_management_auth() {
+        let (card, mut session) = factory_card();
+        assert!(session.rotate_management_key().is_err());
+        assert_eq!(card.borrow().key, FACTORY_MGMT_KEY);
     }
 
     #[test]

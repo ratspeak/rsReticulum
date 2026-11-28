@@ -7,6 +7,7 @@
 - TCP server interfaces take `client_limit`, as Backbone listeners do. Python's TCPServerInterface has no limit, so there is none by default.
 - `init_with_policy_holding` starts the runtime with named configured interfaces left out of the run, as if disabled, without rewriting the config file, so they start again in a run that does not hold them.
 - Apple Bluetooth: a CoreBluetooth manager asks for state restoration only where the app declares the `bluetooth-central` or `bluetooth-peripheral` background mode. iOS raises an exception otherwise, which aborted any process without them, such as a Network Extension, as soon as Bluetooth Peer or a Bluetooth radio started. An Objective-C exception from creating a manager, scanning, or advertising now comes back as an error instead of ending the process.
+- Hardware identities: provisioning a YubiKey replaces its PIV management key with a random one it does not keep, once both identity slots are written, so nothing with the factory key can overwrite them. Setting the key up again takes a PIV reset, which needs only the PIN and PUK blocked. `PivSession::rotate_management_key` and `apdu::set_management_key` are new.
 
 ## 1.5.1 - 2026-11-18
 
